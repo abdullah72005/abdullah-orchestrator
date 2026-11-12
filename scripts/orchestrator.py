@@ -17,6 +17,7 @@ import functools
 import getpass
 import hashlib
 import json
+import numbers
 import os
 from pathlib import Path
 import re
@@ -36,7 +37,28 @@ HERE = Path(__file__).resolve().parent
 SKILL = HERE.parent
 DEFAULT_STATE = Path(os.environ.get("ABDULLAH_STATE_DIR", Path.home() / ".local/state/abdullah-orchestrator/runs"))
 CONFIG_PATH = Path(os.environ.get("ABDULLAH_CONFIG", Path.home() / ".config/abdullah-orchestrator/config.json"))
-RATE_PAT = re.compile(r"rate.limit|too many requests|quota|usage.limit|429|resource.exhausted", re.I)
+RATE_LIMIT_PHRASE_PAT = re.compile(
+    r"\b(?:rate[\s._-]?limit(?:ed|ing)?|too many requests|resource[\s_-]?exhausted|"
+    r"usage[\s_-]?limit|insufficient[\s_-]?quota|"
+    r"(?:quota[^\n]{0,24}(?:exceeded|exhausted))|"
+    r"(?:(?:exceeded|exhausted)[^\n]{0,24}quota))(?![A-Za-z0-9])", re.I)
+# Bare "429" is never enough: it must be attached to an HTTP/status/error
+# marker or to the standard "Too Many Requests" phrase. Hashes, filenames,
+# counters, token counts and session IDs therefore cannot trigger recovery.
+HTTP_429_PAT = re.compile(
+    r"\b(?:http(?:/[0-9.]+)?|status(?:[ _-]?code)?|error(?:[ _-]?code)?|"
+    r"response(?:[ _-]?code)?)\b[\"']?\s*[:=]?\s*(?:http\s*)?429\b"
+    r"|\b429\b\s*(?:too many requests|rate[\s._-]?limit)", re.I)
+RATE_LIMIT_IDENTITY_PAT = re.compile(
+    r"rate[\s._-]?limit|too[\s._-]?many[\s._-]?requests|resource[\s._-]?exhausted",
+    re.I)
+RATE_LIMIT_CODE_TOKENS = {
+    "429", "rate_limit", "rate_limited", "rate_limit_exceeded", "ratelimit",
+    "too_many_requests", "resource_exhausted", "quota_exceeded",
+    "insufficient_quota", "usage_limit_exceeded"}
+RATE_LIMIT_STATUS_KEYS = {
+    "status", "statuscode", "status_code", "httpstatus", "http_status",
+    "code", "errorcode", "error_code", "responsecode", "response_code"}
 REPORT_KEYS = {
     "plan": {"status", "batches", "summary"},
     "implementer": {"status", "summary"},
@@ -2621,8 +2643,168 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None, evid
     raise ValueError("Unsupported strong host")
 
 
+def _json_objects(raw):
+    """Best-effort event objects from a whole JSON document or JSONL stream."""
+    text = raw or ""
+    try:
+        whole = json.loads(text)
+    except ValueError:
+        whole = None
+    else:
+        if isinstance(whole, dict):
+            return [whole]
+        if isinstance(whole, list):
+            return [item for item in whole if isinstance(item, dict)]
+    events = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+        elif isinstance(event, list):
+            events.extend(item for item in event if isinstance(item, dict))
+    return events
+
+
+def _rate_limit_code(value):
+    """True only for an explicit 429 or a known rate-limit identity token."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, numbers.Number):
+        try:
+            return int(value) == 429
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        return normalized in RATE_LIMIT_CODE_TOKENS
+    return False
+
+
+def _error_containers(event):
+    """Error-bearing structures only; success metadata is never inspected."""
+    if not isinstance(event, dict):
+        return []
+    containers = [event[key] for key in ("error", "errors", "failure")
+                  if event.get(key) is not None]
+    part = event.get("part")
+    if isinstance(part, dict):
+        containers.extend(part[key] for key in ("error", "errors", "failure")
+                          if part.get(key) is not None)
+    if str(event.get("type") or "").lower() in {"error", "provider_error", "provider-error"}:
+        containers.append(event)
+    return containers
+
+
+def _structured_rate_limit(event):
+    """Prove a 429 only from explicit provider error fields."""
+    stack = _error_containers(event)
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                lowered = str(key).lower()
+                if lowered in RATE_LIMIT_STATUS_KEYS and _rate_limit_code(item):
+                    return True
+                if lowered in {"name", "type", "code", "error", "reason"}:
+                    if _rate_limit_code(item):
+                        return True
+                    if isinstance(item, str) and (
+                            RATE_LIMIT_IDENTITY_PAT.search(item)
+                            or RATE_LIMIT_PHRASE_PAT.search(item)):
+                        return True
+                if lowered in {"message", "detail", "description", "body"} \
+                        and isinstance(item, str):
+                    if HTTP_429_PAT.search(item) or RATE_LIMIT_PHRASE_PAT.search(item):
+                        return True
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(item for item in value if isinstance(item, (dict, list)))
+    return False
+
+
+def _successful_completion(event):
+    """A terminal OpenCode/step event without an attached error."""
+    if not isinstance(event, dict):
+        return False
+    kind = str(event.get("type") or "").lower()
+    if kind in {"step_finish", "step-finish"}:
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("error") or event.get("error"):
+            return False
+        return str(part.get("reason") or "").lower() in {"", "stop", "end", "complete", "completed"}
+    if kind in {"result", "done", "completed", "complete", "finish", "finished"}:
+        return not event.get("error")
+    return False
+
+
+def _plain_diagnostic_lines(raw):
+    """Non-JSON process diagnostics (stderr/tracebacks), never JSONL metadata."""
+    text = raw or ""
+    try:
+        json.loads(text)
+    except ValueError:
+        pass
+    else:
+        return []
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            json.loads(stripped)
+        except ValueError:
+            lines.append(stripped)
+    return lines
+
+
+def _error_message_text(events):
+    """Message/detail strings from explicit error structures only."""
+    pieces = []
+    for event in events:
+        for container in _error_containers(event):
+            stack = [container]
+            while stack:
+                value = stack.pop()
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if str(key).lower() in {"message", "detail", "description", "body"} \
+                                and isinstance(item, str):
+                            pieces.append(item)
+                        elif isinstance(item, (dict, list)):
+                            stack.append(item)
+                elif isinstance(value, list):
+                    stack.extend(item for item in value if isinstance(item, (dict, list)))
+    return "\n".join(pieces)
+
+
 def is_rate_limited(raw: str):
-    return bool(RATE_PAT.search(raw[-12000:]))
+    """Bounded 429 detection: structured errors first, then real diagnostics.
+
+    A successful completion wins over unrelated `429` digits in metadata
+    because only error structures and non-JSON diagnostics are inspected;
+    assistant text, snapshots, ids, counters and token counts are ignored.
+    """
+    text = raw or ""
+    events = _json_objects(text)
+    if any(_structured_rate_limit(event) for event in events):
+        return True
+    diagnostics = "\n".join(_plain_diagnostic_lines(text))
+    if diagnostics and (RATE_LIMIT_PHRASE_PAT.search(diagnostics)
+                        or HTTP_429_PAT.search(diagnostics)):
+        return True
+    if any(_successful_completion(event) for event in events):
+        return False
+    messages = _error_message_text(events)
+    return bool(messages and (RATE_LIMIT_PHRASE_PAT.search(messages)
+                              or HTTP_429_PAT.search(messages)))
 
 
 def extract_cli_report(format_name, out: str, path: Path):
@@ -2655,47 +2837,135 @@ def extract_cli_report(format_name, out: str, path: Path):
     return parse_json_object("".join(parts)), session_id
 
 
-def extract_reported_usage(raw, format_name="jsonl"):
-    """Extract only provider-reported numeric usage; never synthesize values."""
-    import numbers
-    objects = []
-    text = raw or ""
+def _count(value):
+    """A genuine non-negative count, or None when the field is unavailable."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Number):
+        return None
     try:
-        whole = json.loads(text)
-        if isinstance(whole, dict):
-            objects.append(whole)
-    except ValueError:
-        for line in text.splitlines():
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(event, dict):
-                objects.append(event)
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return count if count >= 0 else None
+
+
+def _cost(value):
+    """A genuine non-negative reported cost, or None when unavailable."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Number):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if amount >= 0 else None
+
+
+def _opencode_step_usage(event):
+    """One real OpenCode V1/V2 `step_finish` event (per-step, not cumulative).
+
+    V1 captured shape:
+      part.tokens = {total, input, output, reasoning, cache:{read, write}}
+    V2 captured shape:
+      part.tokens = {input, output, reasoning, cache:{read, write}}
+    `total` is used when the provider reports it; otherwise it is the sum of
+    the reported components exactly as V1 defines it.
+    """
+    if not isinstance(event, dict):
+        return None
+    if str(event.get("type") or "").lower() not in {"step_finish", "step-finish"}:
+        return None
+    part = event.get("part")
+    if not isinstance(part, dict):
+        return None
+    tokens = part.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    total = _count(tokens.get("total"))
+    input_tokens = _count(tokens.get("input"))
+    output_tokens = _count(tokens.get("output"))
+    reasoning_tokens = _count(tokens.get("reasoning"))
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    cache_read = _count(cache.get("read"))
+    cache_write = _count(cache.get("write"))
+    components = (input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write)
+    if total is None and any(value is not None for value in components):
+        total = sum(value or 0 for value in components)
+    if total is None:
+        return None
+    cache_total = None
+    if cache_read is not None or cache_write is not None:
+        cache_total = (cache_read or 0) + (cache_write or 0)
+    identity = part.get("id") or (
+        f"{part.get('messageID') or event.get('sessionID') or ''}:"
+        f"{event.get('timestamp') or ''}:{part.get('type') or ''}")
+    return {"identity": str(identity), "tokens": total,
+            "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_tokens": cache_total,
+            "cache_read_tokens": cache_read, "cache_write_tokens": cache_write,
+            "cost": _cost(part.get("cost", event.get("cost")))}
+
+
+def _opencode_usage(events):
+    """Sum unique OpenCode steps once; identical replays are not double-counted."""
+    steps = []
+    seen = set()
+    for event in events:
+        step = _opencode_step_usage(event)
+        if not step or step["identity"] in seen:
+            continue
+        seen.add(step["identity"])
+        steps.append(step)
+    if not steps:
+        return None
+
+    def sum_or_none(key):
+        values = [step[key] for step in steps]
+        return sum(values) if all(value is not None for value in values) else None
+
+    costs = [step["cost"] for step in steps]
+    cost = sum(costs) if all(value is not None for value in costs) else None
+    return {"tokens": sum_or_none("tokens"),
+            "input_tokens": sum_or_none("input_tokens"),
+            "output_tokens": sum_or_none("output_tokens"),
+            "reasoning_tokens": sum_or_none("reasoning_tokens"),
+            "cache_tokens": sum_or_none("cache_tokens"),
+            "cache_read_tokens": sum_or_none("cache_read_tokens"),
+            "cache_write_tokens": sum_or_none("cache_write_tokens"),
+            "cost": cost, "source": "opencode.step_finish",
+            "format": "jsonl", "events": len(steps)}
+
+
+def _generic_usage(events, format_name):
+    """Existing flat/cumulative formats: max per field, never double-counted."""
     found = {}
-    stack = list(objects)
+    stack = list(events)
     while stack:
         value = stack.pop()
         if isinstance(value, dict):
             for key, item in value.items():
                 lowered = str(key).lower()
-                if isinstance(item, numbers.Number) and not isinstance(item, bool):
+                count = _count(item)
+                if count is not None:
                     if lowered in {"total_tokens", "total_token_count", "tokens"}:
-                        found["total_tokens"] = max(found.get("total_tokens", 0), int(item))
+                        found["total_tokens"] = max(found.get("total_tokens", 0), count)
                     elif lowered in {"input_tokens", "prompt_tokens"}:
-                        found["input_tokens"] = max(found.get("input_tokens", 0), int(item))
+                        found["input_tokens"] = max(found.get("input_tokens", 0), count)
                     elif lowered in {"output_tokens", "completion_tokens"}:
-                        found["output_tokens"] = max(found.get("output_tokens", 0), int(item))
+                        found["output_tokens"] = max(found.get("output_tokens", 0), count)
+                    elif lowered in {"reasoning_tokens", "reasoning_output_tokens"}:
+                        found["reasoning"] = max(found.get("reasoning", 0), count)
                     elif lowered in {"cache_read_input_tokens", "cached_tokens", "cache_tokens"}:
-                        found["cache_read"] = max(found.get("cache_read", 0), int(item))
+                        found["cache_read"] = max(found.get("cache_read", 0), count)
                     elif lowered in {"cache_creation_input_tokens", "cache_creation_tokens"}:
-                        found["cache_write"] = max(found.get("cache_write", 0), int(item))
+                        found["cache_write"] = max(found.get("cache_write", 0), count)
                     elif lowered in {"cost_usd", "total_cost_usd", "cost", "total_cost"}:
-                        found["cost"] = max(found.get("cost", 0.0), float(item))
-                elif isinstance(item, (dict, list)):
+                        amount = _cost(item)
+                        if amount is not None:
+                            found["cost"] = max(found.get("cost", 0.0), amount)
+                if isinstance(item, (dict, list)):
                     stack.append(item)
         elif isinstance(value, list):
-            stack.extend(value)
+            stack.extend(item for item in value if isinstance(item, (dict, list)))
     tokens = found.get("total_tokens")
     if tokens is None and (found.get("input_tokens") is not None or
                            found.get("output_tokens") is not None):
@@ -2706,8 +2976,35 @@ def extract_reported_usage(raw, format_name="jsonl"):
         cache = (found.get("cache_read") or 0) + (found.get("cache_write") or 0)
     if tokens is None and cache is None and found.get("cost") is None:
         return None
-    return {"tokens": tokens, "cache_tokens": cache, "cost": found.get("cost"),
-            "source": "provider_output", "format": format_name}
+    source = ("codex.token_count" if format_name == "codex"
+              else "claude.result" if format_name == "claude"
+              else "provider_output")
+    return {"tokens": tokens, "input_tokens": found.get("input_tokens"),
+            "output_tokens": found.get("output_tokens"),
+            "reasoning_tokens": found.get("reasoning"),
+            "cache_tokens": cache, "cache_read_tokens": found.get("cache_read"),
+            "cache_write_tokens": found.get("cache_write"),
+            "cost": found.get("cost"), "source": source, "format": format_name}
+
+
+def extract_reported_usage(raw, format_name="jsonl"):
+    """Extract only provider-reported numeric usage; never synthesize values.
+
+    OpenCode V1/V2 step events are summed once per unique step (per-step
+    usage). Cumulative snapshot formats keep the existing max-per-field
+    behaviour, so repeated totals are never added together.
+    """
+    events = _json_objects(raw)
+    return _opencode_usage(events) or _generic_usage(events, format_name)
+
+
+USAGE_DETAIL_FIELDS = (
+    ("input_tokens", "reported_input_tokens"),
+    ("output_tokens", "reported_output_tokens"),
+    ("reasoning_tokens", "reported_reasoning_tokens"),
+    ("cache_read_tokens", "reported_cache_read_tokens"),
+    ("cache_write_tokens", "reported_cache_write_tokens"),
+)
 
 
 def _usage_state(state):
@@ -2715,6 +3012,9 @@ def _usage_state(state):
     defaults = {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
                 "interrupted_attempts": 0, "human_interventions": 0,
                 "reported_tokens": None, "reported_cache_tokens": None,
+                "reported_input_tokens": None, "reported_output_tokens": None,
+                "reported_reasoning_tokens": None, "reported_cache_read_tokens": None,
+                "reported_cache_write_tokens": None, "sources": [],
                 "reported_provider_cost": None, "cost_status": "unavailable",
                 "billing": {"go": 0, "subscription": 0, "api": 0}}
     for key, value in defaults.items():
@@ -2751,6 +3051,15 @@ def record_usage(state, job, outcome, seconds=0):
         if reported.get("cost") is not None:
             usage["reported_provider_cost"] = round(
                 float(usage.get("reported_provider_cost") or 0) + reported["cost"], 6)
+        for reported_key, state_key in USAGE_DETAIL_FIELDS:
+            value = reported.get(reported_key)
+            if value is not None:
+                usage[state_key] = int(usage.get(state_key) or 0) + int(value)
+        source = reported.get("source")
+        if source:
+            sources = usage.setdefault("sources", [])
+            if source not in sources:
+                sources.append(source)
     usage["cost_status"] = ("reported" if usage.get("reported_provider_cost") is not None
                             else "unavailable")
     usage["corrections"] = int(state.get("corrections", 0))
@@ -2775,9 +3084,15 @@ def merge_usage(target_state, source_state):
     for key in ("strong_calls", "cheap_calls", "failed_attempts",
                 "interrupted_attempts", "human_interventions"):
         target[key] = int(target.get(key) or 0) + int(source.get(key) or 0)
-    for key in ("reported_tokens", "reported_cache_tokens"):
+    for key in ("reported_tokens", "reported_cache_tokens") + tuple(
+            state_key for _, state_key in USAGE_DETAIL_FIELDS):
         if source.get(key) is not None:
             target[key] = int(target.get(key) or 0) + int(source[key])
+    sources = list(target.get("sources") or [])
+    for source_name in source.get("sources") or []:
+        if source_name not in sources:
+            sources.append(source_name)
+    target["sources"] = sources
     if source.get("seconds") is not None:
         target["seconds"] = round(float(target.get("seconds") or 0)
                                   + float(source["seconds"]), 2)
@@ -4649,7 +4964,12 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
                  "usage": {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
                            "interrupted_attempts": 0, "corrections": 0,
                            "human_interventions": 0, "reported_tokens": None,
-                           "reported_cache_tokens": None, "reported_provider_cost": None,
+                           "reported_cache_tokens": None,
+                           "reported_input_tokens": None, "reported_output_tokens": None,
+                           "reported_reasoning_tokens": None,
+                           "reported_cache_read_tokens": None,
+                           "reported_cache_write_tokens": None, "sources": [],
+                           "reported_provider_cost": None,
                            "cost_status": "unavailable"},
                  "model_routes": {r: model_route(cfg, host, r) for r in
                                   ("architect", "explorer", "implementer", "reviewer")}}
@@ -5082,6 +5402,18 @@ def explore(args):
                                      usage_after["reported_tokens"] - (usage_before.get("reported_tokens") or 0)),
                  "reported_cache_tokens": (None if usage_after.get("reported_cache_tokens") is None else
                                            usage_after["reported_cache_tokens"] - (usage_before.get("reported_cache_tokens") or 0)),
+                 "reported_input_tokens": (None if usage_after.get("reported_input_tokens") is None else
+                                           usage_after["reported_input_tokens"] - (usage_before.get("reported_input_tokens") or 0)),
+                 "reported_output_tokens": (None if usage_after.get("reported_output_tokens") is None else
+                                            usage_after["reported_output_tokens"] - (usage_before.get("reported_output_tokens") or 0)),
+                 "reported_reasoning_tokens": (None if usage_after.get("reported_reasoning_tokens") is None else
+                                               usage_after["reported_reasoning_tokens"] - (usage_before.get("reported_reasoning_tokens") or 0)),
+                 "reported_cache_read_tokens": (None if usage_after.get("reported_cache_read_tokens") is None else
+                                                usage_after["reported_cache_read_tokens"] - (usage_before.get("reported_cache_read_tokens") or 0)),
+                 "reported_cache_write_tokens": (None if usage_after.get("reported_cache_write_tokens") is None else
+                                                 usage_after["reported_cache_write_tokens"] - (usage_before.get("reported_cache_write_tokens") or 0)),
+                 "sources": sorted(set(usage_after.get("sources") or [])
+                                   - set(usage_before.get("sources") or [])),
                  "reported_provider_cost": (None if usage_after.get("reported_provider_cost") is None else
                                             usage_after["reported_provider_cost"] - (usage_before.get("reported_provider_cost") or 0)),
                  "billing": {key: value - (usage_before.get("billing", {}).get(key, 0))

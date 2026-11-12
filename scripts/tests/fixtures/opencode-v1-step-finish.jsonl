@@ -1,0 +1,3 @@
+{"type":"step_start","timestamp":1794237969309,"sessionID":"ses_v1capture","part":{"id":"prt_v1start","sessionID":"ses_v1capture","messageID":"msg_v1capture","type":"step-start"}}
+{"type":"text","timestamp":1794237971000,"sessionID":"ses_v1capture","part":{"id":"prt_v1text","sessionID":"ses_v1capture","messageID":"msg_v1capture","type":"text","text":"{\"status\":\"complete\",\"summary\":\"V1 capture with nested step tokens\"}"}}
+{"type":"step_finish","timestamp":1794237978368,"sessionID":"ses_v1capture","part":{"id":"prt_v1finish","reason":"tool-calls","messageID":"msg_v1capture","sessionID":"ses_v1capture","type":"step-finish","tokens":{"total":17971,"input":366,"output":762,"reasoning":203,"cache":{"write":0,"read":16640}},"cost":0.00068382}}
