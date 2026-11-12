@@ -66,8 +66,13 @@ class OpenCodeV2Binary(unittest.TestCase):
                 expected = {(r["action"], r["resource"], r["effect"])
                             for r in orc.opencode_profile(role, "v2")["permissions"]}
                 self.assertTrue(expected.issubset(actual), expected - actual)
+                # Ordered, effective validation: the real CLI's last-match
+                # precedence must still enforce the intended restrictions.
+                orc.validate_v2_effective_permissions(role, agent["permissions"])
                 for action in ("subagent", "external_directory"):
-                    self.assertIn((action, "*", "deny"), actual)
+                    self.assertEqual(
+                        orc.v2_effective_permission(
+                            agent["permissions"], action, "probe"), "deny")
 
     def test_doctor_introspection_matches_binary(self):
         with patch.dict(os.environ, {"PATH": str(Path(self.bin).parent)

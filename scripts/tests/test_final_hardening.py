@@ -60,7 +60,12 @@ class CommandPolicyDefaults(unittest.TestCase):
             "scope": "/repo/project-a",
             "authorized_by": "abdullah",
         }]
-        policy = orc.verification_command_policy(["bash", "-lc", "pytest -q"], cfg)
+        # A scoped exception requires a project identity; without one it must
+        # not silently become global.
+        unscoped = orc.verification_command_policy(["bash", "-lc", "pytest -q"], cfg)
+        self.assertFalse(unscoped["allowed"], unscoped)
+        policy = orc.verification_command_policy(
+            ["bash", "-lc", "pytest -q"], cfg, project=Path("/repo/project-a"))
         self.assertTrue(policy["allowed"])
         self.assertEqual(policy["policy"], "exception")
         self.assertEqual(policy["exception"]["authorized_by"], "abdullah")
