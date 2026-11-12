@@ -175,6 +175,8 @@ class CheckpointBProvenance(unittest.TestCase):
                           (["bash", "-e", "-u", "-c", "x"], "shell_wrapper"),
                           (["python", "-B", "-I", "-c", "x"], "interpreter_string"),
                           (["node", "-p", "1"], "interpreter_string"),
+                          (["python3.10", "-c", "x"], "interpreter_string"),
+                          (["python3.11", "-B", "-c", "x"], "interpreter_string"),
                           (["python", "evil.py"], "arbitrary_script"),
                           (["env", "FOO=1", "./run.sh"], "arbitrary_script"),
                           (["docker", "compose", "run", "web", "bash", "-c", "x"],
@@ -232,6 +234,50 @@ class CheckpointBProvenance(unittest.TestCase):
         checks.assert_not_called()
         self.assertEqual(self.state["status"], "blocked")
         self.assertIn("Legacy verification", self.state["pause_reason"])
+
+    def test_baseline_and_plan_hashes_are_stable(self):
+        snap = orc.source_snapshot(self.project, cfg=self.cfg)
+        with patch.dict(os.environ, {"PYTHONPATH": "/tmp/other"}):
+            current = orc.source_snapshot(self.project, cfg=self.cfg)
+        self.assertEqual(orc.signature(snap), orc.signature(current))
+        self.assertNotEqual(orc.content_hash({"invariants": ["a"]}),
+                            orc.content_hash({"invariants": ["b"]}))
+        self.assertNotEqual(orc.signature(snap), orc.content_hash({"invariants": ["a"]}))
+
+    def test_cross_process_signature_is_stable(self):
+        code = (
+            "import importlib.util, json, sys\n"
+            "from pathlib import Path\n"
+            "spec=importlib.util.spec_from_file_location('o', sys.argv[1])\n"
+            "o=importlib.util.module_from_spec(spec); spec.loader.exec_module(o)\n"
+            "print(o.signature(o.source_snapshot(Path(sys.argv[2]), cfg=o.config())))\n")
+        module = Path(orc.__file__)
+        env = {**os.environ, "ABDULLAH_CONFIG": str(orc.HERE / "config.example.json")}
+        one = subprocess.check_output([sys.executable, "-c", code, str(module),
+                                       str(self.project)], env=env, text=True).strip()
+        env["PYTHONPATH"] = "/tmp/different-path"
+        two = subprocess.check_output([sys.executable, "-c", code, str(module),
+                                       str(self.project)], env=env, text=True).strip()
+        self.assertEqual(one, two)
+
+    def test_legacy_acknowledgment_is_explicit_and_recordable(self):
+        snap = orc.source_snapshot(self.project, cfg=self.cfg)
+        candidate = orc.signature(snap)
+        path = self.root / "legacy-ack.json"
+        orc.atomic_json(path, {})
+        self.state.update(verification={"path": str(path), "candidate_hash": candidate,
+                                       "passed": True})
+        orc.save(self.rundir, self.state)
+        result = orc.acknowledge_legacy_verification(
+            "test-run00", "user inspected old evidence", "no re-run available")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["legacy_verification_acknowledged"]["reason"],
+                         "user inspected old evidence")
+        saved = orc.read_json(self.rundir / "state.json")
+        saved["verification"]["evidence_version"] = 2
+        orc.save(self.rundir, saved)
+        with self.assertRaisesRegex(RuntimeError, "already attested"):
+            orc.acknowledge_legacy_verification("test-run00", "x", "y")
 
     def test_legacy_evidence_is_marked_not_equivalent(self):
         snap = orc.source_snapshot(self.project, cfg=self.cfg)

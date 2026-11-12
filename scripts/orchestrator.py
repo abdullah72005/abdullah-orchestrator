@@ -1401,8 +1401,16 @@ def verification_command_policy(cmd, cfg=None):
     direct_docker = len(basenames) >= 2 and basenames[0] == "docker" and basenames[1] == "compose"
     indirect_docker = ("docker" in basenames or "docker-compose" in basenames) and not direct_docker
     shell_names = {"sh", "bash", "zsh", "dash", "cmd", "powershell", "pwsh"}
-    interpreter_names = {"python", "python3", "python2", "node", "ruby", "perl", "php",
-                         "pypy", "pypy3"}
+    interpreter_names = {"python", "python2", "python3", "node", "nodejs", "ruby",
+                         "perl", "php", "pypy", "pypy3"}
+    interpreter_flags = {"python": {"c"}, "python2": {"c"}, "python3": {"c"},
+                         "pypy": {"c"}, "pypy3": {"c"}, "node": {"e", "p"},
+                         "nodejs": {"e", "p"}, "ruby": {"e"}, "perl": {"e", "E"},
+                         "php": {"r"}}
+
+    def is_interpreter(name):
+        return (name in interpreter_names
+                or bool(re.fullmatch(r"(python|pypy)\d+(\.\d+)*", name)))
 
     def option_scan(start):
         options = []
@@ -1446,13 +1454,16 @@ def verification_command_policy(cmd, cfg=None):
                 shell_wrapper = True
             if next_index < len(argv) and not argv[next_index].startswith("-"):
                 arbitrary_script = True
-        elif name in interpreter_names:
+        elif is_interpreter(name):
             options, next_index = option_scan(index + 1)
-            if short_flag(options, "c") or short_flag(options, "e") or any(
-                    option in {"--eval", "--print", "-E", "-p", "--command"} for option in options):
+            base = re.sub(r"\d+(\.\d+)*$", "", name)
+            flags = interpreter_flags.get(base, set())
+            if any(short_flag(options, flag) for flag in flags):
+                interpreter_string = True
+            if any(option.startswith(("--eval=", "--print=")) for option in options):
                 interpreter_string = True
             if (next_index < len(argv) and not argv[next_index].startswith("-")
-                    and argv[next_index] != "-m"):
+                    and "-m" not in options):
                 arbitrary_script = True
         elif name.startswith(".") or Path(name).suffix in {".sh", ".bash", ".py", ".js", ".rb", ".pl", ".php"}:
             arbitrary_script = True
@@ -1522,6 +1533,12 @@ def source_snapshot(project: Path, include_generated=False, cfg=None, provenance
             "toolchain": toolchain_identity(),
         })
     return result
+
+
+def content_hash(value):
+    """Stable content hash for non-snapshot contracts such as plans."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
 
 
 def signature(snapshot):
@@ -2899,7 +2916,7 @@ def advance(run_dir, state, cfg):
             pause_with(run_dir, state, "Plan exceeds configured batch budget")
             return
         state["plan"] = plan
-        state["plan_version"] = signature(plan)
+        state["plan_version"] = content_hash(plan)
         exploration = certified_exploration(run_dir, state, plan) if state.get("require_explorer") else None
         if exploration is not None:
             state["exploration"] = exploration
@@ -2931,7 +2948,9 @@ def advance(run_dir, state, cfg):
         return
     if stage == "implement":
         prior_writer = any(job.get("role") == "implementer" for job in state.get("completed_jobs", []) + state.get("failed_jobs", []))
-        if state.get("handoff_authorization") and not prior_writer and not state.get("active_job") and state["baseline"] != source_snapshot(project):
+        if (state.get("handoff_authorization") and not prior_writer
+                and not state.get("active_job")
+                and signature(state["baseline"]) != signature(source_snapshot(project))):
             pause_with(run_dir, state, "Approved handoff source changed before implementation; obtain a current approved handoff")
             return
         batch = state["plan"]["batches"][state["batch_index"]]
@@ -3541,7 +3560,7 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
                                   ("architect", "explorer", "implementer", "reviewer")}}
         if handoff is not None:
             state["plan"] = plan
-            state["plan_version"] = signature(plan)
+            state["plan_version"] = content_hash(plan)
             state["approved_handoff"] = {k: v for k, v in handoff.items() if k != "plan"}
             state["handoff_authorization"] = {
                 "explicit_user_authorization": True,
@@ -4755,6 +4774,31 @@ def reconcile_run(run_id, launch_missing=False, evidence=None):
             "next_action": next_action_for(state), "next": next_stage_preview(state)}
 
 
+def acknowledge_legacy_verification(run_id, reason, acknowledge):
+    """Explicit user-executed acknowledgment of legacy verification evidence."""
+    reason = (reason or "").strip()
+    acknowledge = (acknowledge or "").strip()
+    if not reason or not acknowledge:
+        raise ValueError("legacy acknowledgment requires --reason and --acknowledge")
+    folder, state = load(run_id)
+    with exclusive(folder):
+        folder, state = load(run_id)
+        verification = state.get("verification") or {}
+        if not verification.get("path"):
+            raise RuntimeError("Run has no verification evidence to acknowledge")
+        version = int(verification.get("evidence_version", 1) or 1)
+        if version >= VERIFICATION_EVIDENCE_VERSION:
+            raise RuntimeError("Verification evidence is already attested; no legacy acknowledgment is needed")
+        state["legacy_verification_acknowledged"] = {
+            "at": now(), "reason": reason, "acknowledge": acknowledge,
+            "actor": _operator_actor(), "verification": verification}
+        save(folder, state)
+        journal_event(folder, state, "legacy_verification_acknowledged",
+                      reason=reason, acknowledge=acknowledge)
+    return {"ok": True, "run_id": run_id, "status": state.get("status"),
+            "legacy_verification_acknowledged": state["legacy_verification_acknowledged"]}
+
+
 def approve_plan_run(run_id):
     folder, state = load(run_id)
     with exclusive(folder):
@@ -5119,6 +5163,11 @@ def main(argv=None):
     subs.add_parser("runs", help="List recent durable runs")
     ad = subs.add_parser("adopt", help="Explicitly adopt a legacy run into checkout ownership")
     ad.add_argument("run_id")
+    al = subs.add_parser("acknowledge-legacy-evidence",
+                         help="Record explicit user acknowledgment of legacy verification")
+    al.add_argument("run_id")
+    al.add_argument("--reason", required=True)
+    al.add_argument("--acknowledge", required=True)
     rt = subs.add_parser("retire", help="Administratively retire an inactive run; never kills work")
     rt.add_argument("run_id")
     rt.add_argument("--reason", required=True)
@@ -5193,6 +5242,10 @@ def main(argv=None):
             print(json.dumps(list_runs(), ensure_ascii=False, indent=2))
         elif opts.command == "adopt":
             print(json.dumps(adopt_run(opts.run_id), ensure_ascii=False, indent=2))
+        elif opts.command == "acknowledge-legacy-evidence":
+            print(json.dumps(acknowledge_legacy_verification(
+                opts.run_id, opts.reason, opts.acknowledge),
+                ensure_ascii=False, indent=2))
         elif opts.command == "retire":
             print(json.dumps(retire_run(opts.run_id, opts.reason, opts.acknowledge),
                              ensure_ascii=False, indent=2))
