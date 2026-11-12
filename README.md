@@ -142,7 +142,8 @@ by Git.
 
 Checkout conflicts expose the owner run ID and resolution commands. Use
 `checkout-status`, `retire` and `checkout-recover` for explicit operator
-resolution; `adopt` is the legacy adoption path. These commands never launch a
+resolution; `adopt` is the legacy state-adoption path. Sensitive CLI actions are
+disabled by default and must be enabled explicitly in the local config. These commands never launch a
 model and never kill live work.
 
 ## Trust boundary

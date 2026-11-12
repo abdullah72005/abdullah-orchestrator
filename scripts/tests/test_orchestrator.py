@@ -84,6 +84,13 @@ class ControlTests(unittest.TestCase):
         self.project = setup_repo(self.root)
         self.rundir = self.root / "runs/test-run00"
         self.rundir.mkdir(parents=True)
+        test_cfg = orc.read_json(orc.HERE / "config.example.json")
+        test_cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = True
+        cfg_path = self.root / "config.json"
+        orc.atomic_json(cfg_path, test_cfg)
+        cfg_patch = patch.object(orc, "CONFIG_PATH", cfg_path)
+        cfg_patch.start()
+        self.addCleanup(cfg_patch.stop)
         self.cfg = orc.config()
         self.state = {
             "id": "test-run00", "status": "running", "phase": "plan",
@@ -92,6 +99,11 @@ class ControlTests(unittest.TestCase):
             "plan": None, "active_job": None, "completed_jobs": [], "failed_jobs": [],
             "accepted_batches": [], "review": None, "implementation": None, "verification": None,
         }
+        self.state.update({
+            "schema_version": orc.STATE_SCHEMA_VERSION,
+            "supervisor_version": orc.SUPERVISOR_VERSION,
+            "config_schema_version": orc.CONFIG_SCHEMA_VERSION,
+            "config_sha256": orc.configuration_provenance().get("sha256")})
         orc.save(self.rundir, self.state)
         orc.atomic_json(self.rundir / "control.json", {"action": "run"})
 
@@ -159,7 +171,7 @@ class ControlTests(unittest.TestCase):
 
     def test_opencode_generation_fails_closed_on_unknown_version(self):
         self.assertEqual(orc.opencode_dialect("opencode version 1.18.35"), "v1")
-        self.assertEqual(orc.opencode_dialect("opencode 2.0.0"), "v2")
+        self.assertEqual(orc.opencode_dialect("opencode 2.0.0", pinned=""), "v2")
         with self.assertRaises(RuntimeError):
             orc.opencode_dialect("release unknown")
 

@@ -33,20 +33,46 @@ class CheckpointCSecurity(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "supervisor version"):
                 orc.config()
 
+    def test_unimplemented_isolation_and_nonboolean_auth_fail_closed(self):
+        cfg = self._cfg()
+        cfg.setdefault("authorization", {})["isolation_profile"] = "container"
+        with patch.object(orc, "read_json", return_value=cfg):
+            with self.assertRaisesRegex(ValueError, "isolation profile"):
+                orc.config()
+        cfg = self._cfg()
+        cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = "false"
+        with patch.object(orc, "read_json", return_value=cfg):
+            with self.assertRaisesRegex(ValueError, "boolean"):
+                orc.config()
+        cfg = self._cfg()
+        cfg.setdefault("authorization", {})["container_profile_enabled"] = True
+        with patch.object(orc, "read_json", return_value=cfg):
+            with self.assertRaisesRegex(ValueError, "not implemented"):
+                orc.config()
+
     def test_opencode_version_pin_is_explicit(self):
         self.assertEqual(orc.opencode_dialect("1.18.35", pinned="1.18"), "v1")
+        self.assertEqual(orc.opencode_dialect("1.18.35", pinned="1.18.35"), "v1")
+        with self.assertRaisesRegex(RuntimeError, "Invalid pinned"):
+            orc.opencode_dialect("1.18.35", pinned="v1")
         with self.assertRaisesRegex(RuntimeError, "pinned"):
             orc.opencode_dialect("1.19.1", pinned="1.18")
         with self.assertRaisesRegex(RuntimeError, "Unsupported|Unrecognized"):
             orc.opencode_dialect("3.0.0", pinned="")
 
-    def test_worker_environment_scrubs_credentials(self):
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "secret", "GITHUB_TOKEN": "secret",
-                                     "NORMAL_SETTING": "yes"}):
+    def test_worker_environment_scrubs_credentials_and_preserves_config(self):
+        with patch.dict(os.environ, {
+                "OPENAI_API_KEY": "secret", "GITHUB_TOKEN": "secret",
+                "NORMAL_SETTING": "yes", "GITHUB_ACTIONS": "true",
+                "AWS_REGION": "eu-west-1", "PIP_INDEX_URL":
+                "https://user:pass@example.test/simple"}):
             env = orc.scrubbed_env()
         self.assertNotIn("OPENAI_API_KEY", env)
         self.assertNotIn("GITHUB_TOKEN", env)
         self.assertEqual(env["NORMAL_SETTING"], "yes")
+        self.assertEqual(env["GITHUB_ACTIONS"], "true")
+        self.assertEqual(env["AWS_REGION"], "eu-west-1")
+        self.assertNotIn("user:pass", env["PIP_INDEX_URL"])
 
     def test_implementer_profile_denies_external_and_network(self):
         v1 = orc.opencode_profile("implementer", "v1")
@@ -106,6 +132,55 @@ class CheckpointCSecurity(unittest.TestCase):
                 patch.dict(os.environ, {"ABDULLAH_JOB_ID": "job-1"}):
             with self.assertRaisesRegex(RuntimeError, "model-owned"):
                 orc._operator_action_allowed("retire")
+
+    def test_sensitive_functions_guard_direct_import(self):
+        cfg = self._cfg()
+        cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = False
+        with patch.object(orc, "config", return_value=cfg):
+            for call in (lambda: orc.retire_run("test-run00", "r", "a"),
+                         lambda: orc.adopt_run("test-run00"),
+                         lambda: orc.checkout_recover(self.project, "owner", "r", "a"),
+                         lambda: orc.migrate_run("test-run00"),
+                         lambda: orc.acknowledge_legacy_verification("test-run00", "r", "a")):
+                with self.subTest(call=call):
+                    with self.assertRaisesRegex(RuntimeError, "disabled"):
+                        call()
+
+    def test_cli_resume_refuses_incompatible_state(self):
+        newer = dict(self.state); newer["schema_version"] = orc.STATE_SCHEMA_VERSION + 1
+        newer["status"] = "paused"; newer["active_job"] = None; newer["active_check"] = None
+        orc.save(self.rundir, newer)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = orc.main(["resume", "test-run00"])
+        self.assertEqual(code, 2)
+        self.assertIn("execution-compatible", err.getvalue())
+        self.assertEqual(orc.read_json(self.rundir / "state.json")["status"], "paused")
+
+    def test_supervisor_or_config_change_blocks_stage_until_migration(self):
+        changed = dict(self.state); changed["supervisor_version"] = "0.0.1"
+        orc.save(self.rundir, changed)
+        with self.assertRaisesRegex(RuntimeError, "execution-compatible"):
+            orc.assert_state_compatible(changed)
+        with self.assertRaisesRegex(RuntimeError, "execution-compatible"):
+            orc.stage_run("test-run00")
+        changed.update(status="paused", schema_version=orc.STATE_SCHEMA_VERSION,
+                       supervisor_version="0.0.1", config_schema_version=orc.CONFIG_SCHEMA_VERSION)
+        orc.save(self.rundir, changed)
+        result = orc.migrate_run("test-run00", str(self.root / "migrate-config"))
+        self.assertTrue(result["migrated"])
+        self.assertEqual(orc.read_json(self.rundir / "state.json")["supervisor_version"],
+                         orc.SUPERVISOR_VERSION)
+
+    def test_migration_refuses_running_or_active_work(self):
+        self.state.update(status="running", schema_version=1)
+        orc.save(self.rundir, self.state)
+        with self.assertRaisesRegex(RuntimeError, "Interrupt|paused"):
+            orc.migrate_run("test-run00", str(self.root / "migrate-running"))
+        self.state.update(status="paused", schema_version=1,
+                          active_job={"id": "j", "status": "running"})
+        orc.save(self.rundir, self.state)
+        with self.assertRaisesRegex(RuntimeError, "active|uncertain"):
+            orc.migrate_run("test-run00", str(self.root / "migrate-active"))
 
     def test_sensitive_cli_main_guard_blocks_before_dispatch(self):
         cfg = self._cfg(); cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = False

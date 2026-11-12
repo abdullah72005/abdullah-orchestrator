@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 HERE = Path(__file__).resolve().parent
@@ -135,6 +136,19 @@ def config():
     if pinned and pinned != SUPERVISOR_VERSION:
         raise ValueError(
             f"Configured supervisor version {pinned!r} does not match {SUPERVISOR_VERSION!r}")
+    authorization = cfg.get("authorization", {})
+    sensitive = authorization.get("sensitive_cli_enabled", False)
+    if not isinstance(sensitive, bool):
+        raise ValueError("authorization.sensitive_cli_enabled must be a boolean")
+    profile = authorization.get("isolation_profile", "host")
+    if profile != "host":
+        raise ValueError(
+            f"Unsupported isolation profile {profile!r}; only host is implemented. "
+            "Use a dedicated user/container outside this supervisor rather than silently forcing isolation")
+    if authorization.get("container_profile_enabled"):
+        raise ValueError(
+            "Container isolation profile is not implemented in this supervisor; "
+            "fail closed instead of pretending it is active")
     for role, val in cfg["workers"].items():
         if val["billing"] != "go" or not val["model"].startswith("opencode-go/"):
             raise ValueError(f"{role}: paid Go authorization is required; model={val['model']!r}")
@@ -753,17 +767,35 @@ def _operator_actor():
             "pid": os.getpid(), "argv": sys.argv[:8], "at": now()}
 
 
-SECRET_ENV_PATTERN = re.compile(
-    r"(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|"
-    r"DATABASE_URL|AWS_|AZURE_|GITHUB_|GH_TOKEN)", re.I)
+SECRET_ENV_SUFFIX = re.compile(
+    r"(API_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|PRIVATE_KEY|CLIENT_SECRET|"
+    r"SECRET_ACCESS_KEY|SESSION_TOKEN)$", re.I)
+SECRET_ENV_EXACT = {"DATABASE_URL", "DOCKER_AUTH_CONFIG", "SSH_AUTH_SOCK",
+                    "PYPI_TOKEN", "TWINE_PASSWORD"}
+URL_CREDENTIAL_ENV = {"PIP_INDEX_URL", "UV_INDEX_URL", "npm_config_registry"}
+
+
+def _without_url_credentials(value):
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value
+    if not parts.username and not parts.password:
+        return value
+    host = parts.hostname or ""
+    if parts.port:
+        host += f":{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
 
 
 def scrubbed_env():
-    """Remove common credentials before handing an environment to a worker."""
+    """Remove reviewed credentials without stripping ordinary tool configuration."""
     env = {}
     for key, value in os.environ.items():
-        if SECRET_ENV_PATTERN.search(key):
+        if key in SECRET_ENV_EXACT or SECRET_ENV_SUFFIX.search(key):
             continue
+        if key in URL_CREDENTIAL_ENV:
+            value = _without_url_credentials(value)
         env[key] = value
     return env
 
@@ -793,35 +825,50 @@ def state_compatibility(state):
     current = STATE_SCHEMA_VERSION
     version = state.get("schema_version")
     supervisor = state.get("supervisor_version")
-    if version is None:
+    config_version = state.get("config_schema_version")
+    config_sha = state.get("config_sha256")
+    current_config = configuration_provenance().get("sha256")
+    supervisor_changed = supervisor != SUPERVISOR_VERSION
+    config_changed = (config_version != CONFIG_SCHEMA_VERSION
+                      or (config_sha is not None and config_sha != current_config))
+    if version is None or supervisor is None or config_version is None:
         status = "legacy"
-    elif version > current:
-        status = "unsupported_newer"
+    elif not isinstance(version, int) or version > current:
+        status = "unsupported_newer" if isinstance(version, int) else "legacy"
     elif version < current:
         status = "migration_required"
+    elif supervisor_changed:
+        status = "supervisor_changed"
+    elif config_changed:
+        status = "config_changed"
     else:
         status = "current"
-    supervisor_changed = bool(supervisor and supervisor != SUPERVISOR_VERSION)
     return {"status": status, "state_schema_version": version,
             "supported_state_schema_version": current,
             "supervisor_version": supervisor,
             "supported_supervisor_version": SUPERVISOR_VERSION,
-            "supervisor_changed": supervisor_changed,
-            "migration_required": status in {"legacy", "migration_required"},
+            "config_schema_version": config_version,
+            "supported_config_schema_version": CONFIG_SCHEMA_VERSION,
+            "config_sha256": config_sha, "current_config_sha256": current_config,
+            "supervisor_changed": bool(supervisor_changed),
+            "config_changed": bool(config_changed),
+            "migration_required": status != "current",
             "writes": False}
 
 
 def assert_state_compatible(state):
     compatibility = state_compatibility(state)
-    if compatibility["status"] == "unsupported_newer":
+    if compatibility["status"] != "current":
         raise RuntimeError(
-            "Run state is newer than this supervisor supports; use a compatible "
-            "supervisor or migrate only after a read-only compatibility preview")
+            "Run is not execution-compatible "
+            f"({compatibility['status']}); run `compatibility RUN_ID` and, if appropriate, "
+            "the explicit backup-first `migrate-run` command before resuming")
     return compatibility
 
 
 def checkout_recover(project, owner_id, reason, acknowledge):
     """Explicitly clear an orphaned/stale registry record after evidence review."""
+    _operator_action_allowed("checkout-recover")
     reason = (reason or "").strip()
     acknowledge = (acknowledge or "").strip()
     if not reason or not acknowledge:
@@ -882,6 +929,7 @@ def retire_run(run_id, reason, acknowledge):
     identities exist, they must already be proven stopped; otherwise the
     operator must interrupt/reconcile first.
     """
+    _operator_action_allowed("retire")
     reason = (reason or "").strip()
     acknowledge = (acknowledge or "").strip()
     if not reason or not acknowledge:
@@ -949,6 +997,7 @@ def retire_run(run_id, reason, acknowledge):
 
 def adopt_run(run_id):
     """Explicitly adopt a legacy run into checkout ownership (writes state)."""
+    _operator_action_allowed("adopt")
     folder, state = load(run_id)
     if state.get("status") in FINAL_STATES:
         raise RuntimeError("Completed/cancelled run cannot adopt checkout ownership")
@@ -1885,8 +1934,14 @@ def opencode_dialect(version=None, pinned=None):
     pinned = pinned if pinned is not None else str(
         config().get("runtime", {}).get("opencode_version") or "").strip()
     if pinned:
-        installed = f"{major}.{int(match.group(2))}"
-        if installed != pinned:
+        pin_match = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", str(pinned))
+        if not pin_match:
+            raise RuntimeError(f"Invalid pinned OpenCode version {pinned!r}")
+        installed = (major, int(match.group(2)), int(match.group(3) or 0))
+        wanted = (int(pin_match.group(1)), int(pin_match.group(2)),
+                  int(pin_match.group(3) or 0))
+        compare = len(pin_match.group(3) and (1, 2, 3) or (1, 2))
+        if installed[:compare] != wanted[:compare]:
             raise RuntimeError(
                 f"OpenCode version {version!r} does not match pinned {pinned!r}; "
                 "refuse to generate an incompatible permission contract")
@@ -3740,6 +3795,7 @@ def compatibility_run(run_id):
 
 def migrate_run(run_id, backup_dir=None):
     """Explicit, backup-first migration; never called automatically."""
+    _operator_action_allowed("migrate-run")
     folder, state = load(run_id)
     with exclusive(folder):
         folder, state = load(run_id)
@@ -3838,7 +3894,10 @@ def _record_launch_missing(folder, state, target, identity, evidence, *,
 
 def modify(run_id, action, role=None, retry_verification=False,
            launch_missing=False, evidence=None):
+    if action == "cancel":
+        _operator_action_allowed("cancel")
     folder, state = load(run_id)
+    assert_state_compatible(state)
     if action in {"pause", "cancel"}:
         atomic_json(folder / "control.json", {"action": action, "requested_at": now()})
         print(f"{action} requested for {run_id}; status will update when running command stops")
@@ -4068,6 +4127,8 @@ def explore(args):
 
 
 def reconcile_explorer(run_id, launch_missing=False, evidence=None):
+    if launch_missing:
+        _operator_action_allowed("reconcile-launch-missing")
     folder, state = load(run_id)
     tracker = folder / "explorations" / "tracker"
     if not (tracker / "state.json").is_file():
@@ -4915,6 +4976,8 @@ def resume_run(run_id):
 
 
 def reconcile_run(run_id, launch_missing=False, evidence=None):
+    if launch_missing:
+        _operator_action_allowed("reconcile-launch-missing")
     folder, state = load(run_id)
     with exclusive(folder):
         folder, state = load(run_id)
@@ -4928,6 +4991,7 @@ def reconcile_run(run_id, launch_missing=False, evidence=None):
 
 def acknowledge_legacy_verification(run_id, reason, acknowledge):
     """Explicit user-executed acknowledgment of legacy verification evidence."""
+    _operator_action_allowed("acknowledge-legacy-evidence")
     reason = (reason or "").strip()
     acknowledge = (acknowledge or "").strip()
     if not reason or not acknowledge:
