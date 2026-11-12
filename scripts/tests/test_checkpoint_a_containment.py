@@ -430,6 +430,42 @@ class CheckpointAContainment(unittest.TestCase):
         finally:
             proc.kill(); proc.wait(timeout=5)
 
+    def test_verification_escape_status_is_reconcilable(self):
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    time.sleep(30)\n"
+            "os._exit(0)\n")
+        self.state.update(phase="verify", plan={"batches": [{"title": "x",
+                          "checks": [[sys.executable, "-c", code]], "risk": "ordinary"}]})
+        orc.save(self.rundir, self.state)
+        real = orc._terminate_pids
+        def not_clean(stats, grace=2):
+            result = real(stats, grace)
+            result["clean"] = False
+            return result
+        with patch.object(orc, "_terminate_pids", side_effect=not_clean):
+            orc.advance(self.rundir, self.state, self.cfg)
+        saved = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(saved["status"], "uncertain")
+        self.assertIsNotNone(saved.get("active_check"))
+        self.assertEqual(orc.next_action_for(saved), "orchestrator_reconcile")
+
+    def test_explorer_reconcile_refuses_run_marker_only_survivor(self):
+        proc = self._run_only()
+        try:
+            tracker = self.rundir / "explorations" / "tracker"
+            tracker.mkdir(parents=True)
+            orc.atomic_json(tracker / "state.json", {
+                "host": "codex", "project": str(self.project), "run_id": "test-run00",
+                "active_job": self._dead_job("explorer-1"),
+                "completed_jobs": [], "failed_jobs": [], "explorer_calls": 1})
+            with self.assertRaisesRegex(RuntimeError, "surviving"):
+                orc.reconcile_explorer("test-run00")
+        finally:
+            proc.kill(); proc.wait(timeout=5)
+
     def test_protected_recovery_actions_remain_cli_only(self):
         self.assertNotIn("orchestrator_retire", orc.MCP_TOOL_NAMES)
         self.assertNotIn("orchestrator_adopt", orc.MCP_TOOL_NAMES)

@@ -202,7 +202,7 @@ if '--version' in sys.argv:
 assert sys.argv[sys.argv.index('--variant')+1] == 'low'
 assert sys.argv[sys.argv.index('--model')+1].startswith('opencode-go/')
 if 'interrupt-me' in sys.argv[-1]: time.sleep(5)
-report={'status':'complete','summary':'read','files':['app.py'],'tests':[], 'evidence':['app.py:1'], 'unknowns':[], 'blocker':''}
+report={'contract_version':2,'status':'complete','summary':'read','files':['app.py'],'tests':[], 'evidence':['app.py:1'], 'unknowns':[], 'blocker':''}
 print(json.dumps({'type':'text','sessionID':'ses_fake','part':{'text':json.dumps(report)}}))
 ''')
         fake.chmod(0o755)

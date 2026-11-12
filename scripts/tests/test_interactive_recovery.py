@@ -253,16 +253,16 @@ if name == 'codex':
     previous = history.read_text().splitlines() if history.exists() else []
     with history.open('a') as f: f.write(kind + '\\n')
     if kind == 'plan':
-        report = {'status':'complete', 'summary':'plan', 'invariants':['Keep behavior'],
+        report = {'contract_version':2, 'status':'complete', 'summary':'plan', 'invariants':['Keep behavior'],
                   'blocker':'',
                   'batches':[{'title':'batch', 'goal':'change app', 'acceptance':['done'],
                               'checks':[[sys.executable, '-c', 'pass']], 'risk':'ordinary'}]}
     elif kind == 'diagnose':
-        report = {'verdict':'changes_required', 'reason':'amendment reassessed',
+        report = {'contract_version':2, 'verdict':'changes_required', 'reason':'amendment reassessed',
                   'inspected':['app.py'], 'correction':'Apply accessibility amendment',
                   'dismissed_findings':[]}
     else:
-        report = {'verdict':'approved', 'reason':'inspected app.py', 'inspected':['app.py'],
+        report = {'contract_version':2, 'verdict':'approved', 'reason':'inspected app.py', 'inspected':['app.py'],
                   'correction':'', 'dismissed_findings':[]}
     output.write_text(json.dumps(report))
 else:
@@ -273,10 +273,10 @@ else:
         p.write_text(p.read_text() + '# implemented\\n')
         if os.environ.get('FAKE_SLEEP'):
             time.sleep(30)
-    report = {'status':'complete', 'summary':role, 'findings':[],
+    report = {'contract_version':2, 'status':'complete', 'summary':role, 'findings':[],
               'evidence':['app.py:1'], 'files':['app.py'], 'tests':['focused'],
               'unknowns':[], 'blocker':''} if role == 'reviewer' else {
-              'status':'complete', 'summary':role, 'files':['app.py'], 'tests':[],
+              'contract_version':2, 'status':'complete', 'summary':role, 'files':['app.py'], 'tests':[],
               'evidence':['app.py:1'], 'unknowns':[], 'blocker':''}
     print(json.dumps({'type':'text','sessionID':'fake-session',
                       'part':{'text':json.dumps(report)}}))

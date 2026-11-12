@@ -148,6 +148,24 @@ class CheckpointDEfficiency(unittest.TestCase):
             prompt = orc.report_prompt("plan", {"blob": "x" * 5000})
         self.assertLessEqual(len(prompt), 12000)
 
+    def test_minor_amendment_consumes_unconsumed_completed_job(self):
+        plan = self._with_plan()
+        jobdir = self.rundir / "jobs" / "implementer-old"
+        jobdir.mkdir(parents=True)
+        report = {"contract_version": 2, "status": "complete", "summary": "OLD",
+                  "files": ["app.py"], "tests": [], "evidence": ["app.py:1"],
+                  "unknowns": [], "blocker": ""}
+        orc.atomic_json(jobdir / "report.json", report)
+        self.state.update(phase="implement",
+                          completed_jobs=[{"id": "old", "kind": "implementer",
+                                           "role": "implementer", "status": "complete",
+                                           "path": str(jobdir)}],
+                          last_consumed_job_id=None)
+        orc.save(self.rundir, self.state)
+        orc.amend_run("test-run00", "minor fix", architect_review=False)
+        saved = orc.read_json(self.rundir / "state.json")
+        self.assertIsNone(orc.cached_job_report(self.rundir, saved, "implementer"))
+
     def test_pending_material_amendment_cannot_be_downgraded(self):
         self._with_plan()
         self.state.update(phase="accept", status="paused",

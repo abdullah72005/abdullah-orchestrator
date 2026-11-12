@@ -126,6 +126,32 @@ class CheckpointCSecurity(unittest.TestCase):
         self.assertEqual(migrated["supervisor_version"], orc.SUPERVISOR_VERSION)
         self.assertIn("migration_from", migrated)
 
+    def test_migration_clears_stale_verification_progress(self):
+        legacy = dict(self.state)
+        legacy.pop("schema_version", None)
+        legacy.update(phase="verify", status="paused",
+                      check_progress={"identity": {"old": True}},
+                      verification={"path": "/tmp/old", "passed": True})
+        orc.save(self.rundir, legacy)
+        result = orc.migrate_run("test-run00", str(self.root / "migrate-verify"))
+        self.assertTrue(result["migrated"])
+        saved = orc.read_json(self.rundir / "state.json")
+        self.assertIsNone(saved.get("check_progress"))
+        self.assertIsNone(saved.get("verification"))
+
+    def test_generated_recovery_command_uses_project_flag(self):
+        advice = orc._conflict_resolution("owner", "new-run", "orphaned")
+        self.assertIn("checkout-recover --project <project>", advice)
+
+    def test_new_run_requires_contract_v2(self):
+        project = self.root / "new-contract-project"
+        project.mkdir(); project = baseline.setup_repo(project)
+        with patch.object(orc, "DEFAULT_STATE", self.root / "new-contract-runs"):
+            run_id, _folder, state = orc.create_run(project=str(project), goal="x",
+                                                    skip_doctor=True)
+            self.assertEqual(state.get("contract_version_required"), 2)
+            self.assertEqual(orc.load(run_id)[1]["contract_version_required"], 2)
+
     def test_sensitive_cli_is_disabled_by_default(self):
         cfg = self._cfg(); cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = False
         with patch.object(orc, "config", return_value=cfg):

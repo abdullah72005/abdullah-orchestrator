@@ -315,7 +315,7 @@ def _job_launch_file(job):
     return str(launch_file) if launch_file else None
 
 
-def inspect_execution(job, *, run_id=None, include_run=False):
+def inspect_execution(job, *, run_id=None, include_run=False, exclude_identity=None):
     """Inspect all durable evidence before treating an execution as stopped.
 
     A dead guard/parent PID is not proof.  The inspection deliberately checks
@@ -340,6 +340,11 @@ def inspect_execution(job, *, run_id=None, include_run=False):
     descendants = _live_extra(descendant_pids)
     launch_references = _processes_referencing_launch(launch_file)
     run_survivors = _processes_for_run(run_id) if include_run else []
+    if exclude_identity and exclude_identity.get("pid"):
+        run_survivors = [stat for stat in run_survivors
+                         if not (stat.get("pid") == exclude_identity.get("pid")
+                                 and (exclude_identity.get("pid_start") is None
+                                      or stat.get("starttime") == exclude_identity.get("pid_start")))]
     launch_child = []
     if isinstance(launch_record, dict):
         child = launch_record.get("child_identity")
@@ -486,8 +491,9 @@ def _conflict_resolution(owner_id=None, run_id=None, kind="conflict"):
         return " ".join(commands)
     if kind == "orphaned":
         commands.append(
-            "python3 <SKILL_DIR>/scripts/orchestrator.py checkout-recover <project> "
-            "--owner <owner-run> --reason '<reason>' --acknowledge '<scope>'")
+            "python3 <SKILL_DIR>/scripts/orchestrator.py checkout-recover "
+            "--project <project> --owner <owner-run> --reason '<reason>' "
+            "--acknowledge '<scope>'")
         return " ".join(commands)
     if kind in {"inconsistent", "containment"}:
         commands.append(
@@ -2477,8 +2483,13 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         report, normalization = normalize_report(check_kind, report)
         atomic_json(jpath / "normalization.json", normalization)
         report = validate_report(check_kind, report)
-        atomic_json(jpath / "report.json", report)
         contract_version = report.get("contract_version", 0)
+        if (state is not None and state.get("contract_version_required", 0) >= 2
+                and contract_version < 2):
+            raise RuntimeError(
+                "Newly dispatched workers must return contract_version: 2; "
+                "legacy reports are not accepted for new jobs")
+        atomic_json(jpath / "report.json", report)
         final_snapshot = source_snapshot(project)
         atomic_json(jpath / "completion.json", {"final_snapshot": final_snapshot, "session_id": session_id})
         job.update({"status": "complete", "session_id": session_id,
@@ -2487,12 +2498,18 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     "legacy_contract": contract_version < 2})
         if state is not None:
             record_usage(state, job, "complete", result_record["seconds"])
-            inspection = inspect_execution(job, run_id=state.get("id"), include_run=False)
+            parent_identity = state.get("parent_job_identity") if isinstance(state, dict) else None
+            inspection = inspect_execution(
+                job, run_id=state.get("id") or state.get("run_id"),
+                include_run=bool(parent_identity) or bool(state.get("run_id")
+                                                          and not state.get("id")),
+                exclude_identity=parent_identity)
             containment = None
             if inspection["survivors"]:
                 containment = _terminate_pids(inspection["survivors"])
-                inspection = inspect_execution(job, run_id=state.get("id"),
-                                               include_run=False)
+                inspection = inspect_execution(
+                    job, run_id=state.get("id") or state.get("run_id"),
+                    include_run=bool(parent_identity), exclude_identity=parent_identity)
             if not inspection["stopped"]:
                 job.update({"status": "uncertain",
                             "recovery_gate": inspection["reasons"],
@@ -3224,6 +3241,10 @@ def verification_evidence_package(reference, current, *, run_id=None,
     return package
 
 
+def failure_phase(state, default="blocked"):
+    return "uncertain" if state.get("active_job") or state.get("active_check") else default
+
+
 def pause_with(run_dir, state, reason, phase="blocked"):
     state["status"] = phase
     state["pause_reason"] = reason
@@ -3464,7 +3485,7 @@ def advance(run_dir, state, cfg):
         if not evidence["passed"]:
             if evidence.get("error") or not evidence.get("source_unchanged", True):
                 state["check_progress"] = None
-                pause_with(run_dir, state, "Verification infrastructure/integrity failure: " + evidence.get("error", "source changed"))
+                pause_with(run_dir, state, "Verification infrastructure/integrity failure: " + evidence.get("error", "source changed"), failure_phase(state))
             else:
                 handle_repair(run_dir, state, cfg, "Supervisor verification failed: " +
                               json.dumps(short_log_evidence(evidence), ensure_ascii=False))
@@ -3556,7 +3577,7 @@ def advance(run_dir, state, cfg):
                 save(run_dir, state)
             final_evidence = run_checks(run_dir, state, cfg, project, {"title": "feature integration", "checks": state["plan"]["batches"][0]["checks"]}, final=True)
             if not final_evidence.get("passed") or final_evidence.get("candidate_hash") != signature(current) or not final_evidence.get("source_unchanged"):
-                pause_with(run_dir, state, "Final verification failed or candidate changed")
+                pause_with(run_dir, state, "Final verification failed or candidate changed", failure_phase(state))
                 return
         verdict = cached_decision or strong_call(run_dir, state, cfg, "decision", {"final_evidence": final_evidence, "integration_instruction": "Also inspect end-to-end feature integration and all original requirements."} if single else None)
         state["architect_verdict"] = verdict
@@ -3787,7 +3808,9 @@ def serve(run_id):
                                   "checkout_conflict": exc.__dict__}, ensure_ascii=False))
                 return
             except InterruptedError as exc:
-                pause_with(run_dir, state, str(exc), "uncertain" if state.get("active_job") else ("paused" if control(run_dir) != "cancel" else "cancelled"))
+                pause_with(run_dir, state, str(exc),
+                           "uncertain" if state.get("active_job") or state.get("active_check")
+                           else ("paused" if control(run_dir) != "cancel" else "cancelled"))
             except (TimeoutError, RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
                 reason = str(exc)
                 status = "uncertain" if state.get("active_job") or state.get("active_check") else ("rate_limited" if "rate_limited" in reason else "blocked")
@@ -4064,7 +4087,7 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
                  "accepted_batches": [], "accepted_history": [],
                  "review": None, "implementation": None,
                  "verification": None, "amendments": [], "interruptions": [],
-                 "amendment_epoch": 0,
+                 "amendment_epoch": 0, "contract_version_required": 2,
                  "usage": {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
                            "interrupted_attempts": 0, "corrections": 0,
                            "human_interventions": 0, "reported_tokens": None,
@@ -4173,6 +4196,11 @@ def migrate_run(run_id, backup_dir=None):
                       "config_sha256": configuration_provenance().get("sha256"),
                       "migrated_at": now(),
                       "migration_from": previous})
+        state.pop("check_progress", None)
+        state.pop("verification_interrupted", None)
+        state["verification"] = None
+        state["review"] = None
+        state["architect_verdict"] = None
         save(folder, state)
         journal_event(folder, state, "state_migrated", backup=str(backup),
                       previous=previous)
@@ -4472,6 +4500,8 @@ def explore(args):
                 f"Explorer call budget exhausted for this run ({calls}/{limit})")
         ts["explorer_calls"] = calls + 1
         save(tracker, ts)
+        parent_job = (state.get("active_job") or {})
+        ts["parent_job_identity"] = job_identity(parent_job) if parent_job else None
         usage_before = copy.deepcopy(_usage_state(ts))
         before = source_snapshot(project)
         report, job = call_model(tracker, ts, cfg, "explorer", "explorer",
@@ -4518,7 +4548,11 @@ def reconcile_explorer(run_id, launch_missing=False, evidence=None):
         job = ts.get("active_job")
         if not job:
             raise RuntimeError("No Explorer attempt requires reconciliation")
-        inspection = inspect_execution(job, run_id=run_id, include_run=False)
+        parent_identity = ts.get("parent_job_identity")
+        inspection = inspect_execution(
+            job, run_id=run_id,
+            include_run=bool(parent_identity) or not parent_identity,
+            exclude_identity=parent_identity)
         if inspection["survivors"]:
             raise RuntimeError(
                 "Explorer has surviving marked process(es) "
@@ -5345,6 +5379,7 @@ def amend_run(run_id, amendment, architect_review=False):
         state["architect_verdict"] = None
         state["check_progress"] = None
         state.pop("single_batch_verification", None)
+        consume_last(state)
         if material:
             state["amendment_epoch"] = state.get("amendment_epoch", 0) + 1
             prior = state.get("plan")

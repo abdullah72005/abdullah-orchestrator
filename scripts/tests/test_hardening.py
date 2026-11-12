@@ -202,12 +202,12 @@ if name == 'codex':
     previous = history.read_text().splitlines() if history.exists() else []
     with history.open('a') as f: f.write(kind + '\\n')
     if kind == 'plan':
-        report = {'status':'complete', 'summary':'plan', 'invariants':[], 'blocker':'',
+        report = {'contract_version':2, 'status':'complete', 'summary':'plan', 'invariants':['Keep behavior'], 'blocker':'',
                   'batches':[{'title':'batch', 'goal':'change', 'acceptance':['done'],
                               'checks':[['true']], 'risk':'ordinary'}]}
     else:
         verdict = 'changes_required' if kind == 'decision' and 'decision' not in previous else 'approved'
-        report = {'verdict':verdict, 'reason':'inspected', 'inspected':['app.py'],
+        report = {'contract_version':2, 'verdict':verdict, 'reason':'inspected', 'inspected':['app.py'],
                   'correction':'fix candidate', 'dismissed_findings':[]}
     output.write_text(json.dumps(report))
 else:
@@ -216,7 +216,7 @@ else:
     if role == 'implementer':
         p = pathlib.Path('app.py')
         p.write_text(p.read_text() + '# implemented\\n')
-    report = {'status':'complete', 'summary':role, 'findings':[], 'evidence':['app.py:1'], 'files':['app.py'], 'tests':[], 'unknowns':[], 'blocker':''} if role == 'reviewer' else {'status':'complete', 'summary':role}
+    report = {'contract_version':2, 'status':'complete', 'summary':role, 'findings':[], 'evidence':['app.py:1'], 'files':['app.py'], 'tests':[], 'unknowns':[], 'blocker':''} if role == 'reviewer' else {'contract_version':2, 'status':'complete', 'summary':role, 'files':['app.py'], 'tests':[], 'evidence':['app.py:1'], 'unknowns':[], 'blocker':''}
     if role == 'explorer': report.update(files=['app.py'], tests=[], evidence=['app.py:1'], unknowns=[], blocker='')
     print(json.dumps({'type':'text','sessionID':'fake-session', 'part':{'text':json.dumps(report)}}))
 ''')
