@@ -63,6 +63,14 @@ class ControlTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # Every test is isolated from the live orchestrator state and its
+        # checkout registry.  This is also a tripwire: a test that rebinds
+        # DEFAULT_STATE outside this temporary root would fail immediately.
+        state_patch = patch.object(orc, "DEFAULT_STATE", self.root / "runs")
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
+        if not Path(orc.DEFAULT_STATE).resolve().is_relative_to(self.root.resolve()):
+            raise AssertionError("Test state root escaped the temporary directory")
         real_popen = subprocess.Popen
         def guarded_popen(args, *pos, **kwargs):
             if isinstance(args, (list, tuple)) and Path(args[0]).name in {'codex', 'claude', 'opencode'}:
@@ -86,6 +94,12 @@ class ControlTests(unittest.TestCase):
         }
         orc.save(self.rundir, self.state)
         orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+
+    def tearDown(self):
+        if not Path(orc.DEFAULT_STATE).resolve().is_relative_to(self.root.resolve()):
+            raise AssertionError("A test rebound DEFAULT_STATE outside its temporary environment")
+        if not orc.leases_root().resolve().is_relative_to(self.root.resolve()):
+            raise AssertionError("A test rebound the checkout registry outside its temporary environment")
 
     def test_source_fingerprint_changes_and_survives_checkpoint(self):
         first = orc.signature(orc.source_snapshot(self.project))

@@ -14,7 +14,7 @@
     "claude": {"model": "claude-haiku-4-5", "effort": "medium"},
     "require_per_run_consent": true
   },
-  "limits": {"max_corrections_per_batch": 3, "max_batches": 12, "max_worker_seconds": 14400, "max_architect_seconds": 14400, "max_check_seconds": 14400},
+  "limits": {"max_corrections_per_batch": 3, "max_batches": 12, "max_worker_seconds": 14400, "max_architect_seconds": 14400, "max_check_seconds": 14400, "max_explorer_calls_per_run": 8},
   "permissions": {"trusted_development": true, "allow_auto_local_edits_and_docker": true, "allow_push": false, "allow_deploy": false, "allow_production": false},
   "verification": {"require_checks": true, "require_docker_source_proof": true}
 }

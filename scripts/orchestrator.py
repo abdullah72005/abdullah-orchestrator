@@ -12,6 +12,7 @@ import contextlib
 import copy
 import datetime as dt
 import fcntl
+import getpass
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -119,6 +121,12 @@ def run_path(run_id):
 def save(path, state):
     state["updated_at"] = now()
     atomic_json(path / "state.json", state)
+    if (state.get("status") in FINAL_STATES and not state.get("active_job")
+            and not state.get("active_check")):
+        try:
+            release_checkout_lease(state)
+        except (OSError, ValueError, RuntimeError):
+            pass
 
 
 def load(run_id):
@@ -138,8 +146,546 @@ def exclusive(path: Path, blocking=False):
 
 
 def git(project: Path, args):
-    proc = subprocess.run(["git", "-C", str(project), *args], capture_output=True, check=True)
+    proc = subprocess.run(["git", "-C", str(project), *args], capture_output=True,
+                          check=True, timeout=30)
     return proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Checkout-wide ownership
+# ---------------------------------------------------------------------------
+# The per-run flock prevents two supervisors from advancing one run.  It does
+# not prevent two *different* runs from editing the same checkout, so admission
+# additionally reserves the canonical checkout in a small external registry.
+# The registry is deliberately outside any run directory: legacy runs can be
+# detected read-only and are never rewritten merely by being inspected.
+
+class CheckoutOwnedError(RuntimeError):
+    def __init__(self, message, *, conflicts=None, owner=None, state=None, resolution=None):
+        super().__init__(message)
+        self.conflicts = conflicts or []
+        self.owner = owner or {}
+        self.state = state
+        self.resolution = resolution
+
+    def __str__(self):
+        text = super().__str__()
+        return text + (f" Resolution: {self.resolution}" if self.resolution else "")
+
+
+def _identity_alive(identity):
+    """Best-effort liveness for a recorded registry owner (not a job claim)."""
+    if not isinstance(identity, dict):
+        return False
+    pid = identity.get("pid")
+    if not pid:
+        return False
+    stat = process_stat(pid)
+    if not stat:
+        return False
+    if identity.get("pid_start") is not None and stat["starttime"] != identity["pid_start"]:
+        return False
+    return stat["state"] not in {"Z", "X", "x"}
+
+
+def _processes_for_run(run_id):
+    """Find same-user processes that inherited this run's identity marker."""
+    if not run_id:
+        return []
+    needle = ("ABDULLAH_RUN_ID=" + str(run_id)).encode()
+    found = []
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            data = Path(f"/proc/{entry.name}/environ").read_bytes()
+        except OSError:
+            continue
+        if needle in data.split(b"\0"):
+            stat = process_stat(entry.name)
+            if stat and stat["state"] not in {"Z", "X", "x"}:
+                found.append(stat)
+    return found
+
+
+def leases_root() -> Path:
+    override = os.environ.get("ABDULLAH_CHECKOUT_REGISTRY")
+    if override:
+        return Path(override).expanduser()
+    state = Path(DEFAULT_STATE)
+    # Keep each isolated state root's registry separate.  A sibling named
+    # "<runs>-checkouts" is used instead of a shared parent/checkouts path.
+    return state.parent / (state.name + "-checkouts")
+
+
+def checkout_identity(project: Path):
+    """Stable identity for a working tree, including WSL path/case variants."""
+    project = Path(project).expanduser()
+    try:
+        top = git(project, ["rev-parse", "--show-toplevel"]).decode().strip()
+        root = Path(top).resolve()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        try:
+            root = project.resolve()
+        except (OSError, RuntimeError):
+            root = Path(project)
+    try:
+        stat = root.stat()
+        # Some WSL/DrvFs mounts report inode 0 or change st_dev on remount.
+        # The path fallback is deliberately fail-closed rather than silently
+        # treating two unrelated checkouts as the same lease holder.
+        inode = (f"{stat.st_dev}:{stat.st_ino}" if stat.st_ino
+                 else "path:" + str(root))
+    except OSError:
+        inode = "path:" + str(root)
+    key = hashlib.sha256(inode.encode("utf-8")).hexdigest()[:32]
+    return {"key": key, "path": str(root), "inode": inode}
+
+
+@contextlib.contextmanager
+def _lease_lock(key):
+    root = leases_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / f"{key}.lock").open("a+") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def _lease_path(key):
+    return leases_root() / f"{key}.json"
+
+
+def _run_state(run_id):
+    return _safe_read(Path(DEFAULT_STATE) / str(run_id) / "state.json")
+
+
+def _lease_record(key):
+    return _safe_read(_lease_path(key))
+
+
+def _conflict_resolution(owner_id=None, run_id=None, kind="conflict"):
+    commands = ["python3 <SKILL_DIR>/scripts/orchestrator.py runs"]
+    if owner_id:
+        commands.append(
+            f"python3 <SKILL_DIR>/scripts/orchestrator.py retire {owner_id} "
+            "--reason '<reason>' --acknowledge '<scope>'")
+    if run_id:
+        commands.append(
+            f"python3 <SKILL_DIR>/scripts/orchestrator.py adopt {run_id}")
+    if kind == "orphaned":
+        commands.append(
+            "python3 <SKILL_DIR>/scripts/orchestrator.py checkout-recover <project> "
+            "--owner <owner-run> --reason '<reason>' --acknowledge '<scope>'")
+    if kind == "initializing":
+        commands.append("Retry after the owner finishes starting; inspect `runs` and `checkout-status` first.")
+    return " ".join(commands)
+
+
+def find_checkout_conflicts(identity, *, exclude_run=None):
+    """Find non-final runs (including legacy runs) that use this checkout."""
+    conflicts = []
+    root = Path(DEFAULT_STATE)
+    if not root.is_dir():
+        return conflicts
+    for child in root.iterdir():
+        if not child.is_dir() or child.name == exclude_run:
+            continue
+        state = _safe_read(child / "state.json")
+        if not isinstance(state, dict):
+            continue
+        if (state.get("status") in FINAL_STATES and not state.get("active_job")
+                and not state.get("active_check")):
+            continue
+        project = state.get("project")
+        if not project:
+            continue
+        try:
+            other = checkout_identity(Path(project))
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            continue
+        if other["key"] == identity["key"]:
+            conflicts.append({"run_id": state.get("id") or child.name,
+                              "status": state.get("status"),
+                              "phase": state.get("phase"),
+                              "project": str(project)})
+    conflicts.sort(key=lambda item: item.get("run_id") or "")
+    return conflicts
+
+
+def _owner_block(owner_id, record):
+    """Classify an existing registry owner without writing any state."""
+    owner_state = _run_state(owner_id)
+    if owner_state is None:
+        owner_identity = record.get("owner_identity") or {"pid": record.get("owner_pid")}
+        alive = _identity_alive(owner_identity)
+        if record.get("status") == "initializing":
+            return ("initializing" if alive else "orphaned"), owner_state
+        return ("inconsistent" if alive else "orphaned"), owner_state
+    if (owner_state.get("status") not in FINAL_STATES
+            or owner_state.get("active_job") or owner_state.get("active_check")):
+        return "active", owner_state
+    return "final", owner_state
+
+
+def acquire_checkout_lease(project: Path, run_id, lease_id=None):
+    """Atomically reserve one checkout for one run; fail closed on conflict."""
+    identity = checkout_identity(project)
+    lease_id = lease_id or uuid.uuid4().hex
+    # Refuse obvious legacy conflicts before creating any registry artifact.
+    pre = find_checkout_conflicts(identity, exclude_run=run_id)
+    if pre:
+        raise CheckoutOwnedError(
+            "Checkout is already used by another non-final run: " +
+            ", ".join(item["run_id"] for item in pre),
+            conflicts=pre, state="conflict",
+            resolution=_conflict_resolution(pre[0]["run_id"], run_id, "conflict"))
+    with _lease_lock(identity["key"]):
+        path = _lease_path(identity["key"])
+        existing = _safe_read(path)
+        if isinstance(existing, dict) and existing.get("run_id") not in {None, run_id}:
+            owner_id = existing.get("run_id")
+            status, owner_state = _owner_block(owner_id, existing)
+            # A normal creation race can briefly expose an initializing record
+            # before its owner's state.json exists.  Give it a bounded window;
+            # do not mislabel that race as corruption.
+            if status == "initializing" and owner_state is None:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and owner_state is None:
+                    time.sleep(0.05)
+                    owner_state = _run_state(owner_id)
+                if owner_state is not None:
+                    status, owner_state = _owner_block(owner_id, existing)
+            if status == "initializing":
+                raise CheckoutOwnedError(
+                    f"Checkout is initializing for run {owner_id!r}; retry shortly",
+                    owner=existing, state="initializing",
+                    resolution=_conflict_resolution(owner_id, run_id, "initializing"))
+            if status == "orphaned":
+                raise CheckoutOwnedError(
+                    f"Checkout lease for run {owner_id!r} is orphaned (no readable state and "
+                    "the recorded owner is not alive); explicit recovery is required",
+                    owner=existing, state="orphaned",
+                    resolution=_conflict_resolution(owner_id, run_id, "orphaned"))
+            if status == "inconsistent":
+                raise CheckoutOwnedError(
+                    f"Active checkout lease for run {owner_id!r} has no readable state; "
+                    "operator recovery is required",
+                    owner=existing, state="inconsistent",
+                    resolution=_conflict_resolution(owner_id, run_id, "orphaned"))
+            if status == "active":
+                raise CheckoutOwnedError(
+                    f"Checkout is owned by non-final run {owner_id!r} "
+                    f"({owner_state.get('status')}/{owner_state.get('phase')})",
+                    owner=existing, state="conflict",
+                    resolution=_conflict_resolution(owner_id, run_id, "conflict"))
+            # final owner without active work: replace below.
+        conflicts = find_checkout_conflicts(identity, exclude_run=run_id)
+        if conflicts:
+            raise CheckoutOwnedError(
+                "Checkout is already used by another non-final run: " +
+                ", ".join(item["run_id"] for item in conflicts),
+                conflicts=conflicts, state="conflict",
+                resolution=_conflict_resolution(conflicts[0]["run_id"], run_id, "conflict"))
+        owner_identity = process_identity(os.getpid()) or {}
+        record = {"run_id": run_id, "lease_id": lease_id, "project": identity["path"],
+                  "checkout_key": identity["key"], "inode": identity["inode"],
+                  "status": "initializing", "owner_pid": os.getpid(),
+                  "owner_identity": owner_identity, "created_at": now(),
+                  "updated_at": now()}
+        atomic_json(path, record)
+        return {key: record[key] for key in
+                ("run_id", "lease_id", "project", "checkout_key", "inode",
+                 "status", "created_at")}
+
+
+def activate_checkout_lease(project, run_id, lease_id):
+    identity = checkout_identity(project)
+    with _lease_lock(identity["key"]):
+        path = _lease_path(identity["key"])
+        record = _safe_read(path)
+        if not isinstance(record, dict) or record.get("run_id") != run_id:
+            raise CheckoutOwnedError(
+                "Checkout lease disappeared or changed during run creation",
+                owner=record or {}, state="orphaned",
+                resolution=_conflict_resolution(run_id, run_id, "orphaned"))
+        if record.get("lease_id") != lease_id:
+            raise CheckoutOwnedError(
+                "Checkout lease generation changed during run creation",
+                owner=record, state="orphaned",
+                resolution=_conflict_resolution(run_id, run_id, "orphaned"))
+        record.update({"status": "active", "activated_at": now(), "updated_at": now()})
+        atomic_json(path, record)
+        return record
+
+
+def ensure_checkout_lease(state, *, adopt_legacy=True):
+    """Verify ownership for a run, or reserve it for an unmodified legacy run."""
+    run_id = state.get("id")
+    project = state.get("project")
+    if not run_id or not project:
+        raise CheckoutOwnedError("Run state has no id/project; checkout ownership is unknown")
+    identity = checkout_identity(Path(project))
+    lease = state.get("project_lease")
+    if isinstance(lease, dict) and lease.get("checkout_key"):
+        if lease.get("checkout_key") != identity["key"]:
+            raise CheckoutOwnedError(
+                "Stored checkout lease does not match the current checkout identity "
+                "(path, st_dev/st_ino, or a WSL remount changed); refuse to execute",
+                state="identity_changed",
+                resolution="Inspect the checkout and run `orchestrator.py adopt <run>` after resolving identity.")
+        record = _lease_record(identity["key"])
+        if not isinstance(record, dict) or record.get("run_id") != run_id:
+            return acquire_checkout_lease(Path(project), run_id, lease.get("lease_id"))
+        if record.get("status") == "initializing":
+            record = activate_checkout_lease(Path(project), run_id, record.get("lease_id"))
+        conflicts = find_checkout_conflicts(identity, exclude_run=run_id)
+        if conflicts:
+            raise CheckoutOwnedError(
+                "Checkout is already used by another non-final run: " +
+                ", ".join(item["run_id"] for item in conflicts),
+                conflicts=conflicts, state="conflict",
+                resolution=_conflict_resolution(conflicts[0]["run_id"], run_id, "conflict"))
+        return record
+    if not adopt_legacy:
+        raise CheckoutOwnedError(
+            "Legacy run has no checkout lease; run `orchestrator.py adopt <run>` first")
+    return acquire_checkout_lease(Path(project), run_id)
+
+
+def release_checkout_lease(state):
+    """Release a checkout only when this exact run still owns the registry."""
+    run_id = state.get("id")
+    project = state.get("project")
+    if not run_id or not project:
+        return
+    try:
+        identity = checkout_identity(Path(project))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return
+    if not leases_root().is_dir():
+        return
+    lease = state.get("project_lease") or {}
+    with _lease_lock(identity["key"]):
+        path = _lease_path(identity["key"])
+        record = _safe_read(path)
+        if not isinstance(record, dict) or record.get("run_id") != run_id:
+            return
+        if lease.get("lease_id") and record.get("lease_id") != lease.get("lease_id"):
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def checkout_conflict(state):
+    """Read-only conflict preview; never creates registry artifacts."""
+    run_id = state.get("id")
+    project = state.get("project")
+    if not run_id or not project:
+        return None
+    try:
+        identity = checkout_identity(Path(project))
+        record = _lease_record(identity["key"])
+        conflicts = find_checkout_conflicts(identity, exclude_run=run_id)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return None
+    if isinstance(record, dict) and record.get("run_id") not in {None, run_id}:
+        status, owner_state = _owner_block(record.get("run_id"), record)
+        if status in {"initializing", "orphaned", "active", "inconsistent"}:
+            return {"kind": status, "owner": record, "owner_state": owner_state,
+                    "resolution": _conflict_resolution(record.get("run_id"), run_id, status)}
+    if conflicts:
+        return {"kind": "conflict", "conflicts": conflicts,
+                "resolution": _conflict_resolution(conflicts[0]["run_id"], run_id, "conflict")}
+    return None
+
+
+def checkout_status(project):
+    identity = checkout_identity(Path(project))
+    record = _lease_record(identity["key"])
+    conflicts = find_checkout_conflicts(identity)
+    owner_id = record.get("run_id") if isinstance(record, dict) else None
+    if owner_id:
+        status, _owner_state = _owner_block(owner_id, record)
+        resolution = _conflict_resolution(owner_id, None, status)
+    elif conflicts:
+        resolution = _conflict_resolution(conflicts[0]["run_id"], None, "conflict")
+    else:
+        resolution = None
+    return {"ok": True, "checkout": identity, "lease": record, "conflicts": conflicts,
+            "resolution": resolution}
+
+
+def _append_lease_audit(identity, entry):
+    audit = leases_root() / "audit"
+    audit.mkdir(parents=True, exist_ok=True)
+    path = audit / f"{identity['key']}.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return str(path)
+
+
+def _operator_actor():
+    return {"user": getpass.getuser(), "host": socket.gethostname(),
+            "pid": os.getpid(), "argv": sys.argv[:8], "at": now()}
+
+
+def checkout_recover(project, owner_id, reason, acknowledge):
+    """Explicitly clear an orphaned/stale registry record after evidence review."""
+    reason = (reason or "").strip()
+    acknowledge = (acknowledge or "").strip()
+    if not reason or not acknowledge:
+        raise ValueError("checkout-recover requires --reason and --acknowledge")
+    identity = checkout_identity(Path(project))
+    with _lease_lock(identity["key"]):
+        path = _lease_path(identity["key"])
+        record = _safe_read(path)
+        if not isinstance(record, dict):
+            raise RuntimeError("No checkout lease record exists")
+        if record.get("run_id") != owner_id:
+            raise RuntimeError(f"Registry owner is {record.get('run_id')!r}, not {owner_id!r}")
+        owner_state = _run_state(owner_id)
+        if owner_state is not None:
+            active = [state.get("active_job"), state.get("active_check")]
+            for identity_item in active:
+                if isinstance(identity_item, dict) and identity_item:
+                    liveness = job_liveness(identity_item)
+                    if liveness.get("alive") is not False:
+                        raise RuntimeError(
+                            "Owner run has active or uncertain execution; reconcile/interrupt first")
+            if owner_state.get("status") not in FINAL_STATES:
+                raise RuntimeError(
+                    "Owner run is not final; retire it explicitly with `orchestrator.py retire` "
+                    "or reconcile its execution first")
+            if owner_state.get("active_job") or owner_state.get("active_check"):
+                raise RuntimeError(
+                    "Owner run still records active work; reconcile or prove termination before recovery")
+        else:
+            owner_identity = record.get("owner_identity") or {"pid": record.get("owner_pid")}
+            if _identity_alive(owner_identity):
+                raise RuntimeError("Recorded owner process is still alive; retry or interrupt it first")
+        live = _processes_for_run(owner_id)
+        if live:
+            raise RuntimeError(
+                "Processes still carry this run's identity; inspect/terminate them first: " +
+                ", ".join(str(item["pid"]) for item in live))
+        path.unlink()
+        audit_path = _append_lease_audit(identity, {
+            "action": "checkout_recover", "at": now(), "actor": _operator_actor(),
+            "project": identity["path"], "owner": owner_id, "reason": reason,
+            "acknowledge": acknowledge, "record": record,
+            "owner_state_summary": ({key: owner_state.get(key) for key in
+                                     ("id", "status", "phase", "project", "updated_at",
+                                      "active_job", "active_check")}
+                                    if isinstance(owner_state, dict) else None),
+            "registry": str(path)})
+    return {"ok": True, "project": identity["path"], "owner": owner_id,
+            "audit": audit_path}
+
+
+def retire_run(run_id, reason, acknowledge):
+    """Administratively retire an inactive run without executing a model.
+
+    This is abandonment, not proof that an old worker terminated.  If active
+    identities exist, they must already be proven stopped; otherwise the
+    operator must interrupt/reconcile first.
+    """
+    reason = (reason or "").strip()
+    acknowledge = (acknowledge or "").strip()
+    if not reason or not acknowledge:
+        raise ValueError("retire requires --reason and --acknowledge")
+    folder, state = load(run_id)
+    with exclusive(folder):
+        folder, state = load(run_id)
+        if state.get("status") in FINAL_STATES:
+            return {"ok": True, "run_id": run_id, "status": state.get("status"),
+                    "already_final": True}
+        terminations = []
+        for key in ("active_job", "active_check"):
+            identity_item = state.get(key)
+            if isinstance(identity_item, dict) and identity_item:
+                liveness = job_liveness(identity_item)
+                if liveness.get("alive") is not False:
+                    raise RuntimeError(
+                        f"Cannot retire {run_id}: {key} is not proven stopped "
+                        f"({liveness.get('reason')}); interrupt/reconcile it first")
+                if key == "active_check":
+                    escaped_live = _escaped_live(identity_item.get("escaped_processes"))
+                    if escaped_live:
+                        raise RuntimeError(
+                            f"Cannot retire {run_id}: escaped verification processes are still alive "
+                            f"({', '.join(str(item['pid']) for item in escaped_live)})")
+                terminations.append({"target": key, "liveness": liveness})
+        live = _processes_for_run(run_id)
+        if live:
+            raise RuntimeError(
+                f"Cannot retire {run_id}: processes still carry its run identity "
+                f"({', '.join(str(item['pid']) for item in live)}); inspect/terminate them first")
+        retirement = {
+            "at": now(), "reason": reason, "acknowledge": acknowledge,
+            "requested_by": _operator_actor(), "mode": "administrative_abandonment",
+            "abandoned": True,
+            "worker_termination_proven": bool(terminations),
+            "worker_termination_evidence": terminations,
+            "active_work_at_retirement": {
+                "active_job": state.get("active_job"),
+                "active_check": state.get("active_check")},
+            "preserved": {
+                "completed_jobs": len(state.get("completed_jobs", [])),
+                "failed_jobs": len(state.get("failed_jobs", [])),
+                "accepted_batches": len(state.get("accepted_batches", [])),
+                "verification": (state.get("verification") or {}).get("path"),
+                "plan_version": state.get("plan_version"),
+            },
+        }
+        if terminations:
+            # Proven stopped identities are preserved in the retirement record
+            # before being cleared so they cannot be mistaken for live work.
+            state["active_job"] = None
+            state["active_check"] = None
+        state["status"] = "cancelled"
+        state["retired_at"] = now()
+        state["retirement"] = retirement
+        state["pause_reason"] = f"Retired by operator: {reason}"
+        save(folder, state)
+        journal_event(folder, state, "retired", reason=reason,
+                      acknowledge=acknowledge, retirement=retirement)
+        return {"ok": True, "run_id": run_id, "status": "cancelled",
+                "retirement": retirement}
+
+
+def adopt_run(run_id):
+    """Explicitly adopt a legacy run into checkout ownership (writes state)."""
+    folder, state = load(run_id)
+    if state.get("status") in FINAL_STATES:
+        raise RuntimeError("Completed/cancelled run cannot adopt checkout ownership")
+    lease = acquire_checkout_lease(Path(state["project"]), run_id)
+    try:
+        lease = activate_checkout_lease(Path(state["project"]), run_id, lease["lease_id"])
+    except CheckoutOwnedError:
+        release_checkout_lease({"id": run_id, "project": state["project"]})
+        raise
+    state["project_lease"] = lease
+    if state.get("explorer_policy") not in {"none", "on_demand", "required"}:
+        state["explorer_policy"] = "none"
+    save(folder, state)
+    journal_event(folder, state, "checkout_lease_adopted", lease=lease)
+    return {"ok": True, "run_id": run_id, "lease": lease,
+            "explorer_policy": state["explorer_policy"]}
+
+
+def explorer_policy_for(state):
+    """Legacy/missing policy is always 'none'; never infer permission."""
+    policy = state.get("explorer_policy")
+    return policy if policy in {"none", "on_demand", "required"} else "none"
+
 
 
 # ---------------------------------------------------------------------------
@@ -196,17 +742,65 @@ def _all_process_stats():
     return result
 
 
+def _launch_identity(path):
+    record = _safe_read(path) if path else None
+    guard = record.get("guard") if isinstance(record, dict) else None
+    if isinstance(guard, dict) and guard.get("pid"):
+        return guard
+    return None
+
+
+def _wait_launch(path, timeout=2.0):
+    if not path:
+        return None
+    deadline = time.monotonic() + max(0.1, timeout)
+    while True:
+        record = _safe_read(path)
+        if isinstance(record, dict):
+            return record
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.02)
+
+
+def _write_launch(path, phase, **fields):
+    identity = process_identity(os.getpid()) or {}
+    record = {"phase": phase, "guard": identity, "guard_pid": os.getpid(),
+              "updated_at": now()}
+    record.update(fields)
+    atomic_json(Path(path), record)
+
+
 def job_identity(job):
     """Resolve the durable identity fields for a dispatched worker/check."""
     if not isinstance(job, dict):
         return {}
     nested = job.get("process") if isinstance(job.get("process"), dict) else {}
-    return {
+    identity = {
         "pid": job.get("pid") or nested.get("pid"),
         "pid_start": job.get("pid_start", nested.get("pid_start")),
         "pgid": job.get("pgid") or nested.get("pgid"),
         "sid": job.get("sid") or nested.get("sid"),
     }
+    launch_file = job.get("launch_file")
+    if not launch_file and job.get("path"):
+        candidate = Path(job["path"]) / "launch.json"
+        if candidate.exists():
+            launch_file = str(candidate)
+    launch = _launch_identity(launch_file)
+    if launch:
+        if not identity.get("pid") or identity.get("pid") == launch.get("pid"):
+            # The guard's pre-child record is authoritative for the session
+            # identity, including when the supervisor crashed before saving it.
+            identity = {"pid": launch.get("pid") or identity.get("pid"),
+                        "pid_start": launch.get("pid_start", identity.get("pid_start")),
+                        "pgid": launch.get("pgid") or identity.get("pgid"),
+                        "sid": launch.get("sid") or identity.get("sid")}
+        else:
+            for key in ("pid_start", "pgid", "sid"):
+                if identity.get(key) is None and launch.get(key) is not None:
+                    identity[key] = launch[key]
+    return identity
 
 
 def job_liveness(job):
@@ -355,6 +949,8 @@ def _guard_entry(argv):
     """Session leader that kills the worker tree when its lease pipe closes."""
     try:
         fd = int(argv[argv.index("--lease-fd") + 1])
+        launch_file = (Path(argv[argv.index("--launch-file") + 1])
+                       if "--launch-file" in argv else None)
         command = argv[argv.index("--") + 1:]
     except (ValueError, IndexError):
         return 2
@@ -365,10 +961,37 @@ def _guard_entry(argv):
     def handler(_signum, _frame):
         stop.set()
 
+    def publish(phase, **fields):
+        if launch_file is None:
+            return True
+        try:
+            _write_launch(launch_file, phase, **fields)
+            return True
+        except (OSError, ValueError):
+            return False
+
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, handler)
-    child = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                             stdout=sys.stdout, stderr=sys.stderr)
+    # Publish the session identity BEFORE the child exists.  A supervisor crash
+    # after Popen but before it records the PID can therefore recover a durable
+    # identity instead of guessing that the process never started.
+    if not publish("starting", argv0=command[0],
+                   command_sha256=hashlib.sha256(
+                       json.dumps(command, ensure_ascii=False).encode()).hexdigest()):
+        return 2
+    try:
+        child = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                 stdout=sys.stdout, stderr=sys.stderr)
+    except BaseException as exc:
+        publish("failed", error=repr(exc))
+        return 2
+    if not publish("running", child_pid=child.pid):
+        try:
+            child.kill()
+            child.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return 2
     rc = None
     while True:
         rc = child.poll()
@@ -399,16 +1022,20 @@ def _guard_entry(argv):
                 rc = child.wait()
     # Nothing launched for this job may outlive the job.
     _terminate_session_children(os.getpid(), grace=1)
+    publish("exited", returncode=rc)
     return rc if isinstance(rc, int) else 1
 
 
-def _spawn_guarded(command, cwd, env, log_stream):
+def _spawn_guarded(command, cwd, env, log_stream, launch_file=None):
     read_fd, write_fd = os.pipe()
+    guard = [sys.executable, str(Path(__file__).resolve()), "_guard",
+             "--lease-fd", str(read_fd)]
+    if launch_file is not None:
+        guard.extend(["--launch-file", str(launch_file)])
+    guard.extend(["--", *command])
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "_guard",
-             "--lease-fd", str(read_fd), "--", *command],
-            cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log_stream,
+            guard, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log_stream,
             stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(read_fd,),
             text=True)
     except BaseException:
@@ -416,6 +1043,11 @@ def _spawn_guarded(command, cwd, env, log_stream):
         raise
     finally:
         os.close(read_fd)
+    if launch_file is not None:
+        # Wait for the guard's pre-child identity record.  A crash after this
+        # point always has a durable identity even if the supervisor had not
+        # yet saved it into state.json.
+        _wait_launch(launch_file, timeout=2.0)
     return proc, write_fd
 
 
@@ -859,11 +1491,21 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 raise RuntimeError(
                     "An unreconciled worker session cannot be reused; reconcile the exact attempt first")
             continuation = prior["session_id"]
+    prompt = prompt.replace("__ABDULLAH_PARENT_JOB__", job_id)
     cmd, env, output_format = cli_command(
         route["provider"] if strong else host, role, route, prompt, jpath, continuation,
         evidence_root=run_dir if role == "architect" else None)
+    if state is not None:
+        env = dict(env)
+        env["ABDULLAH_RUN_ID"] = str(state.get("id") or state.get("run_id") or "")
+        if role == "architect":
+            # The nested `explore` command is authorized only when it inherits
+            # the exact active Architect job identity from this supervisor.
+            env["ABDULLAH_PARENT_JOB"] = job_id
+            env["ABDULLAH_STAGE"] = kind
     job = {"id": job_id, "kind": kind, "role": role, "route": route, "status": "dispatched",
            "path": str(jpath), "created_at": now(), "pid": None,
+           "launch_file": str(jpath / "launch.json"),
            "continued_session": continuation}
     if state is not None:
         state["active_job"] = job
@@ -877,14 +1519,19 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         raise RuntimeError("OPENAI_API_KEY is set: verify subscription billing before launching Codex Architect")
     proc = None
     lease_fd = None
+    launch_file = jpath / "launch.json"
     try:
         with out_file.open("w", encoding="utf-8") as log:
-            proc, lease_fd = _spawn_guarded(cmd, project, env, log)
-            identity = process_identity(proc.pid) or {}
+            proc, lease_fd = _spawn_guarded(cmd, project, env, log,
+                                            launch_file=launch_file)
+            launch = _wait_launch(launch_file)
+            identity = ((launch or {}).get("guard") if isinstance(launch, dict) else None) \
+                or process_identity(proc.pid) or {}
             job.update({"pid": proc.pid, "status": "running",
                         "pid_start": identity.get("pid_start"),
                         "pgid": identity.get("pgid"), "sid": identity.get("sid"),
-                        "process": identity})
+                        "process": identity, "launch_file": str(launch_file),
+                        "launch": launch})
             if state is not None:
                 state["active_job"] = job
                 save(run_dir, state)
@@ -971,6 +1618,14 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 os.close(lease_fd)
             except OSError:
                 pass
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
 
 
 def check_docker_source(project: Path, cmd: list[str], timeout=30):
@@ -1054,6 +1709,68 @@ def check_docker_source(project: Path, cmd: list[str], timeout=30):
             "compose_project": project.name, "working_dir": working, "source": str(project_resolved)}
 
 
+def _check_token_processes(token):
+    """Find same-user processes that inherited this check's environment token.
+
+    This detects a double-fork/setsid escape only when the process still has
+    the token.  It is evidence, not an OS sandbox; a process that clears its
+    environment or changes user is outside this detection.
+    """
+    needle = ("ABDULLAH_CHECK_TOKEN=" + token).encode()
+    found = []
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            data = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            continue
+        if needle not in data.split(b"\0"):
+            continue
+        stat = process_stat(pid)
+        if stat and stat["state"] not in {"Z", "X", "x"}:
+            found.append(stat)
+    return found
+
+
+def _terminate_pids(stats, grace=2):
+    tracked = [{"pid": item["pid"], "pid_start": item.get("starttime")}
+               for item in stats]
+    for identity in tracked:
+        if not _identity_alive(identity):
+            continue
+        try:
+            os.kill(identity["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + max(0.1, grace)
+    while time.monotonic() < deadline:
+        if not any(_identity_alive(identity) for identity in tracked):
+            break
+        time.sleep(0.05)
+    for identity in tracked:
+        if _identity_alive(identity):
+            try:
+                os.kill(identity["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+    remaining = [identity for identity in tracked if _identity_alive(identity)]
+    return {"tracked": tracked, "remaining": remaining,
+            "clean": not remaining, "scope": "same-user PID scan"}
+
+
+def _escaped_live(stats):
+    return [stat for stat in stats or [] if _identity_alive(
+        {"pid": stat.get("pid"), "pid_start": stat.get("starttime")})]
+
+
 def run_checks(run_dir, state, cfg, project, batch, final=False):
     commands = batch.get("checks", [])
     if not commands:
@@ -1084,77 +1801,127 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
         mounts = check_docker_source(project, cmd) if cfg["verification"]["require_docker_source_proof"] else {}
         logpath = run_dir / "jobs" / f"check-{state['batch_index']}-{index}-{uuid.uuid4().hex[:8]}.log"
         logpath.parent.mkdir(exist_ok=True)
+        launch_file = logpath.with_suffix(".launch.json")
+        token = uuid.uuid4().hex
+        check_env = os.environ.copy()
+        check_env["ABDULLAH_CHECK_TOKEN"] = token
+        check_env["ABDULLAH_RUN_ID"] = str(state.get("id", ""))
         state["active_check"] = {"argv": cmd, "log": str(logpath), "started_at": now(),
-                                 "candidate_hash": evidence["candidate_hash"]}
+                                 "candidate_hash": evidence["candidate_hash"],
+                                 "launch_file": str(launch_file), "check_token": token}
         save(run_dir, state)
         with logpath.open("wb") as log:
-            if state.get("interactive"):
-                # Interactive verification must be interruptible too.  The
-                # guard owns the process session and kills descendants if the
-                # host connection disappears.
-                proc = None
-                lease_fd = None
-                started_check = time.monotonic()
-                try:
-                    proc, lease_fd = _spawn_guarded(cmd, project, os.environ.copy(), log)
-                    identity = process_identity(proc.pid) or {}
-                    state["active_check"].update({
-                        "pid": proc.pid, "pid_start": identity.get("pid_start"),
-                        "pgid": identity.get("pgid"), "sid": identity.get("sid"),
-                        "process": identity})
-                    save(run_dir, state)
-                    while proc.poll() is None:
-                        action = control(run_dir)
-                        if action in {"pause", "cancel"}:
-                            terminate_identity(state["active_check"], grace=5)
-                            try:
-                                proc.wait(timeout=8)
-                            except subprocess.TimeoutExpired:
-                                os.killpg(proc.pid, signal.SIGKILL)
-                            raise InterruptedError(f"Run {action} requested during verification")
-                        if time.monotonic() - started_check > timeout:
-                            terminate_identity(state["active_check"], grace=5)
-                            try:
-                                proc.wait(timeout=8)
-                            except subprocess.TimeoutExpired:
-                                os.killpg(proc.pid, signal.SIGKILL)
-                            raise TimeoutError(f"Verification timed out; reconcile {logpath}")
-                        time.sleep(0.2)
-                    rc = proc.returncode
-                finally:
-                    if lease_fd is not None:
+            # Every verification mode uses the guard.  The guard owns the
+            # process session and kills descendants if this supervisor or the
+            # host connection disappears.  A plain subprocess.run(timeout=...)
+            # leaves no durable identity and cannot be reconciled safely.
+            proc = None
+            lease_fd = None
+            started_check = time.monotonic()
+            try:
+                proc, lease_fd = _spawn_guarded(cmd, project, check_env, log,
+                                                launch_file=launch_file)
+                launch = _wait_launch(launch_file)
+                identity = ((launch or {}).get("guard") if isinstance(launch, dict) else None) \
+                    or process_identity(proc.pid) or {}
+                state["active_check"].update({
+                    "pid": proc.pid, "pid_start": identity.get("pid_start"),
+                    "pgid": identity.get("pgid"), "sid": identity.get("sid"),
+                    "process": identity, "launch": launch})
+                save(run_dir, state)
+                while proc.poll() is None:
+                    action = control(run_dir)
+                    if action in {"pause", "cancel"}:
+                        termination = terminate_identity(state["active_check"], grace=5)
                         try:
-                            os.close(lease_fd)
+                            proc.wait(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except OSError:
+                                pass
+                        escaped = _check_token_processes(token)
+                        if escaped:
+                            state["active_check"]["escaped_processes"] = escaped
+                            state["active_check"]["containment"] = _terminate_pids(escaped)
+                        state["active_check"]["termination"] = termination
+                        save(run_dir, state)
+                        raise InterruptedError(f"Run {action} requested during verification")
+                    if time.monotonic() - started_check > timeout:
+                        termination = terminate_identity(state["active_check"], grace=5)
+                        try:
+                            proc.wait(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except OSError:
+                                pass
+                        escaped = _check_token_processes(token)
+                        if escaped:
+                            state["active_check"]["escaped_processes"] = escaped
+                            state["active_check"]["containment"] = _terminate_pids(escaped)
+                        state["active_check"]["termination"] = termination
+                        save(run_dir, state)
+                        raise TimeoutError(f"Verification timed out; reconcile {logpath}")
+                    time.sleep(0.2)
+                rc = proc.returncode
+            finally:
+                if lease_fd is not None:
+                    try:
+                        os.close(lease_fd)
+                    except OSError:
+                        pass
+                # Closing the lease asks the guard to stop the session.  Wait
+                # for it even on an unexpected exception so a crash cannot
+                # leave an unowned verification tree behind.
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
                         except OSError:
                             pass
-            else:
-                try:
-                    execution = subprocess.run(cmd, cwd=project, stdout=log, stderr=subprocess.STDOUT,
-                                               stdin=subprocess.DEVNULL, timeout=timeout, check=False)
-                    rc = execution.returncode
-                except subprocess.TimeoutExpired:
-                    # A timed-out command may have left children or side effects.
-                    # Retain the durable in-flight identity for reconciliation.
-                    raise TimeoutError(f"Verification timed out; reconcile {logpath}")
+        escaped = _check_token_processes(token)
+        containment = {"token": token, "escaped_processes": escaped,
+                       "termination": (_terminate_pids(escaped) if escaped else None),
+                       "scope": "guard session + inherited environment token",
+                       "limits": ("Same-user processes that clear ABDULLAH_CHECK_TOKEN, "
+                                  "change user, or are otherwise hidden from /proc are not "
+                                  "detectable here; this is not an OS sandbox.")}
+        evidence.setdefault("containment", []).append(containment)
         evidence["commands"].append({"argv": cmd, "returncode": rc, "log": str(logpath),
-                                     "source_proof": mounts})
+                                     "source_proof": mounts,
+                                     "containment": containment})
         if rc != 0:
             evidence["passed"] = False
+        if escaped:
+            evidence["passed"] = False
+            evidence["source_unchanged"] = False
+            evidence["error"] = ("Verification left escaped execution; inspect and terminate "
+                                 "the recorded PIDs before any acceptance")
         state["active_check"] = None
         save(run_dir, state)
+        if escaped:
+            break
     after = source_snapshot(project)
     evidence["finished_at"] = now()
     evidence["after_hash"] = signature(after)
     evidence["after"] = after
-    evidence["source_unchanged"] = evidence["candidate_hash"] == evidence["after_hash"]
+    escaped_any = any((entry or {}).get("escaped_processes")
+                      for entry in evidence.get("containment", []) if isinstance(entry, dict))
+    evidence["source_unchanged"] = (evidence["candidate_hash"] == evidence["after_hash"]
+                                    and not escaped_any)
     if not evidence["source_unchanged"]:
         evidence["passed"] = False
-        evidence["error"] = "Tracked or untracked files changed during verification; evidence is stale"
+        if not escaped_any:
+            evidence["error"] = "Tracked or untracked files changed during verification; evidence is stale"
     evpath = run_dir / "jobs" / f"verification-{state['batch_index']}-{uuid.uuid4().hex[:8]}.json"
     evidence["path"] = str(evpath)
     atomic_json(evpath, evidence)
     state["verification"] = {"path": str(evpath), "passed": evidence["passed"],
                              "candidate_hash": evidence["after_hash"]}
+    state.pop("verification_interrupted", None)
     progress["finished"] = True
     save(run_dir, state)
     journal_event(run_dir, state, "verification_complete",
@@ -1187,6 +1954,19 @@ def architect_context(run_dir, state, kind, other=None):
                                             "unknowns": report.get("unknowns", [])[:8]})
         except (ValueError, OSError):
             continue
+    policy = explorer_policy_for(state)
+    explorer_dispatch = None
+    if policy in {"on_demand", "required"} and kind in {"plan", "diagnose"}:
+        explorer_dispatch = (
+            f"python3 {HERE / 'orchestrator.py'} explore {state['id']} "
+            "--task 'YOUR TARGETED INVESTIGATION HERE' "
+            "--parent-job __ABDULLAH_PARENT_JOB__ "
+            "(tracked, synchronous, cheap Go worker). "
+            "Call through shell when more repo exploration would save expensive strong-model context. "
+            "The supervisor substitutes the active parent-job authorization; "
+            "do not run this command outside the active Architect stage. "
+            "Use direct file inspection for correctness-critical contracts."
+        )
     context = {
         "run_id": state["id"], "stage": kind, "goal": state["goal"], "project": str(project), "approved_handoff": state.get("approved_handoff"),
         "snapshot": source_snapshot(project), "approved_plan": ({k: v for k, v in state["plan"].items() if k != "batches"} if state.get("plan") else None),
@@ -1196,12 +1976,8 @@ def architect_context(run_dir, state, kind, other=None):
         "previous_explorer_findings": recent_explorer_reports,
         "user_amendments": state.get("amendments", []),
         "user_requested_plan_approval": state["plan_approval"], "exploration_required": state.get("require_explorer", False),
-        "explorer_dispatch": (
-            f"python3 {HERE / 'orchestrator.py'} explore {state['id']} "
-            "--task 'YOUR TARGETED INVESTIGATION HERE' (tracked, synchronous, cheap Go worker). "
-            "Call through shell whenever more repo exploration would save expensive strong-model context. "
-            "Use direct file inspection for correctness-critical contracts."
-        ),
+        "explorer_policy": policy,
+        "explorer_dispatch": explorer_dispatch,
     }
     if other:
         context.update(other)
@@ -1492,6 +2268,9 @@ def reviewer_verification_package(reference, current, run_id=None):
 
 def advance(run_dir, state, cfg):
     """One durable transition. Persist after each completed transition."""
+    # Defense in depth: every production entry point already verifies this, but
+    # an internal caller must not execute a stage against an unowned checkout.
+    ensure_checkout_lease(state, adopt_legacy=True)
     project = Path(state["project"])
     stage = state["phase"]
     if stage == "diagnose":
@@ -1740,6 +2519,12 @@ def recover_finished_dispatch(run_dir, state):
     if not job.get("path"):
         return False
     path = Path(job["path"])
+    if not any(job_identity(job).values()):
+        job["recovery_gate"] = {"alive": None,
+                                "reason": "no_process_identity_or_launch_record"}
+        state["active_job"] = {**job, "status": "uncertain"}
+        save(run_dir, state)
+        return False
     completed = path / "execution.json"
     if not completed.exists():
         return False
@@ -1751,6 +2536,12 @@ def recover_finished_dispatch(run_dir, state):
         for key in ("pid", "pid_start", "pgid", "sid"):
             if recorded_identity.get(key) is not None and job.get(key) is None:
                 job[key] = recorded_identity[key]
+    if not any(job_identity(job).values()):
+        job["recovery_gate"] = {"alive": None,
+                                "reason": "no_process_identity_or_launch_record"}
+        state["active_job"] = {**job, "status": "uncertain"}
+        save(run_dir, state)
+        return False
     if execution.get("returncode") != 0:
         output = (path / "events.log").read_text(encoding="utf-8", errors="replace") if (path / "events.log").exists() else ""
         if not is_rate_limited(output):
@@ -1806,8 +2597,27 @@ def recover_finished_dispatch(run_dir, state):
 def serve(run_id):
     validate_workflow()
     run_dir, state = load(run_id)
+    if state.get("status") in FINAL_STATES:
+        return
+    if state.get("status") in PAUSED_STATES:
+        return
+    if state.get("active_check"):
+        pause_with(run_dir, state, "Uncertain in-flight verification command; inspect exact test environment and log", "uncertain")
+        return
+    if state.get("active_job") and state["active_job"].get("status") == "uncertain":
+        pause_with(run_dir, state, "A previous dispatch needs reconciliation before retry", "uncertain")
+        return
+    # Final/paused/uncertain inspection must not create registry artifacts.
+    try:
+        ensure_checkout_lease(state, adopt_legacy=True)
+    except CheckoutOwnedError as exc:
+        print(json.dumps({"ok": False, "run_id": run_id,
+                          "status": "checkout_conflict", "error": str(exc),
+                          "checkout_conflict": exc.__dict__}, ensure_ascii=False))
+        return
     cfg = config()
     with exclusive(run_dir):
+        run_dir, state = load(run_id)
         if state.get("active_check"):
             pause_with(run_dir, state, "Uncertain in-flight verification command; inspect exact test environment and log", "uncertain")
             return
@@ -1822,6 +2632,13 @@ def serve(run_id):
             return
         if state["status"] in PAUSED_STATES:
             return
+        try:
+            ensure_checkout_lease(state, adopt_legacy=True)
+        except CheckoutOwnedError as exc:
+            print(json.dumps({"ok": False, "run_id": run_id,
+                              "status": "checkout_conflict", "error": str(exc),
+                              "checkout_conflict": exc.__dict__}, ensure_ascii=False))
+            return
         while state["status"] == "running":
             request = control(run_dir)
             if request in {"pause", "cancel"}:
@@ -1829,6 +2646,12 @@ def serve(run_id):
                 return
             try:
                 advance(run_dir, state, cfg)
+            except CheckoutOwnedError as exc:
+                # Do not write a legacy run just to report an ownership race.
+                print(json.dumps({"ok": False, "run_id": run_id,
+                                  "status": "checkout_conflict", "error": str(exc),
+                                  "checkout_conflict": exc.__dict__}, ensure_ascii=False))
+                return
             except InterruptedError as exc:
                 pause_with(run_dir, state, str(exc), "uncertain" if state.get("active_job") else ("paused" if control(run_dir) != "cancel" else "cancelled"))
             except (TimeoutError, RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -2041,7 +2864,8 @@ def doctor(project: Path, host="codex"):
 
 def create_run(*, project, goal=None, goal_file=None, host="codex",
                plan_approval=False, require_explorer=False, approved_handoff=None,
-               authorize_handoff=False, skip_doctor=False, interactive=False):
+               authorize_handoff=False, skip_doctor=False, interactive=False,
+               allow_explorer=False, explorer_policy=None):
     """Create durable run state without dispatching a worker.
 
     The interactive MCP surface uses this to return immediately, then invokes
@@ -2052,6 +2876,17 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
     project = Path(project).expanduser().resolve()
     if not project.is_dir():
         raise ValueError(f"Project does not exist: {project}")
+    if explorer_policy is not None:
+        if explorer_policy not in {"none", "on_demand", "required"}:
+            raise ValueError("explorer_policy must be none, on_demand or required")
+        policy = explorer_policy
+    elif require_explorer:
+        policy = "required"
+    elif allow_explorer:
+        policy = "on_demand"
+    else:
+        policy = "none"
+    require_explorer = policy == "required"
     if goal_file is not None:
         goal = Path(goal_file).expanduser().read_text(encoding="utf-8").strip()
     if not isinstance(goal, str) or not goal.strip():
@@ -2075,32 +2910,55 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
             raise RuntimeError("Doctor blocked start: " + json.dumps(healthy))
     identifier = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     folder = run_path(identifier)
-    folder.mkdir(parents=True, exist_ok=False)
-    state = {"id": identifier, "created_at": now(), "project": str(project),
-             "host": host, "goal": goal, "baseline": baseline,
-             "plan_approval": bool(plan_approval), "require_explorer": bool(require_explorer),
-             "status": "running", "phase": "plan",
-             "plan": None, "plan_version": None, "batch_index": 0, "corrections": 0,
-             "single_batch_fast_path": True, "interactive": bool(interactive),
-             "correction": "", "active_job": None, "completed_jobs": [], "failed_jobs": [],
-             "accepted_batches": [], "review": None, "implementation": None,
-             "verification": None, "amendments": [], "interruptions": [],
-             "model_routes": {r: model_route(cfg, host, r) for r in
-                              ("architect", "explorer", "implementer", "reviewer")}}
-    if handoff is not None:
-        state["plan"] = plan
-        state["plan_version"] = signature(plan)
-        state["approved_handoff"] = {k: v for k, v in handoff.items() if k != "plan"}
-        state["handoff_authorization"] = {
-            "explicit_user_authorization": True,
-            "file": str(Path(handoff_path).expanduser().resolve()),
-            "sha256": hashlib.sha256(handoff_bytes).hexdigest(), "at": now()}
-        state["phase"] = "explore" if require_explorer else "implement"
-    save(folder, state)
-    atomic_json(folder / "control.json", {"action": "run"})
-    journal_event(folder, state, "run_created", goal=goal, project=str(project),
-                  host=host, interactive=bool(interactive))
-    return identifier, folder, state
+    lease = acquire_checkout_lease(project, identifier)
+    try:
+        folder.mkdir(parents=True, exist_ok=False)
+        state = {"id": identifier, "created_at": now(), "project": str(project),
+                 "host": host, "goal": goal, "baseline": baseline,
+                 "schema_version": 2, "explorer_policy": policy,
+                 "project_lease": lease,
+                 "plan_approval": bool(plan_approval), "require_explorer": bool(require_explorer),
+                 "status": "running", "phase": "plan",
+                 "plan": None, "plan_version": None, "batch_index": 0, "corrections": 0,
+                 "single_batch_fast_path": True, "interactive": bool(interactive),
+                 "correction": "", "active_job": None, "completed_jobs": [], "failed_jobs": [],
+                 "accepted_batches": [], "review": None, "implementation": None,
+                 "verification": None, "amendments": [], "interruptions": [],
+                 "model_routes": {r: model_route(cfg, host, r) for r in
+                                  ("architect", "explorer", "implementer", "reviewer")}}
+        if handoff is not None:
+            state["plan"] = plan
+            state["plan_version"] = signature(plan)
+            state["approved_handoff"] = {k: v for k, v in handoff.items() if k != "plan"}
+            state["handoff_authorization"] = {
+                "explicit_user_authorization": True,
+                "file": str(Path(handoff_path).expanduser().resolve()),
+                "sha256": hashlib.sha256(handoff_bytes).hexdigest(), "at": now()}
+            state["phase"] = "explore" if require_explorer else "implement"
+        save(folder, state)
+        atomic_json(folder / "control.json", {"action": "run"})
+        try:
+            active_lease = activate_checkout_lease(project, identifier, lease["lease_id"])
+        except CheckoutOwnedError as exc:
+            state["status"] = "blocked"
+            state["checkout_conflict"] = {
+                "kind": exc.state or "conflict", "owner": exc.owner,
+                "resolution": exc.resolution, "message": str(exc)}
+            state["pause_reason"] = "Checkout admission could not be activated: " + str(exc)
+            save(folder, state)
+            release_checkout_lease({"id": identifier, "project": str(project),
+                                    "project_lease": lease})
+            raise
+        state["project_lease"] = active_lease
+        save(folder, state)
+        journal_event(folder, state, "run_created", goal=goal, project=str(project),
+                      host=host, interactive=bool(interactive),
+                      explorer_policy=policy)
+        return identifier, folder, state
+    except BaseException:
+        release_checkout_lease({"id": identifier, "project": str(project),
+                                "project_lease": lease})
+        raise
 
 
 def begin(args):
@@ -2108,6 +2966,8 @@ def begin(args):
         project=args.project, goal_file=args.goal_file, host=args.host,
         plan_approval=bool(args.plan_approval),
         require_explorer=bool(args.require_explorer),
+        allow_explorer=bool(getattr(args, "allow_explorer", False)),
+        explorer_policy=getattr(args, "explorer_policy", None),
         approved_handoff=getattr(args, "approved_handoff", None),
         authorize_handoff=getattr(args, "authorize_handoff", False),
         skip_doctor=bool(args.skip_doctor), interactive=False)
@@ -2140,7 +3000,65 @@ def do_status(run_id):
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def modify(run_id, action, role=None, retry_verification=False):
+def _processes_referencing_launch(launch_file):
+    if not launch_file:
+        return []
+    needle = str(launch_file).encode()
+    found = []
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            data = Path(f"/proc/{entry.name}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if needle in data:
+            stat = process_stat(entry.name)
+            if stat and stat["state"] not in {"Z", "X", "x"}:
+                found.append(stat)
+    return found
+
+
+def _record_launch_missing(folder, state, target, identity, evidence):
+    evidence = (evidence or "").strip()
+    if not evidence:
+        raise RuntimeError("launch-missing reconciliation requires --evidence explaining the inspection")
+    launch_file = identity.get("launch_file")
+    if launch_file and _launch_identity(launch_file):
+        raise RuntimeError("A launch record with a process identity exists; use normal reconciliation")
+    job_path = identity.get("path")
+    if job_path and any((Path(job_path) / name).exists()
+                        for name in ("execution.json", "completion.json")):
+        raise RuntimeError(
+            "Completion artifacts exist; use normal recovery/reconciliation instead of --launch-missing")
+    referencing = _processes_referencing_launch(launch_file)
+    if referencing:
+        raise RuntimeError(
+            "A process still references the launch record; inspect/terminate it first: " +
+            ", ".join(str(item["pid"]) for item in referencing))
+    token = identity.get("check_token")
+    if token:
+        survivors = _check_token_processes(token)
+        if survivors:
+            raise RuntimeError(
+                "A verification process still carries this check's token; inspect/terminate it first: " +
+                ", ".join(str(item["pid"]) for item in survivors))
+    job_id = identity.get("id") or target
+    path = Path(folder) / "jobs" / f"reconciliation-launch-{job_id}-{uuid.uuid4().hex[:8]}.json"
+    record = {"action": "launch_missing_reconciliation", "at": now(),
+              "actor": _operator_actor(), "target": target, "job": identity,
+              "launch_file": launch_file, "evidence": evidence,
+              "liveness": job_liveness(identity)}
+    atomic_json(path, record)
+    return str(path)
+
+
+def modify(run_id, action, role=None, retry_verification=False,
+           launch_missing=False, evidence=None):
     folder, state = load(run_id)
     if action in {"pause", "cancel"}:
         atomic_json(folder / "control.json", {"action": action, "requested_at": now()})
@@ -2149,15 +3067,18 @@ def modify(run_id, action, role=None, retry_verification=False):
     with exclusive(folder):
         # The supervisor may have saved another checkpoint since the first read.
         folder, state = load(run_id)
-        launch = modify_locked(folder, state, run_id, action, role, retry_verification)
+        launch = modify_locked(folder, state, run_id, action, role, retry_verification,
+                               launch_missing=launch_missing, evidence=evidence)
     if launch:
         detach(run_id)
 
 
-def modify_locked(folder, state, run_id, action, role=None, retry_verification=False):
+def modify_locked(folder, state, run_id, action, role=None, retry_verification=False,
+                  launch_missing=False, evidence=None):
     if action == "approve-plan":
         if state["status"] != "awaiting_plan_approval":
             raise RuntimeError("Run is not awaiting plan approval")
+        ensure_checkout_lease(state, adopt_legacy=True)
         state["status"] = "running"
         state["pause_reason"] = None
         save(folder, state)
@@ -2175,6 +3096,7 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
         settings = config()["fallback"][state["host"]]
         if not settings["model"]:
             raise RuntimeError("Fallback model must be explicitly configured")
+        ensure_checkout_lease(state, adopt_legacy=True)
         state["fallback_authorization"] = {"role": role, "approved_at": now(), "limit": "one dispatch"}
         state["status"] = "running"
         state["pause_reason"] = None
@@ -2192,6 +3114,7 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
         retry = state.get("retry_session")
         if retry and not retry.get("reconciled"):
             raise RuntimeError("An unreconciled worker session cannot be reused; reconcile the uncertain attempt first")
+        ensure_checkout_lease(state, adopt_legacy=True)
         state["status"] = "running"
         state["pause_reason"] = None
         save(folder, state)
@@ -2208,15 +3131,28 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
             liveness = job_liveness(active_job)
             if liveness.get("alive") is not False:
                 detail = ", ".join(str(item["pid"]) for item in liveness.get("processes", [])) or liveness.get("reason")
-                raise RuntimeError(
-                    f"Execution identity is not proven stopped ({detail}); inspect the process session before reconciliation")
+                if (launch_missing and liveness.get("reason") == "no_process_identity"):
+                    _record_launch_missing(folder, state, "active_job", active_job, evidence)
+                else:
+                    raise RuntimeError(
+                        f"Execution identity is not proven stopped ({detail}); inspect the process session before reconciliation. "
+                        "If no launch record identity exists, use `orchestrator.py reconcile <run> --launch-missing --evidence '<inspection>'`.")
         check = state.get("active_check") or {}
         if check:
             check_liveness = job_liveness(check)
             if check_liveness.get("alive") is not False:
                 detail = ", ".join(str(item["pid"]) for item in check_liveness.get("processes", [])) or check_liveness.get("reason")
+                if (launch_missing and check_liveness.get("reason") == "no_process_identity"):
+                    _record_launch_missing(folder, state, "active_check", check, evidence)
+                else:
+                    raise RuntimeError(
+                        f"Verification process is not proven stopped ({detail}); inspect it before reconciliation. "
+                        "If no launch record identity exists, use `orchestrator.py reconcile <run> --launch-missing --evidence '<inspection>'`.")
+            escaped_live = _escaped_live(check.get("escaped_processes"))
+            if escaped_live:
+                detail = ", ".join(str(item["pid"]) for item in escaped_live)
                 raise RuntimeError(
-                    f"Verification process is not proven stopped ({detail}); inspect it before reconciliation")
+                    f"Escaped verification processes are still alive ({detail}); terminate them before reconciliation")
         if retry_verification:
             job = state.get("active_job") or {}
             jobdir = Path(job.get("path", ""))
@@ -2278,9 +3214,39 @@ def explore(args):
     folder, state = load(args.run)
     cfg = config()
     project = Path(state["project"])
-    task = args.task
+    task = args.task or ""
     if not task.strip():
         raise ValueError("Explorer needs a concrete investigation")
+    policy = explorer_policy_for(state)
+    if policy == "none":
+        raise RuntimeError(
+            "Explorer dispatch is disabled for this run (explorer_policy=none); "
+            "create a new run with explicit --allow-explorer/--explorer-policy permission")
+    if state.get("status") != "running":
+        raise RuntimeError(
+            f"Explorer dispatch requires a running run, not {state.get('status')!r}")
+    if state.get("phase") not in {"plan", "diagnose"}:
+        raise RuntimeError(
+            f"Explorer dispatch is not authorized in phase {state.get('phase')!r}")
+    active = state.get("active_job") if isinstance(state.get("active_job"), dict) else {}
+    parent = getattr(args, "parent_job", None) or os.environ.get("ABDULLAH_PARENT_JOB")
+    env_run = os.environ.get("ABDULLAH_RUN_ID")
+    if env_run and env_run != state.get("id"):
+        raise RuntimeError("Explorer dispatch environment belongs to a different run")
+    if not parent or parent != active.get("id") or active.get("role") != "architect":
+        raise RuntimeError(
+            "Explorer dispatch requires the exact active Architect parent job")
+    if active.get("status") not in {"running", "dispatched"}:
+        raise RuntimeError(
+            f"Explorer dispatch requires an active Architect job, not {active.get('status')!r}")
+    env_parent = os.environ.get("ABDULLAH_PARENT_JOB")
+    if env_parent and getattr(args, "parent_job", None) and env_parent != getattr(args, "parent_job"):
+        raise RuntimeError("Explorer parent-job argument disagrees with the supervisor environment")
+    env_stage = os.environ.get("ABDULLAH_STAGE")
+    if env_stage and env_stage != state.get("phase"):
+        raise RuntimeError(
+            f"Explorer stage environment {env_stage!r} does not match run phase {state.get('phase')!r}")
+    ensure_checkout_lease(state, adopt_legacy=True)
     ctx = {"project": str(project), "source": source_snapshot(project), "task": task,
            "scope": "Read-only, identify relevant paths and evidence with uncertainty; return JSON."}
     # Separate tracker avoids contention with the supervisor's run lock.
@@ -2288,30 +3254,67 @@ def explore(args):
     tracker.mkdir(parents=True, exist_ok=True)
     with exclusive(tracker):
         tracker_file = tracker / "state.json"
-        ts = read_json(tracker_file) if tracker_file.exists() else {"host": state["host"], "project": str(project), "active_job": None, "completed_jobs": [], "failed_jobs": []}
+        if tracker_file.exists():
+            ts = _safe_read(tracker_file)
+            if not isinstance(ts, dict):
+                raise RuntimeError(
+                    "Explorer tracker state is corrupt; inspect the tracker, logs and children "
+                    "before replacing or reconciling it")
+        else:
+            ts = {"host": state["host"], "project": str(project), "active_job": None,
+                  "completed_jobs": [], "failed_jobs": [], "explorer_calls": 0}
+        ts.setdefault("host", state["host"])
+        ts.setdefault("project", str(project))
+        ts["run_id"] = state["id"]
+        ts.setdefault("active_job", None)
+        ts.setdefault("completed_jobs", [])
+        ts.setdefault("failed_jobs", [])
+        ts.setdefault("explorer_calls", 0)
         if ts.get("active_job"):
             raise RuntimeError("Explorer attempt requires reconciliation before another dispatch")
+        limit = int(cfg.get("limits", {}).get("max_explorer_calls_per_run", 8))
+        calls = int(ts.get("explorer_calls", 0))
+        if calls >= limit:
+            raise RuntimeError(
+                f"Explorer call budget exhausted for this run ({calls}/{limit})")
+        ts["explorer_calls"] = calls + 1
+        save(tracker, ts)
         before = source_snapshot(project)
         report, job = call_model(tracker, ts, cfg, "explorer", "explorer",
                                  report_prompt("explorer", ctx), project, archive=folder / "explorations")
         if signature(before) != signature(source_snapshot(project)):
             raise RuntimeError("Source changed during Explorer; inspect before using the report")
+        journal_event(folder, state, "explorer_dispatched",
+                      job_id=job["id"], parent_job=parent, phase=state.get("phase"),
+                      route=job.get("route"), calls=ts["explorer_calls"], limit=limit)
     print(json.dumps({"job_id": job["id"], "report": report}, ensure_ascii=False))
 
 
-def reconcile_explorer(run_id):
+def reconcile_explorer(run_id, launch_missing=False, evidence=None):
     folder, state = load(run_id)
     tracker = folder / "explorations" / "tracker"
+    if not (tracker / "state.json").is_file():
+        raise RuntimeError(
+            "Explorer tracker state is missing or corrupt; inspect the tracker directory, "
+            "process logs and children before deleting or replacing anything")
     with exclusive(tracker):
-        ts = read_json(tracker / "state.json")
+        ts = _safe_read(tracker / "state.json")
+        if not isinstance(ts, dict):
+            raise RuntimeError(
+                "Explorer tracker state is missing or corrupt; inspect the tracker directory, "
+                "process logs and children before deleting or replacing anything")
         job = ts.get("active_job")
         if not job:
             raise RuntimeError("No Explorer attempt requires reconciliation")
         liveness = job_liveness(job)
         if liveness.get("alive") is not False:
             detail = ", ".join(str(item["pid"]) for item in liveness.get("processes", [])) or liveness.get("reason")
-            raise RuntimeError(
-                f"Explorer process session is not proven stopped ({detail}); inspect descendants before reconciliation")
+            if launch_missing and liveness.get("reason") == "no_process_identity":
+                _record_launch_missing(tracker, ts, "explorer", job, evidence)
+            else:
+                raise RuntimeError(
+                    f"Explorer process session is not proven stopped ({detail}); inspect descendants before reconciliation. "
+                    "If no launch record identity exists, use `orchestrator.py reconcile-explorer <run> --launch-missing --evidence '<inspection>'`.")
         if recover_finished_dispatch(tracker, ts):
             print("Recovered completed Explorer report")
             return
@@ -2505,6 +3508,11 @@ def next_action_for(state):
     status = state.get("status")
     if status in {"complete", "cancelled"}:
         return "none"
+    if status == "checkout_conflict":
+        return "orchestrator_runs"
+    conflict = checkout_conflict(state)
+    if conflict:
+        return "orchestrator_runs"
     if status == "awaiting_plan_approval":
         return "orchestrator_approve_plan"
     if status == "needs_fallback_approval":
@@ -2521,6 +3529,11 @@ def next_stage_preview(state):
         return {"action": "none", "phase": state.get("phase"), "agent": None,
                 "agent_label": "Complete", "task": "Run is complete.",
                 "expected": "No further action."}
+    if state.get("status") == "checkout_conflict":
+        return {"action": "orchestrator_runs", "phase": state.get("phase"),
+                "agent": None, "agent_label": "Checkout conflict",
+                "task": state.get("pause_reason") or "Resolve checkout ownership.",
+                "expected": "An explicit operator resolution, not another stage."}
     if state.get("status") in PAUSED_STATES or state.get("active_job") or state.get("active_check"):
         return {"action": next_action_for(state), "phase": state.get("phase"),
                 "agent": None, "agent_label": "Paused",
@@ -2548,13 +3561,48 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
             "next": next_stage_preview(state), "run_dir": str(folder)}
 
 
+def _checkout_conflict_payload(folder, state, exc):
+    shadow = dict(state)
+    shadow["status"] = "checkout_conflict"
+    shadow["checkout_conflict"] = {"kind": getattr(exc, "state", None) or "conflict",
+                                   "owner": getattr(exc, "owner", None),
+                                   "conflicts": getattr(exc, "conflicts", []),
+                                   "resolution": getattr(exc, "resolution", None),
+                                   "message": str(exc)}
+    shadow["pause_reason"] = str(exc)
+    return stage_payload(folder, shadow, shadow.get("phase"), None,
+                         "Resolve checkout ownership", "Exclusive checkout lease",
+                         0.0, error=str(exc))
+
+
 def stage_run(run_id, expected_phase=None):
     """Execute exactly one durable workflow stage in the foreground."""
     validate_workflow()
     folder, state = load(run_id)
+    if state.get("status") in FINAL_STATES:
+        return stage_payload(folder, state, state.get("phase"), None,
+                             "No work remains", "Run is complete", 0.0, error=None)
+    if state.get("status") in PAUSED_STATES:
+        return stage_payload(folder, state, state.get("phase"), None,
+                             "Run is paused", "Resume or reconcile first", 0.0,
+                             error=state.get("pause_reason") or "run is paused")
+    if state.get("active_check"):
+        return stage_payload(folder, state, state.get("phase"), None,
+                             "Inspect the active verification", "Verified process ownership",
+                             0.0, error="active verification is not proven stopped")
+    try:
+        ensure_checkout_lease(state, adopt_legacy=True)
+    except CheckoutOwnedError as exc:
+        # Refuse before creating any run-directory artifact.  A legacy run that
+        # loses admission must remain byte-for-byte intact.
+        return _checkout_conflict_payload(folder, state, exc)
     cfg = config()
     with exclusive(folder):
         folder, state = load(run_id)
+        try:
+            ensure_checkout_lease(state, adopt_legacy=True)
+        except CheckoutOwnedError as exc:
+            return _checkout_conflict_payload(folder, state, exc)
         if state.get("active_job") and state["active_job"].get("status") in {
                 "running", "dispatched", "uncertain"}:
             if not recover_finished_dispatch(folder, state):
@@ -2596,6 +3644,8 @@ def stage_run(run_id, expected_phase=None):
         error = None
         try:
             advance(folder, state, cfg)
+        except CheckoutOwnedError as exc:
+            return _checkout_conflict_payload(folder, state, exc)
         except InterruptedError as exc:
             error = str(exc)
             pause_with(folder, state, str(exc),
@@ -2616,10 +3666,12 @@ def stage_run(run_id, expected_phase=None):
 
 def start_run(*, project, goal=None, goal_file=None, host="codex",
               plan_approval=False, require_explorer=False, approved_handoff=None,
-              authorize_handoff=False, skip_doctor=False, interactive=True):
+              authorize_handoff=False, skip_doctor=False, interactive=True,
+              allow_explorer=False, explorer_policy=None):
     identifier, folder, state = create_run(
         project=project, goal=goal, goal_file=goal_file, host=host,
         plan_approval=plan_approval, require_explorer=require_explorer,
+        allow_explorer=allow_explorer, explorer_policy=explorer_policy,
         approved_handoff=approved_handoff, authorize_handoff=authorize_handoff,
         skip_doctor=skip_doctor, interactive=interactive)
     return {"ok": True, "run_id": identifier, "status": state["status"],
@@ -2631,8 +3683,10 @@ def start_run(*, project, goal=None, goal_file=None, host="codex",
 def status_run(run_id):
     folder, state = load(run_id)
     job = state.get("active_job") or {}
+    conflict = checkout_conflict(state) if state.get("status") not in FINAL_STATES else None
     return {
-        "ok": True, "run_id": run_id, "status": state.get("status"),
+        "ok": True, "run_id": run_id,
+        "status": "checkout_conflict" if conflict else state.get("status"),
         "phase": state.get("phase"), "batch_index": state.get("batch_index", 0),
         "total_batches": len((state.get("plan") or {}).get("batches", [])),
         "batch": (current_batch(state) or {}).get("title"),
@@ -2647,6 +3701,7 @@ def status_run(run_id):
         "architect_verdict": compact_report(state.get("architect_verdict")),
         "amendments": state.get("amendments", [])[-3:],
         "interruptions": state.get("interruptions", [])[-3:],
+        "checkout_conflict": conflict,
         "next_action": next_action_for(state), "next": next_stage_preview(state),
         "updated_at": state.get("updated_at"), "run_dir": str(folder),
         "progress_line": _progress_line(state),
@@ -2670,7 +3725,7 @@ def _git_status(project):
     try:
         raw = git(Path(project), ["status", "--porcelain"]).decode("utf-8", errors="replace")
         return [line for line in raw.splitlines() if line.strip()]
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         return []
 
 
@@ -2879,31 +3934,65 @@ def interrupt_run(run_id, reason="User requested interruption"):
     try:
         folder, state = load(run_id)
         terminations = _terminate_state_identities(state, grace=6)
-        stopped = all(item.get("stopped") for item in terminations) if terminations else True
+        by_target = {item.get("target"): item for item in terminations}
+        job = state.get("active_job") if isinstance(state.get("active_job"), dict) and state.get("active_job") else None
+        check = state.get("active_check") if isinstance(state.get("active_check"), dict) and state.get("active_check") else None
+        job_stopped = by_target.get("active_job", {}).get("stopped") if job else True
+        check_stopped = by_target.get("active_check", {}).get("stopped") if check else True
+        stopped = bool(job_stopped and check_stopped)
         state.setdefault("interruptions", []).append({
             "at": now(), "reason": reason, "stopped": stopped,
-            "job_id": (state.get("active_job") or {}).get("id"),
+            "job_id": (job or {}).get("id"),
             "termination": terminations})
-        if state.get("active_job") and stopped:
-            job = dict(state["active_job"])
-            job.update({"status": "interrupted", "interrupt_reason": reason})
-            failures = [item for item in state.setdefault("failed_jobs", [])
-                        if item.get("id") != job.get("id")]
-            failures.append(job)
-            state["failed_jobs"] = failures
-            state["active_job"] = None
-            state["active_check"] = None
-            state["retry_session"] = None
+        if job:
+            if job_stopped:
+                failed = dict(job)
+                failed.update({"status": "interrupted", "interrupt_reason": reason})
+                failures = [item for item in state.setdefault("failed_jobs", [])
+                            if item.get("id") != failed.get("id")]
+                failures.append(failed)
+                state["failed_jobs"] = failures
+                state["active_job"] = None
+                state["retry_session"] = None
+            else:
+                state["active_job"] = {**job, "status": "uncertain"}
+        if check:
+            if check_stopped and check.get("check_token"):
+                escaped = _check_token_processes(check["check_token"])
+                if escaped:
+                    containment = _terminate_pids(escaped)
+                    check["escaped_processes"] = escaped
+                    check["containment"] = containment
+                    state["active_check"] = check
+                    check_stopped = False
+            if check_stopped:
+                state["verification_interrupted"] = {
+                    "at": now(), "reason": reason,
+                    "argv": check.get("argv"), "log": check.get("log"),
+                    "candidate_hash": check.get("candidate_hash"),
+                    "termination": by_target.get("active_check"),
+                }
+                state["active_check"] = None
+            # An unverified check identity is retained verbatim.  Clearing it
+            # here would make an uncertain command look safely resumable.
+        stopped = bool(job_stopped and check_stopped)
+        if state.get("interruptions"):
+            state["interruptions"][-1]["stopped"] = stopped
+        if stopped:
             state["status"] = "paused"
-            state["pause_reason"] = f"Interrupted by user: {reason}"
-        elif state.get("active_job"):
-            state["active_job"] = {**state["active_job"], "status": "uncertain"}
+            if job and check:
+                state["pause_reason"] = (
+                    f"Interrupted by user: {reason}; verification will re-run on resume")
+            elif job:
+                state["pause_reason"] = f"Interrupted by user: {reason}"
+            elif check:
+                state["pause_reason"] = (
+                    f"Interrupted by user: {reason}; verification will re-run on resume")
+            else:
+                state["pause_reason"] = f"Interrupted by user: {reason}"
+        else:
             state["status"] = "uncertain"
             state["pause_reason"] = f"Interruption could not be verified: {reason}"
-        else:
-            state["active_check"] = None
-            state["status"] = "paused"
-            state["pause_reason"] = f"Interrupted by user: {reason}"
         save(folder, state)
         journal_event(folder, state, "interrupted", reason=reason, stopped=stopped,
                       termination=terminations)
@@ -2986,11 +4075,12 @@ def resume_run(run_id):
             "next": next_stage_preview(state)}
 
 
-def reconcile_run(run_id):
+def reconcile_run(run_id, launch_missing=False, evidence=None):
     folder, state = load(run_id)
     with exclusive(folder):
         folder, state = load(run_id)
-        modify_locked(folder, state, run_id, "reconcile")
+        modify_locked(folder, state, run_id, "reconcile",
+                      launch_missing=launch_missing, evidence=evidence)
         folder, state = load(run_id)
     return {"ok": True, "run_id": run_id, "status": state["status"],
             "phase": state["phase"], "retry_session": state.get("retry_session"),
@@ -3063,6 +4153,8 @@ MCP_TOOLS = [
          "host": {"type": "string", "enum": ["codex", "claude"], "default": "codex"},
          "plan_approval": {"type": "boolean", "default": False},
          "require_explorer": {"type": "boolean", "default": False},
+         "allow_explorer": {"type": "boolean", "default": False},
+         "explorer_policy": {"type": "string", "enum": ["none", "on_demand", "required"]},
          "approved_handoff": {"type": "string",
                               "description": "Absolute JSON handoff path, only with explicit user approval"},
          "authorize_handoff": {"type": "boolean", "default": False},
@@ -3132,6 +4224,8 @@ def _mcp_tool_call(name, arguments):
                          host=arguments.get("host", "codex"),
                          plan_approval=bool(arguments.get("plan_approval", False)),
                          require_explorer=bool(arguments.get("require_explorer", False)),
+                         allow_explorer=bool(arguments.get("allow_explorer", False)),
+                         explorer_policy=arguments.get("explorer_policy"),
                          approved_handoff=arguments.get("approved_handoff"),
                          authorize_handoff=bool(arguments.get("authorize_handoff", False)),
                          skip_doctor=bool(arguments.get("skip_doctor", False)))
@@ -3310,6 +4404,8 @@ def main(argv=None):
     s.add_argument("--approved-handoff", help="Structured JSON handoff, explicitly approved by the user")
     s.add_argument("--authorize-handoff", action="store_true", help="Record user's explicit approval of this handoff")
     s.add_argument("--require-explorer", "--explorer-required", dest="require_explorer", action="store_true", help="Require an Explorer investigation before implementation")
+    s.add_argument("--allow-explorer", action="store_true", help="Allow tracked on-demand Explorer dispatch during planning/diagnosis")
+    s.add_argument("--explorer-policy", choices=("none", "on_demand", "required"), default=None, help="Explicit nested Explorer policy; defaults to none")
     s.add_argument("--skip-doctor", action="store_true", help="Tests/offline development only")
     for name in ("status", "resume", "pause", "cancel", "approve-plan",
                  "approve-fallback", "reconcile", "serve"):
@@ -3321,12 +4417,17 @@ def main(argv=None):
             p.add_argument("--role", required=True, choices=("architect", "implementer", "explorer", "reviewer"))
         if name == "reconcile":
             p.add_argument("--retry-verification", action="store_true", help="Return a proven unchanged interrupted correction to verification")
+            p.add_argument("--launch-missing", action="store_true", help="Audited recovery when no launch identity was ever persisted")
+            p.add_argument("--evidence", help="Operator inspection evidence for --launch-missing")
     e = subs.add_parser("explore", help="Tracked synchronous cheap Explorer from a strong Architect")
     e.add_argument("run_id", nargs="?")
     e.add_argument("--run")
     e.add_argument("--task", required=True)
+    e.add_argument("--parent-job", help="Active Architect job ID; normally supplied by the supervisor environment")
     er = subs.add_parser("reconcile-explorer", help="Reconcile an interrupted synchronous Explorer after inspecting its process")
     er.add_argument("run_id")
+    er.add_argument("--launch-missing", action="store_true")
+    er.add_argument("--evidence")
     rv = subs.add_parser("reconcile-verification", help="Reconcile an unchanged interrupted correction and pause at verification")
     rv.add_argument("run_id")
     subs.add_parser("mcp", help="Run the stdio MCP server for one interactive Codex conversation")
@@ -3348,6 +4449,19 @@ def main(argv=None):
     am.add_argument("--text")
     am.add_argument("--architect-review", action="store_true")
     subs.add_parser("runs", help="List recent durable runs")
+    ad = subs.add_parser("adopt", help="Explicitly adopt a legacy run into checkout ownership")
+    ad.add_argument("run_id")
+    rt = subs.add_parser("retire", help="Administratively retire an inactive run; never kills work")
+    rt.add_argument("run_id")
+    rt.add_argument("--reason", required=True)
+    rt.add_argument("--acknowledge", required=True)
+    cs = subs.add_parser("checkout-status", help="Read-only checkout lease and conflict diagnostics")
+    cs.add_argument("--project", required=True)
+    cr = subs.add_parser("checkout-recover", help="Clear an orphaned checkout registry record with audit evidence")
+    cr.add_argument("--project", required=True)
+    cr.add_argument("--owner", required=True)
+    cr.add_argument("--reason", required=True)
+    cr.add_argument("--acknowledge", required=True)
     opts = parser.parse_args(argv)
     try:
         if opts.command == "doctor":
@@ -3373,11 +4487,14 @@ def main(argv=None):
             opts.run = opts.run or opts.run_id
             explore(opts)
         elif opts.command == "reconcile-explorer":
-            reconcile_explorer(opts.run_id)
+            reconcile_explorer(opts.run_id, launch_missing=opts.launch_missing,
+                               evidence=opts.evidence)
         elif opts.command == "reconcile":
             if bool(opts.run) == bool(opts.run_id):
                 raise ValueError("Provide exactly one run ID, either positional or --run")
-            modify(opts.run or opts.run_id, opts.command, retry_verification=opts.retry_verification)
+            modify(opts.run or opts.run_id, opts.command,
+                   retry_verification=opts.retry_verification,
+                   launch_missing=opts.launch_missing, evidence=opts.evidence)
         elif opts.command == "reconcile-verification":
             modify(opts.run_id, "reconcile", retry_verification=True)
         elif opts.command == "mcp":
@@ -3406,12 +4523,24 @@ def main(argv=None):
                                        opts.architect_review), ensure_ascii=False, indent=2))
         elif opts.command == "runs":
             print(json.dumps(list_runs(), ensure_ascii=False, indent=2))
+        elif opts.command == "adopt":
+            print(json.dumps(adopt_run(opts.run_id), ensure_ascii=False, indent=2))
+        elif opts.command == "retire":
+            print(json.dumps(retire_run(opts.run_id, opts.reason, opts.acknowledge),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "checkout-status":
+            print(json.dumps(checkout_status(Path(opts.project).expanduser().resolve()),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "checkout-recover":
+            print(json.dumps(checkout_recover(Path(opts.project).expanduser().resolve(),
+                                              opts.owner, opts.reason, opts.acknowledge),
+                             ensure_ascii=False, indent=2))
         else:
             if bool(opts.run) == bool(opts.run_id):
                 raise ValueError("Provide exactly one run ID, either positional or --run")
             modify(opts.run or opts.run_id, opts.command, getattr(opts, "role", None))
         return 0
-    except (RuntimeError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"Abdullah Orchestrator: {exc}", file=sys.stderr)
         return 2
 

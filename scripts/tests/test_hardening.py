@@ -130,16 +130,15 @@ print(json.dumps({'sessionID':'ses_retry','type':'text','part':{'text':json.dump
         self.assertEqual(restored['correction'], 'fix')
 
     def test_timeout_check_requires_reconciliation(self):
-        batch = {'title': 'check', 'checks': [['true']]}
-        real_run = orc.subprocess.run
-        def timeout(command, **kwargs):
-            if command == ['true']:
-                raise subprocess.TimeoutExpired(command, 1)
-            return real_run(command, **kwargs)
-        with patch.object(orc.subprocess, 'run', side_effect=timeout):
-            with self.assertRaises(TimeoutError):
-                orc.run_checks(self.rundir, self.state, self.cfg, self.project, batch)
-        self.assertIsNotNone(orc.read_json(self.rundir / 'state.json')['active_check'])
+        batch = {'title': 'check', 'checks': [[sys.executable, '-c',
+                                              'import time; time.sleep(5)']]}
+        self.cfg['limits']['max_check_seconds'] = 0.3
+        with self.assertRaises(TimeoutError):
+            orc.run_checks(self.rundir, self.state, self.cfg, self.project, batch)
+        saved = orc.read_json(self.rundir / 'state.json')['active_check']
+        self.assertIsNotNone(saved)
+        self.assertIsNotNone(saved.get('pid'))
+        self.assertIsNotNone(saved.get('sid'))
 
     def test_example_config_allows_long_engineering_stages(self):
         limits = orc.read_json(orc.HERE / 'config.example.json')['limits']
@@ -154,7 +153,7 @@ print(json.dumps({'sessionID':'ses_retry','type':'text','part':{'text':json.dump
         jobdir.mkdir(parents=True)
         orc.atomic_json(jobdir / 'execution.json', {'returncode': 2})
         (jobdir / 'events.log').write_text('{"sessionID":"ses_1"}\n429 rate limit\n')
-        self.state['active_job'] = {'id':'rate', 'kind':'implementer', 'role':'implementer', 'path':str(jobdir), 'status':'running'}
+        self.state['active_job'] = {'id':'rate', 'kind':'implementer', 'role':'implementer', 'path':str(jobdir), 'status':'running', **baseline.dead_process_identity()}
         self.assertTrue(orc.recover_finished_dispatch(self.rundir, self.state))
         self.assertEqual(self.state['status'], 'uncertain')
         self.assertIsNotNone(self.state['active_job'])
@@ -171,16 +170,15 @@ print(json.dumps({'sessionID':'ses_retry','type':'text','part':{'text':json.dump
             self.assertFalse(orc.validate_cli_arguments(['codex', 'exec', '--model', 'x', '--unsupported-future-option', 'prompt'], '  --model <MODEL>'))
 
     def test_crash_during_verification_stays_uncertain(self):
-        batch = {'title': 'check', 'checks': [['true']]}
-        real_run = orc.subprocess.run
-        def crash(command, **kwargs):
-            if command == ['true']:
-                raise KeyboardInterrupt('supervisor crash')
-            return real_run(command, **kwargs)
-        with patch.object(orc.subprocess, 'run', side_effect=crash):
+        batch = {'title': 'check', 'checks': [[sys.executable, '-c',
+                                              'import time; time.sleep(5)']]}
+        with patch.object(orc, 'control', side_effect=KeyboardInterrupt('supervisor crash')):
             with self.assertRaises(KeyboardInterrupt):
                 orc.run_checks(self.rundir, self.state, self.cfg, self.project, batch)
         restored = orc.read_json(self.rundir / 'state.json')
+        self.assertIsNotNone(restored.get('active_check'))
+        self.assertIsNotNone(restored['active_check'].get('pid'))
+        self.assertIs(orc.job_liveness(restored['active_check'])['alive'], False)
         with patch.object(orc, 'load', return_value=(self.rundir, restored)), patch.object(orc, 'advance') as advance:
             orc.serve('test-run00')
         self.assertEqual(restored['status'], 'uncertain')

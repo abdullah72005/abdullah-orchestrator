@@ -42,3 +42,7 @@ Use LeanCTX MCP (`ctx_read`, `ctx_search`, `ctx_tree`, `ctx_compose`, `ctx_*`) o
 `orchestrator_interrupt` returns the persisted reason, the interruption record and termination results (`stopped`, remaining PIDs, method). Only `stopped:true` authorizes a duplicate retry. A verified stop leaves a resumable `paused` state; otherwise the run is `uncertain` and requires `orchestrator_reconcile`.
 
 `orchestrator_reconcile` succeeds only when the recorded session/process tree is proven stopped. It clears `active_job`/`active_check`, records the reconciled attempt, and disarms any stale `retry_session` unless it belongs to the exact reconciled rate-limited attempt. A session must never be reused merely because it was saved.
+
+Every guarded dispatch writes a durable `launch.json` before the child starts. If no launch identity was persisted, normal reconciliation refuses to guess; the operator may inspect the exact environment and use `reconcile RUN_ID --launch-missing --evidence '<inspection>'`, which records an audited resolution and does not execute a model.
+
+Checkout ownership is distinct from worker termination. `retire RUN_ID --reason ... --acknowledge ...` is administrative abandonment of an inactive run; it preserves reports/checkpoints, refuses live or uncertain execution, and records the operator and evidence. `checkout-recover` clears only an orphaned/stale registry record with the same evidence discipline. Neither command proves that an old worker terminated unless the record explicitly contains termination evidence.

@@ -7,6 +7,9 @@ when making changes. A fresh clone can also be installed in place, because
 `scripts/install_wsl.py` links whichever directory contains it. Back up both
 copies before an update if that layout is in use:
 
+The checkout registry is `<state-root>-checkouts` (or `ABDULLAH_CHECKOUT_REGISTRY`).
+Back it up with the runs; never delete it while any run is active.
+
 ```bash
 mkdir -p ~/.local/state/abdullah-orchestrator/backups/<stamp>
 tar -czf ~/.local/state/abdullah-orchestrator/backups/<stamp>/source.tar.gz -C ~/.local/src abdullah-orchestrator

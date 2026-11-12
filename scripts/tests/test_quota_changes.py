@@ -45,7 +45,8 @@ class QuotaChanges(unittest.TestCase):
                 explore.assert_not_called()
 
     def test_architect_explorer_command_uses_positional_id(self):
-        context = orc.architect_context(self.rundir, self.state, 'decision')
+        self.state['explorer_policy'] = 'on_demand'
+        context = orc.architect_context(self.rundir, self.state, 'plan')
         self.assertIn(' explore ' + self.state['id'] + ' --task ', context['explorer_dispatch'])
         self.assertNotIn(' explore --run ', context['explorer_dispatch'])
 
@@ -205,7 +206,11 @@ report={'status':'complete','summary':'read','files':['app.py'],'tests':[], 'evi
 print(json.dumps({'type':'text','sessionID':'ses_fake','part':{'text':json.dumps(report)}}))
 ''')
         fake.chmod(0o755)
-        args = SimpleNamespace(run='test-run00', task='inspect app')
+        self.state.update(explorer_policy='on_demand', status='running', phase='plan',
+                          active_job={'id': 'parent-job', 'role': 'architect',
+                                      'status': 'running'})
+        args = SimpleNamespace(run='test-run00', task='inspect app',
+                               parent_job='parent-job')
         with patch.object(orc, 'load', return_value=(self.rundir, self.state)), patch.object(orc, 'config', return_value=self.cfg), patch.dict(os.environ, {'PATH':str(self.root)+':'+os.environ['PATH']}), contextlib.redirect_stdout(io.StringIO()):
             orc.explore(args)
             tracker = self.rundir / 'explorations' / 'tracker'

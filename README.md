@@ -133,10 +133,17 @@ workflow and contracts.
 ## State and configuration
 
 - Run state: `~/.local/state/abdullah-orchestrator/runs/<ID>`
+- Checkout lease registry: `~/.local/state/abdullah-orchestrator/runs-checkouts`
 - Configuration: `~/.config/abdullah-orchestrator/config.json`
 
-Override these with `ABDULLAH_STATE_DIR` and `ABDULLAH_CONFIG`. Runtime state,
-generated configs and bytecode are not tracked by Git.
+Override these with `ABDULLAH_STATE_DIR`, `ABDULLAH_CHECKOUT_REGISTRY` and
+`ABDULLAH_CONFIG`. Runtime state, generated configs and bytecode are not tracked
+by Git.
+
+Checkout conflicts expose the owner run ID and resolution commands. Use
+`checkout-status`, `retire` and `checkout-recover` for explicit operator
+resolution; `adopt` is the legacy adoption path. These commands never launch a
+model and never kill live work.
 
 ## Trust boundary
 
