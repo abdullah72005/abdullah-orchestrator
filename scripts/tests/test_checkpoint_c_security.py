@@ -64,7 +64,10 @@ class CheckpointCSecurity(unittest.TestCase):
         with patch.dict(os.environ, {
                 "OPENAI_API_KEY": "secret", "GITHUB_TOKEN": "secret",
                 "NORMAL_SETTING": "yes", "GITHUB_ACTIONS": "true",
-                "AWS_REGION": "eu-west-1", "PIP_INDEX_URL":
+                "AWS_REGION": "eu-west-1", "AWS_ACCESS_KEY_ID": "AKIA",
+                "PGPASSWORD": "secret", "MY_DATABASE_URL": "postgres://u:p@db/x",
+                "REDIS_URL": "redis://u:p@cache/0", "BASE_URL":
+                "https://u:p@example.test/api", "PIP_INDEX_URL":
                 "https://user:pass@example.test/simple"}):
             env = orc.scrubbed_env()
         self.assertNotIn("OPENAI_API_KEY", env)
@@ -72,7 +75,10 @@ class CheckpointCSecurity(unittest.TestCase):
         self.assertEqual(env["NORMAL_SETTING"], "yes")
         self.assertEqual(env["GITHUB_ACTIONS"], "true")
         self.assertEqual(env["AWS_REGION"], "eu-west-1")
+        for key in ("AWS_ACCESS_KEY_ID", "PGPASSWORD", "MY_DATABASE_URL", "REDIS_URL"):
+            self.assertNotIn(key, env)
         self.assertNotIn("user:pass", env["PIP_INDEX_URL"])
+        self.assertNotIn("u:p", env["BASE_URL"])
 
     def test_implementer_profile_denies_external_and_network(self):
         v1 = orc.opencode_profile("implementer", "v1")
@@ -181,6 +187,26 @@ class CheckpointCSecurity(unittest.TestCase):
         orc.save(self.rundir, self.state)
         with self.assertRaisesRegex(RuntimeError, "active|uncertain"):
             orc.migrate_run("test-run00", str(self.root / "migrate-active"))
+
+    def test_modify_launch_missing_is_guarded(self):
+        cfg = self._cfg()
+        cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = False
+        self.state.update(status="uncertain", active_job={"id": "j",
+                          "launch_file": str(self.root / "missing.json")})
+        orc.save(self.rundir, self.state)
+        with patch.object(orc, "config", return_value=cfg):
+            with self.assertRaisesRegex(RuntimeError, "disabled"):
+                orc.modify("test-run00", "reconcile", launch_missing=True,
+                           evidence="inspected")
+
+    def test_recovery_does_not_require_current_config_hash(self):
+        changed = dict(self.state)
+        changed.update(status="uncertain", config_sha256="old-config-hash",
+                       active_job={"id": "j", "status": "uncertain",
+                                   "launch_file": str(self.root / "missing.json")})
+        orc.save(self.rundir, changed)
+        with self.assertRaisesRegex(RuntimeError, "unproven|not proven"):
+            orc.modify("test-run00", "reconcile")
 
     def test_sensitive_cli_main_guard_blocks_before_dispatch(self):
         cfg = self._cfg(); cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = False

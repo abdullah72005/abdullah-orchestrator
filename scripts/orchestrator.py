@@ -137,6 +137,8 @@ def config():
         raise ValueError(
             f"Configured supervisor version {pinned!r} does not match {SUPERVISOR_VERSION!r}")
     authorization = cfg.get("authorization", {})
+    if not isinstance(authorization, dict):
+        raise ValueError("authorization must be a JSON object")
     sensitive = authorization.get("sensitive_cli_enabled", False)
     if not isinstance(sensitive, bool):
         raise ValueError("authorization.sensitive_cli_enabled must be a boolean")
@@ -769,9 +771,11 @@ def _operator_actor():
 
 SECRET_ENV_SUFFIX = re.compile(
     r"(API_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|PRIVATE_KEY|CLIENT_SECRET|"
-    r"SECRET_ACCESS_KEY|SESSION_TOKEN)$", re.I)
-SECRET_ENV_EXACT = {"DATABASE_URL", "DOCKER_AUTH_CONFIG", "SSH_AUTH_SOCK",
-                    "PYPI_TOKEN", "TWINE_PASSWORD"}
+    r"SECRET_ACCESS_KEY|SESSION_TOKEN|_ACCESS_KEY_ID|_DATABASE_URL|_REDIS_URL)$", re.I)
+SECRET_ENV_EXACT = {"DATABASE_URL", "REDIS_URL", "MONGO_URL", "MONGODB_URI",
+                    "DOCKER_AUTH_CONFIG", "SSH_AUTH_SOCK", "PYPI_TOKEN",
+                    "TWINE_PASSWORD", "PGPASSWORD", "MYSQL_PWD", "PASSWORD",
+                    "AWS_ACCESS_KEY_ID"}
 URL_CREDENTIAL_ENV = {"PIP_INDEX_URL", "UV_INDEX_URL", "npm_config_registry"}
 
 
@@ -794,7 +798,7 @@ def scrubbed_env():
     for key, value in os.environ.items():
         if key in SECRET_ENV_EXACT or SECRET_ENV_SUFFIX.search(key):
             continue
-        if key in URL_CREDENTIAL_ENV:
+        if key in URL_CREDENTIAL_ENV or key.endswith("_URL") or key.endswith("_URI"):
             value = _without_url_credentials(value)
         env[key] = value
     return env
@@ -831,7 +835,8 @@ def state_compatibility(state):
     supervisor_changed = supervisor != SUPERVISOR_VERSION
     config_changed = (config_version != CONFIG_SCHEMA_VERSION
                       or (config_sha is not None and config_sha != current_config))
-    if version is None or supervisor is None or config_version is None:
+    if (version is None or supervisor is None or config_version is None
+            or config_sha is None):
         status = "legacy"
     elif not isinstance(version, int) or version > current:
         status = "unsupported_newer" if isinstance(version, int) else "legacy"
@@ -3788,8 +3793,8 @@ def compatibility_run(run_id):
     result.update({"ok": True, "run_id": run_id, "run_dir": str(folder),
                    "current_config_sha256": configuration_provenance().get("sha256"),
                    "run_config_sha256": state.get("config_sha256"),
-                   "config_changed": bool(state.get("config_sha256")
-                                          and state.get("config_sha256") != configuration_provenance().get("sha256"))})
+                   "config_changed": bool(result["config_changed"]
+                                          or result["status"] == "config_changed")})
     return result
 
 
@@ -3896,8 +3901,11 @@ def modify(run_id, action, role=None, retry_verification=False,
            launch_missing=False, evidence=None):
     if action == "cancel":
         _operator_action_allowed("cancel")
+    if launch_missing:
+        _operator_action_allowed("reconcile-launch-missing")
     folder, state = load(run_id)
-    assert_state_compatible(state)
+    if action in {"resume", "approve-plan", "approve-fallback"}:
+        assert_state_compatible(state)
     if action in {"pause", "cancel"}:
         atomic_json(folder / "control.json", {"action": action, "requested_at": now()})
         print(f"{action} requested for {run_id}; status will update when running command stops")
