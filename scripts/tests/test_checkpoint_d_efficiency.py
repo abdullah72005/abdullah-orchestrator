@@ -199,6 +199,12 @@ class CheckpointDEfficiency(unittest.TestCase):
         cfg["risk_policy"] = None
         with self.assertRaisesRegex(ValueError, "object"):
             orc.risk_policy("high", cfg)
+        cfg["risk_policy"] = {"high": {"minimum_checks": None}}
+        with self.assertRaisesRegex(ValueError, "integer"):
+            orc.risk_policy("high", cfg)
+        cfg["risk_policy"] = {"high": {"independent_review": "false"}}
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            orc.risk_policy("high", cfg)
 
     def test_provider_usage_fields_are_parsed(self):
         raw = json.dumps({"usage": {"input_tokens": 10, "output_tokens": 5,

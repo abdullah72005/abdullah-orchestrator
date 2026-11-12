@@ -1060,8 +1060,14 @@ def risk_policy(risk, cfg=None):
                 raise ValueError(f"risk_policy.{name} must be an object")
             settings[name].update(values)
     policy = settings[risk]
-    independent = bool(policy.get("independent_review", True))
-    minimum = int(policy.get("minimum_checks", 1))
+    independent_value = policy.get("independent_review", True)
+    if not isinstance(independent_value, bool):
+        raise ValueError(f"risk_policy.{risk}.independent_review must be boolean")
+    independent = independent_value
+    try:
+        minimum = int(policy.get("minimum_checks", 1))
+    except (TypeError, ValueError):
+        raise ValueError(f"risk_policy.{risk}.minimum_checks must be an integer")
     if risk == "ordinary":
         independent = True
     if risk == "high":
@@ -3339,6 +3345,19 @@ def advance(run_dir, state, cfg):
         save(run_dir, state)
         return
     if stage == "plan":
+        if state.get("plan") is None:
+            # A new plan must not inherit stale batch-scoped context.
+            state["implementation"] = None
+            state["implementation_job"] = None
+            state["review"] = None
+            state["verification"] = None
+            state["correction"] = ""
+            state["corrections"] = 0
+            state["diagnosis_verdict"] = None
+            state["diagnosis_reason"] = None
+            state["exploration"] = None
+            state.pop("required_exploration_job", None)
+            state.pop("verification_interrupted", None)
         plan = cached_job_report(run_dir, state, "plan") or strong_call(run_dir, state, cfg, "plan")
         if plan["status"] == "blocked":
             consume_last(state)
@@ -3364,6 +3383,8 @@ def advance(run_dir, state, cfg):
         state["plan_version"] = new_version
         state["plan_revision"] = state.get("plan_revision", 0) + 1
         state.pop("amendment_material", None)
+        state["exploration"] = None
+        state.pop("required_exploration_job", None)
         exploration = certified_exploration(run_dir, state, plan) if state.get("require_explorer") else None
         if exploration is not None:
             state["exploration"] = exploration
@@ -3378,8 +3399,6 @@ def advance(run_dir, state, cfg):
         state["corrections"] = 0
         state["diagnosis_verdict"] = None
         state["diagnosis_reason"] = None
-        state["exploration"] = None
-        state.pop("required_exploration_job", None)
         state.pop("verification_interrupted", None)
         if state["plan_approval"]:
             pause_with(run_dir, state, "Review plan in state.json, then use approve-plan", "awaiting_plan_approval")
