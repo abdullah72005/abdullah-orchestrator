@@ -260,9 +260,13 @@ class CheckpointAContainment(unittest.TestCase):
                                 start_new_session=True, env=clean_env)
         try:
             launch = self.root / "launch-with-child.json"
-            orc.atomic_json(launch, {"phase": "running",
-                                     "guard": baseline.dead_process_identity(),
+            dead = baseline.dead_process_identity()
+            orc.atomic_json(launch, {"phase": "running", "guard": dead,
                                      "child_identity": orc.process_identity(proc.pid)})
+            with patch.object(orc, "process_identity", return_value=dead):
+                orc._write_launch(launch, "exited", returncode=0)
+            saved_launch = orc.read_json(launch)
+            self.assertEqual(saved_launch["child_identity"]["pid"], proc.pid)
             check = self._dead_job("check-1", check=True)
             check["launch_file"] = str(launch)
             check.pop("pid", None); check.pop("pid_start", None)
@@ -389,6 +393,40 @@ class CheckpointAContainment(unittest.TestCase):
             lease = orc.acquire_checkout_lease(new_project, "new-run")
             self.assertEqual(lease["run_id"], "new-run")
             orc.release_checkout_lease({"id": "new-run", "project": str(new_project)})
+        finally:
+            proc.kill(); proc.wait(timeout=5)
+
+    def test_terminate_identity_reports_descendants(self):
+        code = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(30)\n")
+        proc = subprocess.Popen([sys.executable, "-c", code], start_new_session=True,
+                                stdout=subprocess.PIPE, text=True)
+        try:
+            child_pid = int(proc.stdout.readline().strip())
+            result = orc.terminate_identity(orc.process_identity(proc.pid), grace=2)
+            self.assertIn(child_pid, result.get("descendants", []))
+        finally:
+            proc.kill(); proc.wait(timeout=5)
+            proc.stdout.close()
+
+    def test_final_conflict_preview_uses_containment_guidance(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                start_new_session=True,
+                                env={**os.environ, "ABDULLAH_RUN_ID": "final-owner"})
+        try:
+            owner = self.root / "runs" / "final-owner"
+            owner.mkdir()
+            state = dict(self.state)
+            state.update(id="final-owner", status="complete", active_job=None,
+                         active_check=None, project=str(self.project))
+            orc.atomic_json(owner / "state.json", state)
+            preview = orc.checkout_conflict(self.state)
+            self.assertEqual(preview["kind"], "containment")
+            self.assertNotIn("orchestrator.py retire", preview["resolution"])
+            self.assertNotIn("orchestrator.py adopt", preview["resolution"])
         finally:
             proc.kill(); proc.wait(timeout=5)
 

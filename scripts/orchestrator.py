@@ -677,8 +677,10 @@ def checkout_conflict(state):
             return {"kind": status, "owner": record, "owner_state": owner_state,
                     "resolution": _conflict_resolution(record.get("run_id"), run_id, status)}
     if conflicts:
-        return {"kind": "conflict", "conflicts": conflicts,
-                "resolution": _conflict_resolution(conflicts[0]["run_id"], run_id, "conflict")}
+        kind = "containment" if any(item.get("status") == "final_containment"
+                                    for item in conflicts) else "conflict"
+        return {"kind": kind, "conflicts": conflicts,
+                "resolution": _conflict_resolution(conflicts[0]["run_id"], run_id, kind)}
     return None
 
 
@@ -691,7 +693,9 @@ def checkout_status(project):
         status, _owner_state = _owner_block(owner_id, record)
         resolution = _conflict_resolution(owner_id, None, status)
     elif conflicts:
-        resolution = _conflict_resolution(conflicts[0]["run_id"], None, "conflict")
+        kind = "containment" if any(item.get("status") == "final_containment"
+                                    for item in conflicts) else "conflict"
+        resolution = _conflict_resolution(conflicts[0]["run_id"], None, kind)
     else:
         resolution = None
     return {"ok": True, "checkout": identity, "lease": record, "conflicts": conflicts,
@@ -950,8 +954,10 @@ def _wait_launch(path, timeout=2.0):
 
 def _write_launch(path, phase, **fields):
     identity = process_identity(os.getpid()) or {}
-    record = {"phase": phase, "guard": identity, "guard_pid": os.getpid(),
-              "updated_at": now()}
+    previous = _safe_read(Path(path)) if Path(path).exists() else None
+    record = dict(previous) if isinstance(previous, dict) else {}
+    record.update({"phase": phase, "guard": identity, "guard_pid": os.getpid(),
+                   "updated_at": now()})
     record.update(fields)
     atomic_json(Path(path), record)
 
@@ -1109,6 +1115,7 @@ def terminate_identity(job, grace=8):
     return {"stopped": final.get("alive") is False and not extra,
             "remaining": remaining_pids,
             "zombies": [stat["pid"] for stat in final.get("zombies", [])],
+            "descendants": sorted(tracked),
             "method": "sigterm_sigkill", "identity": ident}
 
 
