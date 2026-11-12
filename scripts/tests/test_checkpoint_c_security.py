@@ -138,6 +138,7 @@ class CheckpointCSecurity(unittest.TestCase):
         saved = orc.read_json(self.rundir / "state.json")
         self.assertIsNone(saved.get("check_progress"))
         self.assertIsNone(saved.get("verification"))
+        self.assertEqual(saved["phase"], "verify")
 
     def test_generated_recovery_command_uses_project_flag(self):
         advice = orc._conflict_resolution("owner", "new-run", "orphaned")

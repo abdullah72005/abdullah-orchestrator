@@ -466,6 +466,21 @@ class CheckpointAContainment(unittest.TestCase):
         finally:
             proc.kill(); proc.wait(timeout=5)
 
+    def test_explorer_reconcile_excludes_live_parent_session(self):
+        parent = self._run_only()
+        try:
+            tracker = self.rundir / "explorations" / "tracker"
+            tracker.mkdir(parents=True)
+            orc.atomic_json(tracker / "state.json", {
+                "host": "codex", "project": str(self.project), "run_id": "test-run00",
+                "active_job": self._dead_job("explorer-1"),
+                "parent_job_identity": orc.process_identity(parent.pid),
+                "completed_jobs": [], "failed_jobs": [], "explorer_calls": 1})
+            orc.reconcile_explorer("test-run00")
+            self.assertIsNone(orc.read_json(tracker / "state.json")["active_job"])
+        finally:
+            parent.kill(); parent.wait(timeout=5)
+
     def test_protected_recovery_actions_remain_cli_only(self):
         self.assertNotIn("orchestrator_retire", orc.MCP_TOOL_NAMES)
         self.assertNotIn("orchestrator_adopt", orc.MCP_TOOL_NAMES)

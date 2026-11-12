@@ -340,11 +340,19 @@ def inspect_execution(job, *, run_id=None, include_run=False, exclude_identity=N
     descendants = _live_extra(descendant_pids)
     launch_references = _processes_referencing_launch(launch_file)
     run_survivors = _processes_for_run(run_id) if include_run else []
-    if exclude_identity and exclude_identity.get("pid"):
-        run_survivors = [stat for stat in run_survivors
-                         if not (stat.get("pid") == exclude_identity.get("pid")
-                                 and (exclude_identity.get("pid_start") is None
-                                      or stat.get("starttime") == exclude_identity.get("pid_start")))]
+    if exclude_identity and _identity_alive(exclude_identity):
+        def is_parent(stat):
+            if (exclude_identity.get("pid")
+                    and stat.get("pid") == exclude_identity.get("pid")
+                    and (exclude_identity.get("pid_start") is None
+                         or stat.get("starttime") == exclude_identity.get("pid_start"))):
+                return True
+            if exclude_identity.get("sid") and stat.get("session") == exclude_identity["sid"]:
+                return True
+            if exclude_identity.get("pgid") and stat.get("pgrp") == exclude_identity["pgid"]:
+                return True
+            return False
+        run_survivors = [stat for stat in run_survivors if not is_parent(stat)]
     launch_child = []
     if isinstance(launch_record, dict):
         child = launch_record.get("child_identity")
@@ -3577,6 +3585,7 @@ def advance(run_dir, state, cfg):
                 save(run_dir, state)
             final_evidence = run_checks(run_dir, state, cfg, project, {"title": "feature integration", "checks": state["plan"]["batches"][0]["checks"]}, final=True)
             if not final_evidence.get("passed") or final_evidence.get("candidate_hash") != signature(current) or not final_evidence.get("source_unchanged"):
+                state["check_progress"] = None
                 pause_with(run_dir, state, "Final verification failed or candidate changed", failure_phase(state))
                 return
         verdict = cached_decision or strong_call(run_dir, state, cfg, "decision", {"final_evidence": final_evidence, "integration_instruction": "Also inspect end-to-end feature integration and all original requirements."} if single else None)
@@ -4198,9 +4207,12 @@ def migrate_run(run_id, backup_dir=None):
                       "migration_from": previous})
         state.pop("check_progress", None)
         state.pop("verification_interrupted", None)
+        state.pop("single_batch_verification", None)
         state["verification"] = None
         state["review"] = None
         state["architect_verdict"] = None
+        if state.get("phase") in {"verify", "review", "accept", "integrate"}:
+            state["phase"] = "verify"
         save(folder, state)
         journal_event(folder, state, "state_migrated", backup=str(backup),
                       previous=previous)
