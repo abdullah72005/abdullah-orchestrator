@@ -86,3 +86,70 @@ tar -xzf ~/.local/state/abdullah-orchestrator/backups/<stamp>/installed.tar.gz -
 Run the restored suite, then re-run `scripts/install_wsl.py` if the skill link
 target moved. Run state and `~/.config/abdullah-orchestrator/config.json` are
 separate and are not part of these archives; never delete them during rollback.
+
+## OpenCode V1 to V2 upgrade handoff
+
+The supervisor supports the tested OpenCode lines `>=1.18 <2.0` and
+`>=2.2 <3.0`. It refuses unknown majors rather than claiming forward
+compatibility. On 2026-11-12 the verified latest stable V2 release was
+**v2.2.7**. The GitHub `releases/latest` endpoint still reported `v1.19.5`, so
+`opencode upgrade` without a target will not reach V2. Always pass the target.
+
+Observed installation on this machine: the curl installer, executable
+`~/.opencode/bin/opencode`, detected version `1.18.35`.
+
+Before upgrading, back up configuration, credentials and session state. V2
+keeps the same locations:
+
+```bash
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p ~/.local/state/abdullah-orchestrator/backups/$stamp
+tar -czf ~/.local/state/abdullah-orchestrator/backups/$stamp/opencode-config.tar.gz \
+  -C "$HOME" .config/opencode
+tar -czf ~/.local/state/abdullah-orchestrator/backups/$stamp/opencode-data.tar.gz \
+  -C "$HOME" .local/share/opencode
+tar -czf ~/.local/state/abdullah-orchestrator/backups/$stamp/opencode-state.tar.gz \
+  -C "$HOME" .local/state/opencode
+```
+
+Do not delete sessions, authentication or history. V2's terminal client migrates
+supported global `tui.json` settings to `~/.config/opencode/cli.json` on first
+start; leave the V1 files in place until the upgrade is accepted.
+
+Upgrade only with explicit authorization:
+
+```bash
+opencode upgrade 2.2.7 --method curl
+opencode --version   # expect 2.2.7
+python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
+```
+
+`doctor` must report `opencode_dialect: v2`, a satisfied version policy,
+compatible generated commands and validated worker profiles. On V2.2.x it
+verifies effective permissions with `opencode debug agents`. It does not prove
+authenticated model execution or entitlement; run one small authorized worker
+check separately if required.
+
+Expected compatibility changes: native `agents`/`permissions` configuration,
+`provider/model#variant` model references, `--standalone` sessions, and explicit
+`external_directory`/`.env` denials because V2 allows external directories by
+default. Existing V1 configuration remains readable by V2, but the supervisor
+generates native V2 shapes when it detects a V2 binary.
+
+Rollback if the upgrade fails:
+
+```bash
+opencode upgrade 1.18.35 --method curl
+```
+
+Then restore the archives above only if configuration was damaged, and rerun
+`doctor`. Tests that require a real globally upgraded V2 CLI are the opt-in
+suite:
+
+```bash
+ABDULLAH_OPENCODE_V2_BIN=$(command -v opencode) \
+  python3 -m pytest scripts/tests/test_opencode_v2_integration.py
+```
+
+No step in this handoff upgrades the global CLI automatically, replaces the
+maintained orchestrator, or touches live runs.
