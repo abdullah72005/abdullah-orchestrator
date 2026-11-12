@@ -17,9 +17,9 @@ class SmokeRegressions(ControlTests):
         self.assertTrue((self.project / '__pycache__').is_dir())
 
     def test_check_that_changes_source_still_fails_integrity(self):
-        script = self.project / 'change.py'
-        script.write_text("from pathlib import Path\nPath('new_source.py').write_text('changed')\n")
-        self.state.update(phase='verify', plan={'batches': [{'title': 'x', 'checks': [[sys.executable, 'change.py']]}]})
+        self.state.update(phase='verify', plan={'batches': [{'title': 'x', 'checks': [[
+            sys.executable, '-c',
+            "from pathlib import Path; Path('new_source.py').write_text('changed')"]]}]})
         orc.advance(self.rundir, self.state, self.cfg)
         self.assertEqual(self.state['status'], 'blocked')
         self.assertEqual(self.state['corrections'], 0)

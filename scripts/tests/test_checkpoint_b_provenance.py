@@ -89,7 +89,11 @@ class CheckpointBProvenance(unittest.TestCase):
         self.assertEqual(evidence["provenance"]["version"], orc.SOURCE_PROVENANCE_VERSION)
         command = evidence["commands"][0]
         self.assertTrue(command["command_policy"]["interpreter_string"])
-        self.assertEqual(command["command_policy"]["policy"], "explicit")
+        self.assertIn(command["command_policy"]["policy"], {"explicit", "exception"})
+        if command["command_policy"]["policy"] == "exception":
+            exception = command["command_policy"]["exception"]
+            self.assertEqual(exception["authorized_by"], "test-operator")
+            self.assertTrue(exception["scope"])
         package = orc.verification_evidence_package(
             {"path": evidence["path"], "passed": True,
              "candidate_hash": evidence["after_hash"]},
@@ -183,8 +187,10 @@ class CheckpointBProvenance(unittest.TestCase):
                           (["env", "FOO=1", "./run.sh"], "arbitrary_script"),
                           (["docker", "compose", "run", "web", "bash", "-c", "x"],
                            "shell_wrapper")):
+            plain = copy.deepcopy(self.cfg)
+            plain["verification"]["command_policy"]["exceptions"] = []
             with self.subTest(argv=argv):
-                policy = orc.verification_command_policy(argv)
+                policy = orc.verification_command_policy(argv, plain)
                 self.assertTrue(policy[key], policy)
                 self.assertEqual(policy["policy"], "explicit")
 

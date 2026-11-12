@@ -83,10 +83,42 @@
         "composer.lock",
         ".python-version",
         ".nvmrc",
-        ".tool-versions"
+        ".tool-versions",
+        ".envrc",
+        ".npmrc",
+        "uv.toml",
+        "mise.toml",
+        "docker-bake.hcl",
+        "*.py",
+        "*.sh",
+        "*.bash",
+        "*.js",
+        "*.mjs",
+        "*.cjs",
+        "*.ts",
+        "*.rb",
+        "*.pl",
+        "*.php",
+        "*.ps1",
+        "*.toml",
+        "*.ini",
+        "*.cfg",
+        "*.conf",
+        "*.json",
+        "*.yaml",
+        "*.yml",
+        "*.mk",
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        "justfile",
+        "Justfile",
+        "Taskfile*"
       ],
       "max_files": 500,
-      "max_total_bytes": 20971520
+      "max_total_bytes": 20971520,
+      "declared": [],
+      "required": []
     },
     "environment_names": [
       "PATH",
@@ -104,16 +136,21 @@
       "npm_config_registry"
     ],
     "command_policy": {
-      "reject_shell_wrappers": false,
-      "reject_interpreter_strings": false,
-      "reject_indirect_docker": false,
-      "reject_arbitrary_scripts": false
+      "reject_shell_wrappers": true,
+      "reject_interpreter_strings": true,
+      "reject_indirect_docker": true,
+      "reject_arbitrary_scripts": true,
+      "exceptions": []
     }
   },
   "schema_version": 2,
   "runtime": {
     "supervisor_version": "3.0.0",
-    "opencode_version": "1.18"
+    "opencode_version": "auto",
+    "opencode_supported": [
+      ">=1.18 <2.0",
+      ">=2.2 <3.0"
+    ]
   },
   "authorization": {
     "sensitive_cli_enabled": false,

@@ -73,7 +73,7 @@ class CheckpointDEfficiency(unittest.TestCase):
         plan = self._with_plan()
         self.state.update(phase="implement", status="paused")
         orc.save(self.rundir, self.state)
-        orc.amend_run("test-run00", "Fix the typo", architect_review=False)
+        orc.amend_run("test-run00", "Fix the typo", architect_review=False, kind="correction")
         saved = orc.read_json(self.rundir / "state.json")
         self.assertEqual(saved["amendments"][-1]["kind"], "minor")
         self.assertEqual(saved["phase"], "implement")
@@ -141,7 +141,8 @@ class CheckpointDEfficiency(unittest.TestCase):
         bounded = orc._bounded_context({"blob": "x" * 5000, "items": list(range(100))}, 500)
         self.assertLessEqual(len(bounded), 500)
         parsed = json.loads(bounded)
-        self.assertTrue(parsed.get("_supervisor_context_truncated") or parsed.get("truncated"))
+        self.assertTrue(parsed.get("_supervisor_context_truncated") or parsed.get("truncated")
+                        or (parsed.get("_context_budget") or {}).get("truncated"))
         cfg = copy.deepcopy(self.cfg)
         cfg["limits"]["max_context_chars"] = 5000
         with patch.object(orc, "config", return_value=cfg):
