@@ -263,6 +263,7 @@ def inspect_execution(job, *, run_id=None, include_run=False):
     liveness = job_liveness(job)
     launch_file = _job_launch_file(job)
     launch = _launch_identity(launch_file)
+    launch_record = _launch_record(launch_file)
     job_id = job.get("id") if isinstance(job, dict) else None
     token = job.get("check_token") if isinstance(job, dict) else None
     markers = _processes_for_job(job_id)
@@ -275,10 +276,10 @@ def inspect_execution(job, *, run_id=None, include_run=False):
     launch_references = _processes_referencing_launch(launch_file)
     run_survivors = _processes_for_run(run_id) if include_run else []
     launch_child = []
-    if isinstance(launch, dict):
-        child = launch.get("child_identity")
-        if not isinstance(child, dict) and launch.get("child_pid"):
-            child = {"pid": launch.get("child_pid")}
+    if isinstance(launch_record, dict):
+        child = launch_record.get("child_identity")
+        if not isinstance(child, dict) and launch_record.get("child_pid"):
+            child = {"pid": launch_record.get("child_pid")}
         if isinstance(child, dict) and child.get("pid"):
             stat = process_stat(child["pid"])
             if stat and stat["state"] not in {"Z", "X", "x"}:
@@ -301,7 +302,8 @@ def inspect_execution(job, *, run_id=None, include_run=False):
     if launch and launch.get("phase") in {"starting", "running"} and not live_members:
         reasons.append("launch record exists but the recorded guard session is stopped")
     return {"stopped": bool(stopped), "liveness": liveness, "identity": identity,
-            "launch": launch, "launch_file": launch_file,
+            "launch": launch, "launch_record": launch_record,
+            "launch_file": launch_file,
             "markers": markers, "token_survivors": token_survivors,
             "escaped": escaped, "descendants": descendants,
             "launch_references": launch_references, "run_survivors": run_survivors,
@@ -334,6 +336,10 @@ def _state_execution_records(state):
             for key, item in active.items():
                 if isinstance(item, dict) and item:
                     yield "retirement_" + key, item
+    for key in ("completed_jobs", "failed_jobs"):
+        for item in state.get(key) or []:
+            if isinstance(item, dict) and item:
+                yield key, item
 
 
 def _state_containment_survivors(state, run_id):
@@ -433,7 +439,7 @@ def _conflict_resolution(owner_id=None, run_id=None, kind="conflict"):
 
 
 def find_checkout_conflicts(identity, *, exclude_run=None):
-    """Find non-final runs (including legacy runs) that use this checkout."""
+    """Find non-final runs or marked final survivors using this checkout."""
     conflicts = []
     root = Path(DEFAULT_STATE)
     if not root.is_dir():
@@ -445,6 +451,14 @@ def find_checkout_conflicts(identity, *, exclude_run=None):
         if not isinstance(state, dict):
             continue
         project = state.get("project")
+        if not project:
+            continue
+        try:
+            other = checkout_identity(Path(project))
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            continue
+        if other["key"] != identity["key"]:
+            continue
         if (state.get("status") in FINAL_STATES and not state.get("active_job")
                 and not state.get("active_check")):
             if _state_containment_survivors(state, state.get("id") or child.name):
@@ -453,17 +467,10 @@ def find_checkout_conflicts(identity, *, exclude_run=None):
                                   "phase": state.get("phase"),
                                   "project": str(project)})
             continue
-        if not project:
-            continue
-        try:
-            other = checkout_identity(Path(project))
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-            continue
-        if other["key"] == identity["key"]:
-            conflicts.append({"run_id": state.get("id") or child.name,
-                              "status": state.get("status"),
-                              "phase": state.get("phase"),
-                              "project": str(project)})
+        conflicts.append({"run_id": state.get("id") or child.name,
+                          "status": state.get("status"),
+                          "phase": state.get("phase"),
+                          "project": str(project)})
     conflicts.sort(key=lambda item: item.get("run_id") or "")
     return conflicts
 
@@ -520,7 +527,7 @@ def acquire_checkout_lease(project: Path, run_id, lease_id=None):
                     f"Final run {owner_id!r} still has marked process survivors; "
                     "inspect/reconcile them before taking over this checkout",
                     owner=existing, state="containment",
-                    resolution=_conflict_resolution(owner_id, run_id, "conflict"))
+                    resolution=_conflict_resolution(owner_id, run_id, "containment"))
             if status == "initializing":
                 raise CheckoutOwnedError(
                     f"Checkout is initializing for run {owner_id!r}; retry shortly",
@@ -915,8 +922,13 @@ def _all_process_stats():
     return result
 
 
-def _launch_identity(path):
+def _launch_record(path):
     record = _safe_read(path) if path else None
+    return record if isinstance(record, dict) else None
+
+
+def _launch_identity(path):
+    record = _launch_record(path)
     guard = record.get("guard") if isinstance(record, dict) else None
     if isinstance(guard, dict) and guard.get("pid"):
         return guard

@@ -254,7 +254,10 @@ class CheckpointAContainment(unittest.TestCase):
             proc.kill(); proc.wait(timeout=5)
 
     def test_reconcile_refuses_live_launch_child_identity(self):
-        proc = self._run_only()
+        clean_env = {k: v for k, v in os.environ.items()
+                     if not k.startswith("ABDULLAH_")}
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                start_new_session=True, env=clean_env)
         try:
             launch = self.root / "launch-with-child.json"
             orc.atomic_json(launch, {"phase": "running",
@@ -347,6 +350,47 @@ class CheckpointAContainment(unittest.TestCase):
                 orc.reconcile_explorer("test-run00")
         finally:
             self._kill_pid(survivor)
+
+    def test_final_owner_takeover_refuses_completed_job_marker_survivor(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                start_new_session=True,
+                                env={**os.environ, "ABDULLAH_JOB_ID": "old-job"})
+        try:
+            owner = self.root / "runs" / "final-owner"
+            owner.mkdir()
+            state = dict(self.state)
+            state.update(id="final-owner", status="complete", active_job=None,
+                         active_check=None, project=str(self.project),
+                         completed_jobs=[{"id": "old-job", "status": "complete"}])
+            orc.atomic_json(owner / "state.json", state)
+            with self.assertRaises(orc.CheckoutOwnedError) as caught:
+                orc.acquire_checkout_lease(self.project, "new-run")
+            self.assertEqual(caught.exception.state, "containment")
+        finally:
+            proc.kill(); proc.wait(timeout=5)
+
+    def test_final_survivor_on_other_project_does_not_block_checkout(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                start_new_session=True,
+                                env={**os.environ, "ABDULLAH_RUN_ID": "other-project-run"})
+        try:
+            other_base = self.root / "other-project"
+            other_base.mkdir()
+            other = baseline.setup_repo(other_base)
+            new_base = self.root / "new-project"
+            new_base.mkdir()
+            new_project = baseline.setup_repo(new_base)
+            owner = self.root / "runs" / "other-project-run"
+            owner.mkdir()
+            state = dict(self.state)
+            state.update(id="other-project-run", status="complete", active_job=None,
+                         active_check=None, project=str(other))
+            orc.atomic_json(owner / "state.json", state)
+            lease = orc.acquire_checkout_lease(new_project, "new-run")
+            self.assertEqual(lease["run_id"], "new-run")
+            orc.release_checkout_lease({"id": "new-run", "project": str(new_project)})
+        finally:
+            proc.kill(); proc.wait(timeout=5)
 
     def test_protected_recovery_actions_remain_cli_only(self):
         self.assertNotIn("orchestrator_retire", orc.MCP_TOOL_NAMES)
