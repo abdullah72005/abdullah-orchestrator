@@ -3,14 +3,18 @@
 Every model must emit one standalone **JSON object** in the final response; process exit, report validity, evidence and acceptance are distinct.
 
 ## Plan
-`{"status":"complete|blocked","summary":"...","invariants":["..."],"batches":[{"title":"...","goal":"...","acceptance":["..."],"checks":[["pytest","-q"]],"risk":"mechanical|ordinary|high"}],"blocker":"..."}`
+`{"contract_version":2,"status":"complete|blocked","summary":"...","invariants":["..."],"batches":[{"title":"...","goal":"...","acceptance":["..."],"checks":[["pytest","-q"]],"risk":"mechanical|ordinary|high"}],"blocker":"..."}`
+
+Contract v2 requires a nonempty invariant list and nonempty acceptance criteria per batch. Reports without `contract_version: 2` are accepted only as marked legacy evidence. Checks remain argv arrays; wrappers, interpreter code strings and indirect Docker execution are recorded by the supervisor command policy.
 
 When required exploration is in scope, include `"required_exploration":{"job_id":"...","scope_satisfied":true}` only if the Architect dispatched and consumed that Explorer and it covers the required scope; otherwise use an empty job_id and false.
 
 Each batch should be inspectable and coherent, not split by arbitrary file counts. Checks must be argv arrays (no implicit shell interpolation), with negative behavior cases where appropriate. A batch without verifiable required checks cannot receive unattended acceptance.
 
 ## Worker
-`{"status":"complete|blocked|needs_architect","summary":"...","files":["..."],"tests":["..."],"evidence":["path:symbol"],"unknowns":["..."],"blocker":"..."}`
+`{"contract_version":2,"status":"complete|blocked|needs_architect","summary":"...","files":["..."],"tests":["..."],"evidence":["path:symbol"],"unknowns":["..."],"blocker":"..."}`
+
+Contract v2 requires `files`, `tests`, `evidence`, `unknowns` and `blocker`, with nonempty evidence for a completed Implementer. Legacy reports are retained but marked with their contract version and are not treated as newly attested evidence.
 
 For a Reviewer the canonical output is the Worker object above with `status`, `summary`, `files`, `tests`, `evidence`, `unknowns`, `blocker`, and `findings`. `status` describes completion of the review, not an approval verdict. Report actual evidence and limitations; never invent them. Reviewer supplies `"findings":[{"severity":"critical|high|medium|low","location":"path:line","claim":"...","evidence":"...","confidence":"confirmed|probable|uncertain","disposition":"..."}]`. Findings require an explicit disposition. Worker reports cannot override acceptance criteria or authorized verification commands.
 
@@ -20,7 +24,9 @@ For a Reviewer the canonical output is the Worker object above with `status`, `s
 Approvals require direct examination of behavior, tests and high-risk boundaries, matching git state and supervisor-issued tests. Confirmed high/critical findings require correction or an explicit evidence-based strong disposition using the exact location and claim (never majority voting). A changes-required verdict creates a bounded new correction wave; never silently reset the wave count on compaction.
 
 ## Provenance and recovery
-Every attempt: unique job ID, model/billing route, source checkout, git HEAD, dirty snapshot, logs, child session ID if available, execution outcome, parsed report and separate verification evidence. Persist dispatch **before** launching. An uncertain write attempt must be reconciled by examining exact session and workspace before any retry. Never promise exactly-once execution.
+Every attempt: unique job ID, model/billing route, source checkout, git HEAD, dirty snapshot, bounded runtime-input manifest, environment/config/toolchain identity, logs, child session ID if available, execution outcome, parsed report and separate verification evidence. Persist dispatch **before** launching. An uncertain write attempt must be reconciled by examining exact session and workspace before any retry. Never promise exactly-once execution.
+
+Verification evidence is versioned (`evidence_version: 2`). It records the source snapshot, runtime input manifest, environment/config hashes and toolchain identity. A truncated or unattested required-input manifest blocks verification. Docker Compose evidence records service, image/build context, bind mounts, working directory, user and environment-variable names (never values). Historical evidence without these fields is marked `legacy_evidence: true`; it is preserved but is not equivalent to newly attested evidence.
 
 ## Tool routing (hybrid)
 Use LeanCTX MCP (`ctx_read`, `ctx_search`, `ctx_tree`, `ctx_compose`, `ctx_*`) only for reading, searching and context retrieval. Run Python, tests, Docker/Compose, Git and `orchestrator.py explore` through the host's native shell. Never use `ctx_shell` or `lean-ctx -c` for execution. Never retry through another tool after an explicit LeanCTX security denial; surface it.

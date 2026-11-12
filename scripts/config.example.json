@@ -1,20 +1,112 @@
 {
   "architect": {
-    "codex": {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
-    "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
+    "codex": {
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "auth": "subscription"
+    },
+    "claude": {
+      "model": "claude-opus-5-5",
+      "effort": "high",
+      "auth": "subscription"
+    }
   },
   "workers": {
-    "explorer": {"model": "opencode-go/deepseek-v4.1-flash", "variant": "low", "billing": "go"},
-    "implementer": {"model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"},
-    "reviewer": {"model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
+    "explorer": {
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "variant": "low",
+      "billing": "go"
+    },
+    "implementer": {
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "variant": "high",
+      "billing": "go"
+    },
+    "reviewer": {
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "variant": "high",
+      "billing": "go"
+    }
   },
   "fallback": {
     "enabled": false,
-    "codex": {"model": "gpt-6-luna", "effort": "medium"},
-    "claude": {"model": "claude-haiku-4-5", "effort": "medium"},
+    "codex": {
+      "model": "gpt-6-luna",
+      "effort": "medium"
+    },
+    "claude": {
+      "model": "claude-haiku-4-5",
+      "effort": "medium"
+    },
     "require_per_run_consent": true
   },
-  "limits": {"max_corrections_per_batch": 3, "max_batches": 12, "max_worker_seconds": 14400, "max_architect_seconds": 14400, "max_check_seconds": 14400, "max_explorer_calls_per_run": 8},
-  "permissions": {"trusted_development": true, "allow_auto_local_edits_and_docker": true, "allow_push": false, "allow_deploy": false, "allow_production": false},
-  "verification": {"require_checks": true, "require_docker_source_proof": true}
+  "limits": {
+    "max_corrections_per_batch": 3,
+    "max_batches": 12,
+    "max_worker_seconds": 14400,
+    "max_architect_seconds": 14400,
+    "max_check_seconds": 14400,
+    "max_explorer_calls_per_run": 8
+  },
+  "permissions": {
+    "trusted_development": true,
+    "allow_auto_local_edits_and_docker": true,
+    "allow_push": false,
+    "allow_deploy": false,
+    "allow_production": false
+  },
+  "verification": {
+    "require_checks": true,
+    "require_docker_source_proof": true,
+    "runtime_inputs": {
+      "patterns": [
+        ".env",
+        ".env.*",
+        "*.env",
+        "docker-compose*.yml",
+        "docker-compose*.yaml",
+        "compose*.yml",
+        "compose*.yaml",
+        "Dockerfile*",
+        ".dockerignore",
+        "requirements*.txt",
+        "poetry.lock",
+        "uv.lock",
+        "Pipfile.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "go.sum",
+        "Cargo.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        ".python-version",
+        ".nvmrc",
+        ".tool-versions"
+      ],
+      "max_files": 500,
+      "max_total_bytes": 20971520
+    },
+    "environment_names": [
+      "PATH",
+      "PYTHONPATH",
+      "VIRTUAL_ENV",
+      "CONDA_PREFIX",
+      "NODE_ENV",
+      "NODE_OPTIONS",
+      "COMPOSE_FILE",
+      "COMPOSE_PROJECT_NAME",
+      "DOCKER_HOST",
+      "DOCKER_CONTEXT",
+      "PIP_INDEX_URL",
+      "UV_INDEX_URL",
+      "npm_config_registry"
+    ],
+    "command_policy": {
+      "reject_shell_wrappers": false,
+      "reject_interpreter_strings": false,
+      "reject_indirect_docker": false,
+      "reject_arbitrary_scripts": false
+    }
+  }
 }

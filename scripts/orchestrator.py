@@ -12,6 +12,7 @@ import contextlib
 import copy
 import datetime as dt
 import fcntl
+import functools
 import getpass
 import hashlib
 import json
@@ -54,6 +55,23 @@ STAGES = {
 ROLE_POLICIES = {"plan": "architect", "decision": "architect", "diagnose": "architect",
                  "integration": "architect", "architect": "architect", "explorer": "explorer",
                  "implementer": "implementer", "reviewer": "independent reviewer"}
+SOURCE_PROVENANCE_VERSION = 2
+VERIFICATION_EVIDENCE_VERSION = 2
+RUNTIME_INPUT_PATTERNS = (
+    ".env", ".env.*", "*.env", "docker-compose*.yml", "docker-compose*.yaml",
+    "compose*.yml", "compose*.yaml", "Dockerfile*", ".dockerignore",
+    "requirements*.txt", "poetry.lock", "uv.lock", "Pipfile.lock",
+    "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "go.sum", "Cargo.lock",
+    "Gemfile.lock", "composer.lock", ".python-version", ".nvmrc", ".tool-versions",
+)
+RUNTIME_SKIP_PARTS = {".git", "node_modules", ".venv", "venv", "__pycache__",
+                      ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+                      "dist", "build", ".next", "target", "coverage", ".cache"}
+DEFAULT_ENV_PROVENANCE = (
+    "PATH", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "NODE_ENV", "NODE_OPTIONS",
+    "COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "DOCKER_HOST", "DOCKER_CONTEXT",
+    "PIP_INDEX_URL", "UV_INDEX_URL", "npm_config_registry",
+)
 
 
 def validate_workflow():
@@ -1245,7 +1263,142 @@ def _spawn_guarded(command, cwd, env, log_stream, launch_file=None):
     return proc, write_fd
 
 
-def source_snapshot(project: Path, include_generated=False):
+def _sha256_file(path: Path):
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for data in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(data)
+    return h.hexdigest()
+
+
+def runtime_input_manifest(project: Path, cfg=None):
+    """Bounded manifest of ignored/runtime inputs that can change verification."""
+    cfg = cfg or config()
+    settings = cfg.get("verification", {}).get("runtime_inputs", {})
+    patterns = settings.get("patterns", RUNTIME_INPUT_PATTERNS)
+    max_files = int(settings.get("max_files", 500))
+    max_bytes = int(settings.get("max_total_bytes", 20 * 1024 * 1024))
+    project = Path(project)
+    paths = {}
+    for pattern in patterns:
+        try:
+            matches = list(project.glob(pattern))
+        except (OSError, ValueError):
+            continue
+        for path in matches:
+            try:
+                relative = path.relative_to(project)
+            except ValueError:
+                continue
+            if any(part in RUNTIME_SKIP_PARTS for part in relative.parts):
+                continue
+            if path.is_file() or path.is_symlink():
+                paths[str(relative)] = path
+    ordered = sorted(paths)
+    truncated = len(ordered) > max_files
+    if truncated:
+        ordered = ordered[:max_files]
+    files = {}
+    total_bytes = 0
+    for relative in ordered:
+        path = paths[relative]
+        try:
+            if path.is_symlink():
+                files[relative] = "link:" + os.readlink(path)
+                continue
+            size = path.stat().st_size
+            if total_bytes + size > max_bytes:
+                truncated = True
+                break
+            files[relative] = _sha256_file(path)
+            total_bytes += size
+        except OSError:
+            files[relative] = "unreadable"
+    return {"version": SOURCE_PROVENANCE_VERSION, "patterns": list(patterns),
+            "files": files, "file_count": len(files), "total_bytes": total_bytes,
+            "max_files": max_files, "max_total_bytes": max_bytes,
+            "truncated": bool(truncated),
+            "complete": not truncated}
+
+
+def environment_provenance(cfg=None):
+    """Hash allowlisted environment values; never record raw values."""
+    cfg = cfg or config()
+    names = cfg.get("verification", {}).get("environment_names", DEFAULT_ENV_PROVENANCE)
+    result = {}
+    for name in names:
+        value = os.environ.get(name)
+        result[name] = {"present": value is not None,
+                        "sha256": hashlib.sha256(value.encode()).hexdigest()
+                        if value is not None else None}
+    return {"version": SOURCE_PROVENANCE_VERSION, "names": list(names), "values": result}
+
+
+@functools.lru_cache(maxsize=8)
+def _toolchain_identity_cached(path_value, python_version, executable):
+    def command_version(argv):
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return {"available": False}
+        text = (proc.stdout or proc.stderr or "").strip()
+        return {"available": proc.returncode == 0,
+                "sha256": hashlib.sha256(text.encode()).hexdigest() if text else None}
+    result = {"python": {"version": python_version, "executable": executable},
+              "git": command_version(["git", "--version"]),
+              "docker": command_version(["docker", "--version"]),
+              "docker_compose": command_version(["docker", "compose", "version"]),
+              "node": command_version(["node", "--version"]),
+              "uv": command_version(["uv", "--version"]),
+              "path_sha256": hashlib.sha256(path_value.encode()).hexdigest()}
+    return result
+
+
+def toolchain_identity():
+    return _toolchain_identity_cached(os.environ.get("PATH", ""), sys.version,
+                                      sys.executable)
+
+
+def configuration_provenance():
+    path = CONFIG_PATH if CONFIG_PATH.is_file() else HERE / "config.example.json"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {"path": str(path), "available": False, "sha256": None}
+    return {"path": str(path), "available": True,
+            "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def verification_command_policy(cmd, cfg=None):
+    """Classify wrapper/interpreter/indirect execution as an explicit decision."""
+    cfg = cfg or config()
+    settings = cfg.get("verification", {}).get("command_policy", {})
+    argv = [str(item) for item in cmd]
+    basenames = [Path(item).name for item in argv]
+    direct_docker = len(basenames) >= 2 and basenames[0] == "docker" and basenames[1] == "compose"
+    indirect_docker = ("docker" in basenames or "docker-compose" in basenames) and not direct_docker
+    shell_names = {"sh", "bash", "zsh", "dash", "cmd", "powershell", "pwsh"}
+    shell_wrapper = any(name in shell_names and any(
+        token in {"-c", "/c", "-Command", "--command"} for token in argv[index + 1:index + 3])
+        for index, name in enumerate(basenames))
+    interpreter = any(name.startswith(("python", "node", "ruby", "perl", "php"))
+                      and any(token in {"-c", "-e", "--eval"} for token in argv[index + 1:index + 3])
+                      for index, name in enumerate(basenames))
+    arbitrary_script = bool(basenames and Path(basenames[0]).suffix in
+                            {".sh", ".bash", ".py", ".js", ".rb", ".pl", ".php"})
+    rejected = ((settings.get("reject_shell_wrappers") and shell_wrapper)
+                or (settings.get("reject_interpreter_strings") and interpreter)
+                or (settings.get("reject_indirect_docker") and indirect_docker)
+                or (settings.get("reject_arbitrary_scripts") and arbitrary_script))
+    return {"version": 1, "argv": argv, "direct_docker": direct_docker,
+            "indirect_docker": bool(indirect_docker), "shell_wrapper": bool(shell_wrapper),
+            "interpreter_string": bool(interpreter),
+            "arbitrary_script": bool(arbitrary_script),
+            "allowed": not rejected,
+            "policy": "explicit" if (shell_wrapper or interpreter or indirect_docker or arbitrary_script) else "direct"}
+
+
+def source_snapshot(project: Path, include_generated=False, cfg=None, provenance=True):
     """Fingerprint git head + every modified/untracked source file, not timestamps."""
     head = git(project, ["rev-parse", "HEAD"]).decode().strip()
     files = git(project, ["ls-files", "-m", "-z"]).split(b"\0")
@@ -1279,6 +1432,17 @@ def source_snapshot(project: Path, include_generated=False):
     result = {"path": str(project.resolve()), "git_head": head, "changed": changed}
     if staged:
         result["staged_sha256"] = hashlib.sha256(staged).hexdigest()
+    if provenance:
+        cfg = cfg or config()
+        manifest = runtime_input_manifest(project, cfg)
+        result.update({
+            "provenance_version": SOURCE_PROVENANCE_VERSION,
+            "provenance_complete": manifest["complete"],
+            "runtime_inputs": manifest,
+            "environment": environment_provenance(cfg),
+            "configuration": configuration_provenance(),
+            "toolchain": toolchain_identity(),
+        })
     return result
 
 
@@ -1351,17 +1515,30 @@ def normalize_report(kind, result):
 def validate_report(kind, result):
     if not isinstance(result, dict) or not REPORT_KEYS[kind].issubset(result):
         raise ValueError(f"Invalid {kind} report; missing {REPORT_KEYS[kind] - set(result if isinstance(result, dict) else [])}")
+    contract_version = result.get("contract_version", 0)
+    if not isinstance(contract_version, int) or contract_version < 0:
+        raise ValueError("Invalid report contract_version")
+    # Legacy reports remain readable; the job records the version explicitly.
     if kind == "plan":
         if result["status"] not in {"complete", "blocked"}:
             raise ValueError("Invalid plan status")
         if result["status"] == "complete":
             if not isinstance(result["batches"], list) or not result["batches"]:
                 raise ValueError("Plan has no batches")
+            if contract_version >= 2:
+                if (not isinstance(result.get("invariants"), list)
+                        or not result["invariants"]
+                        or not all(isinstance(v, str) and v.strip()
+                                   for v in result["invariants"])):
+                    raise ValueError("Contract v2 plan requires nonempty invariants")
             for item in result["batches"]:
                 if not isinstance(item, dict):
                     raise ValueError("Batch must be an object")
                 if not all(key in item for key in ("title", "goal", "acceptance", "checks", "risk")):
                     raise ValueError("Batch missing required fields")
+                if contract_version >= 2 and (not isinstance(item.get("acceptance"), list)
+                                              or not item["acceptance"]):
+                    raise ValueError("Contract v2 batch requires nonempty acceptance criteria")
                 if not isinstance(item["checks"], list) or not item["checks"] or not all(
                     isinstance(c, list) and c and all(isinstance(token, str) for token in c) for c in item["checks"]
                 ):
@@ -1371,6 +1548,15 @@ def validate_report(kind, result):
             raise ValueError("Reviewer summary must be nonempty")
         if result["status"] not in {"complete", "blocked", "needs_architect"}:
             raise ValueError("Invalid worker outcome")
+        if kind == "implementer" and contract_version >= 2:
+            for key in ("files", "tests", "evidence", "unknowns"):
+                if (not isinstance(result.get(key), list)
+                        or not all(isinstance(v, str) and v.strip() for v in result[key])):
+                    raise ValueError(f"Contract v2 implementer requires valid {key}")
+            if not isinstance(result.get("blocker"), str):
+                raise ValueError("Contract v2 implementer requires blocker")
+            if result["status"] == "complete" and not result["evidence"]:
+                raise ValueError("Contract v2 completed implementer requires evidence")
         if kind == "explorer":
             for key in ("files", "tests", "evidence", "unknowns"):
                 if not isinstance(result.get(key), list) or not all(isinstance(v, str) and v.strip() for v in result[key]):
@@ -1431,6 +1617,8 @@ def report_prompt(kind, context):
         + role_text(kind) + "\n\n"
         + "Task and evidence:\n" + json.dumps(context, ensure_ascii=False, indent=2) + "\n\n"
         + "Reply with ONE valid JSON object matching the appropriate role contract, no Markdown. "
+        + "Set contract_version to 2 and include every field required by that version; "
+        + "legacy reports without it are accepted only as marked legacy evidence. "
         + "Do not invent file contents or test results. Do not silently change requirements. "
         + "Raise consequential uncertainty instead of guessing. Keep the task bounded."
     )
@@ -1440,6 +1628,7 @@ def schema(kind):
     # OpenAI's constrained output accepts simple JSON schemas; validate semantics locally.
     if kind == "plan":
         return {"type": "object", "properties": {
+            "contract_version": {"type": "integer"},
             "status": {"type": "string"}, "summary": {"type": "string"},
             "invariants": {"type": "array", "items": {"type": "string"}},
             "batches": {"type": "array", "items": {"type": "object", "properties": {
@@ -1450,9 +1639,10 @@ def schema(kind):
             }, "required": ["title", "goal", "acceptance", "checks", "risk"], "additionalProperties": False}},
             "blocker": {"type": "string"},
             "required_exploration": {"type":"object", "properties":{"job_id":{"type":"string"},"scope_satisfied":{"type":"boolean"}}, "required":["job_id","scope_satisfied"], "additionalProperties":False},
-        }, "required": ["status", "summary", "invariants", "batches", "blocker", "required_exploration"], "additionalProperties": False}
+        }, "required": ["contract_version", "status", "summary", "invariants", "batches", "blocker", "required_exploration"], "additionalProperties": False}
     if kind in {"implementer", "explorer", "reviewer"}:
-        props = {"status": {"type": "string"}, "summary": {"type": "string"},
+        props = {"contract_version": {"type": "integer"},
+                 "status": {"type": "string"}, "summary": {"type": "string"},
                  "files": {"type": "array", "items": {"type": "string"}},
                  "tests": {"type": "array", "items": {"type": "string"}},
                  "evidence": {"type": "array", "items": {"type": "string"}},
@@ -1765,10 +1955,13 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         atomic_json(jpath / "normalization.json", normalization)
         report = validate_report(check_kind, report)
         atomic_json(jpath / "report.json", report)
+        contract_version = report.get("contract_version", 0)
         final_snapshot = source_snapshot(project)
         atomic_json(jpath / "completion.json", {"final_snapshot": final_snapshot, "session_id": session_id})
         job.update({"status": "complete", "session_id": session_id,
-                    "final_snapshot": final_snapshot, "seconds": result_record["seconds"]})
+                    "final_snapshot": final_snapshot, "seconds": result_record["seconds"],
+                    "contract_version": contract_version,
+                    "legacy_contract": contract_version < 2})
         if state is not None:
             inspection = inspect_execution(job, run_id=state.get("id"), include_run=False)
             containment = None
@@ -1839,14 +2032,18 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
 
 
 def check_docker_source(project: Path, cmd: list[str], timeout=30):
-    """Only attest Compose verification when live mounts resolve into this checkout."""
+    """Attest Compose image, service, mounts and working directory provenance."""
     if cmd[:2] != ["docker", "compose"]:
-        return {"kind": "non-compose", "source": str(project)}
+        basenames = [Path(item).name for item in cmd]
+        indirect = "docker" in basenames or "docker-compose" in basenames
+        return {"kind": "indirect-docker" if indirect else "non-compose",
+                "attested": False, "source": str(project), "argv": cmd}
     if not any(token in {"run", "exec"} for token in cmd):
-        return {"kind": "compose-command", "source": str(project)}
+        return {"kind": "compose-command", "attested": False,
+                "source": str(project), "argv": cmd}
     op = next(token for token in cmd if token in {"run", "exec"})
     pos = cmd.index(op)
-    prefix = cmd[2:pos]  # preserve -f / --project-directory / -p Compose choices
+    prefix = cmd[2:pos]
     args = cmd[pos + 1:]
     service = None
     working_override = None
@@ -1873,6 +2070,13 @@ def check_docker_source(project: Path, cmd: list[str], timeout=30):
     if not service:
         raise RuntimeError("Cannot determine compose service from command")
     working = working_override
+    image = None
+    image_id = None
+    build = None
+    user = None
+    environment_keys = []
+    compose_project = project.name
+    compose_files = []
     if op == "exec":
         ps = subprocess.run(["docker", "compose", *prefix, "ps", "-q", service], cwd=project,
                             capture_output=True, text=True, timeout=timeout, check=True)
@@ -1884,14 +2088,45 @@ def check_docker_source(project: Path, cmd: list[str], timeout=30):
         inspector = json.loads(info.stdout)
         mounts = inspector.get("Mounts", [])
         working = working or inspector.get("Config", {}).get("WorkingDir")
+        image = inspector.get("Config", {}).get("Image")
+        image_id = inspector.get("Image")
+        user = inspector.get("Config", {}).get("User")
+        environment_keys = sorted({item.split("=", 1)[0] for item in
+                                   inspector.get("Config", {}).get("Env", []) if "=" in item})
     else:
-        conf = subprocess.run(["docker", "compose", *prefix, "config", "--format", "json"], cwd=project,
-                              capture_output=True, text=True, timeout=timeout, check=True)
+        conf = subprocess.run(["docker", "compose", *prefix, "config", "--format", "json"],
+                              cwd=project, capture_output=True, text=True,
+                              timeout=timeout, check=True)
         config_data = json.loads(conf.stdout)
         svc = config_data.get("services", {}).get(service, {})
         working = working or svc.get("working_dir")
+        image = svc.get("image")
+        user = svc.get("user")
+        environment_keys = sorted((svc.get("environment") or {}).keys())
+        compose_project = config_data.get("name") or compose_project
+        compose_files = [val for idx, val in enumerate(prefix)
+                         if idx and prefix[idx - 1] in {"-f", "--file"}]
+        build_value = svc.get("build")
+        if isinstance(build_value, str):
+            build = {"context": build_value}
+        elif isinstance(build_value, dict):
+            build = {"context": build_value.get("context"),
+                     "dockerfile": build_value.get("dockerfile"),
+                     "target": build_value.get("target")}
+        if build and build.get("context"):
+            context = Path(build["context"])
+            if not context.is_absolute():
+                context = (project / context).resolve()
+            else:
+                context = context.resolve()
+            if not (context == project.resolve()
+                    or context.is_relative_to(project.resolve())):
+                raise RuntimeError(
+                    f"Compose service {service} builds from outside the candidate checkout")
+            build["context"] = str(context)
         volumes = svc.get("volumes", [])
-        mounts = [{"Source": v.get("source"), "Destination": v.get("target"), "Type": v.get("type")}
+        mounts = [{"Source": v.get("source"), "Destination": v.get("target"),
+                   "Type": v.get("type"), "ReadOnly": v.get("read_only", False)}
                   for v in volumes if isinstance(v, dict)]
     project_resolved = project.resolve()
     matching = []
@@ -1900,7 +2135,8 @@ def check_docker_source(project: Path, cmd: list[str], timeout=30):
         if item.get("Type", "").lower() == "bind" and source:
             path = Path(source).resolve()
             if path == project_resolved:
-                matching.append({"source": str(path), "container": item.get("Destination")})
+                matching.append({"source": str(path), "container": item.get("Destination"),
+                                 "read_only": item.get("ReadOnly", False)})
     if not matching:
         raise RuntimeError(
             f"Docker service {service} does not bind the candidate checkout root. "
@@ -1915,8 +2151,12 @@ def check_docker_source(project: Path, cmd: list[str], timeout=30):
             "candidate source. Configure service working_dir under the project bind mount "
             "or pass --workdir to the verification command."
         )
-    return {"kind": f"compose-{op}", "service": service, "matching_mounts": matching,
-            "compose_project": project.name, "working_dir": working, "source": str(project_resolved)}
+    return {"kind": f"compose-{op}", "attested": True, "service": service,
+            "matching_mounts": matching, "compose_project": compose_project,
+            "compose_files": compose_files, "image": image, "image_id": image_id,
+            "build": build, "user": user, "environment_keys": environment_keys,
+            "working_dir": working, "argv": cmd,
+            "source": str(project_resolved)}
 
 
 def _check_token_processes(token):
@@ -1985,16 +2225,30 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
     commands = batch.get("checks", [])
     if not commands:
         raise RuntimeError("No required verification commands in the approved brief")
-    prior = source_snapshot(project)
+    prior = source_snapshot(project, cfg=cfg)
+    manifest = prior.get("runtime_inputs") or {}
+    if not manifest.get("complete"):
+        raise RuntimeError(
+            "Verification blocked: the configured runtime-input manifest is incomplete; "
+            "narrow verification.runtime_inputs or attest the required inputs")
     identity = {"candidate_hash": signature(prior), "batch_index": state["batch_index"],
                 "corrections": state.get("corrections", 0), "batch": batch.get("title"),
-                "final": final, "argv": commands}
+                "final": final, "argv": commands,
+                "provenance_version": SOURCE_PROVENANCE_VERSION}
     progress = state.get("check_progress")
     if progress and progress["identity"] != identity:
         raise RuntimeError("Verification context changed before previous checks were consumed")
     if not progress:
-        evidence = {"candidate": prior, "candidate_hash": signature(prior), "started_at": now(),
-                    "batch": batch.get("title"), "final": final, "commands": [], "passed": True}
+        evidence = {"evidence_version": VERIFICATION_EVIDENCE_VERSION,
+                    "candidate": prior, "candidate_hash": signature(prior), "started_at": now(),
+                    "batch": batch.get("title"), "final": final, "commands": [], "passed": True,
+                    "provenance": {"version": SOURCE_PROVENANCE_VERSION,
+                                   "source": prior,
+                                   "configuration": prior.get("configuration"),
+                                   "environment": prior.get("environment"),
+                                   "toolchain": prior.get("toolchain"),
+                                   "runtime_inputs": prior.get("runtime_inputs"),
+                                   "command_policy": cfg.get("verification", {}).get("command_policy", {})}}
         progress = state["check_progress"] = {"identity": identity, "evidence": evidence}
         save(run_dir, state)
     else:
@@ -2007,6 +2261,13 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
             continue
         if not isinstance(cmd, list) or not cmd or not all(isinstance(i, str) for i in cmd):
             raise ValueError("Verification checks must be argv arrays")
+        # Exactly the plan's argv, never shell=True. Wrapper, interpreter and
+        # indirect-container execution are explicit, recorded security choices.
+        policy = verification_command_policy(cmd, cfg)
+        if not policy["allowed"]:
+            raise RuntimeError(
+                "Verification command rejected by command policy: " +
+                json.dumps(policy, sort_keys=True))
         # Exactly the plan's argv, never shell=True. Workers cannot replace approved checks.
         mounts = check_docker_source(project, cmd) if cfg["verification"]["require_docker_source_proof"] else {}
         logpath = run_dir / "jobs" / f"check-{state['batch_index']}-{index}-{uuid.uuid4().hex[:8]}.log"
@@ -2113,6 +2374,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
         evidence.setdefault("containment", []).append(containment)
         evidence["commands"].append({"argv": cmd, "returncode": rc, "log": str(logpath),
                                      "source_proof": mounts,
+                                     "command_policy": policy,
                                      "containment": containment})
         if rc != 0:
             evidence["passed"] = False
@@ -2131,7 +2393,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
         save(run_dir, state)
         if not_contained:
             break
-    after = source_snapshot(project)
+    after = source_snapshot(project, cfg=cfg)
     evidence["finished_at"] = now()
     evidence["after_hash"] = signature(after)
     evidence["after"] = after
@@ -2147,7 +2409,8 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
     evidence["path"] = str(evpath)
     atomic_json(evpath, evidence)
     state["verification"] = {"path": str(evpath), "passed": evidence["passed"],
-                             "candidate_hash": evidence["after_hash"]}
+                             "candidate_hash": evidence["after_hash"],
+                             "evidence_version": evidence.get("evidence_version")}
     state.pop("verification_interrupted", None)
     progress["finished"] = True
     save(run_dir, state)
@@ -2157,6 +2420,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
                   commands=[{"argv": item["argv"], "returncode": item["returncode"]}
                             for item in evidence.get("commands", [])],
                   source_unchanged=evidence.get("source_unchanged"),
+                  evidence_version=evidence.get("evidence_version"),
                   error=evidence.get("error"), path=str(evpath))
     return evidence
 
@@ -2358,6 +2622,16 @@ def verification_evidence_package(reference, current, *, run_id=None,
         raise ValueError("Verification fingerprints do not match the current candidate")
     if evidence.get("candidate") != current or evidence.get("after") != current:
         raise ValueError("Verification source snapshot does not match the current candidate")
+    evidence_version = int(evidence.get("evidence_version", 1) or 1)
+    provenance = evidence.get("provenance") or {}
+    provenance_complete = bool(provenance.get("source", {}).get("provenance_complete"))
+    if evidence_version >= VERIFICATION_EVIDENCE_VERSION:
+        if provenance.get("version") != SOURCE_PROVENANCE_VERSION:
+            raise ValueError("Versioned verification evidence has missing or incompatible provenance")
+        if provenance.get("source") != current:
+            raise ValueError("Verification provenance source does not match the current candidate")
+        if not provenance_complete:
+            raise ValueError("Versioned verification evidence has an incomplete runtime-input manifest")
     commands = []
     for command in evidence.get("commands", []):
         if not isinstance(command, dict) or not command.get("log"):
@@ -2369,6 +2643,7 @@ def verification_evidence_package(reference, current, *, run_id=None,
             "argv": command.get("argv"),
             "returncode": command.get("returncode"),
             "source_proof": command.get("source_proof"),
+            "command_policy": command.get("command_policy"),
             "log_path": log["path"],
             "log_sha256": log["sha256"],
             "log_bytes": log["bytes"],
@@ -2377,7 +2652,11 @@ def verification_evidence_package(reference, current, *, run_id=None,
             "output_tail": log["text"],
         })
     package = {
-        "package_version": 1,
+        "package_version": 2,
+        "evidence_version": evidence_version,
+        "legacy_evidence": evidence_version < VERIFICATION_EVIDENCE_VERSION,
+        "provenance_complete": provenance_complete,
+        "provenance": provenance,
         "run_id": run_id,
         "verification_path": str(path.resolve()),
         "verification_sha256": record_sha,
