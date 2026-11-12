@@ -1046,13 +1046,31 @@ def risk_policy(risk, cfg=None):
     """Deterministic, configurable QA depth for one batch."""
     cfg = cfg or config()
     risk = risk or "ordinary"
-    settings = cfg.get("risk_policy", RISK_POLICY_DEFAULTS)
-    policy = settings.get(risk)
-    if not isinstance(policy, dict):
+    if risk not in RISK_POLICY_DEFAULTS:
         raise ValueError(f"Unknown risk class {risk!r}; expected mechanical, ordinary or high")
-    return {"risk": risk,
-            "independent_review": bool(policy.get("independent_review", True)),
-            "minimum_checks": max(1, int(policy.get("minimum_checks", 1)))}
+    settings = copy.deepcopy(RISK_POLICY_DEFAULTS)
+    user = cfg.get("risk_policy")
+    if "risk_policy" in cfg:
+        if not isinstance(user, dict):
+            raise ValueError("risk_policy must be an object")
+        for name, values in user.items():
+            if name not in settings:
+                raise ValueError(f"Unknown risk class {name!r}")
+            if not isinstance(values, dict):
+                raise ValueError(f"risk_policy.{name} must be an object")
+            settings[name].update(values)
+    policy = settings[risk]
+    independent = bool(policy.get("independent_review", True))
+    minimum = int(policy.get("minimum_checks", 1))
+    if risk == "ordinary":
+        independent = True
+    if risk == "high":
+        independent = True
+        minimum = max(2, minimum)
+    if minimum < 1:
+        raise ValueError("risk_policy minimum_checks must be at least 1")
+    return {"risk": risk, "independent_review": independent,
+            "minimum_checks": minimum}
 
 
 def explorer_policy_for(state):
@@ -1894,26 +1912,50 @@ def role_text(role):
     return selected + "\n\n" + contract
 
 
+def _bounded_context(context, limit):
+    """Serialize context to valid JSON within a character budget."""
+    def serialized(value):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    raw = serialized(context)
+    if len(raw) <= limit:
+        return raw
+    compact = {}
+    for key, value in context.items():
+        if isinstance(value, str):
+            compact[key] = value[:2000]
+        elif isinstance(value, list):
+            compact[key] = value[:10]
+        elif isinstance(value, dict):
+            compact[key] = {k: v[:1000] if isinstance(v, str) else v
+                            for k, v in list(value.items())[:20]}
+        else:
+            compact[key] = value
+    compact["_supervisor_context_truncated"] = True
+    compact["_note"] = ("Context reduced to the configured handoff budget; "
+                        "inspect referenced files directly if needed.")
+    raw = serialized(compact)
+    if len(raw) <= limit:
+        return raw
+    return serialized({"truncated": True,
+                       "note": "Context omitted because it exceeded the handoff budget.",
+                       "top_level_keys": list(context)[:20]})
+
+
 def report_prompt(kind, context):
-    payload = json.dumps(context, ensure_ascii=False, indent=2)
     try:
         budget = int(config().get("limits", {}).get("max_context_chars", 200000))
     except (ValueError, KeyError, TypeError, OSError):
         budget = 200000
-    if len(payload) > budget:
-        payload = (payload[:max(0, budget - 200)]
-                   + "\n...[context truncated by the supervisor's bounded handoff budget; "
-                     "inspect referenced files directly if needed]...")
-    return (
-        f"You are Abdullah Orchestrator's {kind} role. Follow these policies:\n"
-        + role_text(kind) + "\n\n"
-        + "Task and evidence:\n" + payload + "\n\n"
-        + "Reply with ONE valid JSON object matching the appropriate role contract, no Markdown. "
-        + "Set contract_version to 2 and include every field required by that version; "
-        + "legacy reports without it are accepted only as marked legacy evidence. "
-        + "Do not invent file contents or test results. Do not silently change requirements. "
-        + "Raise consequential uncertainty instead of guessing. Keep the task bounded."
-    )
+    prefix = (f"You are Abdullah Orchestrator's {kind} role. Follow these policies:\n"
+              + role_text(kind) + "\n\nTask and evidence:\n")
+    suffix = ("\n\nReply with ONE valid JSON object matching the appropriate role contract, no Markdown. "
+              "Set contract_version to 2 and include every field required by that version; "
+              "legacy reports without it are accepted only as marked legacy evidence. "
+              "Do not invent file contents or test results. Do not silently change requirements. "
+              "Raise consequential uncertainty instead of guessing. Keep the task bounded.")
+    available = max(200, budget - len(prefix) - len(suffix))
+    payload = _bounded_context(context, available)
+    return prefix + payload + suffix
 
 
 def schema(kind):
@@ -2153,34 +2195,55 @@ def extract_cli_report(format_name, out: str, path: Path):
 def extract_reported_usage(raw, format_name="jsonl"):
     """Extract only provider-reported numeric usage; never synthesize values."""
     import numbers
-    tokens = None
+    objects = []
+    text = raw or ""
+    try:
+        whole = json.loads(text)
+        if isinstance(whole, dict):
+            objects.append(whole)
+    except ValueError:
+        for line in text.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                objects.append(event)
+    found = {}
+    stack = list(objects)
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                lowered = str(key).lower()
+                if isinstance(item, numbers.Number) and not isinstance(item, bool):
+                    if lowered in {"total_tokens", "total_token_count", "tokens"}:
+                        found["total_tokens"] = max(found.get("total_tokens", 0), int(item))
+                    elif lowered in {"input_tokens", "prompt_tokens"}:
+                        found["input_tokens"] = max(found.get("input_tokens", 0), int(item))
+                    elif lowered in {"output_tokens", "completion_tokens"}:
+                        found["output_tokens"] = max(found.get("output_tokens", 0), int(item))
+                    elif lowered in {"cache_read_input_tokens", "cached_tokens", "cache_tokens"}:
+                        found["cache_read"] = max(found.get("cache_read", 0), int(item))
+                    elif lowered in {"cache_creation_input_tokens", "cache_creation_tokens"}:
+                        found["cache_write"] = max(found.get("cache_write", 0), int(item))
+                    elif lowered in {"cost_usd", "total_cost_usd", "cost", "total_cost"}:
+                        found["cost"] = max(found.get("cost", 0.0), float(item))
+                elif isinstance(item, (dict, list)):
+                    stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value)
+    tokens = found.get("total_tokens")
+    if tokens is None and (found.get("input_tokens") is not None or
+                           found.get("output_tokens") is not None):
+        tokens = ((found.get("input_tokens") or 0)
+                  + (found.get("output_tokens") or 0))
     cache = None
-    cost = None
-    for line in (raw or "").splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        stack = [event]
-        while stack:
-            value = stack.pop()
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    lowered = str(key).lower()
-                    if isinstance(item, numbers.Number) and not isinstance(item, bool):
-                        if lowered in {"total_tokens", "total_token_count", "tokens"}:
-                            tokens = int(item)
-                        elif "cache" in lowered and ("token" in lowered or "read" in lowered):
-                            cache = int(item)
-                        elif lowered in {"cost", "total_cost", "cost_usd"}:
-                            cost = float(item)
-                    elif isinstance(item, (dict, list)):
-                        stack.append(item)
-            elif isinstance(value, list):
-                stack.extend(value)
-    if tokens is None and cache is None and cost is None:
+    if found.get("cache_read") is not None or found.get("cache_write") is not None:
+        cache = (found.get("cache_read") or 0) + (found.get("cache_write") or 0)
+    if tokens is None and cache is None and found.get("cost") is None:
         return None
-    return {"tokens": tokens, "cache_tokens": cache, "cost": cost,
+    return {"tokens": tokens, "cache_tokens": cache, "cost": found.get("cost"),
             "source": "provider_output", "format": format_name}
 
 
@@ -2239,8 +2302,12 @@ def usage_report(state):
 
 
 def merge_usage(target_state, source_state):
-    """Fold a tracker's usage counters into the run, without double counting jobs."""
-    source = _usage_state(source_state)
+    """Fold a tracker's or delta usage counters into the run."""
+    if isinstance(source_state, dict) and "usage" not in source_state and any(
+            key in source_state for key in ("strong_calls", "cheap_calls", "reported_tokens")):
+        source = source_state
+    else:
+        source = _usage_state(source_state)
     target = _usage_state(target_state)
     for key in ("strong_calls", "cheap_calls", "failed_attempts",
                 "interrupted_attempts", "human_interventions"):
@@ -2248,6 +2315,9 @@ def merge_usage(target_state, source_state):
     for key in ("reported_tokens", "reported_cache_tokens"):
         if source.get(key) is not None:
             target[key] = int(target.get(key) or 0) + int(source[key])
+    if source.get("seconds") is not None:
+        target["seconds"] = round(float(target.get("seconds") or 0)
+                                  + float(source["seconds"]), 2)
     if source.get("reported_provider_cost") is not None:
         target["reported_provider_cost"] = round(
             float(target.get("reported_provider_cost") or 0)
@@ -2257,6 +2327,32 @@ def merge_usage(target_state, source_state):
         target["billing"][key] = int(target["billing"].get(key) or 0) + int(value)
     target["cost_status"] = ("reported" if target.get("reported_provider_cost") is not None
                              else "unavailable")
+
+
+def append_usage_event(run_dir, delta):
+    path = Path(run_dir) / "usage-events.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(delta, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    _fsync_directory(path.parent)
+
+
+def merge_usage_events(run_dir, state):
+    path = Path(run_dir) / "usage-events.jsonl"
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            delta = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(delta, dict):
+            merge_usage(state, delta)
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def control(run_dir):
@@ -2309,6 +2405,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             env["ABDULLAH_STAGE"] = kind
     job = {"id": job_id, "kind": kind, "role": role, "route": route, "status": "dispatched",
            "path": str(jpath), "created_at": now(), "pid": None,
+           "amendment_epoch": (state.get("amendment_epoch", 0) if state is not None else 0),
            "launch_file": str(jpath / "launch.json"),
            "continued_session": continuation}
     if state is not None:
@@ -2943,12 +3040,21 @@ def strong_call(run_dir, state, cfg, kind, extra=None):
             "Do not accept solely from summaries."
         )
     elif kind == "diagnose":
-        context["instruction"] = (
-            "The cheap worker is stuck or discovered a consequential unknown. Diagnose the "
-            "problem with targeted repository evidence and an Explorer if helpful. "
-            "Return changes_required with a concrete bounded correction or blocked. "
-            "Do not silently redefine the approved contract."
-        )
+        if state.get("amendment_material"):
+            context["instruction"] = (
+                "The user requested a material requirement change. Assess it with targeted "
+                "repository evidence, identify which previously accepted work remains valid, "
+                "and return changes_required with a concrete instruction to create a NEW versioned "
+                "plan. Do not preserve stale acceptance or reuse old checks. Return blocked only "
+                "for a genuine contradiction or missing authorization."
+            )
+        else:
+            context["instruction"] = (
+                "The cheap worker is stuck or discovered a consequential unknown. Diagnose the "
+                "problem with targeted repository evidence and an Explorer if helpful. "
+                "Return changes_required with a concrete bounded correction or blocked. "
+                "Do not silently redefine the approved contract."
+            )
     elif kind == "integration":
         context["instruction"] = (
             "Inspect end-to-end interactions across accepted batches and the final "
@@ -2966,6 +3072,8 @@ def cached_job_report(run_dir, state, kind):
         return None
     last = completed[-1]
     if last["kind"] != kind or last["id"] == state.get("last_consumed_job_id"):
+        return None
+    if last.get("amendment_epoch", 0) != state.get("amendment_epoch", 0):
         return None
     end_snapshot = last.get("final_snapshot")
     if end_snapshot and signature(end_snapshot) != signature(source_snapshot(Path(state["project"]))):
@@ -3208,6 +3316,7 @@ def advance(run_dir, state, cfg):
     # Defense in depth: every production entry point already verifies this, but
     # an internal caller must not execute a stage against an unowned checkout.
     ensure_checkout_lease(state, adopt_legacy=True)
+    merge_usage_events(run_dir, state)
     project = Path(state["project"])
     stage = state["phase"]
     if stage == "diagnose":
@@ -3262,8 +3371,16 @@ def advance(run_dir, state, cfg):
         state["phase"] = "explore" if state.get("require_explorer") and exploration is None else "implement"
         consume_last(state)
         state["implementation"] = None
+        state["implementation_job"] = None
         state["review"] = None
         state["verification"] = None
+        state["correction"] = ""
+        state["corrections"] = 0
+        state["diagnosis_verdict"] = None
+        state["diagnosis_reason"] = None
+        state["exploration"] = None
+        state.pop("required_exploration_job", None)
+        state.pop("verification_interrupted", None)
         if state["plan_approval"]:
             pause_with(run_dir, state, "Review plan in state.json, then use approve-plan", "awaiting_plan_approval")
         else:
@@ -3374,6 +3491,14 @@ def advance(run_dir, state, cfg):
             save(run_dir, state)
         return
     if stage == "accept":
+        acceptance_batch = current_batch(state)
+        if acceptance_batch:
+            policy = risk_policy(acceptance_batch.get("risk"), cfg)
+            if len(acceptance_batch.get("checks", [])) < policy["minimum_checks"]:
+                pause_with(run_dir, state,
+                           f"Risk class {policy['risk']} requires at least "
+                           f"{policy['minimum_checks']} verification checks before acceptance")
+                return
         verification_ref = state.get("verification") or {}
         if (verification_ref.get("path")
                 and int(verification_ref.get("evidence_version", 1) or 1) < VERIFICATION_EVIDENCE_VERSION):
@@ -3920,6 +4045,7 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
                  "accepted_batches": [], "accepted_history": [],
                  "review": None, "implementation": None,
                  "verification": None, "amendments": [], "interruptions": [],
+                 "amendment_epoch": 0,
                  "usage": {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
                            "interrupted_attempts": 0, "corrections": 0,
                            "human_interventions": 0, "reported_tokens": None,
@@ -4339,6 +4465,7 @@ def explore(args):
                  "failed_attempts": usage_after.get("failed_attempts", 0) - usage_before.get("failed_attempts", 0),
                  "interrupted_attempts": usage_after.get("interrupted_attempts", 0) - usage_before.get("interrupted_attempts", 0),
                  "human_interventions": 0,
+                 "seconds": (usage_after.get("seconds", 0) - usage_before.get("seconds", 0)),
                  "reported_tokens": (None if usage_after.get("reported_tokens") is None else
                                      usage_after["reported_tokens"] - (usage_before.get("reported_tokens") or 0)),
                  "reported_cache_tokens": (None if usage_after.get("reported_cache_tokens") is None else
@@ -4347,8 +4474,7 @@ def explore(args):
                                             usage_after["reported_provider_cost"] - (usage_before.get("reported_provider_cost") or 0)),
                  "billing": {key: value - (usage_before.get("billing", {}).get(key, 0))
                              for key, value in usage_after.get("billing", {}).items()}}
-        merge_usage(state, delta)
-        save(folder, state)
+        append_usage_event(folder, delta)
         journal_event(folder, state, "explorer_dispatched",
                       job_id=job["id"], parent_job=parent, phase=state.get("phase"),
                       route=job.get("route"), calls=ts["explorer_calls"], limit=limit)
@@ -4759,6 +4885,24 @@ def start_run(*, project, goal=None, goal_file=None, host="codex",
             "next": next_stage_preview(state)}
 
 
+def usage_line(usage):
+    parts = [f"strong={usage.get('strong_calls', 0)}",
+             f"cheap={usage.get('cheap_calls', 0)}",
+             f"failed={usage.get('failed_attempts', 0)}",
+             f"interrupted={usage.get('interrupted_attempts', 0)}",
+             f"corrections={usage.get('corrections', 0)}"]
+    if usage.get("seconds") is not None:
+        parts.append(f"seconds={usage['seconds']}")
+    if usage.get("reported_tokens") is not None:
+        parts.append(f"tokens={usage['reported_tokens']}")
+    if usage.get("reported_cache_tokens") is not None:
+        parts.append(f"cache={usage['reported_cache_tokens']}")
+    parts.append("cost=" + (str(usage["reported_provider_cost"])
+                            if usage.get("reported_provider_cost") is not None
+                            else "unavailable"))
+    return " | ".join(parts)
+
+
 def status_run(run_id):
     folder, state = load(run_id)
     job = state.get("active_job") or {}
@@ -4778,6 +4922,10 @@ def status_run(run_id):
         "last_implementation": compact_report(state.get("implementation")),
         "last_review": compact_report(state.get("review")),
         "architect_verdict": compact_report(state.get("architect_verdict")),
+        "usage": usage_report(state),
+        "plan_revision": state.get("plan_revision", 0),
+        "plan_history": len(state.get("plan_history", [])),
+        "accepted_history": len(state.get("accepted_history", [])),
         "amendments": state.get("amendments", [])[-3:],
         "interruptions": state.get("interruptions", [])[-3:],
         "checkout_conflict": conflict,
@@ -4836,7 +4984,10 @@ def _recap_facts(folder, state):
     remaining = max(0, len(batches) - state.get("batch_index", 0))
     return {"jobs": jobs, "implementation": implementation, "review": review,
             "files": files, "evidence": evidence, "findings": findings,
-            "unknowns": unknowns, "commands": commands, "remaining_batches": remaining}
+            "unknowns": unknowns, "commands": commands, "remaining_batches": remaining,
+            "usage": usage_report(state), "plan_revision": state.get("plan_revision", 0),
+            "plan_history": len(state.get("plan_history", [])),
+            "accepted_history": len(state.get("accepted_history", []))}
 
 
 def recap_run(run_id, detail="quick"):
@@ -4872,6 +5023,7 @@ def recap_run(run_id, detail="quick"):
             "Decisions: " + ("; ".join(decision_bits) if decision_bits else "none recorded"),
             "Outstanding: " + (str(state.get("pause_reason") or "; ".join(facts["unknowns"]) or
                                    (facts["findings"][0].get("claim") if facts["findings"] else "none recorded"))[:160]),
+            "Usage: " + usage_line(facts["usage"]),
             "Next: " + next_action_for(state),
         ]
         if uncertain:
@@ -4879,7 +5031,10 @@ def recap_run(run_id, detail="quick"):
         return {"ok": True, "run_id": run_id, "detail": detail, "current": not uncertain,
                 "text": "\n".join(lines[:12]), "next_action": next_action_for(state),
                 "facts": {"files": facts["files"], "verification": verification_text,
-                          "remaining_batches": facts["remaining_batches"]}}
+                          "remaining_batches": facts["remaining_batches"],
+                          "usage": facts["usage"], "plan_revision": facts["plan_revision"],
+                          "plan_history": facts["plan_history"],
+                          "accepted_history": facts["accepted_history"]}}
     implementation = facts["implementation"]
     review = facts["review"]
     verdict = state.get("architect_verdict") or state.get("final_verdict") or {}
@@ -4916,6 +5071,9 @@ def recap_run(run_id, detail="quick"):
     if state.get("approved_handoff"):
         sections.append("- Approved handoff restrictions: " +
                         str(state["approved_handoff"].get("execution_restrictions", ""))[:300])
+    sections.append("\nUsage and effort:")
+    sections.append("- " + usage_line(facts["usage"]))
+    sections.append(f"- Plan revision: {facts['plan_revision']}; archived plans: {facts['plan_history']}; invalidated accepted batches: {facts['accepted_history']}")
     sections.append("\nTests and verification evidence:")
     if facts["commands"]:
         for command in facts["commands"][:12]:
@@ -5156,7 +5314,9 @@ def amend_run(run_id, amendment, architect_review=False):
         if state.get("status") in FINAL_STATES:
             raise RuntimeError("Completed/cancelled run cannot be amended")
         _usage_state(state)["human_interventions"] += 1
-        material = bool(architect_review) or state.get("plan") is None
+        material = (bool(architect_review) or state.get("plan") is None
+                    or state.get("amendment_material")
+                    or current_batch(state) is None)
         entry = {"id": uuid.uuid4().hex[:8], "at": now(), "text": amendment,
                  "architect_review": bool(architect_review),
                  "kind": "material" if material else "minor"}
@@ -5167,6 +5327,7 @@ def amend_run(run_id, amendment, architect_review=False):
         state["check_progress"] = None
         state.pop("single_batch_verification", None)
         if material:
+            state["amendment_epoch"] = state.get("amendment_epoch", 0) + 1
             prior = state.get("plan")
             if prior:
                 history = state.setdefault("plan_history", [])
