@@ -466,6 +466,30 @@ class CheckpointAContainment(unittest.TestCase):
         finally:
             proc.kill(); proc.wait(timeout=5)
 
+    def test_integrate_escape_is_uncertain_and_recoverable(self):
+        code = (
+            "import os, time\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    time.sleep(30)\n"
+            "os._exit(0)\n")
+        self.state.update(phase="integrate", batch_index=1,
+                          plan={"batches": [{"title": "x",
+                                             "checks": [[sys.executable, "-c", code]],
+                                             "risk": "ordinary"}]})
+        orc.save(self.rundir, self.state)
+        real = orc._terminate_pids
+        def not_clean(stats, grace=2):
+            result = real(stats, grace)
+            result["clean"] = False
+            return result
+        with patch.object(orc, "_terminate_pids", side_effect=not_clean):
+            orc.advance(self.rundir, self.state, self.cfg)
+        saved = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(saved["status"], "uncertain")
+        self.assertIsNotNone(saved.get("active_check"))
+        self.assertIsNone(saved.get("check_progress"))
+
     def test_explorer_reconcile_excludes_live_parent_session(self):
         parent = self._run_only()
         try:

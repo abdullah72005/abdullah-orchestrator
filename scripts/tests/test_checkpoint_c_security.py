@@ -140,6 +140,25 @@ class CheckpointCSecurity(unittest.TestCase):
         self.assertIsNone(saved.get("verification"))
         self.assertEqual(saved["phase"], "verify")
 
+    def test_migration_resets_review_accept_but_not_integrate(self):
+        legacy = dict(self.state); legacy.pop("schema_version", None)
+        legacy.update(phase="accept", status="paused", batch_index=0,
+                      plan={"batches": [{"title": "x"}]}, verification=None,
+                      single_batch_verification={"path": "old"})
+        orc.save(self.rundir, legacy)
+        orc.migrate_run("test-run00", str(self.root / "migrate-accept"))
+        saved = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(saved["phase"], "verify")
+        self.assertNotIn("single_batch_verification", saved)
+        legacy = dict(self.state); legacy.pop("schema_version", None)
+        legacy.update(phase="integrate", status="paused", batch_index=1,
+                      plan={"batches": [{"title": "x"}]}, verification=None)
+        orc.save(self.rundir, legacy)
+        orc.migrate_run("test-run00", str(self.root / "migrate-integrate"))
+        saved = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(saved["phase"], "integrate")
+        self.assertEqual(saved["batch_index"], 1)
+
     def test_generated_recovery_command_uses_project_flag(self):
         advice = orc._conflict_resolution("owner", "new-run", "orphaned")
         self.assertIn("checkout-recover --project <project>", advice)

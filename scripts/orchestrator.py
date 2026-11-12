@@ -3647,8 +3647,10 @@ def advance(run_dir, state, cfg):
         combined = {"title": "feature integration", "checks": unique}
         evidence = run_checks(run_dir, state, cfg, project, combined, final=True)
         if not evidence["passed"]:
+            state["check_progress"] = None
             pause_with(run_dir, state, "Feature integration verification failed: " +
-                       json.dumps(short_log_evidence(evidence), ensure_ascii=False))
+                       json.dumps(short_log_evidence(evidence), ensure_ascii=False),
+                       failure_phase(state))
             return
         verdict = cached_job_report(run_dir, state, "integration") or strong_call(
             run_dir, state, cfg, "integration",
@@ -4211,7 +4213,7 @@ def migrate_run(run_id, backup_dir=None):
         state["verification"] = None
         state["review"] = None
         state["architect_verdict"] = None
-        if state.get("phase") in {"verify", "review", "accept", "integrate"}:
+        if state.get("phase") in {"verify", "review", "accept"}:
             state["phase"] = "verify"
         save(folder, state)
         journal_event(folder, state, "state_migrated", backup=str(backup),
