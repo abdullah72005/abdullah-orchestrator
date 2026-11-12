@@ -175,6 +175,8 @@ class CheckpointBProvenance(unittest.TestCase):
                           (["bash", "-e", "-u", "-c", "x"], "shell_wrapper"),
                           (["python", "-B", "-I", "-c", "x"], "interpreter_string"),
                           (["node", "-p", "1"], "interpreter_string"),
+                          (["node", "--eval", "1"], "interpreter_string"),
+                          (["ruby", "--eval", "1"], "interpreter_string"),
                           (["python3.10", "-c", "x"], "interpreter_string"),
                           (["python3.11", "-B", "-c", "x"], "interpreter_string"),
                           (["python", "evil.py"], "arbitrary_script"),
@@ -278,6 +280,44 @@ class CheckpointBProvenance(unittest.TestCase):
         orc.save(self.rundir, saved)
         with self.assertRaisesRegex(RuntimeError, "already attested"):
             orc.acknowledge_legacy_verification("test-run00", "x", "y")
+
+    def test_baseline_environment_change_does_not_pause_implement(self):
+        snap = orc.source_snapshot(self.project, cfg=self.cfg)
+        batch = {"title": "one", "goal": "change", "acceptance": ["works"],
+                 "checks": [["true"]], "risk": "ordinary"}
+        self.state.update(phase="implement", plan={"batches": [batch]},
+                          plan_version=orc.content_hash({"batches": [batch]}),
+                          baseline=snap, batch_index=0,
+                          handoff_authorization={"explicit_user_authorization": True})
+        report = {"contract_version": 2, "status": "complete", "summary": "done",
+                  "files": ["app.py"], "tests": [], "evidence": ["app.py:1"],
+                  "unknowns": [], "blocker": ""}
+        with patch.dict(os.environ, {"PYTHONPATH": "/tmp/only-env-change"}),                 patch.object(orc, "call_model", return_value=(report, {"id": "job"})) as model:
+            orc.advance(self.rundir, self.state, self.cfg)
+        model.assert_called_once()
+        self.assertEqual(self.state["phase"], "verify")
+
+    def test_legacy_acknowledgment_allows_acceptance(self):
+        snap = orc.source_snapshot(self.project, cfg=self.cfg)
+        candidate = orc.signature(snap)
+        path = self.root / "legacy-accept-ack.json"
+        orc.atomic_json(path, {})
+        batch = {"title": "one", "checks": [["true"]]}
+        self.state.update(phase="accept", plan={"batches": [batch]},
+                          verification={"path": str(path), "candidate_hash": candidate,
+                                        "passed": True},
+                          review={"status": "complete", "findings": []},
+                          single_batch_fast_path=True)
+        orc.save(self.rundir, self.state)
+        orc.acknowledge_legacy_verification("test-run00", "legacy inspected", "accept")
+        self.state = orc.read_json(self.rundir / "state.json")
+        evidence = {"passed": True, "candidate_hash": candidate,
+                    "source_unchanged": True, "commands": []}
+        verdict = {"verdict": "approved", "reason": "inspected", "inspected": ["app.py"],
+                   "dismissed_findings": []}
+        with patch.object(orc, "run_checks", return_value=evidence),                 patch.object(orc, "strong_call", return_value=verdict):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.state["status"], "complete")
 
     def test_legacy_evidence_is_marked_not_equivalent(self):
         snap = orc.source_snapshot(self.project, cfg=self.cfg)

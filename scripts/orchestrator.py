@@ -1460,7 +1460,8 @@ def verification_command_policy(cmd, cfg=None):
             flags = interpreter_flags.get(base, set())
             if any(short_flag(options, flag) for flag in flags):
                 interpreter_string = True
-            if any(option.startswith(("--eval=", "--print=")) for option in options):
+            if any(option.split("=", 1)[0] in {"--eval", "--print", "--command"}
+                   for option in options):
                 interpreter_string = True
             if (next_index < len(argv) and not argv[next_index].startswith("-")
                     and "-m" not in options):
@@ -3025,12 +3026,18 @@ def advance(run_dir, state, cfg):
     if stage == "accept":
         verification_ref = state.get("verification") or {}
         if (verification_ref.get("path")
-                and int(verification_ref.get("evidence_version", 1) or 1) < VERIFICATION_EVIDENCE_VERSION
-                and not state.get("legacy_verification_acknowledged")):
-            pause_with(run_dir, state,
-                       "Legacy verification evidence is not equivalent to attested evidence; "
-                       "re-run verification or explicitly acknowledge the legacy evidence")
-            return
+                and int(verification_ref.get("evidence_version", 1) or 1) < VERIFICATION_EVIDENCE_VERSION):
+            ack = state.get("legacy_verification_acknowledged") or {}
+            try:
+                digest = _sha256_file(Path(verification_ref["path"]))
+            except OSError:
+                digest = None
+            if not (ack.get("verification_sha256") == digest
+                    and ack.get("candidate_hash") == verification_ref.get("candidate_hash")):
+                pause_with(run_dir, state,
+                           "Legacy verification evidence is not equivalent to attested evidence; "
+                           "re-run verification or explicitly acknowledge the legacy evidence")
+                return
         current = source_snapshot(project)
         if signature(current) != state["verification"]["candidate_hash"]:
             state["phase"] = "verify"
@@ -4789,9 +4796,15 @@ def acknowledge_legacy_verification(run_id, reason, acknowledge):
         version = int(verification.get("evidence_version", 1) or 1)
         if version >= VERIFICATION_EVIDENCE_VERSION:
             raise RuntimeError("Verification evidence is already attested; no legacy acknowledgment is needed")
+        try:
+            verification_sha = _sha256_file(Path(verification["path"]))
+        except OSError:
+            raise RuntimeError("Legacy verification evidence file is missing or unreadable")
         state["legacy_verification_acknowledged"] = {
             "at": now(), "reason": reason, "acknowledge": acknowledge,
-            "actor": _operator_actor(), "verification": verification}
+            "actor": _operator_actor(), "verification": verification,
+            "verification_sha256": verification_sha,
+            "candidate_hash": verification.get("candidate_hash")}
         save(folder, state)
         journal_event(folder, state, "legacy_verification_acknowledged",
                       reason=reason, acknowledge=acknowledge)
