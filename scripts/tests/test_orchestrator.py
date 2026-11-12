@@ -262,8 +262,14 @@ class ControlTests(unittest.TestCase):
             snapshot = orc.source_snapshot(project)
             fingerprint = orc.signature(snapshot)
             evidence_path = self.root / "mock-verification.json"
-            orc.atomic_json(evidence_path, {"candidate":snapshot, "after":snapshot, "candidate_hash":fingerprint, "after_hash":fingerprint, "passed":True, "source_unchanged":True, "commands":[]})
-            state["verification"] = {"path": str(evidence_path), "passed": True, "candidate_hash": fingerprint}
+            orc.atomic_json(evidence_path, {"evidence_version": 2,
+                "provenance": {"version": 2, "source": snapshot},
+                "candidate":snapshot, "after":snapshot, "candidate_hash":fingerprint,
+                "after_hash":fingerprint, "passed":True, "source_unchanged":True,
+                "commands":[]})
+            state["verification"] = {"path": str(evidence_path), "passed": True,
+                                     "candidate_hash": fingerprint,
+                                     "evidence_version": 2}
             orc.save(self.rundir, state)
             return {"passed": True, "commands": [], "candidate_hash": orc.signature(snapshot)}
 

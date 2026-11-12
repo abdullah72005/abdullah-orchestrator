@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -34,17 +35,42 @@ class CheckpointBProvenance(unittest.TestCase):
         self.env_file.write_text("FEATURE=2\n")
         self.assertNotEqual(before, orc.signature(orc.source_snapshot(self.project, cfg=self.cfg)))
 
-    def test_ao_04_runtime_input_change_invalidates_verification(self):
+    def test_ao_04_ignored_nested_runtime_input_change_invalidates(self):
+        (self.project / ".gitignore").write_text(".env.local\n")
+        nested = self.project / "compose"
+        nested.mkdir()
+        (nested / ".env.local").write_text("FEATURE=one\n")
         evidence = orc.run_checks(
             self.rundir, self.state, self.cfg, self.project,
             {"title": "runtime", "checks": [[sys.executable, "-c", "print('ok')"]]})
         self.assertTrue(evidence["passed"])
-        self.env_file.write_text("FEATURE=3\n")
+        (nested / ".env.local").write_text("FEATURE=two\n")
         with self.assertRaisesRegex(ValueError, "stale|snapshot|fingerprint"):
             orc.verification_evidence_package(
                 {"path": evidence["path"], "passed": True,
                  "candidate_hash": evidence["after_hash"]},
                 orc.source_snapshot(self.project, cfg=self.cfg))
+
+    def test_symlinked_runtime_input_hashes_target_content(self):
+        (self.project / ".gitignore").write_text(".env.link\n")
+        target = self.project / "runtime.env"
+        target.write_text("TOKEN=one\n")
+        link = self.project / ".env.link"
+        link.symlink_to(target.name)
+        first = orc.source_snapshot(self.project, cfg=self.cfg)
+        self.assertIn(".env.link", first["runtime_inputs"]["files"])
+        target.write_text("TOKEN=two\n")
+        second = orc.source_snapshot(self.project, cfg=self.cfg)
+        self.assertNotEqual(orc.signature(first), orc.signature(second))
+
+    def test_out_of_tree_symlink_marks_manifest_incomplete(self):
+        (self.project / ".gitignore").write_text(".env.outside\n")
+        outside = self.root / "outside.env"
+        outside.write_text("TOKEN=x\n")
+        (self.project / ".env.outside").symlink_to(outside)
+        manifest = orc.runtime_input_manifest(self.project, self.cfg)
+        self.assertFalse(manifest["complete"])
+        self.assertTrue(manifest["files"][".env.outside"]["target_outside_project"])
 
     def test_incomplete_runtime_manifest_blocks_verification(self):
         manifest = {"version": 2, "complete": False, "truncated": True, "files": {}}
@@ -136,6 +162,76 @@ class CheckpointBProvenance(unittest.TestCase):
         self.assertEqual(proof["user"], "1000")
         self.assertEqual(proof["environment_keys"], ["MODE", "TOKEN"])
         self.assertNotIn("secret", json.dumps(proof))
+
+    def test_signature_ignores_volatile_environment(self):
+        first = orc.source_snapshot(self.project, cfg=self.cfg)
+        with patch.dict(os.environ, {"PYTHONPATH": "/tmp/changed-path"}):
+            second = orc.source_snapshot(self.project, cfg=self.cfg)
+        self.assertEqual(orc.signature(first), orc.signature(second))
+        self.assertNotEqual(first.get("environment"), second.get("environment"))
+
+    def test_policy_catches_combined_flags_and_script_files(self):
+        for argv, key in ((["bash", "-lc", "x"], "shell_wrapper"),
+                          (["bash", "-e", "-u", "-c", "x"], "shell_wrapper"),
+                          (["python", "-B", "-I", "-c", "x"], "interpreter_string"),
+                          (["node", "-p", "1"], "interpreter_string"),
+                          (["python", "evil.py"], "arbitrary_script"),
+                          (["env", "FOO=1", "./run.sh"], "arbitrary_script"),
+                          (["docker", "compose", "run", "web", "bash", "-c", "x"],
+                           "shell_wrapper")):
+            with self.subTest(argv=argv):
+                policy = orc.verification_command_policy(argv)
+                self.assertTrue(policy[key], policy)
+                self.assertEqual(policy["policy"], "explicit")
+
+    def test_v2_evidence_missing_provenance_is_rejected(self):
+        snap = orc.source_snapshot(self.project, cfg=self.cfg)
+        candidate = orc.signature(snap)
+        log = self.root / "unprovenanced.log"
+        log.write_text("ok")
+        path = self.root / "unprovenanced.json"
+        orc.atomic_json(path, {
+            "evidence_version": 2, "candidate": snap, "after": snap,
+            "candidate_hash": candidate, "after_hash": candidate,
+            "passed": True, "source_unchanged": True,
+            "commands": [{"argv": ["true"], "returncode": 0, "log": str(log)}]})
+        with self.assertRaisesRegex(ValueError, "provenance|manifest"):
+            orc.verification_evidence_package(
+                {"path": str(path), "passed": True, "candidate_hash": candidate}, snap)
+
+    def test_contract_v2_is_enforced_and_legacy_is_marked(self):
+        with self.assertRaisesRegex(ValueError, "files|evidence"):
+            orc.validate_report("implementer", {"contract_version": 2,
+                                                "status": "complete", "summary": "x"})
+        legacy = orc.validate_report("implementer", {"status": "complete", "summary": "x"})
+        self.assertNotIn("legacy_contract", legacy)
+        with self.assertRaisesRegex(ValueError, "invariants"):
+            orc.validate_report("plan", {"contract_version": 2, "status": "complete",
+                                         "summary": "x", "batches": [{"title": "x", "goal": "x",
+                                         "acceptance": ["ok"], "checks": [["true"]],
+                                         "risk": "ordinary"}], "blocker": ""})
+
+    def test_legacy_verification_path_is_not_accepted_silently(self):
+        snap = orc.source_snapshot(self.project, cfg=self.cfg)
+        candidate = orc.signature(snap)
+        log = self.root / "legacy-accept.log"
+        log.write_text("ok")
+        path = self.root / "legacy-accept.json"
+        orc.atomic_json(path, {"candidate": snap, "after": snap,
+                               "candidate_hash": candidate, "after_hash": candidate,
+                               "passed": True, "source_unchanged": True,
+                               "commands": [{"argv": ["true"], "returncode": 0,
+                                             "log": str(log)}]})
+        self.state.update(phase="accept",
+                          plan={"batches": [{"title": "one", "checks": [["true"]]}]},
+                          verification={"path": str(path), "candidate_hash": candidate,
+                                        "passed": True},
+                          review={"status": "complete", "findings": []})
+        with patch.object(orc, "run_checks") as checks:
+            orc.advance(self.rundir, self.state, self.cfg)
+        checks.assert_not_called()
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("Legacy verification", self.state["pause_reason"])
 
     def test_legacy_evidence_is_marked_not_equivalent(self):
         snap = orc.source_snapshot(self.project, cfg=self.cfg)

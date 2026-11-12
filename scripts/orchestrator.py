@@ -12,6 +12,7 @@ import contextlib
 import copy
 import datetime as dt
 import fcntl
+import fnmatch
 import functools
 import getpass
 import hashlib
@@ -63,6 +64,7 @@ RUNTIME_INPUT_PATTERNS = (
     "requirements*.txt", "poetry.lock", "uv.lock", "Pipfile.lock",
     "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "go.sum", "Cargo.lock",
     "Gemfile.lock", "composer.lock", ".python-version", ".nvmrc", ".tool-versions",
+    ".envrc", ".npmrc", "uv.toml", "mise.toml", "docker-bake.hcl",
 )
 RUNTIME_SKIP_PARTS = {".git", "node_modules", ".venv", "venv", "__pycache__",
                       ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
@@ -1280,17 +1282,19 @@ def runtime_input_manifest(project: Path, cfg=None):
     max_bytes = int(settings.get("max_total_bytes", 20 * 1024 * 1024))
     project = Path(project)
     paths = {}
-    for pattern in patterns:
-        try:
-            matches = list(project.glob(pattern))
-        except (OSError, ValueError):
-            continue
-        for path in matches:
+    project_resolved = project.resolve()
+    for root, dirs, names in os.walk(project):
+        dirs[:] = [name for name in dirs if name not in RUNTIME_SKIP_PARTS]
+        root_path = Path(root)
+        for name in names:
+            path = root_path / name
             try:
                 relative = path.relative_to(project)
             except ValueError:
                 continue
-            if any(part in RUNTIME_SKIP_PARTS for part in relative.parts):
+            text = relative.as_posix()
+            if not any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(text, pattern)
+                       for pattern in patterns):
                 continue
             if path.is_file() or path.is_symlink():
                 paths[str(relative)] = path
@@ -1300,25 +1304,44 @@ def runtime_input_manifest(project: Path, cfg=None):
         ordered = ordered[:max_files]
     files = {}
     total_bytes = 0
+    complete = not truncated
     for relative in ordered:
         path = paths[relative]
         try:
             if path.is_symlink():
-                files[relative] = "link:" + os.readlink(path)
+                target = path.resolve()
+                link = "link:" + os.readlink(path)
+                if not target.is_relative_to(project_resolved):
+                    files[relative] = {"link": link, "target_outside_project": True}
+                    complete = False
+                    continue
+                if not target.is_file():
+                    files[relative] = {"link": link, "unreadable": True}
+                    complete = False
+                    continue
+                size = target.stat().st_size
+                if total_bytes + size > max_bytes:
+                    truncated = True
+                    complete = False
+                    break
+                files[relative] = {"link": link, "sha256": _sha256_file(target)}
+                total_bytes += size
                 continue
             size = path.stat().st_size
             if total_bytes + size > max_bytes:
                 truncated = True
+                complete = False
                 break
             files[relative] = _sha256_file(path)
             total_bytes += size
         except OSError:
             files[relative] = "unreadable"
+            complete = False
     return {"version": SOURCE_PROVENANCE_VERSION, "patterns": list(patterns),
             "files": files, "file_count": len(files), "total_bytes": total_bytes,
             "max_files": max_files, "max_total_bytes": max_bytes,
             "truncated": bool(truncated),
-            "complete": not truncated}
+            "complete": bool(complete and not truncated)}
 
 
 def environment_provenance(cfg=None):
@@ -1378,24 +1401,72 @@ def verification_command_policy(cmd, cfg=None):
     direct_docker = len(basenames) >= 2 and basenames[0] == "docker" and basenames[1] == "compose"
     indirect_docker = ("docker" in basenames or "docker-compose" in basenames) and not direct_docker
     shell_names = {"sh", "bash", "zsh", "dash", "cmd", "powershell", "pwsh"}
-    shell_wrapper = any(name in shell_names and any(
-        token in {"-c", "/c", "-Command", "--command"} for token in argv[index + 1:index + 3])
-        for index, name in enumerate(basenames))
-    interpreter = any(name.startswith(("python", "node", "ruby", "perl", "php"))
-                      and any(token in {"-c", "-e", "--eval"} for token in argv[index + 1:index + 3])
-                      for index, name in enumerate(basenames))
-    arbitrary_script = bool(basenames and Path(basenames[0]).suffix in
-                            {".sh", ".bash", ".py", ".js", ".rb", ".pl", ".php"})
+    interpreter_names = {"python", "python3", "python2", "node", "ruby", "perl", "php",
+                         "pypy", "pypy3"}
+
+    def option_scan(start):
+        options = []
+        index = start
+        while index < len(argv):
+            token = argv[index]
+            if token == "--":
+                break
+            if token.startswith("-"):
+                options.append(token)
+                index += 1
+                continue
+            break
+        return options, index
+
+    def short_flag(options, flag):
+        for option in options:
+            if option == "--" + flag:
+                return True
+            if option.startswith("-") and not option.startswith("--") and flag in option[1:]:
+                return True
+        return False
+
+    shell_wrapper = False
+    interpreter_string = False
+    arbitrary_script = False
+    env_wrapper = False
+    executable_index = 0
+    if basenames and basenames[0] in {"env", "sudo", "command"}:
+        env_wrapper = True
+        while executable_index < len(argv) and (
+                basenames[executable_index] in {"env", "sudo", "command"}
+                or "=" in argv[executable_index]
+                or argv[executable_index].startswith("-")):
+            executable_index += 1
+    for index, name in enumerate(basenames):
+        if name in shell_names:
+            options, next_index = option_scan(index + 1)
+            if short_flag(options, "c") or any(
+                    option in {"--command", "-command"} for option in options):
+                shell_wrapper = True
+            if next_index < len(argv) and not argv[next_index].startswith("-"):
+                arbitrary_script = True
+        elif name in interpreter_names:
+            options, next_index = option_scan(index + 1)
+            if short_flag(options, "c") or short_flag(options, "e") or any(
+                    option in {"--eval", "--print", "-E", "-p", "--command"} for option in options):
+                interpreter_string = True
+            if (next_index < len(argv) and not argv[next_index].startswith("-")
+                    and argv[next_index] != "-m"):
+                arbitrary_script = True
+        elif name.startswith(".") or Path(name).suffix in {".sh", ".bash", ".py", ".js", ".rb", ".pl", ".php"}:
+            arbitrary_script = True
     rejected = ((settings.get("reject_shell_wrappers") and shell_wrapper)
-                or (settings.get("reject_interpreter_strings") and interpreter)
+                or (settings.get("reject_interpreter_strings") and interpreter_string)
                 or (settings.get("reject_indirect_docker") and indirect_docker)
                 or (settings.get("reject_arbitrary_scripts") and arbitrary_script))
-    return {"version": 1, "argv": argv, "direct_docker": direct_docker,
+    return {"version": 2, "argv": argv, "direct_docker": direct_docker,
             "indirect_docker": bool(indirect_docker), "shell_wrapper": bool(shell_wrapper),
-            "interpreter_string": bool(interpreter),
-            "arbitrary_script": bool(arbitrary_script),
+            "interpreter_string": bool(interpreter_string),
+            "arbitrary_script": bool(arbitrary_script), "env_wrapper": bool(env_wrapper),
             "allowed": not rejected,
-            "policy": "explicit" if (shell_wrapper or interpreter or indirect_docker or arbitrary_script) else "direct"}
+            "policy": "explicit" if (shell_wrapper or interpreter_string or indirect_docker
+                                      or arbitrary_script or env_wrapper) else "direct"}
 
 
 def source_snapshot(project: Path, include_generated=False, cfg=None, provenance=True):
@@ -1417,7 +1488,14 @@ def source_snapshot(project: Path, include_generated=False, cfg=None, provenance
         relative = os.fsdecode(raw)
         fpath = project / relative
         if fpath.is_symlink():
-            changed[relative] = "link:" + os.readlink(fpath)
+            target = fpath.resolve()
+            link = "link:" + os.readlink(fpath)
+            if target.is_file():
+                try:
+                    link += ":" + _sha256_file(target)
+                except OSError:
+                    link += ":unreadable"
+            changed[relative] = link
         elif fpath.is_file():
             h = hashlib.sha256()
             with fpath.open("rb") as stream:
@@ -1447,7 +1525,22 @@ def source_snapshot(project: Path, include_generated=False, cfg=None, provenance
 
 
 def signature(snapshot):
-    return hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+    """Hash source identity only; volatile provenance is compared separately."""
+    if not isinstance(snapshot, dict):
+        return hashlib.sha256(b"invalid").hexdigest()
+    core = {"path": snapshot.get("path"), "git_head": snapshot.get("git_head"),
+            "changed": snapshot.get("changed") or {}}
+    if snapshot.get("staged_sha256"):
+        core["staged_sha256"] = snapshot["staged_sha256"]
+    runtime = snapshot.get("runtime_inputs") or {}
+    changed = core["changed"]
+    extra = {name: value for name, value in (runtime.get("files") or {}).items()
+             if name not in changed}
+    if extra:
+        core["runtime_inputs"] = extra
+    if runtime and not runtime.get("complete", True):
+        core["runtime_incomplete"] = True
+    return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
 
 
 def copy_evidence(value):
@@ -1464,7 +1557,7 @@ def validate_handoff(handoff, project, authorized, goal=None):
             raise ValueError(f"Handoff requires {key}")
     if goal is not None and handoff["goal"].strip() != goal.strip():
         raise ValueError("Handoff goal contradicts the supplied goal")
-    if handoff.get("source") != source_snapshot(project):
+    if signature(handoff.get("source")) != signature(source_snapshot(project)):
         raise ValueError("Handoff source is stale or does not match project")
     plan = handoff.get("plan")
     validate_report("plan", plan)
@@ -2620,7 +2713,8 @@ def verification_evidence_package(reference, current, *, run_id=None,
         raise ValueError("Verification record is not a passed, source-unchanged run")
     if evidence.get("candidate_hash") != fingerprint or evidence.get("after_hash") != fingerprint:
         raise ValueError("Verification fingerprints do not match the current candidate")
-    if evidence.get("candidate") != current or evidence.get("after") != current:
+    if (signature(evidence.get("candidate")) != signature(current)
+            or signature(evidence.get("after")) != signature(current)):
         raise ValueError("Verification source snapshot does not match the current candidate")
     evidence_version = int(evidence.get("evidence_version", 1) or 1)
     provenance = evidence.get("provenance") or {}
@@ -2628,7 +2722,7 @@ def verification_evidence_package(reference, current, *, run_id=None,
     if evidence_version >= VERIFICATION_EVIDENCE_VERSION:
         if provenance.get("version") != SOURCE_PROVENANCE_VERSION:
             raise ValueError("Versioned verification evidence has missing or incompatible provenance")
-        if provenance.get("source") != current:
+        if signature(provenance.get("source")) != signature(current):
             raise ValueError("Verification provenance source does not match the current candidate")
         if not provenance_complete:
             raise ValueError("Versioned verification evidence has an incomplete runtime-input manifest")
@@ -2761,7 +2855,10 @@ def certified_exploration(run_dir, state, plan):
         completion = read_json(archive / "completion.json")
         report = validate_report("explorer", read_json(archive / "report.json"))
         current = source_snapshot(Path(state["project"]))
-        if dispatch.get("role") != "explorer" or dispatch.get("kind") != "explorer" or dispatch.get("source") != current or completion.get("final_snapshot") != current or report["status"] != "complete":
+        if (dispatch.get("role") != "explorer" or dispatch.get("kind") != "explorer"
+                or signature(dispatch.get("source")) != signature(current)
+                or signature(completion.get("final_snapshot")) != signature(current)
+                or report["status"] != "complete"):
             return None
         return report
     except (OSError, ValueError, TypeError, KeyError):
@@ -2907,6 +3004,14 @@ def advance(run_dir, state, cfg):
             save(run_dir, state)
         return
     if stage == "accept":
+        verification_ref = state.get("verification") or {}
+        if (verification_ref.get("path")
+                and int(verification_ref.get("evidence_version", 1) or 1) < VERIFICATION_EVIDENCE_VERSION
+                and not state.get("legacy_verification_acknowledged")):
+            pause_with(run_dir, state,
+                       "Legacy verification evidence is not equivalent to attested evidence; "
+                       "re-run verification or explicitly acknowledge the legacy evidence")
+            return
         current = source_snapshot(project)
         if signature(current) != state["verification"]["candidate_hash"]:
             state["phase"] = "verify"
@@ -3659,7 +3764,8 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
             jobdir = Path(job.get("path", ""))
             project = Path(state["project"])
             dispatch = read_json(jobdir / "dispatch.json")
-            if dispatch.get("source") != source_snapshot(project, include_generated=True):
+            if signature(dispatch.get("source")) != signature(
+                    source_snapshot(project, include_generated=True)):
                 raise RuntimeError("Checkout changed since correction dispatch; inspect manually")
             if (jobdir / "execution.json").exists() or (jobdir / "completion.json").exists():
                 raise RuntimeError("Correction has completion evidence; inspect manually")
@@ -3667,7 +3773,8 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
             if (state.get("phase") != "implement" or not state.get("implementation_job")
                     or not state.get("implementation") or verification.get("error") !=
                     "Tracked or untracked files changed during verification; evidence is stale"
-                    or verification.get("candidate") != source_snapshot(project)):
+                    or signature(verification.get("candidate")) != signature(
+                        source_snapshot(project))):
                 raise RuntimeError("Cannot establish an unchanged previously implemented candidate")
             atomic_json(folder / "jobs" / f"reconciliation-{job['id']}.json", {
                 "at": now(), "interrupted_job": job, "dispatch": dispatch,

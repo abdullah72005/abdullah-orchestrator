@@ -168,7 +168,7 @@ class QuotaChanges(unittest.TestCase):
         self.state.update(
             phase='accept', status='blocked',
             plan={'batches': [{'title': 'one', 'checks': [['true']]}]},
-            verification={'path': str(path), 'candidate_hash': candidate, 'passed': True},
+            verification={'path': str(path), 'candidate_hash': candidate, 'passed': True, 'evidence_version': 2},
             review={'status': 'complete', 'findings': []},
             single_batch_fast_path=True, last_consumed_job_id='decision-old',
             completed_jobs=[{'id': 'decision-old', 'kind': 'decision', 'role': 'architect',
