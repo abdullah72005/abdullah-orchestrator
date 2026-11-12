@@ -2807,6 +2807,21 @@ V2_DANGEROUS_SHELL = (
     "git filter-branch --all", "git gc --prune=now",
     "docker compose down -v", "docker compose push registry/image",
 )
+# Actions the installed V2.2.x CLI can emit in a normalized agent profile.
+# Anything else is unverified and must not be treated as harmless.
+V2_KNOWN_ACTIONS = frozenset({
+    "*", "read", "glob", "grep", "edit", "shell", "subagent",
+    "external_directory", "webfetch", "websearch", "question", "browser", "skill",
+})
+# Global defaults v2.2.x prepends to every normalized agent before the agent's
+# own rules. The broad allow is safe only because the intended role rules
+# follow it and override it; the ordered structural check proves that placement.
+V2_BASELINE_PERMISSION_RULES = frozenset({
+    ("*", "*", "allow"),
+    ("read", "*.env", "ask"),
+    ("read", "*.env.*", "ask"),
+    ("read", "*.env.example", "allow"),
+})
 
 
 def _v2_rules_valid(rules):
@@ -2837,90 +2852,179 @@ def v2_effective_permission(rules, action, resource):
     return effect
 
 
-def _v2_later_deny_covers(rules, index, action):
-    """True when a later deny covers the whole resource pattern of rule[index].
+def _v2_rule_key(rule):
+    return (rule["action"], rule["resource"], rule["effect"])
 
-    A narrower later deny does not neutralise a broad earlier allowance, so
-    only an equal pattern or a universal ``*`` deny counts as full coverage.
+
+def _v2_actions_overlap(left, right):
+    return left == "*" or right == "*" or left == right
+
+
+def _v2_action_covers(broad, narrow):
+    return broad == "*" or broad == narrow
+
+
+def _v2_glob_overlap(left, right):
+    """True when some string is matched by both glob patterns.
+
+    This is a product walk over ``fnmatch``-style patterns. OpenCode rewrites a
+    pattern ending in ``" *"`` so the space and tail are optional (``"git push
+    *"`` matches both ``"git push"`` and ``"git push origin"``), so that variant
+    is tested too. The prover is exact for literals, ``*`` and ``?``; ``[`` is
+    treated conservatively as possibly overlapping. A ``False`` result is
+    therefore a proof that the two patterns are disjoint, which is what a
+    fail-closed check needs.
     """
-    pattern = rules[index]["resource"]
-    for later in rules[index + 1:]:
-        if later["effect"] != "deny" or not _v2_action_matches(later, action):
+    from functools import lru_cache
+
+    # A repo-controlled pattern could otherwise exhaust the recursion limit.
+    # Saying "may overlap" keeps the caller fail-closed.
+    if len(left) + len(right) > 400:
+        return True
+
+    def variants(pattern):
+        yield pattern
+        if pattern.endswith(" *"):
+            yield pattern[:-2]
+
+    def overlap(first, second):
+        @lru_cache(maxsize=None)
+        def walk(i, j):
+            if i == len(first) and j == len(second):
+                return True
+            if i == len(first):
+                return all(char == "*" for char in second[j:])
+            if j == len(second):
+                return all(char == "*" for char in first[i:])
+            lc, rc = first[i], second[j]
+            if lc == "*":
+                return walk(i + 1, j) or walk(i, j + 1)
+            if rc == "*":
+                return walk(i, j + 1) or walk(i + 1, j)
+            if lc == "?" or rc == "?" or lc == "[" or rc == "[":
+                return walk(i + 1, j + 1)
+            return lc == rc and walk(i + 1, j + 1)
+
+        return walk(0, 0)
+
+    return any(overlap(first, second)
+               for first in variants(left) for second in variants(right))
+
+
+def _v2_glob_covers(broad, narrow):
+    """Sufficient proof that every string matching ``narrow`` matches ``broad``."""
+    return broad == "*" or broad == narrow
+
+
+def _v2_mandatory_denies(intended):
+    """Explicit deny rules whose resource region must stay denied.
+
+    Universal ``*`` denies are omitted: every capability they protect is also
+    denied by a later explicit rule, and the structural gate rejects unexpected
+    allows for actions/patterns it does not enumerate.
+    """
+    denies = []
+    for index, rule in enumerate(intended):
+        if rule["effect"] != "deny" or rule["action"] == "*":
             continue
-        if later["resource"] == "*" or later["resource"] == pattern:
-            return True
-    return False
+        action, pattern = rule["action"], rule["resource"]
+        later = intended[index + 1:]
+        if any(item["effect"] == "allow"
+               and _v2_action_covers(item["action"], action)
+               and _v2_glob_covers(item["resource"], pattern)
+               for item in later):
+            continue
+        exceptions = tuple(
+            item["resource"] for item in later
+            if item["effect"] == "allow"
+            and _v2_action_covers(item["action"], action))
+        denies.append((action, pattern, exceptions))
+    return denies
 
 
-def _v2_require_denied(rules, action, resources):
+def _v2_overlap_problems(rules, mandatory):
+    """Reject allow/ask rules whose winning region may hit a mandatory deny."""
     problems = []
-    effective = v2_effective_permission(rules, action, V2_PERMISSION_PROBE)
-    if effective != "deny":
-        problems.append(f"{action}:* is {effective!r}, expected 'deny'")
-    for index, rule in enumerate(rules):
-        if (_v2_action_matches(rule, action)
-                and rule["effect"] in {"allow", "ask"}
-                and not _v2_later_deny_covers(rules, index, action)):
-            problems.append(
-                f"{action}:{rule['resource']} is {rule['effect']!r} without a "
-                "later covering deny")
-    for resource in resources:
-        effective = v2_effective_permission(rules, action, resource)
-        if effective != "deny":
-            problems.append(f"{action}:{resource} is {effective!r}, expected 'deny'")
-    return problems
-
-
-def validate_v2_effective_permissions(role, rules):
-    """Validate ordered V2 rules by effective last-match behavior.
-
-    Set membership is insufficient: a later ``allow`` can defeat an intended
-    ``deny``. This checks sensitive actions and concrete resource patterns,
-    plus broad/narrow overlap. It validates application permissions only; it
-    makes no claim about OS-level isolation.
-    """
-    if not _v2_rules_valid(rules):
-        raise ValueError(f"{role} V2 profile has invalid ordered permissions")
-    problems = []
-    intended = opencode_profile(role, "v2")["permissions"]
-    actions = sorted({rule["action"] for rule in rules if rule["action"] != "*"} |
-                     {rule["action"] for rule in intended if rule["action"] != "*"})
-    # Any observed allow/ask that is not fully covered by a later deny must not
-    # land on a capability the intended profile denies. This catches later
-    # allows for action names the validator does not enumerate (write, patch,
-    # legacy task/bash names, future tool actions) and narrow pattern escapes.
     for index, rule in enumerate(rules):
         if rule["effect"] == "deny":
             continue
-        candidates = actions if rule["action"] == "*" else [rule["action"]]
-        for action in candidates:
-            if _v2_later_deny_covers(rules, index, action):
+        for action, deny_pattern, exceptions in mandatory:
+            if not _v2_actions_overlap(rule["action"], action):
                 continue
-            probe = (rule["resource"] if rule["resource"] != "*"
-                     else V2_PERMISSION_PROBE)
-            if v2_effective_permission(intended, action, probe) == "deny":
+            if not _v2_glob_overlap(rule["resource"], deny_pattern):
+                continue
+            if any(_v2_glob_covers(exception, rule["resource"])
+                   for exception in exceptions):
+                continue
+            covered = False
+            for later in rules[index + 1:]:
+                if later["effect"] != "deny":
+                    continue
+                if not _v2_action_covers(later["action"], action):
+                    continue
+                if (_v2_glob_covers(later["resource"], rule["resource"])
+                        or _v2_glob_covers(later["resource"], deny_pattern)):
+                    covered = True
+                    break
+            if not covered:
                 problems.append(
-                    f"observed {action}:{rule['resource']}={rule['effect']} "
-                    "defeats an intended deny")
-                break
-    # Every deny the intended profile relies on must still be effective.
-    for wanted in intended:
-        if wanted["effect"] != "deny":
+                    f"{rule['action']}:{rule['resource']}={rule['effect']} "
+                    f"may overlap mandatory deny {action}:{deny_pattern}")
+    return problems
+
+
+def _v2_structure_problems(role, rules):
+    """Require the intended sequence with only known-safe additions."""
+    intended = opencode_profile(role, "v2")["permissions"]
+    expected = [_v2_rule_key(rule) for rule in intended]
+    width = len(expected)
+    for start in range(len(rules) - width + 1):
+        if [_v2_rule_key(rule) for rule in rules[start:start + width]] != expected:
             continue
-        smart_action, pattern = wanted["action"], wanted["resource"]
-        probe = V2_PERMISSION_PROBE if pattern == "*" else pattern
-        action_names = actions if smart_action == "*" else [smart_action]
-        for action in action_names:
-            if v2_effective_permission(intended, action, probe) != "deny":
-                continue
-            if v2_effective_permission(rules, action, probe) != "deny":
-                problems.append(
-                    f"intended deny {action}:{pattern} is not effective in the "
-                    "observed ordered rules")
+        prefix, suffix = rules[:start], rules[start + width:]
+        if not all(_v2_rule_key(rule) in V2_BASELINE_PERMISSION_RULES
+                   or rule["effect"] == "deny" for rule in prefix):
+            continue
+        if not all(rule["effect"] == "deny" for rule in suffix):
+            continue
+        return []
+    return [
+        "ordered permissions are not the intended role profile, preceded only "
+        "by known baseline rules and followed only by deny rules"]
+
+
+def validate_v2_effective_permissions(role, rules):
+    """Validate the ordered V2 rules the installed CLI actually applies.
+
+    Two independent gates are required because a glob string cannot be tested
+    against a finite list of examples:
+
+    1. Structural gate: the sequence must contain the generated role profile,
+       optionally preceded by the exact global defaults V2.2.x prepends, and
+       followed only by deny-only hardening. No unexpected later allow or ask
+       can survive, whether or not its glob looks disjoint.
+    2. Semantic gate: every allow/ask whose winning region may overlap an
+       explicit mandatory deny must be neutralised by a later deny. Overlap is
+       decided by a product walk over the patterns, never by sample filenames.
+
+    Uncertain input fails closed. This validates application permissions only;
+    it makes no claim about OS-level isolation.
+    """
+    if not _v2_rules_valid(rules):
+        raise ValueError(f"{role} V2 profile has invalid ordered permissions")
+    intended = opencode_profile(role, "v2")["permissions"]
+    problems = []
+    for rule in rules:
+        if rule["action"] not in V2_KNOWN_ACTIONS:
+            problems.append(f"unrecognized action {rule['action']!r}")
+    problems.extend(_v2_structure_problems(role, rules))
+    problems.extend(_v2_overlap_problems(rules, _v2_mandatory_denies(intended)))
     if role == "implementer":
         for action in ("subagent", "external_directory", "webfetch", "websearch",
                        "question"):
-            problems.extend(_v2_require_denied(rules, action, ()))
+            effective = v2_effective_permission(rules, action, V2_PERMISSION_PROBE)
+            if effective != "deny":
+                problems.append(f"{action}:* is {effective!r}, expected 'deny'")
         if v2_effective_permission(rules, "shell", "pytest -q") != "allow":
             problems.append("shell:pytest -q is not allowed")
         if v2_effective_permission(rules, "shell", "git status --porcelain") != "allow":
@@ -2932,7 +3036,9 @@ def validate_v2_effective_permissions(role, rules):
     else:
         for action in ("edit", "shell", "subagent", "external_directory",
                        "webfetch", "websearch", "question"):
-            problems.extend(_v2_require_denied(rules, action, ()))
+            effective = v2_effective_permission(rules, action, V2_PERMISSION_PROBE)
+            if effective != "deny":
+                problems.append(f"{action}:* is {effective!r}, expected 'deny'")
         for action in ("read", "glob", "grep"):
             if v2_effective_permission(rules, action, "src/app.py") != "allow":
                 problems.append(f"{action}:src/app.py is not allowed")
@@ -5271,11 +5377,19 @@ def probe_opencode_config(project, role, dialect):
             if response.returncode:
                 return None
             agents = json.loads(response.stdout)
-            agent = next((item for item in agents
-                          if item.get("id") == f"abdullah-{role}"), None)
-            if agent is None or agent.get("mode") != "primary":
+            if not isinstance(agents, list) or not all(
+                    isinstance(item, dict) for item in agents):
                 return False
-            if not isinstance(agent.get("system"), str) or not agent["system"].strip():
+            matches = [item for item in agents
+                       if item.get("id") == f"abdullah-{role}"]
+            # Duplicate agent ids make the effective profile ambiguous.
+            if len(matches) != 1:
+                return False
+            agent = matches[0]
+            expected = opencode_profile(role, "v2")
+            if (agent.get("mode") != "primary"
+                    or agent.get("system") != expected["system"]
+                    or agent.get("description") != expected["description"]):
                 return False
             # Evaluate the ordered rules exactly as the CLI returns them. A
             # later allow can override an earlier deny, so membership alone
@@ -5303,7 +5417,8 @@ def probe_opencode_config(project, role, dialect):
                 if not matching or matching[-1].get("action") != action:
                     return False
         return True
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError,
+            subprocess.SubprocessError):
         return False
 
 

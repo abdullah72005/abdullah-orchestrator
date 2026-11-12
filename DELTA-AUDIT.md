@@ -65,19 +65,31 @@ created from that exact commit.
   drop requirements, findings, evidence, amendments or source identity.
 
 ### P1-03 — OpenCode V2 effective permissions
-- `validate_v2_effective_permissions()` evaluates the ordered rules returned
-  by the real CLI with last-match precedence and glob overlap. It:
-  - requires every intended deny to remain effective;
-  - rejects any observed `allow`/`ask` that is not covered by a later deny and
-    lands on an intended deny, including unenumerated action names and narrow
-    shell/secret patterns;
-  - checks concrete secret resources and dangerous implementer shell commands;
-  - validates explorer/reviewer read-only capabilities and implementer shell
-    allow/deny behavior.
-- `probe_opencode_config()` uses this evaluator instead of set membership, so
-  a later allowance that defeats a deny is a Doctor failure.
-- Real v2.2.7 introspection passes for all three roles. Application
-  permissions are explicitly **not** claimed as OS-level isolation.
+- `validate_v2_effective_permissions()` validates the actual ordered rules the
+  CLI returns with two independent, fail-closed gates:
+  - **Structural:** the sequence must contain the exact generated role profile,
+    optionally preceded by the known v2.2.7 global defaults, and followed only
+    by deny-only hardening that still preserves every required capability
+    (reading `src/app.py`, `.env.example`, implementer pytest/git-status shell).
+    Any unexpected later `allow`/`ask` is rejected, whether or not its glob
+    looks disjoint. Unrecognized action names fail.
+  - **Semantic:** every `allow`/`ask` whose winning region may overlap an
+    explicit mandatory deny must be neutralised by a later deny. Overlap is
+    decided by a product walk over the glob patterns (including OpenCode's
+    optional trailing-space rewrite), never by a finite list of sample paths.
+- `probe_opencode_config()` uses this evaluator instead of set membership and
+  requires exactly one matching agent whose `mode`, `system` and `description`
+  match the generated role. Missing, malformed, duplicate-id, contradictory or
+  unvalidatable normalized permissions make Doctor fail.
+- A fixture captured from the real v2.2.7 binary keeps all three role profiles
+  accepted, and real Doctor introspection reports `ready: true`. A wrapper that
+  appends `read src/* allow` to the genuine output makes all three CLI profile
+  checks and Doctor's readiness fail. Application permissions are explicitly
+  **not** claimed as OS-level isolation.
+- Scope note: this closes ordering/overlap certification. It does not change
+  tool-level semantics (for example, `grep` asserts its pattern rather than
+  each file it reads) or widen the existing shell deny globs; those are separate
+  policy/tool contracts, not exceptions to this validator.
 
 ### P2-01 — partial token totals
 - `total_status` now distinguishes `reported`, `derived` and `partial` for

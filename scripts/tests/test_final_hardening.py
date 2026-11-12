@@ -367,14 +367,20 @@ class OpenCodeV2(unittest.TestCase):
     def test_v2_doctor_introspection_uses_debug_agents(self):
         role = "explorer"
         rules = [dict(rule) for rule in orc.opencode_profile(role, "v2")["permissions"]]
-        payload = json.dumps([{"id": f"abdullah-{role}", "mode": "primary",
-                               "system": "policy", "permissions": rules}])
+        payload = json.dumps([{
+            "id": f"abdullah-{role}", "mode": "primary",
+            "system": orc.role_text(role),
+            "description": orc.opencode_profile(role, "v2")["description"],
+            "permissions": rules}])
         reply = subprocess.CompletedProcess([], 0, stdout=payload)
         with patch.object(orc.subprocess, "run", return_value=reply) as run:
             self.assertIs(orc.probe_opencode_config(Path("/tmp"), role, "v2"), True)
         self.assertEqual(run.call_args[0][0][:3], ["opencode", "debug", "agents"])
-        broken = json.dumps([{"id": f"abdullah-{role}", "mode": "primary",
-                              "system": "policy", "permissions": []}])
+        broken = json.dumps([{
+            "id": f"abdullah-{role}", "mode": "primary",
+            "system": orc.role_text(role),
+            "description": orc.opencode_profile(role, "v2")["description"],
+            "permissions": []}])
         with patch.object(orc.subprocess, "run",
                           return_value=subprocess.CompletedProcess([], 0, stdout=broken)):
             self.assertIs(orc.probe_opencode_config(Path("/tmp"), role, "v2"), False)

@@ -520,8 +520,11 @@ class EffectivePermissionTests(unittest.TestCase):
         role = "explorer"
         rules = copy.deepcopy(orc.opencode_profile(role, "v2")["permissions"])
         rules.append({"action": "*", "resource": "*", "effect": "allow"})
-        payload = json.dumps([{"id": f"abdullah-{role}", "mode": "primary",
-                               "system": "policy", "permissions": rules}])
+        payload = json.dumps([{
+            "id": f"abdullah-{role}", "mode": "primary",
+            "system": orc.role_text(role),
+            "description": orc.opencode_profile(role, "v2")["description"],
+            "permissions": rules}])
         with patch.object(orc.subprocess, "run",
                           return_value=subprocess.CompletedProcess([], 0, stdout=payload)):
             self.assertIs(orc.probe_opencode_config(Path("/tmp"), role, "v2"), False)
@@ -532,8 +535,11 @@ class EffectivePermissionTests(unittest.TestCase):
         # The real CLI prepends global defaults before the agent rules.
         rules = [{"action": "*", "resource": "*", "effect": "allow"},
                  {"action": "read", "resource": "*.env", "effect": "ask"}] + rules
-        payload = json.dumps([{"id": f"abdullah-{role}", "mode": "primary",
-                               "system": "policy", "permissions": rules}])
+        payload = json.dumps([{
+            "id": f"abdullah-{role}", "mode": "primary",
+            "system": orc.role_text(role),
+            "description": orc.opencode_profile(role, "v2")["description"],
+            "permissions": rules}])
         with patch.object(orc.subprocess, "run",
                           return_value=subprocess.CompletedProcess([], 0, stdout=payload)):
             self.assertIs(orc.probe_opencode_config(Path("/tmp"), role, "v2"), True)
