@@ -274,9 +274,20 @@ def inspect_execution(job, *, run_id=None, include_run=False):
     descendants = _live_extra(descendant_pids)
     launch_references = _processes_referencing_launch(launch_file)
     run_survivors = _processes_for_run(run_id) if include_run else []
+    launch_child = []
+    if isinstance(launch, dict):
+        child = launch.get("child_identity")
+        if not isinstance(child, dict) and launch.get("child_pid"):
+            child = {"pid": launch.get("child_pid")}
+        if isinstance(child, dict) and child.get("pid"):
+            stat = process_stat(child["pid"])
+            if stat and stat["state"] not in {"Z", "X", "x"}:
+                if child.get("pid_start") is None or stat["starttime"] == child["pid_start"]:
+                    launch_child.append(stat)
     live_members = liveness.get("processes", [])
     survivors = _merge_process_stats(live_members, markers, token_survivors, escaped,
-                                     descendants, launch_references, run_survivors)
+                                     descendants, launch_references, run_survivors,
+                                     launch_child)
     unproven = liveness.get("alive") is None
     stopped = liveness.get("alive") is False and not survivors
     reasons = []
@@ -294,7 +305,7 @@ def inspect_execution(job, *, run_id=None, include_run=False):
             "markers": markers, "token_survivors": token_survivors,
             "escaped": escaped, "descendants": descendants,
             "launch_references": launch_references, "run_survivors": run_survivors,
-            "survivors": survivors, "unproven": bool(unproven),
+            "launch_child": launch_child, "survivors": survivors, "unproven": bool(unproven),
             "reasons": reasons}
 
 
@@ -407,9 +418,9 @@ def _conflict_resolution(owner_id=None, run_id=None, kind="conflict"):
             "python3 <SKILL_DIR>/scripts/orchestrator.py checkout-recover <project> "
             "--owner <owner-run> --reason '<reason>' --acknowledge '<scope>'")
         return " ".join(commands)
-    if kind == "inconsistent":
+    if kind in {"inconsistent", "containment"}:
         commands.append(
-            "Inspect the live owner and state before any recovery; do not delete the registry.")
+            "Inspect the owner run and marked processes before any recovery; do not delete the registry.")
         return " ".join(commands)
     if owner_id:
         commands.append(
@@ -433,10 +444,15 @@ def find_checkout_conflicts(identity, *, exclude_run=None):
         state = _safe_read(child / "state.json")
         if not isinstance(state, dict):
             continue
+        project = state.get("project")
         if (state.get("status") in FINAL_STATES and not state.get("active_job")
                 and not state.get("active_check")):
+            if _state_containment_survivors(state, state.get("id") or child.name):
+                conflicts.append({"run_id": state.get("id") or child.name,
+                                  "status": "final_containment",
+                                  "phase": state.get("phase"),
+                                  "project": str(project)})
             continue
-        project = state.get("project")
         if not project:
             continue
         try:
@@ -464,6 +480,8 @@ def _owner_block(owner_id, record):
     if (owner_state.get("status") not in FINAL_STATES
             or owner_state.get("active_job") or owner_state.get("active_check")):
         return "active", owner_state
+    if _state_containment_survivors(owner_state, owner_id):
+        return "containment", owner_state
     return "final", owner_state
 
 
@@ -474,11 +492,13 @@ def acquire_checkout_lease(project: Path, run_id, lease_id=None):
     # Refuse obvious legacy conflicts before creating any registry artifact.
     pre = find_checkout_conflicts(identity, exclude_run=run_id)
     if pre:
+        kind = "containment" if any(item.get("status") == "final_containment"
+                                    for item in pre) else "conflict"
         raise CheckoutOwnedError(
-            "Checkout is already used by another non-final run: " +
+            "Checkout is already used by another non-final run or contains marked survivors: " +
             ", ".join(item["run_id"] for item in pre),
-            conflicts=pre, state="conflict",
-            resolution=_conflict_resolution(pre[0]["run_id"], run_id, "conflict"))
+            conflicts=pre, state=kind,
+            resolution=_conflict_resolution(pre[0]["run_id"], run_id, kind))
     with _lease_lock(identity["key"]):
         path = _lease_path(identity["key"])
         existing = _safe_read(path)
@@ -495,6 +515,12 @@ def acquire_checkout_lease(project: Path, run_id, lease_id=None):
                     owner_state = _run_state(owner_id)
                 if owner_state is not None:
                     status, owner_state = _owner_block(owner_id, existing)
+            if status == "containment":
+                raise CheckoutOwnedError(
+                    f"Final run {owner_id!r} still has marked process survivors; "
+                    "inspect/reconcile them before taking over this checkout",
+                    owner=existing, state="containment",
+                    resolution=_conflict_resolution(owner_id, run_id, "conflict"))
             if status == "initializing":
                 raise CheckoutOwnedError(
                     f"Checkout is initializing for run {owner_id!r}; retry shortly",
@@ -521,11 +547,13 @@ def acquire_checkout_lease(project: Path, run_id, lease_id=None):
             # final owner without active work: replace below.
         conflicts = find_checkout_conflicts(identity, exclude_run=run_id)
         if conflicts:
+            kind = "containment" if any(item.get("status") == "final_containment"
+                                        for item in conflicts) else "conflict"
             raise CheckoutOwnedError(
-                "Checkout is already used by another non-final run: " +
+                "Checkout is already used by another non-final run or contains marked survivors: " +
                 ", ".join(item["run_id"] for item in conflicts),
-                conflicts=conflicts, state="conflict",
-                resolution=_conflict_resolution(conflicts[0]["run_id"], run_id, "conflict"))
+                conflicts=conflicts, state=kind,
+                resolution=_conflict_resolution(conflicts[0]["run_id"], run_id, kind))
         owner_identity = process_identity(os.getpid()) or {}
         record = {"run_id": run_id, "lease_id": lease_id, "project": identity["path"],
                   "checkout_key": identity["key"], "inode": identity["inode"],
@@ -580,11 +608,13 @@ def ensure_checkout_lease(state, *, adopt_legacy=True):
             record = activate_checkout_lease(Path(project), run_id, record.get("lease_id"))
         conflicts = find_checkout_conflicts(identity, exclude_run=run_id)
         if conflicts:
+            kind = "containment" if any(item.get("status") == "final_containment"
+                                        for item in conflicts) else "conflict"
             raise CheckoutOwnedError(
-                "Checkout is already used by another non-final run: " +
+                "Checkout is already used by another non-final run or contains marked survivors: " +
                 ", ".join(item["run_id"] for item in conflicts),
-                conflicts=conflicts, state="conflict",
-                resolution=_conflict_resolution(conflicts[0]["run_id"], run_id, "conflict"))
+                conflicts=conflicts, state=kind,
+                resolution=_conflict_resolution(conflicts[0]["run_id"], run_id, kind))
         return record
     if not adopt_legacy:
         raise CheckoutOwnedError(
@@ -636,7 +666,7 @@ def checkout_conflict(state):
         return None
     if isinstance(record, dict) and record.get("run_id") not in {None, run_id}:
         status, owner_state = _owner_block(record.get("run_id"), record)
-        if status in {"initializing", "orphaned", "active", "inconsistent"}:
+        if status in {"initializing", "orphaned", "active", "inconsistent", "containment"}:
             return {"kind": status, "owner": record, "owner_state": owner_state,
                     "resolution": _conflict_resolution(record.get("run_id"), run_id, status)}
     if conflicts:
@@ -1129,7 +1159,8 @@ def _guard_entry(argv):
     except BaseException as exc:
         publish("failed", error=repr(exc))
         return 2
-    if not publish("running", child_pid=child.pid):
+    child_identity = process_identity(child.pid) or {"pid": child.pid}
+    if not publish("running", child_pid=child.pid, child_identity=child_identity):
         try:
             child.kill()
             child.wait(timeout=5)
@@ -2045,35 +2076,41 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
                             os.killpg(proc.pid, signal.SIGKILL)
                         except OSError:
                             pass
-        escaped = _check_token_processes(token)
-        containment = {"token": token, "escaped_processes": escaped,
-                       "termination": (_terminate_pids(escaped) if escaped else None),
-                       "scope": "guard session + inherited environment token",
-                       "limits": ("Same-user processes that clear ABDULLAH_CHECK_TOKEN, "
-                                  "change user, or are otherwise hidden from /proc are not "
-                                  "detectable here; this is not an OS sandbox.")}
+        inspection = inspect_execution(state["active_check"], run_id=state.get("id"),
+                                        include_run=True)
+        detected = inspection["survivors"]
+        containment_result = _terminate_pids(detected) if detected else None
+        if detected:
+            inspection = inspect_execution(state["active_check"], run_id=state.get("id"),
+                                           include_run=True)
+        remaining = inspection["survivors"]
+        containment = {"token": token, "escaped_processes": detected,
+                       "remaining": remaining,
+                       "termination": containment_result,
+                       "scope": "guard session + inherited environment markers",
+                       "limits": ("Same-user processes that clear all markers, change user, "
+                                  "or are otherwise hidden from /proc are not detectable here; "
+                                  "this is not an OS sandbox.")}
         evidence.setdefault("containment", []).append(containment)
         evidence["commands"].append({"argv": cmd, "returncode": rc, "log": str(logpath),
                                      "source_proof": mounts,
                                      "containment": containment})
         if rc != 0:
             evidence["passed"] = False
-        if escaped:
+        not_contained = bool(detected) or not inspection["stopped"]
+        if not_contained:
             evidence["passed"] = False
             evidence["source_unchanged"] = False
             evidence["error"] = ("Verification left escaped execution; inspect and terminate "
                                  "the recorded PIDs before any acceptance")
-        containment_clean = not escaped or bool(
-            (containment.get("termination") or {}).get("clean"))
-        if escaped and not containment_clean:
             state["active_check"] = {
                 **state["active_check"], "status": "uncertain",
-                "escaped_processes": escaped, "containment": containment,
-                "interrupt_gate": ["escaped verification process(es) still alive"]}
+                "escaped_processes": detected, "containment": containment,
+                "interrupt_gate": inspection["reasons"] or ["escaped verification process(es)"]}
         else:
             state["active_check"] = None
         save(run_dir, state)
-        if escaped:
+        if not_contained:
             break
     after = source_snapshot(project)
     evidence["finished_at"] = now()
@@ -4121,6 +4158,26 @@ def interrupt_run(run_id, reason="User requested interruption"):
         by_target = {item.get("target"): item for item in terminations}
         job = state.get("active_job") if isinstance(state.get("active_job"), dict) and state.get("active_job") else None
         check = state.get("active_check") if isinstance(state.get("active_check"), dict) and state.get("active_check") else None
+        if not job and not check:
+            survivors = _state_containment_survivors(state, run_id)
+            if survivors:
+                state.setdefault("interruptions", []).append({
+                    "at": now(), "reason": reason, "stopped": False,
+                    "termination": [], "survivors": survivors,
+                    "reason_detail": "marked run processes remain without an active record"})
+                state["status"] = "uncertain"
+                state["pause_reason"] = (
+                    "Interruption could not be verified: marked run processes remain "
+                    "without an active execution record")
+                save(folder, state)
+                journal_event(folder, state, "interrupted", reason=reason, stopped=False,
+                              survivors=[item["pid"] for item in survivors])
+                return {"ok": False, "run_id": run_id, "status": "uncertain",
+                        "termination": {"stopped": False,
+                                        "remaining": [item["pid"] for item in survivors],
+                                        "method": "whole_run_marker_scan"},
+                        "next_action": "orchestrator_status",
+                        "message": "Marked run processes remain; reconcile before retrying."}
         job_inspection = inspect_execution(job, run_id=run_id, include_run=True) if job else None
         check_inspection = inspect_execution(check, run_id=run_id, include_run=True) if check else None
         combined = _merge_process_stats((job_inspection or {}).get("survivors"),
@@ -4161,6 +4218,7 @@ def interrupt_run(run_id, reason="User requested interruption"):
                     **job, "status": "uncertain",
                     "interrupt_gate": (job_inspection or {}).get("reasons", []),
                     "escaped_processes": (job_inspection or {}).get("survivors", []),
+                    "descendant_pids": (by_target.get("active_job") or {}).get("descendants", []),
                     "containment": containment}
         if check:
             if check_stopped:
@@ -4178,6 +4236,7 @@ def interrupt_run(run_id, reason="User requested interruption"):
                     **check,
                     "interrupt_gate": (check_inspection or {}).get("reasons", []),
                     "escaped_processes": (check_inspection or {}).get("survivors", []),
+                    "descendant_pids": (by_target.get("active_check") or {}).get("descendants", []),
                     "containment": containment}
         stopped = bool(job_stopped and check_stopped)
         if state.get("interruptions"):
