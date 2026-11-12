@@ -17,6 +17,7 @@ import functools
 import getpass
 import hashlib
 import json
+import numbers
 import os
 from pathlib import Path
 import re
@@ -36,7 +37,28 @@ HERE = Path(__file__).resolve().parent
 SKILL = HERE.parent
 DEFAULT_STATE = Path(os.environ.get("ABDULLAH_STATE_DIR", Path.home() / ".local/state/abdullah-orchestrator/runs"))
 CONFIG_PATH = Path(os.environ.get("ABDULLAH_CONFIG", Path.home() / ".config/abdullah-orchestrator/config.json"))
-RATE_PAT = re.compile(r"rate.limit|too many requests|quota|usage.limit|429|resource.exhausted", re.I)
+RATE_LIMIT_PHRASE_PAT = re.compile(
+    r"\b(?:rate[\s._-]?limit(?:ed|ing)?|too many requests|resource[\s_-]?exhausted|"
+    r"usage[\s_-]?limit|insufficient[\s_-]?quota|"
+    r"(?:quota[^\n]{0,24}(?:exceeded|exhausted))|"
+    r"(?:(?:exceeded|exhausted)[^\n]{0,24}quota))(?![A-Za-z0-9])", re.I)
+# Bare "429" is never enough: it must be attached to an HTTP/status/error
+# marker or to the standard "Too Many Requests" phrase. Hashes, filenames,
+# counters, token counts and session IDs therefore cannot trigger recovery.
+HTTP_429_PAT = re.compile(
+    r"\b(?:http(?:/[0-9.]+)?|status(?:[ _-]?code)?|error(?:[ _-]?code)?|"
+    r"response(?:[ _-]?code)?)\b[\"']?\s*[:=]?\s*(?:http\s*)?429\b"
+    r"|\b429\b\s*(?:too many requests|rate[\s._-]?limit)", re.I)
+RATE_LIMIT_IDENTITY_PAT = re.compile(
+    r"rate[\s._-]?limit|too[\s._-]?many[\s._-]?requests|resource[\s._-]?exhausted",
+    re.I)
+RATE_LIMIT_CODE_TOKENS = {
+    "429", "rate_limit", "rate_limited", "rate_limit_exceeded", "ratelimit",
+    "too_many_requests", "resource_exhausted", "quota_exceeded",
+    "insufficient_quota", "usage_limit_exceeded"}
+RATE_LIMIT_STATUS_KEYS = {
+    "status", "statuscode", "status_code", "httpstatus", "http_status",
+    "code", "errorcode", "error_code", "responsecode", "response_code"}
 REPORT_KEYS = {
     "plan": {"status", "batches", "summary"},
     "implementer": {"status", "summary"},
@@ -64,7 +86,7 @@ STATE_SCHEMA_VERSION = 2
 CONFIG_SCHEMA_VERSION = 2
 SENSITIVE_OPERATOR_COMMANDS = {"adopt", "retire", "checkout-recover",
                                "acknowledge-legacy-evidence", "migrate-run", "cancel"}
-RUNTIME_INPUT_PATTERNS = (
+RUNTIME_INPUT_PATTERNS_CORE = (
     ".env", ".env.*", "*.env", "docker-compose*.yml", "docker-compose*.yaml",
     "compose*.yml", "compose*.yaml", "Dockerfile*", ".dockerignore",
     "requirements*.txt", "poetry.lock", "uv.lock", "Pipfile.lock",
@@ -72,6 +94,31 @@ RUNTIME_INPUT_PATTERNS = (
     "Gemfile.lock", "composer.lock", ".python-version", ".nvmrc", ".tool-versions",
     ".envrc", ".npmrc", "uv.toml", "mise.toml", "docker-bake.hcl",
 )
+# Conservative discovery of likely executable/configuration inputs that
+# verification can import or execute even when Git ignores them. This is
+# deliberately a bounded heuristic, NOT a complete dependency graph.
+RUNTIME_INPUT_PATTERNS_HEURISTIC = (
+    "*.py", "*.sh", "*.bash", "*.zsh", "*.ksh", "*.fish", "*.js", "*.mjs",
+    "*.cjs", "*.ts", "*.rb", "*.pl", "*.php", "*.ps1", "*.bat", "*.cmd",
+    "*.toml", "*.ini", "*.cfg", "*.conf", "*.json", "*.yaml", "*.yml", "*.mk",
+    "Makefile", "makefile", "GNUmakefile", "justfile", "Justfile", "Taskfile*",
+)
+RUNTIME_INPUT_PATTERNS = RUNTIME_INPUT_PATTERNS_CORE + RUNTIME_INPUT_PATTERNS_HEURISTIC
+RUNTIME_DECLARATION = Path(".abdullah") / "runtime-inputs.json"
+COMMAND_POLICY_DEFAULTS = {
+    "reject_shell_wrappers": True,
+    "reject_interpreter_strings": True,
+    "reject_indirect_docker": True,
+    "reject_arbitrary_scripts": True,
+}
+TRIVIAL_CHECK_EXECUTABLES = {"true", "false", ":", "echo", "printf", "cat"}
+# Supported OpenCode release lines. Bounds are half-open: [min, max).
+OPENCODE_VERSION_RANGES = (("1.18", "2.0"), ("2.2", "3.0"))
+ESSENTIAL_CONTEXT_KEYS = frozenset({
+    "goal", "invariants", "acceptance", "acceptance_criteria", "authorized_scope",
+    "scope", "task", "requirements", "batch", "checks", "file_references",
+    "references", "project", "contract_version", "amendment", "risk",
+})
 RUNTIME_SKIP_PARTS = {".git", "node_modules", ".venv", "venv", "__pycache__",
                       ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
                       "dist", "build", ".next", "target", "coverage", ".cache"}
@@ -852,6 +899,39 @@ def _operator_action_allowed(action):
     return True
 
 
+HUMAN_ONLY_ACTIONS = {"approve-plan", "approve-fallback"}
+
+
+def require_human_operator(action, run_id, confirmation=None):
+    """Require an interactive operator terminal for a human-only action.
+
+    This is an operator-controlled boundary, not cryptographic proof. A model
+    running non-interactively has no TTY and cannot supply the exact typed
+    confirmation. A same-user process that allocates a TTY and types the token
+    can still pass it; document that limit instead of overclaiming.
+    """
+    if action not in HUMAN_ONLY_ACTIONS:
+        raise RuntimeError(f"{action} is not a human-only action")
+    agent_markers = ("ABDULLAH_JOB_ID", "ABDULLAH_RUN_ID", "ABDULLAH_CHECK_TOKEN",
+                     "ABDULLAH_PARENT_JOB", "ABDULLAH_AGENT_CONTEXT")
+    if any(os.environ.get(marker) for marker in agent_markers):
+        raise RuntimeError(
+            f"{action} is refused from a model-owned worker context; "
+            "the user must run it in their own interactive terminal.")
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            f"{action} requires an interactive operator terminal (no TTY detected). "
+            "MCP tools and non-interactive model shells cannot approve it.")
+    expected = f"{action}:{run_id}"
+    if confirmation != expected:
+        raise RuntimeError(
+            f"Confirmation mismatch. Re-run with --confirm {expected!r} from an "
+            "interactive terminal after reviewing the run.")
+    return {"actor": _operator_actor(), "method": "interactive-tty-confirmation",
+            "action": action, "run_id": run_id, "at": now(),
+            "confirmation_sha256": hashlib.sha256(expected.encode()).hexdigest()}
+
+
 def state_compatibility(state):
     """Read-only compatibility classification; never mutates a run."""
     current = STATE_SCHEMA_VERSION
@@ -1482,13 +1562,57 @@ def _sha256_file(path: Path):
 
 
 def runtime_input_manifest(project: Path, cfg=None):
-    """Bounded manifest of ignored/runtime inputs that can change verification."""
+    """Bounded manifest of ignored/runtime inputs that can change verification.
+
+    ``complete`` means every candidate matched by the configured patterns or an
+    explicit project declaration was hashed, none was truncated/unreadable/
+    outside the project, and every declared ``required`` input was found. It is
+    NOT proof that the discovered set is the complete runtime dependency graph:
+    discovery is a conservative heuristic plus explicit declarations.
+    """
     cfg = cfg or config()
-    settings = cfg.get("verification", {}).get("runtime_inputs", {})
-    patterns = settings.get("patterns", RUNTIME_INPUT_PATTERNS)
-    max_files = int(settings.get("max_files", 500))
-    max_bytes = int(settings.get("max_total_bytes", 20 * 1024 * 1024))
+    settings = cfg.get("verification", {}).get("runtime_inputs", {}) or {}
+    heuristic = settings.get("heuristic", True)
+    if not isinstance(heuristic, bool):
+        raise ValueError("verification.runtime_inputs.heuristic must be boolean")
+    configured = list(settings.get("patterns") or [])
+    patterns = list(dict.fromkeys(
+        (configured or list(RUNTIME_INPUT_PATTERNS_CORE))
+        + (list(RUNTIME_INPUT_PATTERNS_HEURISTIC) if heuristic else [])))
+    declared = [str(item) for item in (settings.get("declared") or [])]
+    required = [str(item) for item in (settings.get("required") or [])]
+    operator_excludes = [str(item) for item in (settings.get("exclude") or [])]
+    project_excludes = []
     project = Path(project)
+    declaration_path = project / RUNTIME_DECLARATION
+    declaration_error = None
+    if declaration_path.is_file():
+        try:
+            declaration = read_json(declaration_path)
+        except (OSError, ValueError) as exc:
+            declaration, declaration_error = None, f"invalid declaration: {exc}"
+        if declaration is not None:
+            if not isinstance(declaration, dict):
+                declaration, declaration_error = None, "declaration must be a JSON object"
+            else:
+                for key in ("include", "required", "exclude"):
+                    value = declaration.get(key, [])
+                    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                        declaration, declaration_error = None, f"declaration {key} must be a string list"
+                        break
+                if declaration is not None:
+                    patterns += declaration.get("include", [])
+                    declared += declaration.get("include", [])
+                    required += declaration.get("required", [])
+                    project_excludes = declaration.get("exclude", [])
+    excludes = operator_excludes + project_excludes
+    max_files = int(settings.get("max_files", 2000))
+    max_bytes = int(settings.get("max_total_bytes", 20 * 1024 * 1024))
+
+    def matches(name, text, candidates):
+        return any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(text, pattern)
+                   for pattern in candidates)
+
     paths = {}
     project_resolved = project.resolve()
     for root, dirs, names in os.walk(project):
@@ -1501,11 +1625,16 @@ def runtime_input_manifest(project: Path, cfg=None):
             except ValueError:
                 continue
             text = relative.as_posix()
-            if not any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(text, pattern)
-                       for pattern in patterns):
+            if excludes and matches(name, text, excludes):
+                continue
+            if not (matches(name, text, patterns) or matches(name, text, declared)
+                    or matches(name, text, required)):
                 continue
             if path.is_file() or path.is_symlink():
                 paths[str(relative)] = path
+    missing_required = [pattern for pattern in required
+                        if not any(matches(Path(name).name, name, [pattern])
+                                   for name in paths)]
     ordered = sorted(paths)
     truncated = len(ordered) > max_files
     if truncated:
@@ -1545,11 +1674,22 @@ def runtime_input_manifest(project: Path, cfg=None):
         except OSError:
             files[relative] = "unreadable"
             complete = False
+    if declaration_error or missing_required or project_excludes:
+        complete = False
     return {"version": SOURCE_PROVENANCE_VERSION, "patterns": list(patterns),
+            "declared": declared, "required": required,
+            "declaration": str(RUNTIME_DECLARATION),
+            "declaration_error": declaration_error,
+            "project_excludes": project_excludes,
+            "missing_required": missing_required,
             "files": files, "file_count": len(files), "total_bytes": total_bytes,
             "max_files": max_files, "max_total_bytes": max_bytes,
             "truncated": bool(truncated),
-            "complete": bool(complete and not truncated)}
+            "complete": bool(complete and not truncated),
+            "complete_meaning": (
+                "All configured/declared candidates were hashed with no truncation or "
+                "unreadable input and every required input was found. This is not proof "
+                "of a complete runtime dependency graph.")}
 
 
 def environment_provenance(cfg=None):
@@ -1600,15 +1740,68 @@ def configuration_provenance():
             "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def verification_command_policy(cmd, cfg=None):
-    """Classify wrapper/interpreter/indirect execution as an explicit decision."""
+def _command_policy_settings(cfg):
+    """Merge the secure defaults with explicit config and validate exceptions.
+
+    Disabling a rejection is only accepted with a written acknowledgement so a
+    dangerous policy can never be enabled silently. Exceptions must be scoped,
+    justified and attributed to an operator.
+    """
+    raw = (cfg.get("verification", {}) or {}).get("command_policy", {}) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("verification.command_policy must be an object")
+    settings = dict(COMMAND_POLICY_DEFAULTS)
+    for key in COMMAND_POLICY_DEFAULTS:
+        if key in raw:
+            if not isinstance(raw[key], bool):
+                raise ValueError(f"verification.command_policy.{key} must be boolean")
+            settings[key] = raw[key]
+    disabled = sorted(key for key, value in settings.items() if not value)
+    acknowledged = raw.get("unsafe_acknowledged")
+    if disabled and acknowledged != "I accept unclassified verification commands":
+        raise ValueError(
+            "Refusing to disable verification command protection ("
+            + ", ".join(disabled)
+            + "). Set command_policy.unsafe_acknowledged to the documented "
+            "acknowledgement string if you really accept unclassified commands.")
+    exceptions = raw.get("exceptions", [])
+    if not isinstance(exceptions, list):
+        raise ValueError("verification.command_policy.exceptions must be a list")
+    validated = []
+    for item in exceptions:
+        if not isinstance(item, dict):
+            raise ValueError("Each command-policy exception must be an object")
+        missing = [key for key in ("argv_regex", "reason", "scope", "authorized_by")
+                   if not isinstance(item.get(key), str) or not item[key].strip()]
+        if missing:
+            raise ValueError(f"Command-policy exception is missing {missing}")
+        actor = item["authorized_by"].strip().lower()
+        if actor in {"model", "architect", "coordinator", "orchestrator", "agent"}:
+            raise ValueError("A model or coordinator cannot authorize a command exception")
+        try:
+            re.compile(item["argv_regex"])
+        except re.error as exc:
+            raise ValueError(f"Invalid command-policy exception regex: {exc}")
+        validated.append({**item, "authorized_by": item["authorized_by"].strip(),
+                          "scope": item["scope"].strip(), "reason": item["reason"].strip()})
+    return settings, validated
+
+
+def verification_command_policy(cmd, cfg=None, project=None):
+    """Classify wrapper/interpreter/indirect execution as an explicit decision.
+
+    Filtering argv is NOT filesystem, network or credential isolation. It only
+    prevents the supervisor from executing known-obfuscated forms by default.
+    """
     cfg = cfg or config()
-    settings = cfg.get("verification", {}).get("command_policy", {})
+    settings, exceptions = _command_policy_settings(cfg)
     argv = [str(item) for item in cmd]
     basenames = [Path(item).name for item in argv]
     direct_docker = len(basenames) >= 2 and basenames[0] == "docker" and basenames[1] == "compose"
     indirect_docker = ("docker" in basenames or "docker-compose" in basenames) and not direct_docker
     shell_names = {"sh", "bash", "zsh", "dash", "cmd", "powershell", "pwsh"}
+    wrapper_names = {"env", "sudo", "command", "nohup", "timeout", "nice",
+                     "ionice", "stdbuf", "setsid", "xargs"}
     interpreter_names = {"python", "python2", "python3", "node", "nodejs", "ruby",
                          "perl", "php", "pypy", "pypy3"}
     interpreter_flags = {"python": {"c"}, "python2": {"c"}, "python3": {"c"},
@@ -1646,15 +1839,43 @@ def verification_command_policy(cmd, cfg=None):
     interpreter_string = False
     arbitrary_script = False
     env_wrapper = False
+    malformed = any(not token or "\x00" in token for token in argv)
     executable_index = 0
-    if basenames and basenames[0] in {"env", "sudo", "command"}:
+    if basenames and basenames[0] in wrapper_names:
         env_wrapper = True
         while executable_index < len(argv) and (
-                basenames[executable_index] in {"env", "sudo", "command"}
+                basenames[executable_index] in wrapper_names
                 or "=" in argv[executable_index]
                 or argv[executable_index].startswith("-")):
             executable_index += 1
+    if executable_index < len(argv):
+        invoked = argv[executable_index]
+        resolved = shutil.which(invoked)
+        if resolved:
+            resolved_name = Path(os.path.realpath(resolved)).name
+            invoked_name = basenames[executable_index]
+            # Only flag a hidden interpreter/shell; a normal versioned symlink
+            # such as python3 -> python3.10 is already recognized above.
+            if resolved_name in shell_names and invoked_name not in shell_names:
+                shell_wrapper = True
+            if (is_interpreter(resolved_name) and not is_interpreter(invoked_name)
+                    and invoked_name not in shell_names):
+                interpreter_string = True
+        if project is not None and ("/" in invoked or "\\" in invoked):
+            candidate = Path(invoked)
+            if not candidate.is_absolute():
+                candidate = Path(project) / candidate
+            try:
+                if candidate.resolve().is_relative_to(Path(project).resolve()):
+                    # A project-local executable is an arbitrary script even
+                    # when it has no extension or a non-listed suffix.
+                    arbitrary_script = True
+            except (OSError, ValueError):
+                arbitrary_script = True
     for index, name in enumerate(basenames):
+        if name in wrapper_names:
+            env_wrapper = True
+            continue
         if name in shell_names:
             options, next_index = option_scan(index + 1)
             if short_flag(options, "c") or any(
@@ -1674,19 +1895,48 @@ def verification_command_policy(cmd, cfg=None):
             if (next_index < len(argv) and not argv[next_index].startswith("-")
                     and "-m" not in options):
                 arbitrary_script = True
-        elif name.startswith(".") or Path(name).suffix in {".sh", ".bash", ".py", ".js", ".rb", ".pl", ".php"}:
+        elif name.startswith(".") or Path(name).suffix.lower() in {
+                ".sh", ".bash", ".zsh", ".ksh", ".fish", ".py", ".js", ".mjs",
+                ".cjs", ".ts", ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd"}:
             arbitrary_script = True
-    rejected = ((settings.get("reject_shell_wrappers") and shell_wrapper)
+    rejected = ((settings.get("reject_shell_wrappers") and (shell_wrapper or env_wrapper))
                 or (settings.get("reject_interpreter_strings") and interpreter_string)
                 or (settings.get("reject_indirect_docker") and indirect_docker)
-                or (settings.get("reject_arbitrary_scripts") and arbitrary_script))
+                or (settings.get("reject_arbitrary_scripts") and arbitrary_script)
+                or malformed)
+    matched_exception = None
+    if rejected:
+        encoded = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
+        for item in exceptions:
+            scope = item["scope"]
+            if scope != "*" and project is not None:
+                try:
+                    if not Path(project).resolve().is_relative_to(
+                            Path(scope).expanduser().resolve()):
+                        continue
+                except (OSError, ValueError):
+                    continue
+            if re.fullmatch(item["argv_regex"], encoded, re.S):
+                matched_exception = item
+                break
+    allowed = (not rejected) or matched_exception is not None
     return {"version": 2, "argv": argv, "direct_docker": direct_docker,
             "indirect_docker": bool(indirect_docker), "shell_wrapper": bool(shell_wrapper),
             "interpreter_string": bool(interpreter_string),
             "arbitrary_script": bool(arbitrary_script), "env_wrapper": bool(env_wrapper),
-            "allowed": not rejected,
-            "policy": "explicit" if (shell_wrapper or interpreter_string or indirect_docker
-                                      or arbitrary_script or env_wrapper) else "direct"}
+            "malformed": bool(malformed),
+            "rejected_reasons": [name for name, active in (
+                ("shell_wrapper", settings.get("reject_shell_wrappers") and shell_wrapper),
+                ("wrapper", settings.get("reject_shell_wrappers") and env_wrapper),
+                ("interpreter_string", settings.get("reject_interpreter_strings") and interpreter_string),
+                ("indirect_docker", settings.get("reject_indirect_docker") and indirect_docker),
+                ("arbitrary_script", settings.get("reject_arbitrary_scripts") and arbitrary_script),
+                ("malformed", malformed)) if active],
+            "exception": matched_exception,
+            "allowed": allowed,
+            "policy": ("exception" if matched_exception else
+                       "explicit" if (shell_wrapper or interpreter_string or indirect_docker
+                                      or arbitrary_script or env_wrapper) else "direct")}
 
 
 def source_snapshot(project: Path, include_generated=False, cfg=None, provenance=True):
@@ -1767,6 +2017,29 @@ def signature(snapshot):
     if runtime and not runtime.get("complete", True):
         core["runtime_incomplete"] = True
     return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
+
+
+def provenance_drift(recorded, current):
+    """Return the dimensions whose recorded provenance differs from current.
+
+    Comparison is against freshly observed values, not merely recorded metadata.
+    """
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return ["provenance"]
+    current_runtime = current.get("runtime_inputs") or {}
+    recorded_runtime = recorded.get("runtime_inputs") or {}
+    diffs = []
+    if recorded.get("environment") != current.get("environment"):
+        diffs.append("environment")
+    if recorded.get("configuration") != current.get("configuration"):
+        diffs.append("configuration")
+    if recorded.get("toolchain") != current.get("toolchain"):
+        diffs.append("toolchain")
+    if recorded_runtime.get("files") != current_runtime.get("files"):
+        diffs.append("runtime_inputs")
+    if recorded_runtime.get("complete") != current_runtime.get("complete"):
+        diffs.append("runtime_inputs_complete")
+    return diffs
 
 
 def copy_evidence(value):
@@ -1855,8 +2128,11 @@ def validate_report(kind, result):
                     raise ValueError("Batch must be an object")
                 if not all(key in item for key in ("title", "goal", "acceptance", "checks", "risk")):
                     raise ValueError("Batch missing required fields")
-                if contract_version >= 2 and (not isinstance(item.get("acceptance"), list)
-                                              or not item["acceptance"]):
+                if contract_version >= 2 and (
+                        not isinstance(item.get("acceptance"), list)
+                        or not item["acceptance"]
+                        or not all(isinstance(v, str) and v.strip()
+                                   for v in item["acceptance"])):
                     raise ValueError("Contract v2 batch requires nonempty acceptance criteria")
                 if item.get("risk") not in RISK_POLICY_DEFAULTS:
                     raise ValueError("Batch risk must be mechanical, ordinary or high")
@@ -1864,6 +2140,30 @@ def validate_report(kind, result):
                     isinstance(c, list) and c and all(isinstance(token, str) for token in c) for c in item["checks"]
                 ):
                     raise ValueError("Batch checks must be nonempty argv lists")
+                normalized = []
+                for check in item["checks"]:
+                    tokens = [token for token in check]
+                    if (not tokens or not tokens[0].strip()
+                            or any(not token.strip() or "\x00" in token
+                                   for token in tokens)):
+                        raise ValueError("Batch check contains a malformed argv token")
+                    normalized.append(tuple(tokens))
+                if contract_version >= 2 and item["risk"] == "high":
+                    if (not isinstance(item.get("verification_purpose"), str)
+                            or not item["verification_purpose"].strip()):
+                        raise ValueError(
+                            "High-risk batches require a documented verification_purpose")
+                    trivial = [check for check in normalized
+                               if Path(check[0]).name in TRIVIAL_CHECK_EXECUTABLES]
+                    if trivial:
+                        raise ValueError(
+                            f"High-risk batch contains trivial checks {trivial!r} that "
+                            "cannot verify acceptance")
+                    if len(set(normalized)) < RISK_POLICY_DEFAULTS["high"]["minimum_checks"]:
+                        raise ValueError(
+                            "High-risk batches require at least "
+                            f"{RISK_POLICY_DEFAULTS['high']['minimum_checks']} distinct "
+                            "verification checks; duplicates do not count")
     elif kind in {"implementer", "explorer", "reviewer"}:
         if kind == "reviewer" and (not isinstance(result.get("summary"), str) or not result["summary"].strip()):
             raise ValueError("Reviewer summary must be nonempty")
@@ -1932,33 +2232,63 @@ def role_text(role):
     return selected + "\n\n" + contract
 
 
+def _context_reference(value):
+    """Validated concise reference for a non-essential, oversized field."""
+    try:
+        raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        raw = repr(value)
+    return {"omitted": True, "type": type(value).__name__,
+            "chars": len(raw), "canonical": "json-sorted",
+            "sha256": hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest(),
+            "note": ("Omitted to meet the handoff budget. This is not context-window "
+                     "compaction; read the referenced source directly if it is needed.")}
+
+
 def _bounded_context(context, limit):
-    """Serialize context to valid JSON within a character budget."""
-    def serialized(value):
-        return json.dumps(value, ensure_ascii=False, indent=2)
+    """Serialize context to valid JSON within a character budget.
+
+    Essential requirement/scope fields are never silently dropped. Oversized
+    non-essential fields become validated references. If the essential brief
+    cannot fit, fail clearly so the caller can produce a corrected handoff.
+    """
+    if not isinstance(context, dict):
+        context = {"task": context}
+    serialized = lambda value: json.dumps(value, ensure_ascii=False, indent=2, default=str)
     raw = serialized(context)
     if len(raw) <= limit:
         return raw
-    compact = {}
-    for key, value in context.items():
-        if isinstance(value, str):
-            compact[key] = value[:2000]
-        elif isinstance(value, list):
-            compact[key] = value[:10]
-        elif isinstance(value, dict):
-            compact[key] = {k: v[:1000] if isinstance(v, str) else v
-                            for k, v in list(value.items())[:20]}
-        else:
-            compact[key] = value
-    compact["_supervisor_context_truncated"] = True
-    compact["_note"] = ("Context reduced to the configured handoff budget; "
-                        "inspect referenced files directly if needed.")
+    essential = {key: value for key, value in context.items()
+                 if key in ESSENTIAL_CONTEXT_KEYS}
+    optional = {key: value for key, value in context.items()
+                if key not in ESSENTIAL_CONTEXT_KEYS}
+    compact = dict(essential)
+    compact.update({key: _context_reference(value) for key, value in optional.items()})
+    compact["_context_budget"] = {
+        "limit": limit, "original_chars": len(raw), "truncated": True,
+        "essential_keys_preserved": sorted(essential),
+        "referenced_keys": sorted(optional),
+        "note": ("Oversized non-essential fields were replaced with validated "
+                 "references. Essential requirements, invariants, acceptance "
+                 "criteria and scope were preserved verbatim."),
+    }
     raw = serialized(compact)
     if len(raw) <= limit:
         return raw
-    return serialized({"truncated": True,
-                       "note": "Context omitted because it exceeded the handoff budget.",
-                       "top_level_keys": list(context)[:20]})
+    minimal = dict(essential)
+    minimal["_context_budget"] = {
+        "limit": limit, "original_chars": len(raw), "truncated": True,
+        "essential_keys_preserved": sorted(essential), "referenced_keys": [],
+        "note": "Only essential fields fit the handoff budget.",
+    }
+    raw = serialized(minimal)
+    if len(raw) <= limit:
+        return raw
+    raise ValueError(
+        "Essential handoff context exceeds the configured budget ("
+        f"{len(raw)} > {limit} chars). Essential keys: {sorted(essential)}. "
+        "Provide validated concise file references or raise limits.max_context_chars; "
+        "refusing to drop mandatory requirements, invariants or acceptance criteria.")
 
 
 def report_prompt(kind, context):
@@ -1990,6 +2320,7 @@ def schema(kind):
                 "acceptance": {"type": "array", "items": {"type": "string"}},
                 "checks": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
                 "risk": {"type": "string"},
+                "verification_purpose": {"type": "string"},
             }, "required": ["title", "goal", "acceptance", "checks", "risk"], "additionalProperties": False}},
             "blocker": {"type": "string"},
             "required_exploration": {"type":"object", "properties":{"job_id":{"type":"string"},"scope_satisfied":{"type":"boolean"}}, "required":["job_id","scope_satisfied"], "additionalProperties":False},
@@ -2029,37 +2360,91 @@ def model_route(cfg, host, role):
     return {"provider": "opencode", "model": spec["model"], "effort": spec["variant"], "billing": spec["billing"]}
 
 
-def opencode_dialect(version=None, pinned=None):
+def _version_tuple(text):
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?", str(text))
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+
+
+def _version_supported(version, ranges=OPENCODE_VERSION_RANGES):
+    parsed = _version_tuple(version)
+    if parsed is None:
+        return False
+    for low, high in ranges:
+        low_t = _version_tuple(low)
+        high_t = _version_tuple(high)
+        if low_t is None or high_t is None:
+            continue
+        if low_t <= parsed < high_t:
+            return True
+    return False
+
+
+def opencode_version_policy(cfg=None):
+    """Return the tested supported-version ranges and the configured pin.
+
+    ``runtime.opencode_version`` may be ``"auto"`` (any tested range), or an
+    exact ``major.minor[.patch]`` pin. Pins never widen the tested ranges.
+    """
+    cfg = cfg or config()
+    runtime = cfg.get("runtime", {}) if isinstance(cfg.get("runtime"), dict) else {}
+    raw_ranges = runtime.get("opencode_supported")
+    ranges = OPENCODE_VERSION_RANGES
+    if raw_ranges is not None:
+        if not isinstance(raw_ranges, list) or not raw_ranges:
+            raise RuntimeError("runtime.opencode_supported must be a nonempty list of ranges")
+        parsed = []
+        for item in raw_ranges:
+            match = (re.fullmatch(r"\s*(?:>=)?\s*([0-9][0-9.]*)\s*(?:-|<)\s*([0-9][0-9.]*)\s*", item)
+                     if isinstance(item, str) else None)
+            if match is None:
+                raise RuntimeError(
+                    f"Invalid OpenCode support range {item!r}; expected 'min-max' or '>=min <max'")
+            low, high = match.group(1), match.group(2)
+            if _version_tuple(low) is None or _version_tuple(high) is None:
+                raise RuntimeError(f"Invalid OpenCode support range {item!r}")
+            parsed.append((low, high))
+        ranges = tuple(parsed)
+    pinned = str(runtime.get("opencode_version") or "auto").strip()
+    return {"pin": pinned, "ranges": [list(item) for item in ranges],
+            "supported": [f">={low} <{high}" for low, high in ranges]}
+
+
+def opencode_dialect(version=None, pinned=None, cfg=None):
     """Select the documented OpenCode V1 or V2 configuration contract.
 
     OpenCode CLI 1.x uses agent/prompt/permission/bash/task; V2 uses
     agents/system/permissions/shell/subagent. Never silently mix them.
     """
+    cfg = cfg or config()
+    policy = opencode_version_policy(cfg)
     if version is None:
         result = subprocess.run(["opencode", "--version"], capture_output=True,
                                 text=True, timeout=10, check=False)
         version = (result.stdout or result.stderr).strip()
-    match = re.search(r"\b(\d+)\.(\d+)(?:\.(\d+))?", version)
-    if not match:
+    parsed = _version_tuple(version)
+    if parsed is None:
         raise RuntimeError(f"Unrecognized OpenCode version {version!r}; cannot enforce worker permissions")
-    major = int(match.group(1))
-    pinned = pinned if pinned is not None else str(
-        config().get("runtime", {}).get("opencode_version") or "").strip()
-    if pinned:
-        pin_match = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", str(pinned))
-        if not pin_match:
+    ranges = tuple(tuple(item) for item in policy["ranges"])
+    if not _version_supported(version, ranges):
+        raise RuntimeError(
+            f"Unsupported OpenCode version {version!r}; tested ranges are "
+            + ", ".join(policy["supported"])
+            + ". Refuse to generate an unverified permission contract.")
+    pinned = policy["pin"] if pinned is None else str(pinned).strip()
+    if pinned and pinned.lower() != "auto":
+        wanted = _version_tuple(pinned)
+        if wanted is None:
             raise RuntimeError(f"Invalid pinned OpenCode version {pinned!r}")
-        installed = (major, int(match.group(2)), int(match.group(3) or 0))
-        wanted = (int(pin_match.group(1)), int(pin_match.group(2)),
-                  int(pin_match.group(3) or 0))
-        compare = len(pin_match.group(3) and (1, 2, 3) or (1, 2))
-        if installed[:compare] != wanted[:compare]:
+        compare = 3 if re.search(r"\.\d+\.\d+", pinned) else 2
+        if parsed[:compare] != wanted[:compare]:
             raise RuntimeError(
                 f"OpenCode version {version!r} does not match pinned {pinned!r}; "
                 "refuse to generate an incompatible permission contract")
-    if major == 1:
+    if parsed[0] == 1:
         return "v1"
-    if major == 2:
+    if parsed[0] == 2:
         return "v2"
     raise RuntimeError(f"Unsupported OpenCode version {version!r}")
 
@@ -2070,7 +2455,7 @@ def opencode_profile(role, dialect="v1"):
         if role != "implementer":
             permission = {
                 "*": "deny", "read": "allow", "glob": "allow", "grep": "allow",
-                "list": "allow", "webfetch": "allow", "websearch": "allow",
+                "list": "allow", "webfetch": "deny", "websearch": "deny",
                 "edit": "deny", "bash": "deny", "task": "deny",
                 "external_directory": "deny",
             }
@@ -2079,7 +2464,9 @@ def opencode_profile(role, dialect="v1"):
                 "*": "allow", "task": "deny", "external_directory": "deny",
                 "webfetch": "deny", "websearch": "deny",
                 "bash": {"*": "allow", "git push *": "deny", "git clean *": "deny",
-                         "git reset --hard *": "deny", "docker * down -v*": "deny"},
+                         "git reset --hard *": "deny", "git filter-branch *": "deny",
+                         "git gc --prune*": "deny", "docker * down -v*": "deny",
+                         "docker * push*": "deny"},
             }
         return {
             "description": f"Abdullah {role}, tracked external worker",
@@ -2089,22 +2476,95 @@ def opencode_profile(role, dialect="v1"):
         raise ValueError(f"Unsupported OpenCode dialect {dialect}")
     allow = lambda action, resource="*", effect="allow": {"action": action, "resource": resource, "effect": effect}
     if role != "implementer":
+        # V2 permits external directories by default; every restriction below
+        # must be explicit because agent rules are appended to the base policy.
         perms = [allow("*", effect="deny"),
-                 allow("read"), allow("glob"), allow("grep"), allow("list"),
-                 allow("webfetch"), allow("websearch"),
+                 allow("read"), allow("glob"), allow("grep"),
                  allow("edit", effect="deny"), allow("shell", effect="deny"),
-                 allow("subagent", effect="deny"), allow("external_directory", effect="deny")]
+                 allow("subagent", effect="deny"), allow("external_directory", effect="deny"),
+                 allow("webfetch", effect="deny"), allow("websearch", effect="deny"),
+                 allow("question", effect="deny"),
+                 allow("read", "*.env", "deny"), allow("read", "*.env.*", "deny"),
+                 allow("read", "*.env.example", "allow")]
     else:
         perms = [allow("*"), allow("subagent", effect="deny"),
-                      allow("external_directory", effect="deny"),
-                      allow("webfetch", effect="deny"),
-                      allow("websearch", effect="deny"),
-                      allow("shell", "git push *", "deny"),
-                      allow("shell", "git clean *", "deny"),
-                      allow("shell", "git reset --hard *", "deny"),
-                      allow("shell", "docker * down -v*", "deny")]
+                 allow("external_directory", effect="deny"),
+                 allow("webfetch", effect="deny"),
+                 allow("websearch", effect="deny"),
+                 allow("question", effect="deny"),
+                 allow("read", "*.env", "deny"), allow("read", "*.env.*", "deny"),
+                 allow("read", "*.env.example", "allow"),
+                 allow("shell", "git push *", "deny"),
+                 allow("shell", "git clean *", "deny"),
+                 allow("shell", "git reset --hard *", "deny"),
+                 allow("shell", "git filter-branch *", "deny"),
+                 allow("shell", "git gc --prune*", "deny"),
+                 allow("shell", "docker * down -v*", "deny"),
+                 allow("shell", "docker * push*", "deny")]
     return {"description": f"Abdullah {role}, tracked external worker",
             "mode": "primary", "system": role_text(role), "permissions": perms}
+
+
+def validate_worker_profile(role, dialect="v2"):
+    """Deterministically assert the generated profile enforces the role policy.
+
+    This validates the contract we generate. It does not prove that the
+    installed OpenCode binary applies it (doctor probes that separately).
+    """
+    profile = opencode_profile(role, dialect)
+    if dialect == "v1":
+        permission = profile["permission"]
+        if role == "implementer":
+            required = {"task": "deny", "external_directory": "deny",
+                        "webfetch": "deny", "websearch": "deny"}
+            shell = permission.get("bash") or {}
+            required_shell = {"git push *", "git clean *", "git reset --hard *"}
+            missing = [f"{k}={v}" for k, v in required.items()
+                       if permission.get(k) != v]
+            missing += [f"bash {p}" for p in sorted(required_shell) if shell.get(p) != "deny"]
+            if missing:
+                raise ValueError(f"implementer profile is not restrictive enough: {missing}")
+        else:
+            required = {"*": "deny", "edit": "deny", "bash": "deny", "task": "deny",
+                        "external_directory": "deny", "webfetch": "deny",
+                        "websearch": "deny"}
+            missing = [f"{k}={v}" for k, v in required.items()
+                       if permission.get(k) != v]
+            if missing:
+                raise ValueError(f"{role} profile is not restrictive enough: {missing}")
+        return True
+    rules = profile.get("permissions")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError(f"{role} V2 profile has no ordered permissions")
+    # Last matching rule wins in V2; resolve the effective effect per action.
+    def effective(action, resource="*"):
+        result = None
+        for rule in rules:
+            if rule.get("action") in {action, "*"}:
+                pattern = rule.get("resource")
+                if pattern == "*" or pattern == resource:
+                    result = rule.get("effect")
+        return result
+    if role == "implementer":
+        checks = {("subagent", "*"): "deny", ("external_directory", "*"): "deny",
+                  ("webfetch", "*"): "deny", ("websearch", "*"): "deny",
+                  ("read", "*.env"): "deny", ("read", "*.env.*"): "deny",
+                  ("shell", "git push *"): "deny", ("shell", "git clean *"): "deny",
+                  ("shell", "git reset --hard *"): "deny"}
+        missing = [f"{a}:{r}" for (a, r), want in checks.items() if effective(a, r) != want]
+        if effective("shell") != "allow":
+            missing.append("shell:*=allow")
+    else:
+        checks = {("edit", "*"): "deny", ("shell", "*"): "deny",
+                  ("subagent", "*"): "deny", ("external_directory", "*"): "deny",
+                  ("webfetch", "*"): "deny", ("websearch", "*"): "deny",
+                  ("read", "*.env"): "deny", ("read", "*.env.*"): "deny"}
+        missing = [f"{a}:{r}" for (a, r), want in checks.items() if effective(a, r) != want]
+        if effective("read") != "allow":
+            missing.append("read:*=allow")
+    if missing:
+        raise ValueError(f"{role} V2 profile is not restrictive enough: {missing}")
+    return True
 
 
 def opencode_env(role, dialect):
@@ -2133,6 +2593,11 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None, evid
             selector += f"#{route['effort']}"
         cmd = ["opencode", "run", "--auto", "--agent", f"abdullah-{role}",
                "--model", selector, "--format", "json"]
+        if dialect == "v2":
+            # V2 defaults to a shared background service. A private server keeps
+            # the model session inside the guarded process tree so interruption,
+            # containment and reconciliation keep working.
+            cmd.append("--standalone")
         if dialect == "v1" and route["effort"]:
             cmd.extend(["--variant", route["effort"]])
         if resume_session:
@@ -2178,8 +2643,168 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None, evid
     raise ValueError("Unsupported strong host")
 
 
+def _json_objects(raw):
+    """Best-effort event objects from a whole JSON document or JSONL stream."""
+    text = raw or ""
+    try:
+        whole = json.loads(text)
+    except ValueError:
+        whole = None
+    else:
+        if isinstance(whole, dict):
+            return [whole]
+        if isinstance(whole, list):
+            return [item for item in whole if isinstance(item, dict)]
+    events = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+        elif isinstance(event, list):
+            events.extend(item for item in event if isinstance(item, dict))
+    return events
+
+
+def _rate_limit_code(value):
+    """True only for an explicit 429 or a known rate-limit identity token."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, numbers.Number):
+        try:
+            return int(value) == 429
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        return normalized in RATE_LIMIT_CODE_TOKENS
+    return False
+
+
+def _error_containers(event):
+    """Error-bearing structures only; success metadata is never inspected."""
+    if not isinstance(event, dict):
+        return []
+    containers = [event[key] for key in ("error", "errors", "failure")
+                  if event.get(key) is not None]
+    part = event.get("part")
+    if isinstance(part, dict):
+        containers.extend(part[key] for key in ("error", "errors", "failure")
+                          if part.get(key) is not None)
+    if str(event.get("type") or "").lower() in {"error", "provider_error", "provider-error"}:
+        containers.append(event)
+    return containers
+
+
+def _structured_rate_limit(event):
+    """Prove a 429 only from explicit provider error fields."""
+    stack = _error_containers(event)
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                lowered = str(key).lower()
+                if lowered in RATE_LIMIT_STATUS_KEYS and _rate_limit_code(item):
+                    return True
+                if lowered in {"name", "type", "code", "error", "reason"}:
+                    if _rate_limit_code(item):
+                        return True
+                    if isinstance(item, str) and (
+                            RATE_LIMIT_IDENTITY_PAT.search(item)
+                            or RATE_LIMIT_PHRASE_PAT.search(item)):
+                        return True
+                if lowered in {"message", "detail", "description", "body"} \
+                        and isinstance(item, str):
+                    if HTTP_429_PAT.search(item) or RATE_LIMIT_PHRASE_PAT.search(item):
+                        return True
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(item for item in value if isinstance(item, (dict, list)))
+    return False
+
+
+def _successful_completion(event):
+    """A terminal OpenCode/step event without an attached error."""
+    if not isinstance(event, dict):
+        return False
+    kind = str(event.get("type") or "").lower()
+    if kind in {"step_finish", "step-finish"}:
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("error") or event.get("error"):
+            return False
+        return str(part.get("reason") or "").lower() in {"", "stop", "end", "complete", "completed"}
+    if kind in {"result", "done", "completed", "complete", "finish", "finished"}:
+        return not event.get("error")
+    return False
+
+
+def _plain_diagnostic_lines(raw):
+    """Non-JSON process diagnostics (stderr/tracebacks), never JSONL metadata."""
+    text = raw or ""
+    try:
+        json.loads(text)
+    except ValueError:
+        pass
+    else:
+        return []
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            json.loads(stripped)
+        except ValueError:
+            lines.append(stripped)
+    return lines
+
+
+def _error_message_text(events):
+    """Message/detail strings from explicit error structures only."""
+    pieces = []
+    for event in events:
+        for container in _error_containers(event):
+            stack = [container]
+            while stack:
+                value = stack.pop()
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if str(key).lower() in {"message", "detail", "description", "body"} \
+                                and isinstance(item, str):
+                            pieces.append(item)
+                        elif isinstance(item, (dict, list)):
+                            stack.append(item)
+                elif isinstance(value, list):
+                    stack.extend(item for item in value if isinstance(item, (dict, list)))
+    return "\n".join(pieces)
+
+
 def is_rate_limited(raw: str):
-    return bool(RATE_PAT.search(raw[-12000:]))
+    """Bounded 429 detection: structured errors first, then real diagnostics.
+
+    A successful completion wins over unrelated `429` digits in metadata
+    because only error structures and non-JSON diagnostics are inspected;
+    assistant text, snapshots, ids, counters and token counts are ignored.
+    """
+    text = raw or ""
+    events = _json_objects(text)
+    if any(_structured_rate_limit(event) for event in events):
+        return True
+    diagnostics = "\n".join(_plain_diagnostic_lines(text))
+    if diagnostics and (RATE_LIMIT_PHRASE_PAT.search(diagnostics)
+                        or HTTP_429_PAT.search(diagnostics)):
+        return True
+    if any(_successful_completion(event) for event in events):
+        return False
+    messages = _error_message_text(events)
+    return bool(messages and (RATE_LIMIT_PHRASE_PAT.search(messages)
+                              or HTTP_429_PAT.search(messages)))
 
 
 def extract_cli_report(format_name, out: str, path: Path):
@@ -2212,47 +2837,135 @@ def extract_cli_report(format_name, out: str, path: Path):
     return parse_json_object("".join(parts)), session_id
 
 
-def extract_reported_usage(raw, format_name="jsonl"):
-    """Extract only provider-reported numeric usage; never synthesize values."""
-    import numbers
-    objects = []
-    text = raw or ""
+def _count(value):
+    """A genuine non-negative count, or None when the field is unavailable."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Number):
+        return None
     try:
-        whole = json.loads(text)
-        if isinstance(whole, dict):
-            objects.append(whole)
-    except ValueError:
-        for line in text.splitlines():
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(event, dict):
-                objects.append(event)
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return count if count >= 0 else None
+
+
+def _cost(value):
+    """A genuine non-negative reported cost, or None when unavailable."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Number):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if amount >= 0 else None
+
+
+def _opencode_step_usage(event):
+    """One real OpenCode V1/V2 `step_finish` event (per-step, not cumulative).
+
+    V1 captured shape:
+      part.tokens = {total, input, output, reasoning, cache:{read, write}}
+    V2 captured shape:
+      part.tokens = {input, output, reasoning, cache:{read, write}}
+    `total` is used when the provider reports it; otherwise it is the sum of
+    the reported components exactly as V1 defines it.
+    """
+    if not isinstance(event, dict):
+        return None
+    if str(event.get("type") or "").lower() not in {"step_finish", "step-finish"}:
+        return None
+    part = event.get("part")
+    if not isinstance(part, dict):
+        return None
+    tokens = part.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    total = _count(tokens.get("total"))
+    input_tokens = _count(tokens.get("input"))
+    output_tokens = _count(tokens.get("output"))
+    reasoning_tokens = _count(tokens.get("reasoning"))
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    cache_read = _count(cache.get("read"))
+    cache_write = _count(cache.get("write"))
+    components = (input_tokens, output_tokens, reasoning_tokens, cache_read, cache_write)
+    if total is None and any(value is not None for value in components):
+        total = sum(value or 0 for value in components)
+    if total is None:
+        return None
+    cache_total = None
+    if cache_read is not None or cache_write is not None:
+        cache_total = (cache_read or 0) + (cache_write or 0)
+    identity = part.get("id") or (
+        f"{part.get('messageID') or event.get('sessionID') or ''}:"
+        f"{event.get('timestamp') or ''}:{part.get('type') or ''}")
+    return {"identity": str(identity), "tokens": total,
+            "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_tokens": cache_total,
+            "cache_read_tokens": cache_read, "cache_write_tokens": cache_write,
+            "cost": _cost(part.get("cost", event.get("cost")))}
+
+
+def _opencode_usage(events):
+    """Sum unique OpenCode steps once; identical replays are not double-counted."""
+    steps = []
+    seen = set()
+    for event in events:
+        step = _opencode_step_usage(event)
+        if not step or step["identity"] in seen:
+            continue
+        seen.add(step["identity"])
+        steps.append(step)
+    if not steps:
+        return None
+
+    def sum_or_none(key):
+        values = [step[key] for step in steps]
+        return sum(values) if all(value is not None for value in values) else None
+
+    costs = [step["cost"] for step in steps]
+    cost = sum(costs) if all(value is not None for value in costs) else None
+    return {"tokens": sum_or_none("tokens"),
+            "input_tokens": sum_or_none("input_tokens"),
+            "output_tokens": sum_or_none("output_tokens"),
+            "reasoning_tokens": sum_or_none("reasoning_tokens"),
+            "cache_tokens": sum_or_none("cache_tokens"),
+            "cache_read_tokens": sum_or_none("cache_read_tokens"),
+            "cache_write_tokens": sum_or_none("cache_write_tokens"),
+            "cost": cost, "source": "opencode.step_finish",
+            "format": "jsonl", "events": len(steps)}
+
+
+def _generic_usage(events, format_name):
+    """Existing flat/cumulative formats: max per field, never double-counted."""
     found = {}
-    stack = list(objects)
+    stack = list(events)
     while stack:
         value = stack.pop()
         if isinstance(value, dict):
             for key, item in value.items():
                 lowered = str(key).lower()
-                if isinstance(item, numbers.Number) and not isinstance(item, bool):
+                count = _count(item)
+                if count is not None:
                     if lowered in {"total_tokens", "total_token_count", "tokens"}:
-                        found["total_tokens"] = max(found.get("total_tokens", 0), int(item))
+                        found["total_tokens"] = max(found.get("total_tokens", 0), count)
                     elif lowered in {"input_tokens", "prompt_tokens"}:
-                        found["input_tokens"] = max(found.get("input_tokens", 0), int(item))
+                        found["input_tokens"] = max(found.get("input_tokens", 0), count)
                     elif lowered in {"output_tokens", "completion_tokens"}:
-                        found["output_tokens"] = max(found.get("output_tokens", 0), int(item))
+                        found["output_tokens"] = max(found.get("output_tokens", 0), count)
+                    elif lowered in {"reasoning_tokens", "reasoning_output_tokens"}:
+                        found["reasoning"] = max(found.get("reasoning", 0), count)
                     elif lowered in {"cache_read_input_tokens", "cached_tokens", "cache_tokens"}:
-                        found["cache_read"] = max(found.get("cache_read", 0), int(item))
+                        found["cache_read"] = max(found.get("cache_read", 0), count)
                     elif lowered in {"cache_creation_input_tokens", "cache_creation_tokens"}:
-                        found["cache_write"] = max(found.get("cache_write", 0), int(item))
+                        found["cache_write"] = max(found.get("cache_write", 0), count)
                     elif lowered in {"cost_usd", "total_cost_usd", "cost", "total_cost"}:
-                        found["cost"] = max(found.get("cost", 0.0), float(item))
-                elif isinstance(item, (dict, list)):
+                        amount = _cost(item)
+                        if amount is not None:
+                            found["cost"] = max(found.get("cost", 0.0), amount)
+                if isinstance(item, (dict, list)):
                     stack.append(item)
         elif isinstance(value, list):
-            stack.extend(value)
+            stack.extend(item for item in value if isinstance(item, (dict, list)))
     tokens = found.get("total_tokens")
     if tokens is None and (found.get("input_tokens") is not None or
                            found.get("output_tokens") is not None):
@@ -2263,8 +2976,35 @@ def extract_reported_usage(raw, format_name="jsonl"):
         cache = (found.get("cache_read") or 0) + (found.get("cache_write") or 0)
     if tokens is None and cache is None and found.get("cost") is None:
         return None
-    return {"tokens": tokens, "cache_tokens": cache, "cost": found.get("cost"),
-            "source": "provider_output", "format": format_name}
+    source = ("codex.token_count" if format_name == "codex"
+              else "claude.result" if format_name == "claude"
+              else "provider_output")
+    return {"tokens": tokens, "input_tokens": found.get("input_tokens"),
+            "output_tokens": found.get("output_tokens"),
+            "reasoning_tokens": found.get("reasoning"),
+            "cache_tokens": cache, "cache_read_tokens": found.get("cache_read"),
+            "cache_write_tokens": found.get("cache_write"),
+            "cost": found.get("cost"), "source": source, "format": format_name}
+
+
+def extract_reported_usage(raw, format_name="jsonl"):
+    """Extract only provider-reported numeric usage; never synthesize values.
+
+    OpenCode V1/V2 step events are summed once per unique step (per-step
+    usage). Cumulative snapshot formats keep the existing max-per-field
+    behaviour, so repeated totals are never added together.
+    """
+    events = _json_objects(raw)
+    return _opencode_usage(events) or _generic_usage(events, format_name)
+
+
+USAGE_DETAIL_FIELDS = (
+    ("input_tokens", "reported_input_tokens"),
+    ("output_tokens", "reported_output_tokens"),
+    ("reasoning_tokens", "reported_reasoning_tokens"),
+    ("cache_read_tokens", "reported_cache_read_tokens"),
+    ("cache_write_tokens", "reported_cache_write_tokens"),
+)
 
 
 def _usage_state(state):
@@ -2272,6 +3012,9 @@ def _usage_state(state):
     defaults = {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
                 "interrupted_attempts": 0, "human_interventions": 0,
                 "reported_tokens": None, "reported_cache_tokens": None,
+                "reported_input_tokens": None, "reported_output_tokens": None,
+                "reported_reasoning_tokens": None, "reported_cache_read_tokens": None,
+                "reported_cache_write_tokens": None, "sources": [],
                 "reported_provider_cost": None, "cost_status": "unavailable",
                 "billing": {"go": 0, "subscription": 0, "api": 0}}
     for key, value in defaults.items():
@@ -2308,6 +3051,15 @@ def record_usage(state, job, outcome, seconds=0):
         if reported.get("cost") is not None:
             usage["reported_provider_cost"] = round(
                 float(usage.get("reported_provider_cost") or 0) + reported["cost"], 6)
+        for reported_key, state_key in USAGE_DETAIL_FIELDS:
+            value = reported.get(reported_key)
+            if value is not None:
+                usage[state_key] = int(usage.get(state_key) or 0) + int(value)
+        source = reported.get("source")
+        if source:
+            sources = usage.setdefault("sources", [])
+            if source not in sources:
+                sources.append(source)
     usage["cost_status"] = ("reported" if usage.get("reported_provider_cost") is not None
                             else "unavailable")
     usage["corrections"] = int(state.get("corrections", 0))
@@ -2332,9 +3084,15 @@ def merge_usage(target_state, source_state):
     for key in ("strong_calls", "cheap_calls", "failed_attempts",
                 "interrupted_attempts", "human_interventions"):
         target[key] = int(target.get(key) or 0) + int(source.get(key) or 0)
-    for key in ("reported_tokens", "reported_cache_tokens"):
+    for key in ("reported_tokens", "reported_cache_tokens") + tuple(
+            state_key for _, state_key in USAGE_DETAIL_FIELDS):
         if source.get(key) is not None:
             target[key] = int(target.get(key) or 0) + int(source[key])
+    sources = list(target.get("sources") or [])
+    for source_name in source.get("sources") or []:
+        if source_name not in sources:
+            sources.append(source_name)
+    target["sources"] = sources
     if source.get("seconds") is not None:
         target["seconds"] = round(float(target.get("seconds") or 0)
                                   + float(source["seconds"]), 2)
@@ -2789,6 +3547,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
     identity = {"candidate_hash": signature(prior), "batch_index": state["batch_index"],
                 "corrections": state.get("corrections", 0), "batch": batch.get("title"),
                 "final": final, "argv": commands,
+                "plan_version": state.get("plan_version"),
                 "provenance_version": SOURCE_PROVENANCE_VERSION}
     progress = state.get("check_progress")
     if progress and progress["identity"] != identity:
@@ -2797,6 +3556,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
         evidence = {"evidence_version": VERIFICATION_EVIDENCE_VERSION,
                     "candidate": prior, "candidate_hash": signature(prior), "started_at": now(),
                     "batch": batch.get("title"), "final": final, "commands": [], "passed": True,
+                    "plan_version": state.get("plan_version"),
                     "provenance": {"version": SOURCE_PROVENANCE_VERSION,
                                    "source": prior,
                                    "configuration": prior.get("configuration"),
@@ -2818,7 +3578,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
             raise ValueError("Verification checks must be argv arrays")
         # Exactly the plan's argv, never shell=True. Wrapper, interpreter and
         # indirect-container execution are explicit, recorded security choices.
-        policy = verification_command_policy(cmd, cfg)
+        policy = verification_command_policy(cmd, cfg, project=project)
         if not policy["allowed"]:
             raise RuntimeError(
                 "Verification command rejected by command policy: " +
@@ -2954,11 +3714,16 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
     evidence["after"] = after
     escaped_any = any((entry or {}).get("escaped_processes")
                       for entry in evidence.get("containment", []) if isinstance(entry, dict))
+    provenance_delta = provenance_drift(prior, after)
+    evidence["provenance_drift"] = provenance_delta
     evidence["source_unchanged"] = (evidence["candidate_hash"] == evidence["after_hash"]
-                                    and not escaped_any)
+                                    and not escaped_any and not provenance_delta)
     if not evidence["source_unchanged"]:
         evidence["passed"] = False
-        if not escaped_any:
+        if provenance_delta:
+            evidence["error"] = ("Verification environment/toolchain/configuration drifted "
+                                 "during the run: " + ", ".join(provenance_delta))
+        elif not escaped_any:
             evidence["error"] = "Tracked or untracked files changed during verification; evidence is stale"
     evpath = run_dir / "jobs" / f"verification-{state['batch_index']}-{uuid.uuid4().hex[:8]}.json"
     evidence["path"] = str(evpath)
@@ -3044,7 +3809,8 @@ def strong_call(run_dir, state, cfg, kind, extra=None):
         if not reference:
             raise ValueError("Acceptance requires supervisor verification evidence")
         context["verification_evidence"] = verification_evidence_package(
-            reference, context["snapshot"], run_id=state["id"])
+            reference, context["snapshot"], run_id=state["id"],
+            plan_version=state.get("plan_version"))
         context["verification_evidence_root"] = str(Path(run_dir).resolve())
         context["verification_evidence_note"] = (
             "verification_evidence is supervisor-generated and source-bound. "
@@ -3163,6 +3929,7 @@ def _bounded_log_text(path, *, success, limit=EVIDENCE_LOG_LIMIT,
 
 
 def verification_evidence_package(reference, current, *, run_id=None,
+                                  plan_version=None,
                                   log_limit=EVIDENCE_LOG_LIMIT,
                                   failure_log_limit=EVIDENCE_FAILURE_LOG_LIMIT):
     """Build a bounded, source-bound acceptance package from supervisor evidence.
@@ -3184,6 +3951,10 @@ def verification_evidence_package(reference, current, *, run_id=None,
         raise ValueError("Verification reference is stale or not passed")
     if not (evidence.get("passed") is True and evidence.get("source_unchanged") is True):
         raise ValueError("Verification record is not a passed, source-unchanged run")
+    if plan_version is not None and evidence.get("plan_version") not in (None, plan_version):
+        raise ValueError(
+            "Verification evidence belongs to a different plan revision; "
+            "re-run verification for the current plan")
     if evidence.get("candidate_hash") != fingerprint or evidence.get("after_hash") != fingerprint:
         raise ValueError("Verification fingerprints do not match the current candidate")
     if (signature(evidence.get("candidate")) != signature(current)
@@ -3199,6 +3970,12 @@ def verification_evidence_package(reference, current, *, run_id=None,
             raise ValueError("Verification provenance source does not match the current candidate")
         if not provenance_complete:
             raise ValueError("Versioned verification evidence has an incomplete runtime-input manifest")
+        drift = provenance_drift(provenance, current)
+        if drift:
+            raise ValueError(
+                "Verification provenance drifted since the check: "
+                + ", ".join(drift)
+                + ". Re-run verification instead of reusing stale evidence.")
     commands = []
     for command in evidence.get("commands", []):
         if not isinstance(command, dict) or not command.get("log"):
@@ -3342,8 +4119,9 @@ def certified_exploration(run_dir, state, plan):
         return None
 
 
-def reviewer_verification_package(reference, current, run_id=None):
-    return verification_evidence_package(reference, current, run_id=run_id)
+def reviewer_verification_package(reference, current, run_id=None, plan_version=None):
+    return verification_evidence_package(reference, current, run_id=run_id,
+                                         plan_version=plan_version)
 
 
 def advance(run_dir, state, cfg):
@@ -3499,7 +4277,8 @@ def advance(run_dir, state, cfg):
                               json.dumps(short_log_evidence(evidence), ensure_ascii=False))
         else:
             policy = risk_policy(batch.get("risk"), cfg)
-            if len(batch.get("checks", [])) < policy["minimum_checks"]:
+            distinct_checks = {tuple(check) for check in batch.get("checks", [])}
+            if len(distinct_checks) < policy["minimum_checks"]:
                 pause_with(run_dir, state,
                            f"Risk class {policy['risk']} requires at least "
                            f"{policy['minimum_checks']} verification checks")
@@ -3518,7 +4297,7 @@ def advance(run_dir, state, cfg):
     if stage == "review":
         batch = state["plan"]["batches"][state["batch_index"]]
         context = {"project": str(project), "batch": batch, "plan_version": state["plan_version"],
-                   "source": source_snapshot(project), "verification": reviewer_verification_package(state["verification"], source_snapshot(project), run_id=state["id"]),
+                   "source": source_snapshot(project), "verification": reviewer_verification_package(state["verification"], source_snapshot(project), run_id=state["id"], plan_version=state.get("plan_version")),
                    "invariants": state["plan"].get("invariants", []), "approved_handoff": state.get("approved_handoff"),
                    "instruction": (
                        "Review candidate INDEPENDENTLY: read requirements, changed source and tests first; "
@@ -3542,7 +4321,8 @@ def advance(run_dir, state, cfg):
         acceptance_batch = current_batch(state)
         if acceptance_batch:
             policy = risk_policy(acceptance_batch.get("risk"), cfg)
-            if len(acceptance_batch.get("checks", [])) < policy["minimum_checks"]:
+            distinct_checks = {tuple(check) for check in acceptance_batch.get("checks", [])}
+            if len(distinct_checks) < policy["minimum_checks"]:
                 pause_with(run_dir, state,
                            f"Risk class {policy['risk']} requires at least "
                            f"{policy['minimum_checks']} verification checks before acceptance")
@@ -3892,12 +4672,49 @@ def parse_model_inventory(output):
     return result
 
 
+def parse_model_inventory_v2(output):
+    """Parse V2 `opencode models` output (one provider/model ID per line).
+
+    V2 does not expose reasoning variants through this command, so callers must
+    treat variant support as unverified.
+    """
+    models = {}
+    for line in output.splitlines():
+        token = line.strip()
+        if not token or token.startswith("#") or " " in token:
+            continue
+        if token.startswith("opencode-go/"):
+            models[token] = {}
+    if not models:
+        raise ValueError("No opencode-go models in V2 model inventory")
+    return models
+
+
 def probe_opencode_config(project, role, dialect):
     try:
-        # V1 exposes normalized effective rules without dumping the potentially
-        # huge global configuration (which some CLI releases truncate).
+        if dialect == "v2":
+            # V2.2 exposes normalized agents, including effective permissions.
+            response = subprocess.run(
+                ["opencode", "debug", "agents", "--standalone"], cwd=project,
+                env=opencode_env(role, dialect), capture_output=True,
+                text=True, timeout=25, check=False)
+            if response.returncode:
+                return None
+            agents = json.loads(response.stdout)
+            agent = next((item for item in agents
+                          if item.get("id") == f"abdullah-{role}"), None)
+            if agent is None or agent.get("mode") != "primary":
+                return False
+            if not isinstance(agent.get("system"), str) or not agent["system"].strip():
+                return False
+            actual = {(rule.get("action"), rule.get("resource"), rule.get("effect"))
+                      for rule in agent.get("permissions", [])
+                      if isinstance(rule, dict)}
+            expected = {(rule["action"], rule["resource"], rule["effect"])
+                        for rule in opencode_profile(role, "v2")["permissions"]}
+            return expected.issubset(actual)
         if dialect != "v1":
-            return False
+            return None
         response = subprocess.run(["opencode", "debug", "agent", f"abdullah-{role}"], cwd=project,
                                   env=opencode_env(role, dialect), capture_output=True,
                                   text=True, timeout=20, check=False)
@@ -3945,12 +4762,18 @@ def doctor(project: Path, host="codex"):
     checks["commands"]["docker"] = shutil.which("docker") is not None
     help_by_provider = {}
     dialect = None
+    try:
+        checks["opencode_version_policy"] = opencode_version_policy(cfg)
+    except RuntimeError as exc:
+        checks["opencode_version_policy"] = {"error": str(exc)}
     if checks["commands"].get("opencode"):
         version = checks["versions"].get("opencode", "")
         try:
-            dialect = opencode_dialect(version)
-        except RuntimeError:
+            dialect = opencode_dialect(version, cfg=cfg)
+            checks["opencode_version_error"] = None
+        except RuntimeError as exc:
             dialect = None
+            checks["opencode_version_error"] = str(exc)
         checks["opencode_dialect"] = dialect
         checks["cli_compatible"]["opencode_version"] = dialect is not None
         try:
@@ -3961,6 +4784,8 @@ def doctor(project: Path, host="codex"):
             keys = ("--agent", "--model", "--format", "--auto", "--session")
             if dialect == "v1":
                 keys += ("--variant",)
+            if dialect == "v2":
+                keys += ("--standalone",)
             checks["cli_compatible"]["opencode_run"] = response.returncode == 0 and all(
                 item in help_text for item in keys)
         except (OSError, subprocess.TimeoutExpired):
@@ -3993,30 +4818,58 @@ def doctor(project: Path, host="codex"):
         checks["route"][role] = model_route(cfg, host, role)
     checks["route"]["architect"] = model_route(cfg, host, "architect")
     checks["generated_commands"] = probe_generated_commands(cfg, host, dialect, help_by_provider)
-    checks["worker_profiles"] = {role: probe_opencode_config(project, role, dialect) if dialect else False
-                                 for role in ("explorer", "implementer", "reviewer")}
+    # Deterministic contract validation is authoritative; live CLI
+    # introspection is best-effort and reported separately.
+    checks["worker_profiles"] = {}
+    for role in ("explorer", "implementer", "reviewer"):
+        try:
+            validate_worker_profile(role, dialect or "v2")
+            checks["worker_profiles"][role] = True
+        except (ValueError, RuntimeError):
+            checks["worker_profiles"][role] = False
+    checks["worker_profiles_cli"] = {
+        role: probe_opencode_config(project, role, dialect) if dialect else "unavailable"
+        for role in ("explorer", "implementer", "reviewer")}
+    checks["worker_profiles_note"] = (
+        "worker_profiles validates the generated contract; worker_profiles_cli is the "
+        "installed binary's normalized view (V2 introspection is unverified)."
+    )
     # Model identifiers may be provider/entitlement scoped; inventory can check
     # presence, but may not reveal supported reasoning variants.
     checks["model_inventory"] = "unavailable"
+    checks["variant_verified"] = "unavailable"
     if checks["commands"]["opencode"]:
         try:
-            inv = subprocess.run(["opencode", "models", "opencode-go", "--verbose"], cwd=project,
-                                 capture_output=True, text=True, timeout=30, check=False)
+            if dialect == "v2":
+                inv = subprocess.run(["opencode", "models"], cwd=project,
+                                     capture_output=True, text=True, timeout=20, check=False)
+            else:
+                inv = subprocess.run(["opencode", "models", "opencode-go", "--verbose"], cwd=project,
+                                     capture_output=True, text=True, timeout=20, check=False)
             checks["model_inventory"] = "listed" if inv.returncode == 0 else "failed"
             if inv.returncode == 0:
-                models = parse_model_inventory(inv.stdout)
-                checks["paid_go_model_listed"] = all(
-                    cfg["workers"][role]["model"] in models for role in cfg["workers"])
-                checks["variant_verified"] = all(
-                    spec["variant"] in models.get(spec["model"], {}).get("variants", {})
-                    for spec in cfg["workers"].values())
+                if dialect == "v2":
+                    models = parse_model_inventory_v2(inv.stdout)
+                    checks["paid_go_model_listed"] = all(
+                        cfg["workers"][role]["model"] in models for role in cfg["workers"])
+                    # V2 `models` has no variant catalog output.
+                    checks["variant_verified"] = "unavailable"
+                else:
+                    models = parse_model_inventory(inv.stdout)
+                    checks["paid_go_model_listed"] = all(
+                        cfg["workers"][role]["model"] in models for role in cfg["workers"])
+                    checks["variant_verified"] = all(
+                        spec["variant"] in models.get(spec["model"], {}).get("variants", {})
+                        for spec in cfg["workers"].values())
             else:
                 checks["paid_go_model_listed"] = False
         except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
             checks["paid_go_model_listed"] = False
-    checks.setdefault("variant_verified", False)
+    checks.setdefault("variant_verified", "unavailable")
     checks["variant_note"] = (
-        "Variants are checked against the installed OpenCode catalog; actual model execution and entitlement remain untested."
+        "Variants are checked against the installed OpenCode catalog when the CLI exposes "
+        "them; V2 `models` does not, so variant support remains unverified there. "
+        "Actual model execution and entitlement remain untested."
     )
     checks["execution_note"] = "Generated argv is checked against installed help and parsed using --help; no model session or authentication was exercised."
     checks["api_billing_risk"] = []
@@ -4024,9 +4877,18 @@ def doctor(project: Path, host="codex"):
         checks["api_billing_risk"].append("OPENAI_API_KEY is set")
     if host == "claude" and os.getenv("ANTHROPIC_API_KEY"):
         checks["api_billing_risk"].append("ANTHROPIC_API_KEY is set")
+    profiles_cli_ok = (dialect is not None
+                       and all(value is True for value in checks["worker_profiles_cli"].values()))
+    checks["worker_profiles_cli_verified"] = profiles_cli_ok
     checks["ready"] = checks["valid_repo"] and all(checks["commands"][c] for c in required) and (
-        all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and (
-        checks.get("paid_go_model_listed") is True and checks["variant_verified"]) and not checks["api_billing_risk"]
+        all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and profiles_cli_ok and (
+        checks.get("paid_go_model_listed") is True
+        and checks["variant_verified"] is not False) and not checks["api_billing_risk"]
+    checks["compatibility_note"] = (
+        "ready proves local configuration, version-policy, argv and contract checks. It does "
+        "not prove authenticated model execution, entitlement, or V2 permission enforcement "
+        "inside the binary."
+    )
     return checks
 
 
@@ -4102,7 +4964,12 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
                  "usage": {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
                            "interrupted_attempts": 0, "corrections": 0,
                            "human_interventions": 0, "reported_tokens": None,
-                           "reported_cache_tokens": None, "reported_provider_cost": None,
+                           "reported_cache_tokens": None,
+                           "reported_input_tokens": None, "reported_output_tokens": None,
+                           "reported_reasoning_tokens": None,
+                           "reported_cache_read_tokens": None,
+                           "reported_cache_write_tokens": None, "sources": [],
+                           "reported_provider_cost": None,
                            "cost_status": "unavailable"},
                  "model_routes": {r: model_route(cfg, host, r) for r in
                                   ("architect", "explorer", "implementer", "reviewer")}}
@@ -4289,7 +5156,9 @@ def _record_launch_missing(folder, state, target, identity, evidence, *,
 
 
 def modify(run_id, action, role=None, retry_verification=False,
-           launch_missing=False, evidence=None):
+           launch_missing=False, evidence=None, confirmation=None):
+    if action in HUMAN_ONLY_ACTIONS:
+        require_human_operator(action, run_id, confirmation)
     if action == "cancel":
         _operator_action_allowed("cancel")
     if launch_missing:
@@ -4533,6 +5402,18 @@ def explore(args):
                                      usage_after["reported_tokens"] - (usage_before.get("reported_tokens") or 0)),
                  "reported_cache_tokens": (None if usage_after.get("reported_cache_tokens") is None else
                                            usage_after["reported_cache_tokens"] - (usage_before.get("reported_cache_tokens") or 0)),
+                 "reported_input_tokens": (None if usage_after.get("reported_input_tokens") is None else
+                                           usage_after["reported_input_tokens"] - (usage_before.get("reported_input_tokens") or 0)),
+                 "reported_output_tokens": (None if usage_after.get("reported_output_tokens") is None else
+                                            usage_after["reported_output_tokens"] - (usage_before.get("reported_output_tokens") or 0)),
+                 "reported_reasoning_tokens": (None if usage_after.get("reported_reasoning_tokens") is None else
+                                               usage_after["reported_reasoning_tokens"] - (usage_before.get("reported_reasoning_tokens") or 0)),
+                 "reported_cache_read_tokens": (None if usage_after.get("reported_cache_read_tokens") is None else
+                                                usage_after["reported_cache_read_tokens"] - (usage_before.get("reported_cache_read_tokens") or 0)),
+                 "reported_cache_write_tokens": (None if usage_after.get("reported_cache_write_tokens") is None else
+                                                 usage_after["reported_cache_write_tokens"] - (usage_before.get("reported_cache_write_tokens") or 0)),
+                 "sources": sorted(set(usage_after.get("sources") or [])
+                                   - set(usage_before.get("sources") or [])),
                  "reported_provider_cost": (None if usage_after.get("reported_provider_cost") is None else
                                             usage_after["reported_provider_cost"] - (usage_before.get("reported_provider_cost") or 0)),
                  "billing": {key: value - (usage_before.get("billing", {}).get(key, 0))
@@ -4785,9 +5666,11 @@ def next_action_for(state):
     if conflict:
         return "orchestrator_runs"
     if status == "awaiting_plan_approval":
-        return "orchestrator_approve_plan"
+        return ("operator: approve-plan "
+                f"{state.get('id')} --confirm approve-plan:{state.get('id')}")
     if status == "needs_fallback_approval":
-        return "orchestrator_approve_fallback"
+        return ("operator: approve-fallback "
+                f"{state.get('id')} --role <role> --confirm approve-fallback:{state.get('id')}")
     if status == "uncertain":
         return "orchestrator_reconcile"
     if status in {"paused", "blocked", "rate_limited"}:
@@ -5360,10 +6243,12 @@ def interrupt_run(run_id, reason="User requested interruption"):
         _release_lock_file(stream)
 
 
-def amend_run(run_id, amendment, architect_review=False):
+def amend_run(run_id, amendment, architect_review=False, kind="requirement"):
     amendment = (amendment or "").strip()
     if not amendment:
         raise ValueError("Amendment text is required")
+    if kind not in {"requirement", "correction"}:
+        raise ValueError("Amendment kind must be 'requirement' or 'correction'")
     folder, state = load(run_id)
     if state.get("active_job") or state.get("active_check"):
         interrupted = interrupt_run(run_id, "Interrupted to apply user amendment")
@@ -5381,11 +6266,14 @@ def amend_run(run_id, amendment, architect_review=False):
         if state.get("status") in FINAL_STATES:
             raise RuntimeError("Completed/cancelled run cannot be amended")
         _usage_state(state)["human_interventions"] += 1
-        material = (bool(architect_review) or state.get("plan") is None
-                    or state.get("amendment_material")
+        # A user-originated requirement change is never a minor correction just
+        # because architect_review was omitted. Default to replanning.
+        material = (bool(architect_review) or kind != "correction"
+                    or state.get("plan") is None or state.get("amendment_material")
                     or current_batch(state) is None)
         entry = {"id": uuid.uuid4().hex[:8], "at": now(), "text": amendment,
                  "architect_review": bool(architect_review),
+                 "request_kind": kind,
                  "kind": "material" if material else "minor"}
         state.setdefault("amendments", []).append(entry)
         state["verification"] = None
@@ -5502,24 +6390,34 @@ def acknowledge_legacy_verification(run_id, reason, acknowledge):
             "legacy_verification_acknowledged": state["legacy_verification_acknowledged"]}
 
 
-def approve_plan_run(run_id):
+def approve_plan_run(run_id, confirmation=None):
+    authorization = require_human_operator("approve-plan", run_id, confirmation)
     folder, state = load(run_id)
     with exclusive(folder):
         folder, state = load(run_id)
         modify_locked(folder, state, run_id, "approve-plan")
         folder, state = load(run_id)
+        state["human_authorization"] = authorization
+        save(folder, state)
+        journal_event(folder, state, "human_authorization", **authorization)
     return {"ok": True, "run_id": run_id, "status": state["status"],
-            "phase": state["phase"], "next_action": next_action_for(state)}
+            "phase": state["phase"], "human_authorization": authorization,
+            "next_action": next_action_for(state)}
 
 
-def approve_fallback_run(run_id, role):
+def approve_fallback_run(run_id, role, confirmation=None):
+    authorization = require_human_operator("approve-fallback", run_id, confirmation)
     folder, state = load(run_id)
     with exclusive(folder):
         folder, state = load(run_id)
         modify_locked(folder, state, run_id, "approve-fallback", role=role)
         folder, state = load(run_id)
+        state["human_authorization"] = authorization
+        save(folder, state)
+        journal_event(folder, state, "human_authorization", **authorization)
     return {"ok": True, "run_id": run_id, "status": state["status"],
             "phase": state["phase"], "fallback_authorization": state.get("fallback_authorization"),
+            "human_authorization": authorization,
             "next_action": next_action_for(state)}
 
 
@@ -5604,6 +6502,9 @@ MCP_TOOLS = [
      "inputSchema": _schema({
          "run_id": {"type": "string"},
          "amendment": {"type": "string"},
+         "kind": {"type": "string", "enum": ["requirement", "correction"],
+                  "default": "requirement",
+                  "description": "Requirement changes replan; corrections stay bounded"},
          "architect_review": {"type": "boolean", "default": False}},
          ["run_id", "amendment"])},
     {"name": "orchestrator_resume", "description":
@@ -5613,17 +6514,6 @@ MCP_TOOLS = [
      "Reconcile an uncertain attempt only after its process session is proven stopped. "
      "Clears stale retry sessions. Fails closed when ownership is uncertain.",
      "inputSchema": _schema({"run_id": {"type": "string"}}, ["run_id"])},
-    {"name": "orchestrator_approve_plan", "description":
-     "Approve a run explicitly awaiting human plan approval.",
-     "inputSchema": _schema({"run_id": {"type": "string"}}, ["run_id"])},
-    {"name": "orchestrator_approve_fallback", "description":
-     "Authorize ONE paid/subscription fallback dispatch after a genuine model "
-     "failure, only when the user explicitly approves it. role must match the paused stage.",
-     "inputSchema": _schema({
-         "run_id": {"type": "string"},
-         "role": {"type": "string",
-                  "enum": ["architect", "implementer", "explorer", "reviewer"]}},
-         ["run_id", "role"])},
     {"name": "orchestrator_runs", "description":
      "List recent durable runs so a new chat can attach to existing work.",
      "inputSchema": _schema({"limit": {"type": "integer", "default": 20}}, [])},
@@ -5655,15 +6545,16 @@ def _mcp_tool_call(name, arguments):
                              arguments.get("reason", "User requested interruption"))
     if name == "orchestrator_amend":
         return amend_run(arguments["run_id"], arguments["amendment"],
-                         bool(arguments.get("architect_review", False)))
+                         bool(arguments.get("architect_review", False)),
+                         kind=arguments.get("kind", "requirement"))
     if name == "orchestrator_resume":
         return resume_run(arguments["run_id"])
     if name == "orchestrator_reconcile":
         return reconcile_run(arguments["run_id"])
-    if name == "orchestrator_approve_plan":
-        return approve_plan_run(arguments["run_id"])
-    if name == "orchestrator_approve_fallback":
-        return approve_fallback_run(arguments["run_id"], arguments["role"])
+    if name in {"orchestrator_approve_plan", "orchestrator_approve_fallback"}:
+        raise RuntimeError(
+            f"{name} is not available to model/MCP callers. A human must run "
+            "`orchestrator.py approve-plan|approve-fallback` in an interactive terminal.")
     if name == "orchestrator_runs":
         return list_runs(int(arguments.get("limit", 20)))
     raise ValueError(f"Unknown orchestrator tool: {name}")
@@ -5830,6 +6721,8 @@ def main(argv=None):
         p.add_argument("run_id", nargs="?")
         if name == "approve-fallback":
             p.add_argument("--role", required=True, choices=("architect", "implementer", "explorer", "reviewer"))
+        if name in ("approve-plan", "approve-fallback"):
+            p.add_argument("--confirm", help="Exact typed confirmation, e.g. approve-plan:<run>")
         if name == "reconcile":
             p.add_argument("--retry-verification", action="store_true", help="Return a proven unchanged interrupted correction to verification")
             p.add_argument("--launch-missing", action="store_true", help="Audited recovery when no launch identity was ever persisted")
@@ -5862,6 +6755,8 @@ def main(argv=None):
     am.add_argument("--run")
     am.add_argument("amendment", nargs="?")
     am.add_argument("--text")
+    am.add_argument("--kind", choices=("requirement", "correction"), default="requirement",
+                    help="Requirement changes replan; corrections stay bounded")
     am.add_argument("--architect-review", action="store_true")
     subs.add_parser("runs", help="List recent durable runs")
     ad = subs.add_parser("adopt", help="Explicitly adopt a legacy run into checkout ownership")
@@ -5950,7 +6845,8 @@ def main(argv=None):
             if not amendment:
                 raise ValueError("Amendment text is required")
             print(json.dumps(amend_run(opts.run or opts.run_id, amendment,
-                                       opts.architect_review), ensure_ascii=False, indent=2))
+                                       opts.architect_review, kind=opts.kind),
+                             ensure_ascii=False, indent=2))
         elif opts.command == "runs":
             print(json.dumps(list_runs(), ensure_ascii=False, indent=2))
         elif opts.command == "adopt":
@@ -5975,10 +6871,22 @@ def main(argv=None):
             print(json.dumps(checkout_recover(Path(opts.project).expanduser().resolve(),
                                               opts.owner, opts.reason, opts.acknowledge),
                              ensure_ascii=False, indent=2))
+        elif opts.command == "approve-plan":
+            if bool(opts.run) == bool(opts.run_id):
+                raise ValueError("Provide exactly one run ID, either positional or --run")
+            print(json.dumps(approve_plan_run(opts.run or opts.run_id, opts.confirm),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "approve-fallback":
+            if bool(opts.run) == bool(opts.run_id):
+                raise ValueError("Provide exactly one run ID, either positional or --run")
+            print(json.dumps(approve_fallback_run(opts.run or opts.run_id, opts.role,
+                                                  opts.confirm),
+                             ensure_ascii=False, indent=2))
         else:
             if bool(opts.run) == bool(opts.run_id):
                 raise ValueError("Provide exactly one run ID, either positional or --run")
-            modify(opts.run or opts.run_id, opts.command, getattr(opts, "role", None))
+            modify(opts.run or opts.run_id, opts.command, getattr(opts, "role", None),
+                   confirmation=getattr(opts, "confirm", None))
         return 0
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"Abdullah Orchestrator: {exc}", file=sys.stderr)

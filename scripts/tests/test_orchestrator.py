@@ -86,6 +86,12 @@ class ControlTests(unittest.TestCase):
         self.rundir.mkdir(parents=True)
         test_cfg = orc.read_json(orc.HERE / "config.example.json")
         test_cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = True
+        test_cfg["verification"]["command_policy"]["exceptions"] = [{
+            "argv_regex": r'.*python[0-9.]*","-c".*',
+            "reason": "test harness containment/provenance probe",
+            "scope": "*",
+            "authorized_by": "test-operator",
+        }]
         cfg_path = self.root / "config.json"
         orc.atomic_json(cfg_path, test_cfg)
         cfg_patch = patch.object(orc, "CONFIG_PATH", cfg_path)
@@ -157,7 +163,10 @@ class ControlTests(unittest.TestCase):
             with self.subTest(dialect=dialect), patch.object(orc, "opencode_dialect", return_value=dialect):
                 command, env, fmt = orc.cli_command("codex", "implementer", route, "Task", self.rundir)
                 self.assertEqual(fmt, "jsonl")
-                self.assertNotIn("--standalone", command)
+                if dialect == "v1":
+                    self.assertNotIn("--standalone", command)
+                else:
+                    self.assertIn("--standalone", command)
                 inline = json.loads(env["OPENCODE_CONFIG_CONTENT"])
                 if dialect == "v1":
                     self.assertEqual(command[command.index("--variant") + 1], "high")
@@ -171,7 +180,7 @@ class ControlTests(unittest.TestCase):
 
     def test_opencode_generation_fails_closed_on_unknown_version(self):
         self.assertEqual(orc.opencode_dialect("opencode version 1.18.35"), "v1")
-        self.assertEqual(orc.opencode_dialect("opencode 2.0.0", pinned=""), "v2")
+        self.assertEqual(orc.opencode_dialect("opencode 2.2.7", pinned=""), "v2")
         with self.assertRaises(RuntimeError):
             orc.opencode_dialect("release unknown")
 
@@ -275,7 +284,12 @@ class ControlTests(unittest.TestCase):
             fingerprint = orc.signature(snapshot)
             evidence_path = self.root / "mock-verification.json"
             orc.atomic_json(evidence_path, {"evidence_version": 2,
-                "provenance": {"version": 2, "source": snapshot},
+                "provenance": {"version": 2, "source": snapshot,
+                    "configuration": snapshot.get("configuration"),
+                    "environment": snapshot.get("environment"),
+                    "toolchain": snapshot.get("toolchain"),
+                    "runtime_inputs": snapshot.get("runtime_inputs"),
+                    "command_policy": _cfg.get("verification", {}).get("command_policy", {})},
                 "candidate":snapshot, "after":snapshot, "candidate_hash":fingerprint,
                 "after_hash":fingerprint, "passed":True, "source_unchanged":True,
                 "commands":[]})
@@ -405,7 +419,9 @@ class ControlTests(unittest.TestCase):
         orc.save(self.rundir, self.state)
         with patch.object(orc, "load", return_value=(self.rundir, self.state)):
             with patch.object(orc, "detach"):
-                orc.modify("test-run00", "approve-fallback", "implementer")
+                with patch.object(orc, "require_human_operator",
+                                  return_value={"actor": "test", "method": "test"}):
+                    orc.modify("test-run00", "approve-fallback", "implementer")
         self.assertEqual(self.state["fallback_authorization"]["role"], "implementer")
         self.assertEqual(self.state["status"], "running")
         # After dispatch, host model—not a secretly selected free Go model.
