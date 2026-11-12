@@ -190,9 +190,11 @@ in `.abdullah/runtime-inputs.json` (`include`, `required`, `exclude`).
 ## Trust boundary
 
 The Implementer may edit the authorized project and run local shell/Docker
-commands, but generated OpenCode profiles explicitly deny pushes, destructive
-Git operations, `docker compose down -v`, external directories, web access,
-subagents and `.env` reads. Explorer and Reviewer are read-only. These are
+commands, but generated **V2** OpenCode profiles explicitly deny pushes,
+destructive Git operations, `docker compose down -v`, external directories, web
+access, subagents and `.env` reads. Explorer and Reviewer are read-only. The
+V1 profile format cannot express every pattern-level denial; V1 relies on the
+documented tool restrictions plus OS isolation for credential files. These are
 application-level permissions, not an OS sandbox; a malicious project can still
 abuse an allowed command. Push, deploy, production access, broad deletion and
 billing changes are never authorized by starting a run. Keep the workflow away

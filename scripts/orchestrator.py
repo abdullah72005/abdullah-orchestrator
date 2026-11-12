@@ -64,21 +64,24 @@ STATE_SCHEMA_VERSION = 2
 CONFIG_SCHEMA_VERSION = 2
 SENSITIVE_OPERATOR_COMMANDS = {"adopt", "retire", "checkout-recover",
                                "acknowledge-legacy-evidence", "migrate-run", "cancel"}
-RUNTIME_INPUT_PATTERNS = (
+RUNTIME_INPUT_PATTERNS_CORE = (
     ".env", ".env.*", "*.env", "docker-compose*.yml", "docker-compose*.yaml",
     "compose*.yml", "compose*.yaml", "Dockerfile*", ".dockerignore",
     "requirements*.txt", "poetry.lock", "uv.lock", "Pipfile.lock",
     "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "go.sum", "Cargo.lock",
     "Gemfile.lock", "composer.lock", ".python-version", ".nvmrc", ".tool-versions",
     ".envrc", ".npmrc", "uv.toml", "mise.toml", "docker-bake.hcl",
-    # Conservative discovery of likely executable/configuration inputs that
-    # verification can import or execute even when Git ignores them. This is
-    # deliberately a bounded heuristic, NOT a complete dependency graph.
-    "*.py", "*.sh", "*.bash", "*.js", "*.mjs", "*.cjs", "*.ts", "*.rb",
-    "*.pl", "*.php", "*.ps1", "*.toml", "*.ini", "*.cfg", "*.conf", "*.json",
-    "*.yaml", "*.yml", "*.mk", "Makefile", "makefile", "GNUmakefile",
-    "justfile", "Justfile", "Taskfile*",
 )
+# Conservative discovery of likely executable/configuration inputs that
+# verification can import or execute even when Git ignores them. This is
+# deliberately a bounded heuristic, NOT a complete dependency graph.
+RUNTIME_INPUT_PATTERNS_HEURISTIC = (
+    "*.py", "*.sh", "*.bash", "*.zsh", "*.ksh", "*.fish", "*.js", "*.mjs",
+    "*.cjs", "*.ts", "*.rb", "*.pl", "*.php", "*.ps1", "*.bat", "*.cmd",
+    "*.toml", "*.ini", "*.cfg", "*.conf", "*.json", "*.yaml", "*.yml", "*.mk",
+    "Makefile", "makefile", "GNUmakefile", "justfile", "Justfile", "Taskfile*",
+)
+RUNTIME_INPUT_PATTERNS = RUNTIME_INPUT_PATTERNS_CORE + RUNTIME_INPUT_PATTERNS_HEURISTIC
 RUNTIME_DECLARATION = Path(".abdullah") / "runtime-inputs.json"
 COMMAND_POLICY_DEFAULTS = {
     "reject_shell_wrappers": True,
@@ -91,9 +94,8 @@ TRIVIAL_CHECK_EXECUTABLES = {"true", "false", ":", "echo", "printf", "cat"}
 OPENCODE_VERSION_RANGES = (("1.18", "2.0"), ("2.2", "3.0"))
 ESSENTIAL_CONTEXT_KEYS = frozenset({
     "goal", "invariants", "acceptance", "acceptance_criteria", "authorized_scope",
-    "scope", "task", "requirements", "batch", "batches", "checks", "files",
-    "file_references", "references", "project", "plan", "contract_version",
-    "source", "provenance", "amendment", "risk",
+    "scope", "task", "requirements", "batch", "checks", "file_references",
+    "references", "project", "contract_version", "amendment", "risk",
 })
 RUNTIME_SKIP_PARTS = {".git", "node_modules", ".venv", "venv", "__pycache__",
                       ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
@@ -1548,13 +1550,17 @@ def runtime_input_manifest(project: Path, cfg=None):
     """
     cfg = cfg or config()
     settings = cfg.get("verification", {}).get("runtime_inputs", {}) or {}
-    # Always keep the conservative built-in discovery; configuration may add
-    # project-specific patterns, and declarations may exclude false positives.
-    patterns = list(dict.fromkeys(list(RUNTIME_INPUT_PATTERNS)
-                                  + list(settings.get("patterns") or [])))
+    heuristic = settings.get("heuristic", True)
+    if not isinstance(heuristic, bool):
+        raise ValueError("verification.runtime_inputs.heuristic must be boolean")
+    configured = list(settings.get("patterns") or [])
+    patterns = list(dict.fromkeys(
+        (configured or list(RUNTIME_INPUT_PATTERNS_CORE))
+        + (list(RUNTIME_INPUT_PATTERNS_HEURISTIC) if heuristic else [])))
     declared = [str(item) for item in (settings.get("declared") or [])]
     required = [str(item) for item in (settings.get("required") or [])]
-    excludes = []
+    operator_excludes = [str(item) for item in (settings.get("exclude") or [])]
+    project_excludes = []
     project = Path(project)
     declaration_path = project / RUNTIME_DECLARATION
     declaration_error = None
@@ -1576,8 +1582,9 @@ def runtime_input_manifest(project: Path, cfg=None):
                     patterns += declaration.get("include", [])
                     declared += declaration.get("include", [])
                     required += declaration.get("required", [])
-                    excludes = declaration.get("exclude", [])
-    max_files = int(settings.get("max_files", 500))
+                    project_excludes = declaration.get("exclude", [])
+    excludes = operator_excludes + project_excludes
+    max_files = int(settings.get("max_files", 2000))
     max_bytes = int(settings.get("max_total_bytes", 20 * 1024 * 1024))
 
     def matches(name, text, candidates):
@@ -1645,12 +1652,13 @@ def runtime_input_manifest(project: Path, cfg=None):
         except OSError:
             files[relative] = "unreadable"
             complete = False
-    if declaration_error or missing_required:
+    if declaration_error or missing_required or project_excludes:
         complete = False
     return {"version": SOURCE_PROVENANCE_VERSION, "patterns": list(patterns),
             "declared": declared, "required": required,
             "declaration": str(RUNTIME_DECLARATION),
             "declaration_error": declaration_error,
+            "project_excludes": project_excludes,
             "missing_required": missing_required,
             "files": files, "file_count": len(files), "total_bytes": total_bytes,
             "max_files": max_files, "max_total_bytes": max_bytes,
@@ -1757,7 +1765,7 @@ def _command_policy_settings(cfg):
     return settings, validated
 
 
-def verification_command_policy(cmd, cfg=None):
+def verification_command_policy(cmd, cfg=None, project=None):
     """Classify wrapper/interpreter/indirect execution as an explicit decision.
 
     Filtering argv is NOT filesystem, network or credential isolation. It only
@@ -1819,7 +1827,8 @@ def verification_command_policy(cmd, cfg=None):
                 or argv[executable_index].startswith("-")):
             executable_index += 1
     if executable_index < len(argv):
-        resolved = shutil.which(argv[executable_index])
+        invoked = argv[executable_index]
+        resolved = shutil.which(invoked)
         if resolved:
             resolved_name = Path(os.path.realpath(resolved)).name
             invoked_name = basenames[executable_index]
@@ -1830,6 +1839,17 @@ def verification_command_policy(cmd, cfg=None):
             if (is_interpreter(resolved_name) and not is_interpreter(invoked_name)
                     and invoked_name not in shell_names):
                 interpreter_string = True
+        if project is not None and ("/" in invoked or "\\" in invoked):
+            candidate = Path(invoked)
+            if not candidate.is_absolute():
+                candidate = Path(project) / candidate
+            try:
+                if candidate.resolve().is_relative_to(Path(project).resolve()):
+                    # A project-local executable is an arbitrary script even
+                    # when it has no extension or a non-listed suffix.
+                    arbitrary_script = True
+            except (OSError, ValueError):
+                arbitrary_script = True
     for index, name in enumerate(basenames):
         if name in wrapper_names:
             env_wrapper = True
@@ -1853,18 +1873,28 @@ def verification_command_policy(cmd, cfg=None):
             if (next_index < len(argv) and not argv[next_index].startswith("-")
                     and "-m" not in options):
                 arbitrary_script = True
-        elif name.startswith(".") or Path(name).suffix in {".sh", ".bash", ".py", ".js", ".rb", ".pl", ".php"}:
+        elif name.startswith(".") or Path(name).suffix.lower() in {
+                ".sh", ".bash", ".zsh", ".ksh", ".fish", ".py", ".js", ".mjs",
+                ".cjs", ".ts", ".rb", ".pl", ".php", ".ps1", ".bat", ".cmd"}:
             arbitrary_script = True
-    rejected = ((settings.get("reject_shell_wrappers") and shell_wrapper)
+    rejected = ((settings.get("reject_shell_wrappers") and (shell_wrapper or env_wrapper))
                 or (settings.get("reject_interpreter_strings") and interpreter_string)
                 or (settings.get("reject_indirect_docker") and indirect_docker)
                 or (settings.get("reject_arbitrary_scripts") and arbitrary_script)
                 or malformed)
     matched_exception = None
     if rejected:
-        joined = " ".join(argv)
+        encoded = json.dumps(argv, ensure_ascii=False, separators=(",", ":"))
         for item in exceptions:
-            if re.fullmatch(item["argv_regex"], joined, re.S):
+            scope = item["scope"]
+            if scope != "*" and project is not None:
+                try:
+                    if not Path(project).resolve().is_relative_to(
+                            Path(scope).expanduser().resolve()):
+                        continue
+                except (OSError, ValueError):
+                    continue
+            if re.fullmatch(item["argv_regex"], encoded, re.S):
                 matched_exception = item
                 break
     allowed = (not rejected) or matched_exception is not None
@@ -1875,6 +1905,7 @@ def verification_command_policy(cmd, cfg=None):
             "malformed": bool(malformed),
             "rejected_reasons": [name for name, active in (
                 ("shell_wrapper", settings.get("reject_shell_wrappers") and shell_wrapper),
+                ("wrapper", settings.get("reject_shell_wrappers") and env_wrapper),
                 ("interpreter_string", settings.get("reject_interpreter_strings") and interpreter_string),
                 ("indirect_docker", settings.get("reject_indirect_docker") and indirect_docker),
                 ("arbitrary_script", settings.get("reject_arbitrary_scripts") and arbitrary_script),
@@ -1964,19 +1995,6 @@ def signature(snapshot):
     if runtime and not runtime.get("complete", True):
         core["runtime_incomplete"] = True
     return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
-
-
-def provenance_fingerprint(snapshot):
-    """Fingerprint non-source verification inputs that can change outcomes."""
-    if not isinstance(snapshot, dict):
-        return hashlib.sha256(b"invalid-provenance").hexdigest()
-    runtime = snapshot.get("runtime_inputs") or {}
-    core = {"environment": snapshot.get("environment"),
-            "configuration": snapshot.get("configuration"),
-            "toolchain": snapshot.get("toolchain"),
-            "runtime_inputs": runtime.get("files"),
-            "runtime_complete": runtime.get("complete")}
-    return content_hash(core)
 
 
 def provenance_drift(recorded, current):
@@ -2199,7 +2217,7 @@ def _context_reference(value):
     except (TypeError, ValueError):
         raw = repr(value)
     return {"omitted": True, "type": type(value).__name__,
-            "chars": len(raw),
+            "chars": len(raw), "canonical": "json-sorted",
             "sha256": hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest(),
             "note": ("Omitted to meet the handoff budget. This is not context-window "
                      "compaction; read the referenced source directly if it is needed.")}
@@ -2321,7 +2339,7 @@ def model_route(cfg, host, role):
 
 
 def _version_tuple(text):
-    match = re.search(r"\b(\d+)\.(\d+)(?:\.(\d+))?", str(text))
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?", str(text))
     if not match:
         return None
     return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
@@ -3245,7 +3263,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
             raise ValueError("Verification checks must be argv arrays")
         # Exactly the plan's argv, never shell=True. Wrapper, interpreter and
         # indirect-container execution are explicit, recorded security choices.
-        policy = verification_command_policy(cmd, cfg)
+        policy = verification_command_policy(cmd, cfg, project=project)
         if not policy["allowed"]:
             raise RuntimeError(
                 "Verification command rejected by command policy: " +
@@ -4544,8 +4562,11 @@ def doctor(project: Path, host="codex"):
         checks["api_billing_risk"].append("OPENAI_API_KEY is set")
     if host == "claude" and os.getenv("ANTHROPIC_API_KEY"):
         checks["api_billing_risk"].append("ANTHROPIC_API_KEY is set")
+    profiles_cli_ok = (dialect is not None
+                       and all(value is True for value in checks["worker_profiles_cli"].values()))
+    checks["worker_profiles_cli_verified"] = profiles_cli_ok
     checks["ready"] = checks["valid_repo"] and all(checks["commands"][c] for c in required) and (
-        all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and (
+        all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and profiles_cli_ok and (
         checks.get("paid_go_model_listed") is True
         and checks["variant_verified"] is not False) and not checks["api_billing_risk"]
     checks["compatibility_note"] = (
@@ -5313,9 +5334,11 @@ def next_action_for(state):
     if conflict:
         return "orchestrator_runs"
     if status == "awaiting_plan_approval":
-        return "orchestrator_approve_plan"
+        return ("operator: approve-plan "
+                f"{state.get('id')} --confirm approve-plan:{state.get('id')}")
     if status == "needs_fallback_approval":
-        return "orchestrator_approve_fallback"
+        return ("operator: approve-fallback "
+                f"{state.get('id')} --role <role> --confirm approve-fallback:{state.get('id')}")
     if status == "uncertain":
         return "orchestrator_reconcile"
     if status in {"paused", "blocked", "rate_limited"}:
@@ -5913,8 +5936,8 @@ def amend_run(run_id, amendment, architect_review=False, kind="requirement"):
         _usage_state(state)["human_interventions"] += 1
         # A user-originated requirement change is never a minor correction just
         # because architect_review was omitted. Default to replanning.
-        material = (kind != "correction" or state.get("plan") is None
-                    or state.get("amendment_material")
+        material = (bool(architect_review) or kind != "correction"
+                    or state.get("plan") is None or state.get("amendment_material")
                     or current_batch(state) is None)
         entry = {"id": uuid.uuid4().hex[:8], "at": now(), "text": amendment,
                  "architect_review": bool(architect_review),
@@ -6515,6 +6538,17 @@ def main(argv=None):
         elif opts.command == "checkout-recover":
             print(json.dumps(checkout_recover(Path(opts.project).expanduser().resolve(),
                                               opts.owner, opts.reason, opts.acknowledge),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "approve-plan":
+            if bool(opts.run) == bool(opts.run_id):
+                raise ValueError("Provide exactly one run ID, either positional or --run")
+            print(json.dumps(approve_plan_run(opts.run or opts.run_id, opts.confirm),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "approve-fallback":
+            if bool(opts.run) == bool(opts.run_id):
+                raise ValueError("Provide exactly one run ID, either positional or --run")
+            print(json.dumps(approve_fallback_run(opts.run or opts.run_id, opts.role,
+                                                  opts.confirm),
                              ensure_ascii=False, indent=2))
         else:
             if bool(opts.run) == bool(opts.run_id):

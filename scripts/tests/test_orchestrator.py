@@ -87,9 +87,9 @@ class ControlTests(unittest.TestCase):
         test_cfg = orc.read_json(orc.HERE / "config.example.json")
         test_cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = True
         test_cfg["verification"]["command_policy"]["exceptions"] = [{
-            "argv_regex": r".*python[0-9.]* -c .*",
+            "argv_regex": r'.*python[0-9.]*","-c".*',
             "reason": "test harness containment/provenance probe",
-            "scope": "unit tests under a temporary directory",
+            "scope": "*",
             "authorized_by": "test-operator",
         }]
         cfg_path = self.root / "config.json"

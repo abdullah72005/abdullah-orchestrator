@@ -4,7 +4,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -53,7 +55,7 @@ class CommandPolicyDefaults(unittest.TestCase):
     def test_scoped_exception_is_recorded_and_cannot_be_model_authorized(self):
         cfg = shipped_config()
         cfg["verification"]["command_policy"]["exceptions"] = [{
-            "argv_regex": r".*bash -lc pytest -q",
+            "argv_regex": r'.*"bash","-lc","pytest -q".*',
             "reason": "legacy project wrapper required by CI",
             "scope": "/repo/project-a",
             "authorized_by": "abdullah",
@@ -66,6 +68,50 @@ class CommandPolicyDefaults(unittest.TestCase):
         cfg["verification"]["command_policy"]["exceptions"][0]["authorized_by"] = "architect"
         with self.assertRaisesRegex(ValueError, "cannot authorize"):
             orc.verification_command_policy(["bash", "-lc", "pytest -q"], cfg)
+
+    def test_wrappers_and_project_local_executables_are_rejected(self):
+        cfg = shipped_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "payload").write_text("#!/bin/sh\n")
+            (project / "run.zsh").write_text("echo hi\n")
+            for argv in (["sudo", "pytest"], ["timeout", "30", "pytest"],
+                         ["env", "PATH=.", "pytest"], ["xargs", "pytest"],
+                         ["./payload"], ["scripts/run"], ["run.zsh"]):
+                with self.subTest(argv=argv):
+                    policy = orc.verification_command_policy(argv, cfg, project=project)
+                    self.assertFalse(policy["allowed"], policy)
+                    self.assertTrue(policy["rejected_reasons"], policy)
+
+    def test_exception_for_plain_command_does_not_authorize_wrapper(self):
+        cfg = shipped_config()
+        cfg["verification"]["command_policy"]["exceptions"] = [{
+            "argv_regex": r'.*"pytest","-q".*',
+            "reason": "plain pytest is approved",
+            "scope": "*",
+            "authorized_by": "ops",
+        }]
+        self.assertTrue(orc.verification_command_policy(["pytest", "-q"], cfg)["allowed"])
+        wrapped = orc.verification_command_policy(["bash", "-lc", "pytest -q"], cfg)
+        self.assertFalse(wrapped["allowed"], wrapped)
+
+    def test_exception_scope_is_enforced(self):
+        cfg = shipped_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            allowed_project = Path(tmp) / "allowed"
+            other_project = Path(tmp) / "other"
+            allowed_project.mkdir()
+            other_project.mkdir()
+            cfg["verification"]["command_policy"]["exceptions"] = [{
+                "argv_regex": r'.*"bash","-lc","pytest -q".*',
+                "reason": "legacy wrapper for one project",
+                "scope": str(allowed_project),
+                "authorized_by": "ops",
+            }]
+            self.assertTrue(orc.verification_command_policy(
+                ["bash", "-lc", "pytest -q"], cfg, project=allowed_project)["allowed"])
+            self.assertFalse(orc.verification_command_policy(
+                ["bash", "-lc", "pytest -q"], cfg, project=other_project)["allowed"])
 
     def test_exception_requires_scope_and_reason(self):
         cfg = shipped_config()
@@ -269,6 +315,10 @@ class OpenCodeV2(unittest.TestCase):
             orc.opencode_dialect("opencode 3.0.0")
         with self.assertRaisesRegex(RuntimeError, "does not match pinned"):
             orc.opencode_dialect("opencode 2.2.7", pinned="1.18")
+        self.assertEqual(orc.opencode_dialect("opencode v1.18.35"), "v1")
+        self.assertEqual(orc.opencode_dialect("opencode v2.2.7", pinned="2.2.7"), "v2")
+        with self.assertRaisesRegex(RuntimeError, "does not match pinned"):
+            orc.opencode_dialect("opencode v2.2.7", pinned="2.2.6")
 
     def test_v2_profiles_enforce_role_restrictions(self):
         for role in ("explorer", "reviewer"):
@@ -283,6 +333,31 @@ class OpenCodeV2(unittest.TestCase):
         for resource in ("git push *", "git clean *", "git reset --hard *"):
             self.assertTrue(any(r["action"] == "shell" and r["resource"] == resource
                                 and r["effect"] == "deny" for r in rules))
+
+    def test_v2_model_inventory_parser(self):
+        models = orc.parse_model_inventory_v2(
+            "opencode-go/deepseek-v4.1-flash\nopencode-go/glm-5.3\nother/model\n")
+        self.assertIn("opencode-go/deepseek-v4.1-flash", models)
+        with self.assertRaises(ValueError):
+            orc.parse_model_inventory_v2("other/model\n")
+
+    def test_v2_doctor_introspection_uses_debug_agents(self):
+        role = "explorer"
+        rules = [dict(rule) for rule in orc.opencode_profile(role, "v2")["permissions"]]
+        payload = json.dumps([{"id": f"abdullah-{role}", "mode": "primary",
+                               "system": "policy", "permissions": rules}])
+        reply = subprocess.CompletedProcess([], 0, stdout=payload)
+        with patch.object(orc.subprocess, "run", return_value=reply) as run:
+            self.assertIs(orc.probe_opencode_config(Path("/tmp"), role, "v2"), True)
+        self.assertEqual(run.call_args[0][0][:3], ["opencode", "debug", "agents"])
+        broken = json.dumps([{"id": f"abdullah-{role}", "mode": "primary",
+                              "system": "policy", "permissions": []}])
+        with patch.object(orc.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, stdout=broken)):
+            self.assertIs(orc.probe_opencode_config(Path("/tmp"), role, "v2"), False)
+        with patch.object(orc.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 1, stdout="")):
+            self.assertIsNone(orc.probe_opencode_config(Path("/tmp"), role, "v2"))
 
     def test_v2_command_uses_variant_reference_and_standalone(self):
         route = {"provider": "opencode", "model": "opencode-go/deepseek-v4.1-flash",
