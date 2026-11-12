@@ -430,8 +430,7 @@ class InteractiveWorkflowTests(unittest.TestCase):
             diagnosed = orc.stage_run(self.state["id"])
         self.assertEqual(diagnosed["stage"], "diagnose")
         _, state = orc.load(self.state["id"])
-        self.assertEqual(state["phase"], "implement")
-        self.assertIn("accessibility", state["correction"].lower())
+        self.assertEqual(state["phase"], "plan")
         self.assertNotIn("implementer", self.history.read_text().splitlines())
 
 

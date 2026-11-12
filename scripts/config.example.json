@@ -46,7 +46,8 @@
     "max_worker_seconds": 14400,
     "max_architect_seconds": 14400,
     "max_check_seconds": 14400,
-    "max_explorer_calls_per_run": 8
+    "max_explorer_calls_per_run": 8,
+    "max_context_chars": 200000
   },
   "permissions": {
     "trusted_development": true,
@@ -118,5 +119,19 @@
     "sensitive_cli_enabled": false,
     "isolation_profile": "host",
     "container_profile_enabled": false
+  },
+  "risk_policy": {
+    "mechanical": {
+      "independent_review": false,
+      "minimum_checks": 1
+    },
+    "ordinary": {
+      "independent_review": true,
+      "minimum_checks": 1
+    },
+    "high": {
+      "independent_review": true,
+      "minimum_checks": 2
+    }
   }
 }

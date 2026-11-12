@@ -64,11 +64,19 @@ A queued chat message cannot preempt an already-running foreground tool. The use
 
 At any time the user may interrupt and ask what happened, what was implemented, how it works, why it was done that way, which files changed, which tests passed and what remains. The coordinator answers from `orchestrator_status` and `orchestrator_recap` (`quick` for short summaries, `developer` when the user asks how or why), citing recorded files, commands and results and admitting missing evidence. Routine summaries stay short. After an interruption the coordinator never blindly repeats completed work; it resumes the same run or reconciles an uncertain termination first.
 
-Amendments are persisted in run state and the journal. A requirement/architecture amendment can route through the strong Architect (`diagnose`); an implementation-only amendment becomes a bounded correction. Accepted batches and on-disk work are preserved; affected verification/review evidence is invalidated.
+Amendments are persisted in run state and the journal. `architect_review: true` (or an amendment before any plan exists) is a **material** amendment: it archives the prior versioned plan, moves accepted batches to `accepted_history` with the invalidating amendment ID, clears current acceptance/verification/review evidence, and routes through Architect diagnosis to a new versioned plan with fresh invariants, acceptance criteria and checks. A minor implementation correction stays on the current plan and becomes a bounded correction. Previously accepted work is preserved as history but is not treated as valid under the amended plan until it is replanned and reverified.
+
+Risk depth is deterministic and configurable through `risk_policy`: mechanical batches may skip the separate reviewer but still require supervisor checks and Architect acceptance; ordinary batches require independent review; high-risk batches require independent review and at least two verification commands. Unknown risk classes fail closed.
+
+`status`/`recap` expose recorded usage: strong and cheap calls, reported tokens/cache, elapsed time, failed/interrupted attempts, corrections, human interventions and reported provider cost where available. Subscription quota and monetary billing are never inferred; unavailable fields remain null. `usage.note` states this explicitly.
+
+Worker prompts are bounded by `limits.max_context_chars`; truncation is explicit and tells the worker to inspect referenced files directly. This is the supervisor's handoff budget, not a guarantee about the external CLI's own context management; no automatic 70% compaction is claimed.
+
+Automatic application-repository Git commits are disabled by default. Supervisor state, journal, dispatch artifacts, reports and verification evidence are the checkpoint mechanism. `git commit --only` is not used as an isolation guarantee; an opt-in Git checkpoint strategy is not enabled.
 
 ## Recovery guarantees and limits
 
-State is stored on WSL Linux disk in `~/.local/state/abdullah-orchestrator/runs/<ID>`. Each run has immutable dispatch artifacts, a durable `journal.jsonl`, checkpoints, reports and verification logs. Recovery from a new chat uses `orchestrator_runs`, `orchestrator_status`, then `orchestrator_resume`.
+State is stored on WSL Linux disk in `~/.local/state/abdullah-orchestrator/runs/<ID>`. State writes use fsynced temporary files plus atomic replacement and directory fsync; each run has immutable dispatch artifacts, a durable `journal.jsonl`, checkpoints, reports and verification logs. Recovery from a new chat uses `orchestrator_runs`, `orchestrator_status`, then `orchestrator_resume`.
 
 A completed artifact is only recovered as complete when its recorded process session is proven stopped and its completion snapshot matches the current checkout. Artifacts alone are not proof. Reports written before process exit with live descendants, missing reports, contradictory snapshots, reused PIDs, and legacy jobs without process identity fail closed.
 

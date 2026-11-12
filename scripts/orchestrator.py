@@ -108,6 +108,19 @@ def now():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def _fsync_directory(path: Path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=".state-", delete=False) as stream:
@@ -117,6 +130,7 @@ def atomic_json(path: Path, value):
         os.fsync(stream.fileno())
         tmp = Path(stream.name)
     os.replace(tmp, path)
+    _fsync_directory(path.parent)
 
 
 def read_json(path: Path):
@@ -1021,6 +1035,26 @@ def adopt_run(run_id):
             "explorer_policy": state["explorer_policy"]}
 
 
+RISK_POLICY_DEFAULTS = {
+    "mechanical": {"independent_review": False, "minimum_checks": 1},
+    "ordinary": {"independent_review": True, "minimum_checks": 1},
+    "high": {"independent_review": True, "minimum_checks": 2},
+}
+
+
+def risk_policy(risk, cfg=None):
+    """Deterministic, configurable QA depth for one batch."""
+    cfg = cfg or config()
+    risk = risk or "ordinary"
+    settings = cfg.get("risk_policy", RISK_POLICY_DEFAULTS)
+    policy = settings.get(risk)
+    if not isinstance(policy, dict):
+        raise ValueError(f"Unknown risk class {risk!r}; expected mechanical, ordinary or high")
+    return {"risk": risk,
+            "independent_review": bool(policy.get("independent_review", True)),
+            "minimum_checks": max(1, int(policy.get("minimum_checks", 1)))}
+
+
 def explorer_policy_for(state):
     """Legacy/missing policy is always 'none'; never infer permission."""
     policy = state.get("explorer_policy")
@@ -1786,6 +1820,8 @@ def validate_report(kind, result):
                 if contract_version >= 2 and (not isinstance(item.get("acceptance"), list)
                                               or not item["acceptance"]):
                     raise ValueError("Contract v2 batch requires nonempty acceptance criteria")
+                if item.get("risk") not in RISK_POLICY_DEFAULTS:
+                    raise ValueError("Batch risk must be mechanical, ordinary or high")
                 if not isinstance(item["checks"], list) or not item["checks"] or not all(
                     isinstance(c, list) and c and all(isinstance(token, str) for token in c) for c in item["checks"]
                 ):
@@ -1859,10 +1895,19 @@ def role_text(role):
 
 
 def report_prompt(kind, context):
+    payload = json.dumps(context, ensure_ascii=False, indent=2)
+    try:
+        budget = int(config().get("limits", {}).get("max_context_chars", 200000))
+    except (ValueError, KeyError, TypeError, OSError):
+        budget = 200000
+    if len(payload) > budget:
+        payload = (payload[:max(0, budget - 200)]
+                   + "\n...[context truncated by the supervisor's bounded handoff budget; "
+                     "inspect referenced files directly if needed]...")
     return (
         f"You are Abdullah Orchestrator's {kind} role. Follow these policies:\n"
         + role_text(kind) + "\n\n"
-        + "Task and evidence:\n" + json.dumps(context, ensure_ascii=False, indent=2) + "\n\n"
+        + "Task and evidence:\n" + payload + "\n\n"
         + "Reply with ONE valid JSON object matching the appropriate role contract, no Markdown. "
         + "Set contract_version to 2 and include every field required by that version; "
         + "legacy reports without it are accepted only as marked legacy evidence. "
@@ -2105,6 +2150,115 @@ def extract_cli_report(format_name, out: str, path: Path):
     return parse_json_object("".join(parts)), session_id
 
 
+def extract_reported_usage(raw, format_name="jsonl"):
+    """Extract only provider-reported numeric usage; never synthesize values."""
+    import numbers
+    tokens = None
+    cache = None
+    cost = None
+    for line in (raw or "").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        stack = [event]
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    lowered = str(key).lower()
+                    if isinstance(item, numbers.Number) and not isinstance(item, bool):
+                        if lowered in {"total_tokens", "total_token_count", "tokens"}:
+                            tokens = int(item)
+                        elif "cache" in lowered and ("token" in lowered or "read" in lowered):
+                            cache = int(item)
+                        elif lowered in {"cost", "total_cost", "cost_usd"}:
+                            cost = float(item)
+                    elif isinstance(item, (dict, list)):
+                        stack.append(item)
+            elif isinstance(value, list):
+                stack.extend(value)
+    if tokens is None and cache is None and cost is None:
+        return None
+    return {"tokens": tokens, "cache_tokens": cache, "cost": cost,
+            "source": "provider_output", "format": format_name}
+
+
+def _usage_state(state):
+    usage = state.setdefault("usage", {})
+    defaults = {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
+                "interrupted_attempts": 0, "human_interventions": 0,
+                "reported_tokens": None, "reported_cache_tokens": None,
+                "reported_provider_cost": None, "cost_status": "unavailable",
+                "billing": {"go": 0, "subscription": 0, "api": 0}}
+    for key, value in defaults.items():
+        usage.setdefault(key, value)
+    return usage
+
+
+def record_usage(state, job, outcome, seconds=0):
+    """Record one attempt once; unavailable provider fields stay null."""
+    if not isinstance(job, dict) or job.get("usage_recorded"):
+        return
+    job["usage_recorded"] = True
+    usage = _usage_state(state)
+    role = job.get("role")
+    if role == "architect":
+        usage["strong_calls"] += 1
+    else:
+        usage["cheap_calls"] += 1
+    billing = (job.get("route") or {}).get("billing", "unknown")
+    usage.setdefault("billing", {}).setdefault(billing, 0)
+    usage["billing"][billing] += 1
+    if outcome == "failed":
+        usage["failed_attempts"] += 1
+    elif outcome == "interrupted":
+        usage["interrupted_attempts"] += 1
+    usage["seconds"] = round(float(usage.get("seconds", 0)) + float(seconds or 0), 2)
+    reported = job.get("reported_usage")
+    if reported:
+        if reported.get("tokens") is not None:
+            usage["reported_tokens"] = int(usage.get("reported_tokens") or 0) + reported["tokens"]
+        if reported.get("cache_tokens") is not None:
+            usage["reported_cache_tokens"] = (int(usage.get("reported_cache_tokens") or 0)
+                                               + reported["cache_tokens"])
+        if reported.get("cost") is not None:
+            usage["reported_provider_cost"] = round(
+                float(usage.get("reported_provider_cost") or 0) + reported["cost"], 6)
+    usage["cost_status"] = ("reported" if usage.get("reported_provider_cost") is not None
+                            else "unavailable")
+    usage["corrections"] = int(state.get("corrections", 0))
+
+
+def usage_report(state):
+    usage = copy.deepcopy(_usage_state(state))
+    usage["corrections"] = int(state.get("corrections", 0))
+    usage["note"] = ("Provider token/cost values are only those explicitly reported; "
+                     "subscription quota and monetary billing are not inferred.")
+    return usage
+
+
+def merge_usage(target_state, source_state):
+    """Fold a tracker's usage counters into the run, without double counting jobs."""
+    source = _usage_state(source_state)
+    target = _usage_state(target_state)
+    for key in ("strong_calls", "cheap_calls", "failed_attempts",
+                "interrupted_attempts", "human_interventions"):
+        target[key] = int(target.get(key) or 0) + int(source.get(key) or 0)
+    for key in ("reported_tokens", "reported_cache_tokens"):
+        if source.get(key) is not None:
+            target[key] = int(target.get(key) or 0) + int(source[key])
+    if source.get("reported_provider_cost") is not None:
+        target["reported_provider_cost"] = round(
+            float(target.get("reported_provider_cost") or 0)
+            + float(source["reported_provider_cost"]), 6)
+    target.setdefault("billing", {})
+    for key, value in (source.get("billing") or {}).items():
+        target["billing"][key] = int(target["billing"].get(key) or 0) + int(value)
+    target["cost_status"] = ("reported" if target.get("reported_provider_cost") is not None
+                             else "unavailable")
+
+
 def control(run_dir):
     cfile = run_dir / "control.json"
     return read_json(cfile).get("action", "run") if cfile.exists() else "run"
@@ -2214,6 +2368,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             error = "rate_limited" if is_rate_limited(output) else "failed"
             raise RuntimeError(f"{error}: {role} exited {proc.returncode}; consult {out_file}")
         report, session_id = extract_cli_report(output_format, output, jpath)
+        job["reported_usage"] = extract_reported_usage(output, output_format)
         check_kind = "plan" if kind == "plan" else "decision" if role == "architect" else role
         atomic_json(jpath / "raw_report.json", report)
         report, normalization = normalize_report(check_kind, report)
@@ -2228,6 +2383,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     "contract_version": contract_version,
                     "legacy_contract": contract_version < 2})
         if state is not None:
+            record_usage(state, job, "complete", result_record["seconds"])
             inspection = inspect_execution(job, run_id=state.get("id"), include_run=False)
             containment = None
             if inspection["survivors"]:
@@ -2258,6 +2414,12 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     except BaseException as exc:
         job["status"] = "interrupted" if isinstance(exc, InterruptedError) else "failed"
         job["error"] = str(exc)
+        if state is not None:
+            job["reported_usage"] = extract_reported_usage(
+                out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "",
+                output_format)
+            record_usage(state, job, "interrupted" if isinstance(exc, InterruptedError) else "failed",
+                         round(time.monotonic() - started, 2))
         if out_file.exists() and output_format == "jsonl":
             for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
@@ -3057,7 +3219,14 @@ def advance(run_dir, state, cfg):
             pause_with(run_dir, state, "Strong diagnosis blocked: " + verdict["reason"])
             return
         state["correction"] = verdict.get("correction") or verdict["reason"]
-        state["phase"] = "implement"
+        if state.pop("amendment_material", False):
+            state["phase"] = "plan"
+            state["plan"] = None
+            state["plan_version"] = None
+            state["batch_index"] = 0
+            state["pause_reason"] = "Material amendment requires a new versioned plan"
+        else:
+            state["phase"] = "implement"
         save(run_dir, state)
         return
     if stage == "plan":
@@ -3070,8 +3239,22 @@ def advance(run_dir, state, cfg):
             consume_last(state)
             pause_with(run_dir, state, "Plan exceeds configured batch budget")
             return
+        previous_plan = state.get("plan")
+        previous_version = state.get("plan_version")
+        new_version = content_hash(plan)
+        if previous_plan and previous_version != new_version:
+            history = state.setdefault("plan_history", [])
+            if not history or history[-1].get("plan_version") != previous_version:
+                history.append({"version": state.get("plan_revision", 0),
+                                "plan_version": previous_version,
+                                "plan": previous_plan,
+                                "accepted_batches": copy.deepcopy(
+                                    state.get("accepted_batches", [])),
+                                "archived_at": now()})
         state["plan"] = plan
-        state["plan_version"] = content_hash(plan)
+        state["plan_version"] = new_version
+        state["plan_revision"] = state.get("plan_revision", 0) + 1
+        state.pop("amendment_material", None)
         exploration = certified_exploration(run_dir, state, plan) if state.get("require_explorer") else None
         if exploration is not None:
             state["exploration"] = exploration
@@ -3150,8 +3333,21 @@ def advance(run_dir, state, cfg):
                 handle_repair(run_dir, state, cfg, "Supervisor verification failed: " +
                               json.dumps(short_log_evidence(evidence), ensure_ascii=False))
         else:
+            policy = risk_policy(batch.get("risk"), cfg)
+            if len(batch.get("checks", [])) < policy["minimum_checks"]:
+                pause_with(run_dir, state,
+                           f"Risk class {policy['risk']} requires at least "
+                           f"{policy['minimum_checks']} verification checks")
+                return
             state["check_progress"] = None
-            state["phase"] = "review"
+            if policy["independent_review"]:
+                state["phase"] = "review"
+            else:
+                state["review"] = {"status": "complete", "summary":
+                                   "Mechanical batch accepted by bounded supervisor checks",
+                                   "files": [], "tests": [], "evidence": [], "unknowns": [],
+                                   "blocker": "", "findings": []}
+                state["phase"] = "accept"
             save(run_dir, state)
         return
     if stage == "review":
@@ -3717,11 +3913,18 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
                  "project_lease": lease,
                  "plan_approval": bool(plan_approval), "require_explorer": bool(require_explorer),
                  "status": "running", "phase": "plan",
-                 "plan": None, "plan_version": None, "batch_index": 0, "corrections": 0,
+                 "plan": None, "plan_version": None, "plan_revision": 0,
+                 "plan_history": [], "batch_index": 0, "corrections": 0,
                  "single_batch_fast_path": True, "interactive": bool(interactive),
                  "correction": "", "active_job": None, "completed_jobs": [], "failed_jobs": [],
-                 "accepted_batches": [], "review": None, "implementation": None,
+                 "accepted_batches": [], "accepted_history": [],
+                 "review": None, "implementation": None,
                  "verification": None, "amendments": [], "interruptions": [],
+                 "usage": {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
+                           "interrupted_attempts": 0, "corrections": 0,
+                           "human_interventions": 0, "reported_tokens": None,
+                           "reported_cache_tokens": None, "reported_provider_cost": None,
+                           "cost_status": "unavailable"},
                  "model_routes": {r: model_route(cfg, host, r) for r in
                                   ("architect", "explorer", "implementer", "reviewer")}}
         if handoff is not None:
@@ -3839,6 +4042,7 @@ def do_status(run_id):
         "active_job", "verification", "architect_verdict", "final_verdict")}
     result["total_batches"] = len(state["plan"]["batches"]) if state.get("plan") else 0
     result["recent_completed_jobs"] = state.get("completed_jobs", [])[-3:]
+    result["usage"] = usage_report(state)
     result["run_dir"] = str(folder)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -4123,11 +4327,28 @@ def explore(args):
                 f"Explorer call budget exhausted for this run ({calls}/{limit})")
         ts["explorer_calls"] = calls + 1
         save(tracker, ts)
+        usage_before = copy.deepcopy(_usage_state(ts))
         before = source_snapshot(project)
         report, job = call_model(tracker, ts, cfg, "explorer", "explorer",
                                  report_prompt("explorer", ctx), project, archive=folder / "explorations")
         if signature(before) != signature(source_snapshot(project)):
             raise RuntimeError("Source changed during Explorer; inspect before using the report")
+        usage_after = _usage_state(ts)
+        delta = {"strong_calls": usage_after.get("strong_calls", 0) - usage_before.get("strong_calls", 0),
+                 "cheap_calls": usage_after.get("cheap_calls", 0) - usage_before.get("cheap_calls", 0),
+                 "failed_attempts": usage_after.get("failed_attempts", 0) - usage_before.get("failed_attempts", 0),
+                 "interrupted_attempts": usage_after.get("interrupted_attempts", 0) - usage_before.get("interrupted_attempts", 0),
+                 "human_interventions": 0,
+                 "reported_tokens": (None if usage_after.get("reported_tokens") is None else
+                                     usage_after["reported_tokens"] - (usage_before.get("reported_tokens") or 0)),
+                 "reported_cache_tokens": (None if usage_after.get("reported_cache_tokens") is None else
+                                           usage_after["reported_cache_tokens"] - (usage_before.get("reported_cache_tokens") or 0)),
+                 "reported_provider_cost": (None if usage_after.get("reported_provider_cost") is None else
+                                            usage_after["reported_provider_cost"] - (usage_before.get("reported_provider_cost") or 0)),
+                 "billing": {key: value - (usage_before.get("billing", {}).get(key, 0))
+                             for key, value in usage_after.get("billing", {}).items()}}
+        merge_usage(state, delta)
+        save(folder, state)
         journal_event(folder, state, "explorer_dispatched",
                       job_id=job["id"], parent_job=parent, phase=state.get("phase"),
                       route=job.get("route"), calls=ts["explorer_calls"], limit=limit)
@@ -4798,6 +5019,7 @@ def interrupt_run(run_id, reason="User requested interruption"):
                 "message": "Interruption was requested but ownership could not be verified; do not launch a duplicate."}
     try:
         folder, state = load(run_id)
+        _usage_state(state)["human_interventions"] += 1
         terminations = _terminate_state_identities(state, grace=6)
         by_target = {item.get("target"): item for item in terminations}
         job = state.get("active_job") if isinstance(state.get("active_job"), dict) and state.get("active_job") else None
@@ -4933,25 +5155,47 @@ def amend_run(run_id, amendment, architect_review=False):
         folder, state = load(run_id)
         if state.get("status") in FINAL_STATES:
             raise RuntimeError("Completed/cancelled run cannot be amended")
+        _usage_state(state)["human_interventions"] += 1
+        material = bool(architect_review) or state.get("plan") is None
         entry = {"id": uuid.uuid4().hex[:8], "at": now(), "text": amendment,
-                 "architect_review": bool(architect_review)}
+                 "architect_review": bool(architect_review),
+                 "kind": "material" if material else "minor"}
         state.setdefault("amendments", []).append(entry)
         state["verification"] = None
         state["review"] = None
         state["architect_verdict"] = None
         state["check_progress"] = None
         state.pop("single_batch_verification", None)
-        if state.get("plan") is None:
-            # The plan has not been produced yet; the amendment joins its inputs.
-            state["status"] = "paused"
-            state["pause_reason"] = "Amendment persisted; resume to plan with the amended requirement"
-        elif architect_review or current_batch(state) is None:
-            # Requirement changes and amendments after the last accepted batch
-            # need an explicit strong reassessment rather than guessing a target.
-            state["phase"] = "diagnose"
-            state["diagnosis_reason"] = "User amendment: " + amendment
-            state["status"] = "paused"
-            state["pause_reason"] = "Amendment requires Architect reassessment; resume to diagnose"
+        if material:
+            prior = state.get("plan")
+            if prior:
+                history = state.setdefault("plan_history", [])
+                if not history or history[-1].get("plan_version") != state.get("plan_version"):
+                    history.append({"version": state.get("plan_revision", 0),
+                                    "plan_version": state.get("plan_version"),
+                                    "plan": copy.deepcopy(prior),
+                                    "accepted_batches": copy.deepcopy(
+                                        state.get("accepted_batches", [])),
+                                    "archived_at": now(), "amendment_id": entry["id"]})
+            invalidated = []
+            for accepted in state.get("accepted_batches", []):
+                invalidated.append({**accepted, "invalidated_by": entry["id"],
+                                    "invalidated_at": now()})
+            if invalidated:
+                state.setdefault("accepted_history", []).extend(invalidated)
+            state["accepted_batches"] = []
+            state["batch_index"] = 0
+            if prior is None:
+                state["phase"] = "plan"
+                state["status"] = "paused"
+                state["pause_reason"] = "Material amendment persisted; resume to produce a new versioned plan"
+                state["amendment_material"] = True
+            else:
+                state["phase"] = "diagnose"
+                state["diagnosis_reason"] = "Material user amendment: " + amendment
+                state["status"] = "paused"
+                state["pause_reason"] = "Material amendment requires Architect reassessment and a new plan"
+                state["amendment_material"] = True
         else:
             state["phase"] = "implement"
             previous = (state.get("correction") or "").strip()
