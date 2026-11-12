@@ -128,7 +128,9 @@ this is reported rather than claimed. Authenticated model execution was not test
 ## Test suite
 
 ```
-436 passed, 70 subtests passed (includes opt-in V2 binary suite)
+489 passed, 86 subtests passed (includes opt-in V2.2.7 binary suite)
+485 passed, 4 skipped, 80 subtests passed (offline default suite)
 ```
 
 All model CLIs remain faked in the default suite; the V2 suite makes no model call.
+See `DELTA-AUDIT.md` for the final delta-audit corrections and before/after probes.
