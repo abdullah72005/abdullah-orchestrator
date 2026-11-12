@@ -108,5 +108,15 @@
       "reject_indirect_docker": false,
       "reject_arbitrary_scripts": false
     }
+  },
+  "schema_version": 2,
+  "runtime": {
+    "supervisor_version": "3.0.0",
+    "opencode_version": ""
+  },
+  "authorization": {
+    "sensitive_cli_enabled": false,
+    "isolation_profile": "host",
+    "container_profile_enabled": false
   }
 }

@@ -58,6 +58,11 @@ ROLE_POLICIES = {"plan": "architect", "decision": "architect", "diagnose": "arch
                  "implementer": "implementer", "reviewer": "independent reviewer"}
 SOURCE_PROVENANCE_VERSION = 2
 VERIFICATION_EVIDENCE_VERSION = 2
+SUPERVISOR_VERSION = "3.0.0"
+STATE_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 2
+SENSITIVE_OPERATOR_COMMANDS = {"adopt", "retire", "checkout-recover",
+                               "acknowledge-legacy-evidence", "migrate-run", "cancel"}
 RUNTIME_INPUT_PATTERNS = (
     ".env", ".env.*", "*.env", "docker-compose*.yml", "docker-compose*.yaml",
     "compose*.yml", "compose*.yaml", "Dockerfile*", ".dockerignore",
@@ -120,6 +125,16 @@ def read_json(path: Path):
 def config():
     source = CONFIG_PATH if CONFIG_PATH.exists() else HERE / "config.example.json"
     cfg = read_json(source)
+    schema = cfg.get("schema_version")
+    if isinstance(schema, int) and schema > CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            f"Configuration schema {schema} is newer than supervisor supports "
+            f"({CONFIG_SCHEMA_VERSION}); refuse to reinterpret it silently")
+    runtime = cfg.get("runtime", {})
+    pinned = str(runtime.get("supervisor_version") or "").strip()
+    if pinned and pinned != SUPERVISOR_VERSION:
+        raise ValueError(
+            f"Configured supervisor version {pinned!r} does not match {SUPERVISOR_VERSION!r}")
     for role, val in cfg["workers"].items():
         if val["billing"] != "go" or not val["model"].startswith("opencode-go/"):
             raise ValueError(f"{role}: paid Go authorization is required; model={val['model']!r}")
@@ -736,6 +751,73 @@ def _append_lease_audit(identity, entry):
 def _operator_actor():
     return {"user": getpass.getuser(), "host": socket.gethostname(),
             "pid": os.getpid(), "argv": sys.argv[:8], "at": now()}
+
+
+SECRET_ENV_PATTERN = re.compile(
+    r"(API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|"
+    r"DATABASE_URL|AWS_|AZURE_|GITHUB_|GH_TOKEN)", re.I)
+
+
+def scrubbed_env():
+    """Remove common credentials before handing an environment to a worker."""
+    env = {}
+    for key, value in os.environ.items():
+        if SECRET_ENV_PATTERN.search(key):
+            continue
+        env[key] = value
+    return env
+
+
+def _operator_action_allowed(action):
+    """Fail closed on sensitive CLI actions from a model-owned context.
+
+    This is a same-user boundary, not cryptographic human proof.  It prevents
+    the routine model agent from silently invoking its own escalation path.
+    """
+    settings = config().get("authorization", {})
+    if not settings.get("sensitive_cli_enabled", False):
+        raise RuntimeError(
+            f"{action} is disabled. The user must explicitly enable "
+            "authorization.sensitive_cli_enabled in the local config.")
+    agent_markers = ("ABDULLAH_JOB_ID", "ABDULLAH_RUN_ID", "ABDULLAH_CHECK_TOKEN",
+                     "ABDULLAH_PARENT_JOB", "ABDULLAH_AGENT_CONTEXT")
+    if any(os.environ.get(marker) for marker in agent_markers):
+        raise RuntimeError(
+            f"{action} is refused from a model-owned worker context; "
+            "the user must run it manually outside the agent session.")
+    return True
+
+
+def state_compatibility(state):
+    """Read-only compatibility classification; never mutates a run."""
+    current = STATE_SCHEMA_VERSION
+    version = state.get("schema_version")
+    supervisor = state.get("supervisor_version")
+    if version is None:
+        status = "legacy"
+    elif version > current:
+        status = "unsupported_newer"
+    elif version < current:
+        status = "migration_required"
+    else:
+        status = "current"
+    supervisor_changed = bool(supervisor and supervisor != SUPERVISOR_VERSION)
+    return {"status": status, "state_schema_version": version,
+            "supported_state_schema_version": current,
+            "supervisor_version": supervisor,
+            "supported_supervisor_version": SUPERVISOR_VERSION,
+            "supervisor_changed": supervisor_changed,
+            "migration_required": status in {"legacy", "migration_required"},
+            "writes": False}
+
+
+def assert_state_compatible(state):
+    compatibility = state_compatibility(state)
+    if compatibility["status"] == "unsupported_newer":
+        raise RuntimeError(
+            "Run state is newer than this supervisor supports; use a compatible "
+            "supervisor or migrate only after a read-only compatibility preview")
+    return compatibility
 
 
 def checkout_recover(project, owner_id, reason, acknowledge):
@@ -1786,7 +1868,7 @@ def model_route(cfg, host, role):
     return {"provider": "opencode", "model": spec["model"], "effort": spec["variant"], "billing": spec["billing"]}
 
 
-def opencode_dialect(version=None):
+def opencode_dialect(version=None, pinned=None):
     """Select the documented OpenCode V1 or V2 configuration contract.
 
     OpenCode CLI 1.x uses agent/prompt/permission/bash/task; V2 uses
@@ -1800,6 +1882,14 @@ def opencode_dialect(version=None):
     if not match:
         raise RuntimeError(f"Unrecognized OpenCode version {version!r}; cannot enforce worker permissions")
     major = int(match.group(1))
+    pinned = pinned if pinned is not None else str(
+        config().get("runtime", {}).get("opencode_version") or "").strip()
+    if pinned:
+        installed = f"{major}.{int(match.group(2))}"
+        if installed != pinned:
+            raise RuntimeError(
+                f"OpenCode version {version!r} does not match pinned {pinned!r}; "
+                "refuse to generate an incompatible permission contract")
     if major == 1:
         return "v1"
     if major == 2:
@@ -1819,7 +1909,8 @@ def opencode_profile(role, dialect="v1"):
             }
         else:
             permission = {
-                "*": "allow", "task": "deny",
+                "*": "allow", "task": "deny", "external_directory": "deny",
+                "webfetch": "deny", "websearch": "deny",
                 "bash": {"*": "allow", "git push *": "deny", "git clean *": "deny",
                          "git reset --hard *": "deny", "docker * down -v*": "deny"},
             }
@@ -1838,6 +1929,9 @@ def opencode_profile(role, dialect="v1"):
                  allow("subagent", effect="deny"), allow("external_directory", effect="deny")]
     else:
         perms = [allow("*"), allow("subagent", effect="deny"),
+                      allow("external_directory", effect="deny"),
+                      allow("webfetch", effect="deny"),
+                      allow("websearch", effect="deny"),
                       allow("shell", "git push *", "deny"),
                       allow("shell", "git clean *", "deny"),
                       allow("shell", "git reset --hard *", "deny"),
@@ -1847,7 +1941,7 @@ def opencode_profile(role, dialect="v1"):
 
 
 def opencode_env(role, dialect):
-    env = os.environ.copy()
+    env = scrubbed_env()
     # Run-scoped read-only evidence access belongs to the Architect only; a
     # worker launched by the Architect (e.g. via `explore`) must not inherit it.
     for key in ("LEAN_CTX_READ_ONLY_ROOTS", "__LEAN_CTX_NO_DAEMON"):
@@ -1888,7 +1982,7 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None, evid
                "--config", f"model_reasoning_effort={route['effort']}",
                "--config", "approval_policy=never", "--sandbox", access,
                "--output-schema", str(sc), "--output-last-message", str(path / "last-message.json")]
-        env = os.environ.copy()
+        env = scrubbed_env()
         if role == "architect" and evidence_root:
             root = str(Path(evidence_root).resolve())
             # Codex MCP servers do not necessarily inherit this process's env.
@@ -1903,7 +1997,7 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None, evid
         cmd.append(prompt)
         return (cmd, env, "codex")
     if host == "claude":
-        env = os.environ.copy()
+        env = scrubbed_env()
         env["CLAUDE_CODE_EFFORT_LEVEL"] = route["effort"]
         if role == "architect" and evidence_root:
             root = str(Path(evidence_root).resolve())
@@ -2386,7 +2480,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
         launch_file = logpath.with_suffix(".launch.json")
         token = uuid.uuid4().hex
         check_id = f"check-{state['batch_index']}-{index}-{uuid.uuid4().hex[:8]}"
-        check_env = os.environ.copy()
+        check_env = scrubbed_env()
         check_env["ABDULLAH_CHECK_TOKEN"] = token
         check_env["ABDULLAH_JOB_ID"] = check_id
         check_env["ABDULLAH_RUN_ID"] = str(state.get("id", ""))
@@ -3236,6 +3330,7 @@ def recover_finished_dispatch(run_dir, state):
 def serve(run_id):
     validate_workflow()
     run_dir, state = load(run_id)
+    assert_state_compatible(state)
     if state.get("status") in FINAL_STATES:
         return
     if state.get("status") in PAUSED_STATES:
@@ -3554,7 +3649,11 @@ def create_run(*, project, goal=None, goal_file=None, host="codex",
         folder.mkdir(parents=True, exist_ok=False)
         state = {"id": identifier, "created_at": now(), "project": str(project),
                  "host": host, "goal": goal, "baseline": baseline,
-                 "schema_version": 2, "explorer_policy": policy,
+                 "schema_version": STATE_SCHEMA_VERSION,
+                 "supervisor_version": SUPERVISOR_VERSION,
+                 "config_schema_version": CONFIG_SCHEMA_VERSION,
+                 "config_sha256": configuration_provenance().get("sha256"),
+                 "explorer_policy": policy,
                  "project_lease": lease,
                  "plan_approval": bool(plan_approval), "require_explorer": bool(require_explorer),
                  "status": "running", "phase": "plan",
@@ -3626,6 +3725,50 @@ def detach(run_id):
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                              start_new_session=True, cwd=folder)
     print(json.dumps({"supervisor_pid": p.pid, "log": str(logfile)}))
+
+
+def compatibility_run(run_id):
+    folder, state = load(run_id)
+    result = state_compatibility(state)
+    result.update({"ok": True, "run_id": run_id, "run_dir": str(folder),
+                   "current_config_sha256": configuration_provenance().get("sha256"),
+                   "run_config_sha256": state.get("config_sha256"),
+                   "config_changed": bool(state.get("config_sha256")
+                                          and state.get("config_sha256") != configuration_provenance().get("sha256"))})
+    return result
+
+
+def migrate_run(run_id, backup_dir=None):
+    """Explicit, backup-first migration; never called automatically."""
+    folder, state = load(run_id)
+    with exclusive(folder):
+        folder, state = load(run_id)
+        if state.get("active_job") or state.get("active_check"):
+            raise RuntimeError("Cannot migrate a run with active or uncertain execution")
+        if state.get("status") == "running":
+            raise RuntimeError("Interrupt and pause the run before migration")
+        previous = state_compatibility(state)
+        if previous["status"] == "unsupported_newer":
+            raise RuntimeError("Run state is newer than this supervisor; migration refused")
+        if previous["status"] == "current" and not previous["supervisor_changed"]:
+            return {"ok": True, "run_id": run_id, "migrated": False,
+                    "compatibility": previous, "backup": None}
+        root = (Path(backup_dir).expanduser() if backup_dir
+                else DEFAULT_STATE.parent / "backups" / "migrations")
+        root.mkdir(parents=True, exist_ok=True)
+        backup = root / f"{run_id}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S')}.json"
+        shutil.copy2(folder / "state.json", backup)
+        state.update({"schema_version": STATE_SCHEMA_VERSION,
+                      "supervisor_version": SUPERVISOR_VERSION,
+                      "config_schema_version": CONFIG_SCHEMA_VERSION,
+                      "config_sha256": configuration_provenance().get("sha256"),
+                      "migrated_at": now(),
+                      "migration_from": previous})
+        save(folder, state)
+        journal_event(folder, state, "state_migrated", backup=str(backup),
+                      previous=previous)
+    return {"ok": True, "run_id": run_id, "migrated": True,
+            "backup": str(backup), "compatibility": state_compatibility(state)}
 
 
 def do_status(run_id):
@@ -4224,6 +4367,7 @@ def stage_run(run_id, expected_phase=None):
     """Execute exactly one durable workflow stage in the foreground."""
     validate_workflow()
     folder, state = load(run_id)
+    assert_state_compatible(state)
     if state.get("status") in FINAL_STATES:
         return stage_payload(folder, state, state.get("phase"), None,
                              "No work remains", "Run is complete", 0.0, error=None)
@@ -4760,6 +4904,7 @@ def amend_run(run_id, amendment, architect_review=False):
 
 def resume_run(run_id):
     folder, state = load(run_id)
+    assert_state_compatible(state)
     with exclusive(folder):
         folder, state = load(run_id)
         modify_locked(folder, state, run_id, "resume")
@@ -5181,6 +5326,11 @@ def main(argv=None):
     al.add_argument("run_id")
     al.add_argument("--reason", required=True)
     al.add_argument("--acknowledge", required=True)
+    cp = subs.add_parser("compatibility", help="Read-only supervisor/config/state compatibility preview")
+    cp.add_argument("run_id")
+    mg = subs.add_parser("migrate-run", help="Explicit backup-first state migration")
+    mg.add_argument("run_id")
+    mg.add_argument("--backup-dir")
     rt = subs.add_parser("retire", help="Administratively retire an inactive run; never kills work")
     rt.add_argument("run_id")
     rt.add_argument("--reason", required=True)
@@ -5193,7 +5343,12 @@ def main(argv=None):
     cr.add_argument("--reason", required=True)
     cr.add_argument("--acknowledge", required=True)
     opts = parser.parse_args(argv)
+    sensitive = (opts.command in SENSITIVE_OPERATOR_COMMANDS
+                 or (opts.command in {"reconcile", "reconcile-explorer"}
+                     and getattr(opts, "launch_missing", False)))
     try:
+        if sensitive:
+            _operator_action_allowed(opts.command)
         if opts.command == "doctor":
             result = doctor(Path(opts.project), opts.host)
             print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -5259,6 +5414,12 @@ def main(argv=None):
             print(json.dumps(acknowledge_legacy_verification(
                 opts.run_id, opts.reason, opts.acknowledge),
                 ensure_ascii=False, indent=2))
+        elif opts.command == "compatibility":
+            print(json.dumps(compatibility_run(opts.run_id),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "migrate-run":
+            print(json.dumps(migrate_run(opts.run_id, opts.backup_dir),
+                             ensure_ascii=False, indent=2))
         elif opts.command == "retire":
             print(json.dumps(retire_run(opts.run_id, opts.reason, opts.acknowledge),
                              ensure_ascii=False, indent=2))
