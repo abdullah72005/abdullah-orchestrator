@@ -171,6 +171,16 @@ class ProvenanceBinding(unittest.TestCase):
             orc.run_checks(self.rundir, self.state, cfg, self.project,
                            {"title": "x", "checks": [["git", "status"]]})
 
+    def test_project_declared_exclusion_fails_closed(self):
+        declared = self.project / ".abdullah"
+        declared.mkdir()
+        (self.project / "evil.py").write_text("V=1\n")
+        (declared / "runtime-inputs.json").write_text(json.dumps(
+            {"exclude": ["evil.py"]}))
+        manifest = orc.runtime_input_manifest(self.project, self.cfg)
+        self.assertFalse(manifest["complete"])
+        self.assertEqual(manifest["project_excludes"], ["evil.py"])
+
     def test_project_declaration_adds_inputs(self):
         declared = self.project / ".abdullah"
         declared.mkdir()
@@ -290,6 +300,14 @@ class AmendmentsAndContext(unittest.TestCase):
         saved = orc.read_json(self.rundir / "state.json")
         self.assertEqual(saved["amendments"][-1]["kind"], "minor")
         self.assertEqual(saved["phase"], "implement")
+
+    def test_architect_review_forces_material_even_for_correction(self):
+        self._plan()
+        orc.amend_run("test-run00", "Design change", kind="correction",
+                      architect_review=True)
+        saved = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(saved["amendments"][-1]["kind"], "material")
+        self.assertEqual(saved["phase"], "diagnose")
 
     def test_essential_context_is_never_silently_dropped(self):
         payload = {"goal": "required goal", "invariants": ["i1"],

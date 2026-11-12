@@ -128,7 +128,7 @@ this is reported rather than claimed. Authenticated model execution was not test
 ## Test suite
 
 ```
-434 passed, 70 subtests passed (includes opt-in V2 binary suite)
+436 passed, 70 subtests passed (includes opt-in V2 binary suite)
 ```
 
 All model CLIs remain faked in the default suite; the V2 suite makes no model call.
