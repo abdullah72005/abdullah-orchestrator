@@ -185,32 +185,83 @@ class Batch1Corrections(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not proven stopped"):
             orc.retire_run("test-run00", "reason", "ack")
 
-    def test_retire_and_adopt_sanatry_state_copies(self):
-        actual = Path.home() / ".local/state/abdullah-orchestrator/runs"
-        names = ("20261109T132000-39d6dd12", "20261110T034941-4419f301")
-        if not all((actual / name / "state.json").is_file() for name in names):
-            self.skipTest("Sanatry run states are not present on this machine")
-        hashes = {name: orc.hashlib.sha256((actual / name / "state.json").read_bytes()).hexdigest()
-                  for name in names}
-        root = self.root / "sanatry-copies"
+    def test_retire_and_adopt_synthetic_legacy_states(self):
+        project = self._repo("legacy-synthetic-project")
+        root = self.root / "synthetic-legacy-runs"
         root.mkdir(parents=True)
-        for name in names:
+        names = ("legacy-blocked", "legacy-running")
+        for name, status in zip(names, ("blocked", "running")):
             folder = root / name
             folder.mkdir()
-            state = orc.read_json(actual / name / "state.json")
+            state = dict(self.state)
+            state.update(id=name, project=str(project), status=status,
+                         phase="plan", plan=None, active_job=None, active_check=None,
+                         completed_jobs=[{"id": "completed"}],
+                         accepted_batches=[{"index": 0}])
             orc.atomic_json(folder / "state.json", state)
             (folder / "artifact.txt").write_text("preserved")
         with patch.object(orc, "DEFAULT_STATE", root):
-            retired = orc.retire_run(names[0], "superseded by active run",
+            retired = orc.retire_run(names[0], "superseded synthetic run",
                                      "abandon blocked plan; preserve reports")
             self.assertEqual(retired["status"], "cancelled")
             adopted = orc.adopt_run(names[1])
             self.assertTrue(adopted["ok"])
-        self.assertEqual((root / names[0] / "artifact.txt").read_text(), "preserved")
-        self.assertEqual((root / names[1] / "artifact.txt").read_text(), "preserved")
         for name in names:
-            self.assertEqual(orc.hashlib.sha256((actual / name / "state.json").read_bytes()).hexdigest(),
-                             hashes[name])
+            self.assertEqual((root / name / "artifact.txt").read_text(), "preserved")
+        self.assertTrue((root / names[0] / "state.json").is_file())
+        self.assertTrue((root / names[1] / "state.json").is_file())
+
+    def _readable_owner(self, project, run_id, status, active_job=None,
+                        active_check=None):
+        root = Path(orc.DEFAULT_STATE)
+        folder = root / run_id
+        folder.mkdir(parents=True, exist_ok=True)
+        state = dict(self.state)
+        state.update(id=run_id, project=str(project), status=status, phase="plan",
+                     active_job=active_job, active_check=active_check)
+        orc.atomic_json(folder / "state.json", state)
+        identity = orc.checkout_identity(project)
+        record = {"run_id": run_id, "lease_id": "x", "project": str(project),
+                  "checkout_key": identity["key"], "inode": identity["inode"],
+                  "status": "active", "owner_pid": os.getpid(), "created_at": orc.now()}
+        orc.atomic_json(orc._lease_path(identity["key"]), record)
+        return folder, state, record
+
+    def test_checkout_recover_readable_final_owner_does_not_nameerror(self):
+        project = self._repo("recover-final-project")
+        folder, _state, _record = self._readable_owner(project, "final-owner", "complete")
+        result = orc.checkout_recover(project, "final-owner", "owner complete",
+                                      "inspected final state and no active work")
+        self.assertTrue(result["ok"])
+        self.assertFalse(orc._lease_path(orc.checkout_identity(project)["key"]).exists())
+        self.assertTrue((folder / "state.json").exists())
+
+    def test_checkout_recover_refuses_non_final_owner(self):
+        project = self._repo("recover-nonfinal-project")
+        self._readable_owner(project, "blocked-owner", "blocked")
+        with self.assertRaisesRegex(RuntimeError, "not final"):
+            orc.checkout_recover(project, "blocked-owner", "reason", "ack")
+
+    def test_checkout_recover_refuses_final_owner_with_active_work(self):
+        project = self._repo("recover-final-active-project")
+        dead = baseline.dead_process_identity()
+        active = {"id": "job", "role": "implementer", "status": "running",
+                  "pid": dead["pid"], "pid_start": dead.get("pid_start")}
+        self._readable_owner(project, "final-active", "complete", active_job=active)
+        with self.assertRaisesRegex(RuntimeError, "active"):
+            orc.checkout_recover(project, "final-active", "reason", "ack")
+
+    def test_initializing_conflict_advice_is_retry_only(self):
+        advice = orc._conflict_resolution("owner-run", "new-run", "initializing")
+        self.assertIn("Retry", advice)
+        self.assertNotIn("orchestrator.py retire", advice)
+        self.assertNotIn("orchestrator.py adopt", advice)
+
+    def test_protected_recovery_actions_are_not_mcp_tools(self):
+        for name in ("retire", "adopt", "checkout-recover", "checkout_recover",
+                     "launch-missing"):
+            self.assertNotIn("orchestrator_" + name, orc.MCP_TOOL_NAMES)
+        self.assertIn("orchestrator_reconcile", orc.MCP_TOOL_NAMES)
 
     def test_checkout_recover_orphan_and_audit(self):
         project = self._repo("orphan-project")

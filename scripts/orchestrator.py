@@ -188,11 +188,11 @@ def _identity_alive(identity):
     return stat["state"] not in {"Z", "X", "x"}
 
 
-def _processes_for_run(run_id):
-    """Find same-user processes that inherited this run's identity marker."""
-    if not run_id:
+def _processes_with_env(name, value):
+    """Find same-user live processes carrying one exact environment marker."""
+    if not value:
         return []
-    needle = ("ABDULLAH_RUN_ID=" + str(run_id)).encode()
+    needle = (str(name) + "=" + str(value)).encode()
     found = []
     try:
         entries = list(os.scandir("/proc"))
@@ -210,6 +210,132 @@ def _processes_for_run(run_id):
             if stat and stat["state"] not in {"Z", "X", "x"}:
                 found.append(stat)
     return found
+
+
+def _processes_for_run(run_id):
+    """Find same-user processes that inherited this run's identity marker."""
+    return _processes_with_env("ABDULLAH_RUN_ID", run_id)
+
+
+def _processes_for_job(job_id):
+    """Find same-user processes that inherited this exact job's marker."""
+    return _processes_with_env("ABDULLAH_JOB_ID", job_id)
+
+
+def _merge_process_stats(*groups):
+    """Deduplicate process records by PID and start time."""
+    seen = set()
+    merged = []
+    for group in groups:
+        for stat in group or []:
+            if not isinstance(stat, dict) or not stat.get("pid"):
+                continue
+            key = (stat.get("pid"), stat.get("starttime") or stat.get("pid_start"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(stat)
+    return merged
+
+
+def _job_launch_file(job):
+    """Resolve a job's durable launch record without guessing completion."""
+    if not isinstance(job, dict):
+        return None
+    launch_file = job.get("launch_file")
+    if not launch_file and job.get("path"):
+        candidate = Path(job["path"]) / "launch.json"
+        if candidate.exists():
+            launch_file = str(candidate)
+    return str(launch_file) if launch_file else None
+
+
+def inspect_execution(job, *, run_id=None, include_run=False):
+    """Inspect all durable evidence before treating an execution as stopped.
+
+    A dead guard/parent PID is not proof.  The inspection deliberately checks
+    the recorded session, the durable launch record, exact job/check markers,
+    recorded escaped processes, descendants, launch references and (when
+    requested) the whole-run marker.  ``stopped`` is true only when every
+    observable source agrees that no marked process remains.
+    """
+    identity = job_identity(job)
+    liveness = job_liveness(job)
+    launch_file = _job_launch_file(job)
+    launch = _launch_identity(launch_file)
+    job_id = job.get("id") if isinstance(job, dict) else None
+    token = job.get("check_token") if isinstance(job, dict) else None
+    markers = _processes_for_job(job_id)
+    token_survivors = _check_token_processes(token) if token else []
+    escaped = _escaped_live(job.get("escaped_processes") if isinstance(job, dict) else None)
+    descendant_pids = []
+    if isinstance(job, dict):
+        descendant_pids = job.get("descendant_pids") or job.get("descendants") or []
+    descendants = _live_extra(descendant_pids)
+    launch_references = _processes_referencing_launch(launch_file)
+    run_survivors = _processes_for_run(run_id) if include_run else []
+    live_members = liveness.get("processes", [])
+    survivors = _merge_process_stats(live_members, markers, token_survivors, escaped,
+                                     descendants, launch_references, run_survivors)
+    unproven = liveness.get("alive") is None
+    stopped = liveness.get("alive") is False and not survivors
+    reasons = []
+    if liveness.get("alive") is True:
+        reasons.append("recorded session is still alive")
+    if unproven:
+        reasons.append(liveness.get("reason") or "execution identity is unproven")
+    if survivors:
+        reasons.append("marked process(es) still alive: " +
+                       ", ".join(str(item["pid"]) for item in survivors))
+    if launch and launch.get("phase") in {"starting", "running"} and not live_members:
+        reasons.append("launch record exists but the recorded guard session is stopped")
+    return {"stopped": bool(stopped), "liveness": liveness, "identity": identity,
+            "launch": launch, "launch_file": launch_file,
+            "markers": markers, "token_survivors": token_survivors,
+            "escaped": escaped, "descendants": descendants,
+            "launch_references": launch_references, "run_survivors": run_survivors,
+            "survivors": survivors, "unproven": bool(unproven),
+            "reasons": reasons}
+
+
+def _containment_detail(inspection):
+    if inspection.get("survivors"):
+        return "marked process(es) still alive: " + ", ".join(
+            str(item["pid"]) for item in inspection["survivors"])
+    if inspection.get("liveness", {}).get("alive") is True:
+        return "recorded process session is still alive"
+    return inspection.get("liveness", {}).get("reason") or "execution identity is unproven"
+
+
+def _state_execution_records(state):
+    """Yield every execution record that can still own a process."""
+    for key in ("active_job", "active_check"):
+        item = state.get(key)
+        if isinstance(item, dict) and item:
+            yield key, item
+    interrupted = state.get("verification_interrupted")
+    if isinstance(interrupted, dict) and interrupted:
+        yield "verification_interrupted", interrupted
+    retirement = state.get("retirement")
+    if isinstance(retirement, dict):
+        active = retirement.get("active_work_at_retirement")
+        if isinstance(active, dict):
+            for key, item in active.items():
+                if isinstance(item, dict) and item:
+                    yield "retirement_" + key, item
+
+
+def _state_containment_survivors(state, run_id):
+    """Whole-run evidence used before releasing checkout ownership."""
+    survivors = []
+    for target, item in _state_execution_records(state):
+        inspection = inspect_execution(item, run_id=run_id, include_run=False)
+        survivors = _merge_process_stats(survivors, inspection.get("survivors"))
+        if inspection.get("liveness", {}).get("alive") is True:
+            survivors = _merge_process_stats(survivors,
+                                             inspection["liveness"].get("processes"))
+    survivors = _merge_process_stats(survivors, _processes_for_run(run_id))
+    return survivors
 
 
 def leases_root() -> Path:
@@ -269,6 +395,22 @@ def _lease_record(key):
 
 def _conflict_resolution(owner_id=None, run_id=None, kind="conflict"):
     commands = ["python3 <SKILL_DIR>/scripts/orchestrator.py runs"]
+    if kind == "initializing":
+        # A creation race is not a dead owner.  Never suggest retirement or
+        # adoption until the owner has actually finished starting.
+        commands.append(
+            "Retry after the owner finishes starting; inspect `runs` and "
+            "`checkout-status` first; do not retire or adopt an initializing owner.")
+        return " ".join(commands)
+    if kind == "orphaned":
+        commands.append(
+            "python3 <SKILL_DIR>/scripts/orchestrator.py checkout-recover <project> "
+            "--owner <owner-run> --reason '<reason>' --acknowledge '<scope>'")
+        return " ".join(commands)
+    if kind == "inconsistent":
+        commands.append(
+            "Inspect the live owner and state before any recovery; do not delete the registry.")
+        return " ".join(commands)
     if owner_id:
         commands.append(
             f"python3 <SKILL_DIR>/scripts/orchestrator.py retire {owner_id} "
@@ -276,12 +418,6 @@ def _conflict_resolution(owner_id=None, run_id=None, kind="conflict"):
     if run_id:
         commands.append(
             f"python3 <SKILL_DIR>/scripts/orchestrator.py adopt {run_id}")
-    if kind == "orphaned":
-        commands.append(
-            "python3 <SKILL_DIR>/scripts/orchestrator.py checkout-recover <project> "
-            "--owner <owner-run> --reason '<reason>' --acknowledge '<scope>'")
-    if kind == "initializing":
-        commands.append("Retry after the owner finishes starting; inspect `runs` and `checkout-status` first.")
     return " ".join(commands)
 
 
@@ -375,7 +511,7 @@ def acquire_checkout_lease(project: Path, run_id, lease_id=None):
                     f"Active checkout lease for run {owner_id!r} has no readable state; "
                     "operator recovery is required",
                     owner=existing, state="inconsistent",
-                    resolution=_conflict_resolution(owner_id, run_id, "orphaned"))
+                    resolution=_conflict_resolution(owner_id, run_id, "inconsistent"))
             if status == "active":
                 raise CheckoutOwnedError(
                     f"Checkout is owned by non-final run {owner_id!r} "
@@ -461,6 +597,10 @@ def release_checkout_lease(state):
     run_id = state.get("id")
     project = state.get("project")
     if not run_id or not project:
+        return
+    # A final-state write must not release ownership while a marked process
+    # remains.  This is the last line of defense around save().
+    if _state_containment_survivors(state, run_id):
         return
     try:
         identity = checkout_identity(Path(project))
@@ -553,13 +693,15 @@ def checkout_recover(project, owner_id, reason, acknowledge):
             raise RuntimeError(f"Registry owner is {record.get('run_id')!r}, not {owner_id!r}")
         owner_state = _run_state(owner_id)
         if owner_state is not None:
-            active = [state.get("active_job"), state.get("active_check")]
-            for identity_item in active:
-                if isinstance(identity_item, dict) and identity_item:
-                    liveness = job_liveness(identity_item)
-                    if liveness.get("alive") is not False:
-                        raise RuntimeError(
-                            "Owner run has active or uncertain execution; reconcile/interrupt first")
+            for target in ("active_job", "active_check"):
+                item = owner_state.get(target)
+                if not isinstance(item, dict) or not item:
+                    continue
+                inspection = inspect_execution(item, run_id=owner_id, include_run=False)
+                if not inspection["stopped"]:
+                    raise RuntimeError(
+                        f"Owner run {owner_id!r} has active or uncertain execution "
+                        f"({target}: {_containment_detail(inspection)}); reconcile/interrupt first")
             if owner_state.get("status") not in FINAL_STATES:
                 raise RuntimeError(
                     "Owner run is not final; retire it explicitly with `orchestrator.py retire` "
@@ -571,7 +713,7 @@ def checkout_recover(project, owner_id, reason, acknowledge):
             owner_identity = record.get("owner_identity") or {"pid": record.get("owner_pid")}
             if _identity_alive(owner_identity):
                 raise RuntimeError("Recorded owner process is still alive; retry or interrupt it first")
-        live = _processes_for_run(owner_id)
+        live = _state_containment_survivors(owner_state or {}, owner_id)
         if live:
             raise RuntimeError(
                 "Processes still carry this run's identity; inspect/terminate them first: " +
@@ -605,28 +747,29 @@ def retire_run(run_id, reason, acknowledge):
     with exclusive(folder):
         folder, state = load(run_id)
         if state.get("status") in FINAL_STATES:
+            live = _state_containment_survivors(state, run_id)
+            if live:
+                raise RuntimeError(
+                    f"Cannot retire {run_id}: marked processes are still alive "
+                    f"({', '.join(str(item['pid']) for item in live)}); inspect/terminate them first")
             return {"ok": True, "run_id": run_id, "status": state.get("status"),
                     "already_final": True}
         terminations = []
-        for key in ("active_job", "active_check"):
-            identity_item = state.get(key)
-            if isinstance(identity_item, dict) and identity_item:
-                liveness = job_liveness(identity_item)
-                if liveness.get("alive") is not False:
-                    raise RuntimeError(
-                        f"Cannot retire {run_id}: {key} is not proven stopped "
-                        f"({liveness.get('reason')}); interrupt/reconcile it first")
-                if key == "active_check":
-                    escaped_live = _escaped_live(identity_item.get("escaped_processes"))
-                    if escaped_live:
-                        raise RuntimeError(
-                            f"Cannot retire {run_id}: escaped verification processes are still alive "
-                            f"({', '.join(str(item['pid']) for item in escaped_live)})")
-                terminations.append({"target": key, "liveness": liveness})
-        live = _processes_for_run(run_id)
+        for target in ("active_job", "active_check"):
+            identity_item = state.get(target)
+            if not isinstance(identity_item, dict) or not identity_item:
+                continue
+            inspection = inspect_execution(identity_item, run_id=run_id, include_run=False)
+            if not inspection["stopped"]:
+                raise RuntimeError(
+                    f"Cannot retire {run_id}: {target} is not proven stopped "
+                    f"({_containment_detail(inspection)}); interrupt/reconcile it first")
+            terminations.append({"target": target, "liveness": inspection["liveness"],
+                                 "survivors": inspection["survivors"]})
+        live = _state_containment_survivors(state, run_id)
         if live:
             raise RuntimeError(
-                f"Cannot retire {run_id}: processes still carry its run identity "
+                f"Cannot retire {run_id}: processes still carry its run identity or job marker "
                 f"({', '.join(str(item['pid']) for item in live)}); inspect/terminate them first")
         retirement = {
             "at": now(), "reason": reason, "acknowledge": acknowledge,
@@ -878,10 +1021,11 @@ def terminate_identity(job, grace=8):
     initial = job_liveness(job)
     if initial.get("alive") is False:
         return {"stopped": True, "remaining": [], "method": "already_stopped",
-                "identity": initial.get("identity")}
+                "identity": initial.get("identity"), "descendants": []}
     if initial.get("alive") is None:
         return {"stopped": False, "remaining": [], "method": "identity_unverified",
-                "reason": initial.get("reason"), "identity": initial.get("identity")}
+                "reason": initial.get("reason"), "identity": initial.get("identity"),
+                "descendants": []}
     ident = initial["identity"]
     live = initial.get("processes", [])
     descendants = _descendant_pids(ident.get("pid"))
@@ -1498,6 +1642,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     if state is not None:
         env = dict(env)
         env["ABDULLAH_RUN_ID"] = str(state.get("id") or state.get("run_id") or "")
+        env["ABDULLAH_JOB_ID"] = job_id
         if role == "architect":
             # The nested `explore` command is authorized only when it inherits
             # the exact active Architect job identity from this supervisor.
@@ -1575,6 +1720,21 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         job.update({"status": "complete", "session_id": session_id,
                     "final_snapshot": final_snapshot, "seconds": result_record["seconds"]})
         if state is not None:
+            inspection = inspect_execution(job, run_id=state.get("id"), include_run=False)
+            containment = None
+            if inspection["survivors"]:
+                containment = _terminate_pids(inspection["survivors"])
+                inspection = inspect_execution(job, run_id=state.get("id"),
+                                               include_run=False)
+            if not inspection["stopped"]:
+                job.update({"status": "uncertain",
+                            "recovery_gate": inspection["reasons"],
+                            "escaped_processes": inspection["survivors"],
+                            "containment": containment})
+                state["active_job"] = job
+                save(run_dir, state)
+                raise RuntimeError(
+                    "Worker exited but marked process(es) remain; reconcile before accepting its report")
             state.setdefault("completed_jobs", []).append(job)
             state["active_job"] = None
             state["retry_session"] = None
@@ -1803,10 +1963,13 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
         logpath.parent.mkdir(exist_ok=True)
         launch_file = logpath.with_suffix(".launch.json")
         token = uuid.uuid4().hex
+        check_id = f"check-{state['batch_index']}-{index}-{uuid.uuid4().hex[:8]}"
         check_env = os.environ.copy()
         check_env["ABDULLAH_CHECK_TOKEN"] = token
+        check_env["ABDULLAH_JOB_ID"] = check_id
         check_env["ABDULLAH_RUN_ID"] = str(state.get("id", ""))
-        state["active_check"] = {"argv": cmd, "log": str(logpath), "started_at": now(),
+        state["active_check"] = {"id": check_id, "argv": cmd, "log": str(logpath),
+                                 "started_at": now(),
                                  "candidate_hash": evidence["candidate_hash"],
                                  "launch_file": str(launch_file), "check_token": token}
         save(run_dir, state)
@@ -1900,7 +2063,15 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
             evidence["source_unchanged"] = False
             evidence["error"] = ("Verification left escaped execution; inspect and terminate "
                                  "the recorded PIDs before any acceptance")
-        state["active_check"] = None
+        containment_clean = not escaped or bool(
+            (containment.get("termination") or {}).get("clean"))
+        if escaped and not containment_clean:
+            state["active_check"] = {
+                **state["active_check"], "status": "uncertain",
+                "escaped_processes": escaped, "containment": containment,
+                "interrupt_gate": ["escaped verification process(es) still alive"]}
+        else:
+            state["active_check"] = None
         save(run_dir, state)
         if escaped:
             break
@@ -2574,13 +2745,15 @@ def recover_finished_dispatch(run_dir, state):
             return False
     except (ValueError, OSError, KeyError, TypeError):
         return False
-    liveness = job_liveness(job)
-    if liveness.get("alive") is not False:
-        # Artifacts say the CLI exited, but a descendant may still be writing or
-        # the identity may be unusable (reused PID / no process record).
-        job["recovery_gate"] = {"alive": liveness.get("alive"),
-                                "reason": liveness.get("reason"),
-                                "processes": [item["pid"] for item in liveness.get("processes", [])]}
+    inspection = inspect_execution(job, run_id=state.get("id"), include_run=True)
+    if not inspection["stopped"]:
+        # Artifacts say the CLI exited, but a descendant or another marked
+        # process may still be writing; a dead guard is not proof of a stop.
+        job["recovery_gate"] = {
+            "alive": inspection["liveness"].get("alive"),
+            "reason": inspection["liveness"].get("reason"),
+            "processes": [item["pid"] for item in inspection["survivors"]],
+            "reasons": inspection["reasons"]}
         state["active_job"] = {**job, "status": "uncertain"}
         save(run_dir, state)
         return False
@@ -3023,11 +3196,12 @@ def _processes_referencing_launch(launch_file):
     return found
 
 
-def _record_launch_missing(folder, state, target, identity, evidence):
+def _record_launch_missing(folder, state, target, identity, evidence, *,
+                            run_id=None, include_run=False):
     evidence = (evidence or "").strip()
     if not evidence:
         raise RuntimeError("launch-missing reconciliation requires --evidence explaining the inspection")
-    launch_file = identity.get("launch_file")
+    launch_file = _job_launch_file(identity)
     if launch_file and _launch_identity(launch_file):
         raise RuntimeError("A launch record with a process identity exists; use normal reconciliation")
     job_path = identity.get("path")
@@ -3035,24 +3209,20 @@ def _record_launch_missing(folder, state, target, identity, evidence):
                         for name in ("execution.json", "completion.json")):
         raise RuntimeError(
             "Completion artifacts exist; use normal recovery/reconciliation instead of --launch-missing")
-    referencing = _processes_referencing_launch(launch_file)
-    if referencing:
+    inspection = inspect_execution(identity, run_id=run_id, include_run=include_run)
+    if inspection["survivors"]:
         raise RuntimeError(
-            "A process still references the launch record; inspect/terminate it first: " +
-            ", ".join(str(item["pid"]) for item in referencing))
-    token = identity.get("check_token")
-    if token:
-        survivors = _check_token_processes(token)
-        if survivors:
-            raise RuntimeError(
-                "A verification process still carries this check's token; inspect/terminate it first: " +
-                ", ".join(str(item["pid"]) for item in survivors))
+            "Marked execution process(es) are still alive; inspect/terminate them first: " +
+            ", ".join(str(item["pid"]) for item in inspection["survivors"]))
+    if inspection["liveness"].get("alive") is True:
+        raise RuntimeError(
+            "A recorded process session is still alive; inspect/terminate it first")
     job_id = identity.get("id") or target
     path = Path(folder) / "jobs" / f"reconciliation-launch-{job_id}-{uuid.uuid4().hex[:8]}.json"
     record = {"action": "launch_missing_reconciliation", "at": now(),
               "actor": _operator_actor(), "target": target, "job": identity,
               "launch_file": launch_file, "evidence": evidence,
-              "liveness": job_liveness(identity)}
+              "inspection": inspection}
     atomic_json(path, record)
     return str(path)
 
@@ -3126,33 +3296,29 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
             raise RuntimeError("Run is not in uncertain state")
         if not state.get("active_job") and not state.get("active_check"):
             raise RuntimeError("No uncertain job/check identity to reconcile")
-        active_job = state.get("active_job") or {}
-        if active_job:
-            liveness = job_liveness(active_job)
-            if liveness.get("alive") is not False:
-                detail = ", ".join(str(item["pid"]) for item in liveness.get("processes", [])) or liveness.get("reason")
-                if (launch_missing and liveness.get("reason") == "no_process_identity"):
-                    _record_launch_missing(folder, state, "active_job", active_job, evidence)
-                else:
-                    raise RuntimeError(
-                        f"Execution identity is not proven stopped ({detail}); inspect the process session before reconciliation. "
-                        "If no launch record identity exists, use `orchestrator.py reconcile <run> --launch-missing --evidence '<inspection>'`.")
-        check = state.get("active_check") or {}
-        if check:
-            check_liveness = job_liveness(check)
-            if check_liveness.get("alive") is not False:
-                detail = ", ".join(str(item["pid"]) for item in check_liveness.get("processes", [])) or check_liveness.get("reason")
-                if (launch_missing and check_liveness.get("reason") == "no_process_identity"):
-                    _record_launch_missing(folder, state, "active_check", check, evidence)
-                else:
-                    raise RuntimeError(
-                        f"Verification process is not proven stopped ({detail}); inspect it before reconciliation. "
-                        "If no launch record identity exists, use `orchestrator.py reconcile <run> --launch-missing --evidence '<inspection>'`.")
-            escaped_live = _escaped_live(check.get("escaped_processes"))
-            if escaped_live:
-                detail = ", ".join(str(item["pid"]) for item in escaped_live)
+        for target, item in (("active_job", state.get("active_job") or {}),
+                             ("active_check", state.get("active_check") or {})):
+            if not item:
+                continue
+            inspection = inspect_execution(item, run_id=state.get("id"), include_run=True)
+            if inspection["survivors"]:
                 raise RuntimeError(
-                    f"Escaped verification processes are still alive ({detail}); terminate them before reconciliation")
+                    f"{target} has surviving marked process(es) "
+                    f"({_containment_detail(inspection)}); inspect/terminate them before reconciliation")
+            if inspection["liveness"].get("alive") is True:
+                raise RuntimeError(
+                    f"{target} session is still alive ({_containment_detail(inspection)}); "
+                    "inspect the process session before reconciliation")
+            if inspection["liveness"].get("alive") is None:
+                reason = inspection["liveness"].get("reason")
+                if launch_missing and reason == "no_process_identity":
+                    _record_launch_missing(folder, state, target, item, evidence,
+                                           run_id=state.get("id"), include_run=True)
+                else:
+                    raise RuntimeError(
+                        f"{target} execution identity is unproven ({_containment_detail(inspection)}); "
+                        "inspect it before reconciliation. If no launch record identity exists, use "
+                        "`orchestrator.py reconcile <run> --launch-missing --evidence '<inspection>'`.")
         if retry_verification:
             job = state.get("active_job") or {}
             jobdir = Path(job.get("path", ""))
@@ -3306,15 +3472,26 @@ def reconcile_explorer(run_id, launch_missing=False, evidence=None):
         job = ts.get("active_job")
         if not job:
             raise RuntimeError("No Explorer attempt requires reconciliation")
-        liveness = job_liveness(job)
-        if liveness.get("alive") is not False:
-            detail = ", ".join(str(item["pid"]) for item in liveness.get("processes", [])) or liveness.get("reason")
-            if launch_missing and liveness.get("reason") == "no_process_identity":
-                _record_launch_missing(tracker, ts, "explorer", job, evidence)
+        inspection = inspect_execution(job, run_id=run_id, include_run=False)
+        if inspection["survivors"]:
+            raise RuntimeError(
+                "Explorer has surviving marked process(es) "
+                f"({_containment_detail(inspection)}); inspect/terminate them before reconciliation")
+        if inspection["liveness"].get("alive") is True:
+            raise RuntimeError(
+                "Explorer process session is still alive "
+                f"({_containment_detail(inspection)}); inspect descendants before reconciliation")
+        if inspection["liveness"].get("alive") is None:
+            if (launch_missing
+                    and inspection["liveness"].get("reason") == "no_process_identity"):
+                _record_launch_missing(tracker, ts, "explorer", job, evidence,
+                                       run_id=run_id, include_run=False)
             else:
                 raise RuntimeError(
-                    f"Explorer process session is not proven stopped ({detail}); inspect descendants before reconciliation. "
-                    "If no launch record identity exists, use `orchestrator.py reconcile-explorer <run> --launch-missing --evidence '<inspection>'`.")
+                    "Explorer execution identity is unproven "
+                    f"({_containment_detail(inspection)}); inspect it before reconciliation. "
+                    "If no launch record identity exists, use "
+                    "`orchestrator.py reconcile-explorer <run> --launch-missing --evidence '<inspection>'`.")
         if recover_finished_dispatch(tracker, ts):
             print("Recovered completed Explorer report")
             return
@@ -3916,6 +4093,13 @@ def interrupt_run(run_id, reason="User requested interruption"):
     """Persist, propagate and verify an interruption; return only verified state."""
     folder, state = load(run_id)
     if state.get("status") in FINAL_STATES and not state.get("active_job") and not state.get("active_check"):
+        live = _state_containment_survivors(state, run_id)
+        if live:
+            return {"ok": False, "run_id": run_id, "status": "uncertain",
+                    "termination": {"stopped": False, "remaining": [item["pid"] for item in live],
+                                    "method": "marked_survivor"},
+                    "next_action": "orchestrator_status",
+                    "message": "Final run still has marked processes; inspect before trusting it."}
         return {"ok": True, "run_id": run_id, "status": state.get("status"),
                 "termination": {"stopped": True, "details": [], "method": "already_final"},
                 "next_action": "none", "message": "Run already reached a final state."}
@@ -3937,8 +4121,26 @@ def interrupt_run(run_id, reason="User requested interruption"):
         by_target = {item.get("target"): item for item in terminations}
         job = state.get("active_job") if isinstance(state.get("active_job"), dict) and state.get("active_job") else None
         check = state.get("active_check") if isinstance(state.get("active_check"), dict) and state.get("active_check") else None
-        job_stopped = by_target.get("active_job", {}).get("stopped") if job else True
-        check_stopped = by_target.get("active_check", {}).get("stopped") if check else True
+        job_inspection = inspect_execution(job, run_id=run_id, include_run=True) if job else None
+        check_inspection = inspect_execution(check, run_id=run_id, include_run=True) if check else None
+        combined = _merge_process_stats((job_inspection or {}).get("survivors"),
+                                        (check_inspection or {}).get("survivors"))
+        containment = None
+        if combined:
+            # A process outside the recorded session carried a run/job/check
+            # marker.  Try to contain it, then inspect again; do not clear any
+            # identity while it survives.
+            containment = _terminate_pids(combined)
+            job_inspection = inspect_execution(job, run_id=run_id, include_run=True) if job else None
+            check_inspection = inspect_execution(check, run_id=run_id, include_run=True) if check else None
+        job_stopped = job_inspection["stopped"] if job else True
+        check_stopped = check_inspection["stopped"] if check else True
+        if combined:
+            # A process outside the recorded session carried an execution
+            # marker.  Even if containment killed it, preserve the run as
+            # uncertain so the operator can inspect side effects and reconcile.
+            job_stopped = False if job else True
+            check_stopped = False if check else True
         stopped = bool(job_stopped and check_stopped)
         state.setdefault("interruptions", []).append({
             "at": now(), "reason": reason, "stopped": stopped,
@@ -3955,26 +4157,28 @@ def interrupt_run(run_id, reason="User requested interruption"):
                 state["active_job"] = None
                 state["retry_session"] = None
             else:
-                state["active_job"] = {**job, "status": "uncertain"}
+                state["active_job"] = {
+                    **job, "status": "uncertain",
+                    "interrupt_gate": (job_inspection or {}).get("reasons", []),
+                    "escaped_processes": (job_inspection or {}).get("survivors", []),
+                    "containment": containment}
         if check:
-            if check_stopped and check.get("check_token"):
-                escaped = _check_token_processes(check["check_token"])
-                if escaped:
-                    containment = _terminate_pids(escaped)
-                    check["escaped_processes"] = escaped
-                    check["containment"] = containment
-                    state["active_check"] = check
-                    check_stopped = False
             if check_stopped:
                 state["verification_interrupted"] = {
                     "at": now(), "reason": reason,
                     "argv": check.get("argv"), "log": check.get("log"),
                     "candidate_hash": check.get("candidate_hash"),
                     "termination": by_target.get("active_check"),
+                    "escaped_processes": (check_inspection or {}).get("survivors", []),
+                    "containment": containment,
                 }
                 state["active_check"] = None
-            # An unverified check identity is retained verbatim.  Clearing it
-            # here would make an uncertain command look safely resumable.
+            else:
+                state["active_check"] = {
+                    **check,
+                    "interrupt_gate": (check_inspection or {}).get("reasons", []),
+                    "escaped_processes": (check_inspection or {}).get("survivors", []),
+                    "containment": containment}
         stopped = bool(job_stopped and check_stopped)
         if state.get("interruptions"):
             state["interruptions"][-1]["stopped"] = stopped
