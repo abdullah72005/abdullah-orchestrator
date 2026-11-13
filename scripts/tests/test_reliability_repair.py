@@ -177,16 +177,36 @@ class ReliabilityRepair(ControlTests):
 
     def test_architect_prompt_includes_evidence_package(self):
         snap, candidate, _, ev, path = self._evidence_fixture()
-        self.state['verification'] = {'path': str(path), 'passed': True,
-                                      'candidate_hash': candidate}
+        plan = {'batches': [{'title': 'one', 'checks': [['true']]}]}
+        modern = copy.deepcopy(ev)
+        modern['evidence_version'] = orc.VERIFICATION_EVIDENCE_VERSION
+        modern['plan_version'] = orc.content_hash(plan)
+        modern['provenance'] = {
+            'version': orc.SOURCE_PROVENANCE_VERSION, 'source': snap,
+            'configuration': snap.get('configuration'),
+            'environment': snap.get('environment'),
+            'toolchain': snap.get('toolchain'),
+            'runtime_inputs': snap.get('runtime_inputs'),
+            'check_toolchain': orc.check_toolchain_identity(
+                [item['argv'] for item in ev['commands']]),
+            'command_policy': {}}
+        modern_path = self.root / 'verification-modern.json'
+        orc.atomic_json(modern_path, modern)
+        self.state.update(plan=plan, plan_version=orc.content_hash(plan),
+                          plan_revision=1)
+        self.state['verification'] = {
+            'path': str(modern_path), 'passed': True,
+            'candidate_hash': candidate,
+            'evidence_version': orc.VERIFICATION_EVIDENCE_VERSION}
         captured = {}
         def fake_call_model(*args, **kwargs):
             captured['prompt'] = args[5]
             return ({'verdict': 'approved', 'reason': 'inspected',
-                     'inspected': ['app.py'], 'dismissed_findings': []}, {'id': 'fake'})
+                     'inspected': ['app.py'], 'dismissed_findings': []},
+                    {'id': 'fake', 'path': str(self.rundir)})
         with patch.object(orc, 'call_model', side_effect=fake_call_model):
             orc.strong_call(self.rundir, self.state, self.cfg, 'decision',
-                            {'final_evidence': ev})
+                            {'final_evidence': modern})
         prompt = captured['prompt']
         self.assertIn('"verification_evidence"', prompt)
         self.assertIn('tests passed', prompt)

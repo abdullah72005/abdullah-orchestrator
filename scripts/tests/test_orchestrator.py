@@ -313,7 +313,9 @@ class ControlTests(unittest.TestCase):
                                      "candidate_hash": fingerprint,
                                      "evidence_version": 2}
             orc.save(self.rundir, state)
-            return {"passed": True, "commands": [], "candidate_hash": orc.signature(snapshot)}
+            return {"passed": True, "commands": [], "candidate_hash": fingerprint,
+                    "source_unchanged": True, "evidence_version": 2,
+                    "path": str(evidence_path)}
 
         with patch.object(orc, "strong_call", side_effect=strong), \
              patch.object(orc, "call_model", side_effect=worker), \

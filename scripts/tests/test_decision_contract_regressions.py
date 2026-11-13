@@ -175,6 +175,16 @@ class AcceptanceTransition(unittest.TestCase):
             review=copy.deepcopy(self.review), verification=copy.deepcopy(self.verification),
             corrections=0, correction="",
             usage={"strong_calls": 3, "cheap_calls": 2, "failed_attempts": 1})
+        # Acceptance now requires a real supervisor-issued record; a pathless
+        # fixture is not equivalent to attested evidence.
+        evidence = orc.run_checks(
+            self.rundir, self.state, self.cfg, self.project,
+            {"title": "one", "checks": [["true"]]})
+        self.verification = {"path": evidence["path"], "passed": True,
+                             "candidate_hash": evidence["after_hash"],
+                             "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION}
+        self.state["verification"] = copy.deepcopy(self.verification)
+        self.state["check_progress"] = None
         orc.save(self.rundir, self.state)
 
     def test_changes_required_moves_to_the_head_of_the_correction_stage(self):
@@ -229,6 +239,10 @@ class AcceptanceTransition(unittest.TestCase):
         jobdir = self.rundir / "jobs" / "decision-old"
         jobdir.mkdir(parents=True)
         orc.atomic_json(jobdir / "report.json", self.decision)
+        snapshot = orc.source_snapshot(self.project)
+        orc.atomic_json(jobdir / "dispatch.json", {
+            "kind": "decision", "role": "architect", "source": snapshot})
+        orc.atomic_json(jobdir / "completion.json", {"final_snapshot": snapshot})
         self.state.update(
             single_batch_fast_path=True,
             completed_jobs=[{"id": "old", "kind": "decision", "role": "architect",

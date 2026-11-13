@@ -12,20 +12,36 @@ class QuotaChanges(unittest.TestCase):
     def setUp(self):
         ControlTests.setUp(self)
         self.state['single_batch_fast_path'] = True
+
+    def real_verification(self, checks=None, final=False, title='one'):
+        """Create an actual supervisor record; pathless fixtures are not valid."""
+        evidence = orc.run_checks(
+            self.rundir, self.state, self.cfg, self.project,
+            {'title': title, 'checks': checks or [['true']]}, final=final)
+        self.state['verification'] = {
+            'path': evidence['path'], 'passed': True,
+            'candidate_hash': evidence['after_hash'],
+            'evidence_version': evidence['evidence_version']}
+        self.state['check_progress'] = None
+        orc.save(self.rundir, self.state)
+        return self.state['verification']
+
     def test_single_batch_accept_runs_final_checks_before_one_decision(self):
-        snap = orc.source_snapshot(self.project)
-        candidate = orc.signature(snap)
-        self.state.update(phase='accept', plan={'batches': [{'title':'one', 'checks':[['true']]}]},
-                          verification={'candidate_hash':candidate, 'passed':True},
-                          review={'status':'complete', 'findings':[]})
-        evidence = {'passed':True, 'candidate_hash':candidate, 'source_unchanged':True, 'commands':[]}
-        verdict = {'verdict':'approved', 'reason':'inspected', 'inspected':['app.py'], 'dismissed_findings':[]}
-        with patch.object(orc, 'run_checks', return_value=evidence) as checks, patch.object(orc, 'strong_call', return_value=verdict) as strong:
+        plan = {'batches': [{'title': 'one', 'checks': [['true']]}]}
+        self.state.update(phase='accept', plan=plan,
+                          review={'status': 'complete', 'findings': []})
+        self.real_verification()
+        verdict = {'verdict': 'approved', 'reason': 'inspected', 'inspected': ['app.py'],
+                   'dismissed_findings': []}
+        real_checks = orc.run_checks
+        with patch.object(orc, 'run_checks', wraps=real_checks) as checks, \
+                patch.object(orc, 'strong_call', return_value=verdict) as strong:
             orc.advance(self.rundir, self.state, self.cfg)
         self.assertTrue(checks.call_args.kwargs['final'])
         self.assertEqual(strong.call_count, 1)
         self.assertEqual(self.state['status'], 'complete')
         self.assertEqual(len(self.state['accepted_batches']), 1)
+        self.assertTrue(self.state['final_evidence']['final'])
 
     def test_explorer_requires_full_evidence(self):
         with self.assertRaises(ValueError):
@@ -116,37 +132,54 @@ class QuotaChanges(unittest.TestCase):
         self.assertIsNone(self.state['review'])
 
     def test_failed_final_checks_do_not_accept(self):
-        candidate = orc.signature(orc.source_snapshot(self.project))
-        self.state.update(phase='accept', plan={'batches':[{'title':'one','checks':[['false']]}]},
-                          verification={'candidate_hash':candidate,'passed':True}, review={'status':'complete','findings':[]})
+        self.state.update(phase='accept', plan={'batches': [{'title': 'one', 'checks': [['false']]}]},
+                          review={'status': 'complete', 'findings': []})
+        self.real_verification()
         with patch.object(orc, 'strong_call') as strong:
             orc.advance(self.rundir, self.state, self.cfg)
         strong.assert_not_called()
         self.assertEqual(self.state['status'], 'blocked')
 
     def test_incomplete_review_does_not_accept(self):
-        candidate = orc.signature(orc.source_snapshot(self.project))
-        self.state.update(phase='accept', plan={'batches':[{'title':'one','checks':[['true']]}]},
-                          verification={'candidate_hash':candidate,'passed':True}, review={'status':'blocked','findings':[]})
+        self.state.update(phase='accept', plan={'batches': [{'title': 'one', 'checks': [['true']]}]},
+                          review={'status': 'blocked', 'findings': []})
+        self.real_verification()
         with patch.object(orc, 'strong_call') as strong:
             orc.advance(self.rundir, self.state, self.cfg)
         strong.assert_not_called()
         self.assertEqual(self.state['status'], 'blocked')
 
     def test_recovered_decision_is_consumed_without_second_call(self):
-        snap = orc.source_snapshot(self.project)
-        candidate = orc.signature(snap)
-        self.state.update(phase='accept', plan={'batches':[{'title':'one','checks':[['true']]}]},
-                          verification={'candidate_hash':candidate,'passed':True}, review={'status':'complete','findings':[]})
-        verdict = {'verdict':'approved','reason':'inspected','inspected':['app.py'],'dismissed_findings':[]}
-        self.state['single_batch_verification'] = dict(self.state['verification'])
-        orc.run_checks(self.rundir, self.state, self.cfg, self.project, {'title':'feature integration','checks':[['true']]}, final=True)
+        plan = {'batches': [{'title': 'one', 'checks': [['true']]}]}
+        self.state.update(phase='accept', plan=plan,
+                          plan_version=orc.content_hash(plan),
+                          review={'status': 'complete', 'findings': []})
+        batch_ref = self.real_verification()
+        self.state['single_batch_verification'] = dict(batch_ref)
+        final_evidence = orc.run_checks(
+            self.rundir, self.state, self.cfg, self.project,
+            {'title': 'feature integration', 'checks': [['true']]}, final=True)
+        self.state['verification'] = {
+            'path': final_evidence['path'], 'passed': True,
+            'candidate_hash': final_evidence['after_hash'],
+            'evidence_version': final_evidence['evidence_version']}
+        verdict = {'verdict': 'approved', 'reason': 'inspected', 'inspected': ['app.py'],
+                   'dismissed_findings': []}
+        binding = orc.make_decision_binding(
+            self.state, self.project, [batch_ref, self.state['verification']])
         jobdir = self.rundir / 'jobs' / 'decision-recovered'
         jobdir.mkdir(parents=True)
-        orc.atomic_json(jobdir / 'execution.json', {'returncode':0})
+        orc.atomic_json(jobdir / 'execution.json', {'returncode': 0})
         orc.atomic_json(jobdir / 'report.json', verdict)
-        orc.atomic_json(jobdir / 'completion.json', {'final_snapshot':snap, 'session_id':None})
-        self.state['active_job'] = {'id':'recovered', 'kind':'decision', 'role':'architect', 'path':str(jobdir), 'status':'running', **dead_process_identity()}
+        orc.atomic_json(jobdir / 'decision-binding.json', binding)
+        orc.atomic_json(jobdir / 'dispatch.json', {
+            'kind': 'decision', 'role': 'architect',
+            'source': orc.source_snapshot(self.project)})
+        orc.atomic_json(jobdir / 'completion.json', {
+            'final_snapshot': orc.source_snapshot(self.project), 'session_id': None})
+        self.state['active_job'] = {'id': 'recovered', 'kind': 'decision', 'role': 'architect',
+                                    'path': str(jobdir), 'status': 'running',
+                                    **dead_process_identity()}
         self.assertTrue(orc.recover_finished_dispatch(self.rundir, self.state))
         with patch.object(orc, 'strong_call') as strong:
             orc.advance(self.rundir, self.state, self.cfg)
@@ -154,27 +187,19 @@ class QuotaChanges(unittest.TestCase):
         self.assertEqual(self.state['status'], 'complete')
 
     def test_consumed_blocked_decision_gets_new_evidence_aware_call(self):
-        snap = orc.source_snapshot(self.project)
-        candidate = orc.signature(snap)
-        log = self.root / 'test.log'
-        log.write_text('tests passed')
-        evidence = {'candidate': snap, 'after': snap, 'candidate_hash': candidate,
-                    'after_hash': candidate, 'passed': True, 'source_unchanged': True,
-                    'commands': [{'argv': ['true'], 'returncode': 0, 'log': str(log)}]}
-        path = self.root / 'verification.json'
-        orc.atomic_json(path, evidence)
+        plan = {'batches': [{'title': 'one', 'checks': [['true']]}]}
         verdict = {'verdict': 'approved', 'reason': 'inspected',
                    'inspected': ['app.py'], 'dismissed_findings': []}
         self.state.update(
-            phase='accept', status='blocked',
-            plan={'batches': [{'title': 'one', 'checks': [['true']]}]},
-            verification={'path': str(path), 'candidate_hash': candidate, 'passed': True, 'evidence_version': 2},
+            phase='accept', status='blocked', plan=plan,
             review={'status': 'complete', 'findings': []},
             single_batch_fast_path=True, last_consumed_job_id='decision-old',
             completed_jobs=[{'id': 'decision-old', 'kind': 'decision', 'role': 'architect',
                              'path': str(self.rundir / 'jobs' / 'decision-old'),
                              'status': 'complete'}])
-        with patch.object(orc, 'run_checks', return_value=evidence) as checks, \
+        self.real_verification()
+        real_checks = orc.run_checks
+        with patch.object(orc, 'run_checks', wraps=real_checks) as checks, \
                 patch.object(orc, 'strong_call', return_value=verdict) as strong:
             orc.advance(self.rundir, self.state, self.cfg)
         self.assertEqual(strong.call_count, 1)
@@ -183,11 +208,13 @@ class QuotaChanges(unittest.TestCase):
         self.assertEqual(self.state['final_verdict']['verdict'], 'approved')
 
     def test_serious_finding_cannot_be_silently_accepted(self):
-        candidate = orc.signature(orc.source_snapshot(self.project))
-        finding = {'severity':'high','confidence':'confirmed','location':'app.py:1','claim':'bug','evidence':'code'}
-        self.state.update(phase='accept', plan={'batches':[{'title':'one','checks':[['true']]}]},
-                          verification={'candidate_hash':candidate,'passed':True}, review={'status':'complete','findings':[finding]})
-        verdict = {'verdict':'approved','reason':'inspected','inspected':['app.py'],'dismissed_findings':[]}
+        finding = {'severity': 'high', 'confidence': 'confirmed',
+                   'location': 'app.py:1', 'claim': 'bug', 'evidence': 'code'}
+        self.state.update(phase='accept', plan={'batches': [{'title': 'one', 'checks': [['true']]}]},
+                          review={'status': 'complete', 'findings': [finding]})
+        self.real_verification()
+        verdict = {'verdict': 'approved', 'reason': 'inspected', 'inspected': ['app.py'],
+                   'dismissed_findings': []}
         with patch.object(orc, 'strong_call', return_value=verdict):
             orc.advance(self.rundir, self.state, self.cfg)
         self.assertEqual(self.state['status'], 'blocked')

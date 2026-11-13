@@ -303,7 +303,7 @@ class CheckpointBProvenance(unittest.TestCase):
         model.assert_called_once()
         self.assertEqual(self.state["phase"], "verify")
 
-    def test_legacy_acknowledgment_allows_acceptance(self):
+    def test_legacy_acknowledgment_cannot_certify_new_completion(self):
         snap = orc.source_snapshot(self.project, cfg=self.cfg)
         candidate = orc.signature(snap)
         path = self.root / "legacy-accept-ack.json"
@@ -317,13 +317,12 @@ class CheckpointBProvenance(unittest.TestCase):
         orc.save(self.rundir, self.state)
         orc.acknowledge_legacy_verification("test-run00", "legacy inspected", "accept")
         self.state = orc.read_json(self.rundir / "state.json")
-        evidence = {"passed": True, "candidate_hash": candidate,
-                    "source_unchanged": True, "commands": []}
-        verdict = {"verdict": "approved", "reason": "inspected", "inspected": ["app.py"],
-                   "dismissed_findings": []}
-        with patch.object(orc, "run_checks", return_value=evidence),                 patch.object(orc, "strong_call", return_value=verdict):
+        with patch.object(orc, "run_checks"), patch.object(orc, "strong_call"):
             orc.advance(self.rundir, self.state, self.cfg)
-        self.assertEqual(self.state["status"], "complete")
+        self.assertNotEqual(self.state["status"], "complete")
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertIn("Legacy verification", self.state["pause_reason"])
+        self.assertIsNone(self.state["verification"])
 
     def test_legacy_evidence_is_marked_not_equivalent(self):
         snap = orc.source_snapshot(self.project, cfg=self.cfg)
