@@ -2754,6 +2754,36 @@ def validate_structured_output_schema(document, label="schema"):
     return document
 
 
+# Fields the supervisor semantically requires from every newly dispatched
+# report. A strict schema that omits one makes the report impossible to emit,
+# which is a guaranteed post-model rejection rather than a model mistake.
+REPORT_CONTRACT_FIELDS = {"contract_version"}
+
+
+def assert_report_schema_contract(kind, document):
+    """Every semantically mandatory report field must be declared *and* required.
+
+    ``contract_version`` is enforced for new jobs in ``call_model`` and
+    ``REPORT_KEYS`` lists the fields each validator reads. Strict structured
+    outputs reject unknown properties, so a field missing from this schema can
+    never appear in a valid model report.
+    """
+    required = set(REPORT_KEYS.get(kind, ())) | REPORT_CONTRACT_FIELDS
+    properties = document.get("properties") if isinstance(document, dict) else None
+    properties = properties if isinstance(properties, dict) else {}
+    declared = set(properties)
+    listed = document.get("required") if isinstance(document, dict) else None
+    listed = set(listed) if isinstance(listed, list) else set()
+    missing = sorted(required - declared)
+    not_required = sorted(required - listed)
+    if missing or not_required:
+        raise ValueError(
+            f"Report schema {kind!r} contradicts its contract: "
+            f"undeclared={missing} not_required={not_required}. "
+            "Strict structured outputs cannot emit a field the schema omits.")
+    return document
+
+
 def structured_output_schema_status():
     """Deterministic compatibility report for every schema the orchestrator sends."""
     status = {}
@@ -2809,18 +2839,20 @@ def _report_schema(kind):
             required.append("findings")
         return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
     return {"type": "object", "properties": {
+        "contract_version": {"type": "integer"},
         "verdict": {"type": "string"}, "reason": {"type": "string"},
         "inspected": {"type": "array", "items": {"type": "string"}}, "correction": {"type": "string"},
         "dismissed_findings": {"type": "array", "items": {"type": "object", "properties": {
             "location": {"type": "string"}, "claim": {"type": "string"}, "reason": {"type": "string"},
         }, "required": ["location", "claim", "reason"], "additionalProperties": False}},
-    }, "required": ["verdict", "reason", "inspected", "correction", "dismissed_findings"],
+    }, "required": ["contract_version", "verdict", "reason", "inspected", "correction", "dismissed_findings"],
         "additionalProperties": False}
 
 
 def schema(kind):
     """Return a provider-compatible report schema or fail before dispatch."""
-    return validate_structured_output_schema(_report_schema(kind), f"report:{kind}")
+    document = validate_structured_output_schema(_report_schema(kind), f"report:{kind}")
+    return assert_report_schema_contract(kind, document)
 
 
 def model_route(cfg, host, role):
@@ -4000,6 +4032,11 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         contract_version = report.get("contract_version", 0)
         if (state is not None and state.get("contract_version_required", 0) >= 2
                 and contract_version < 2):
+            if "contract_version" not in report:
+                raise RuntimeError(
+                    f"Newly dispatched {check_kind} reports must declare "
+                    "contract_version: 2; the generated output schema omitted "
+                    "or failed to require it, so the report cannot be emitted")
             raise RuntimeError(
                 "Newly dispatched workers must return contract_version: 2; "
                 "legacy reports are not accepted for new jobs")

@@ -21,7 +21,9 @@ Contract v2 requires `files`, `tests`, `evidence`, `unknowns` and `blocker`, wit
 For a Reviewer the canonical output is the Worker object above with `status`, `summary`, `files`, `tests`, `evidence`, `unknowns`, `blocker`, and `findings`. `status` describes completion of the review, not an approval verdict. Report actual evidence and limitations; never invent them. Reviewer supplies `"findings":[{"severity":"critical|high|medium|low","location":"path:line","claim":"...","evidence":"...","confidence":"confirmed|probable|uncertain","disposition":"..."}]`. Findings require an explicit disposition. Worker reports cannot override acceptance criteria or authorized verification commands.
 
 ## Strong verdict
-`{"verdict":"approved|changes_required|blocked","reason":"...","inspected":["path:symbol"],"correction":"...","dismissed_findings":[{"location":"path:line","claim":"exact finding claim","reason":"specific direct code evidence for why it is not a defect"}]}`
+`{"contract_version":2,"verdict":"approved|changes_required|blocked","reason":"...","inspected":["path:symbol"],"correction":"...","dismissed_findings":[{"location":"path:line","claim":"exact finding claim","reason":"specific direct code evidence for why it is not a defect"}]}`
+
+`contract_version` is mandatory for every newly dispatched report, including the Architect decision. The generated output schema declares and requires it; omitting it is a supervisor/schema defect, not an acceptable legacy report, and is rejected before acceptance.
 
 Approvals require direct examination of behavior, tests and high-risk boundaries, matching git state and supervisor-issued tests. Confirmed high/critical findings require correction or an explicit evidence-based strong disposition using the exact location and claim (never majority voting). A changes-required verdict creates a bounded new correction wave; never silently reset the wave count on compaction.
 

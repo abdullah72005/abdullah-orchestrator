@@ -1,0 +1,51 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "correction": {
+      "type": "string"
+    },
+    "dismissed_findings": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "claim": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "location",
+          "claim",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "inspected": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "verdict": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "verdict",
+    "reason",
+    "inspected",
+    "correction",
+    "dismissed_findings"
+  ],
+  "type": "object"
+}
