@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile supervisor
+        run: python -m compileall -q scripts
+
+      - name: Run deterministic suite
+        run: python -m unittest discover -s scripts/tests -v
+
+      - name: Confirm the suite is hermetic under exported overrides
+        run: |
+          export ABDULLAH_STATE_DIR="$RUNNER_TEMP/live-runs"
+          export ABDULLAH_CHECKOUT_REGISTRY="$RUNNER_TEMP/live-checkouts"
+          export ABDULLAH_CONFIG="$RUNNER_TEMP/live-config.json"
+          python -m unittest discover -s scripts/tests -p "test_orchestrator.py"
+          python -m unittest discover -s scripts/tests -p "test_batch1_corrections.py"

@@ -1,0 +1,53 @@
+name: Feature request
+description: Propose a capability, workflow change, or documentation improvement
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep the trust model in mind: sensitive actions belong in the operator
+        CLI, not in the MCP surface. Read
+        [docs/security-model.md](https://github.com/abdullah72005/abdullah-orchestrator/blob/main/docs/security-model.md)
+        before proposing new permissions or automated approvals.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change, and for which role (coordinator, Architect, worker, supervisor)?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - supervisor / state
+        - containment / recovery
+        - verification / provenance
+        - OpenCode or Codex integration
+        - MCP interface
+        - documentation
+        - other
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: This proposal does not let a model approve its own plan, fallback, or sensitive operator action.
+          required: true
+        - label: I described how this fails closed when evidence or ownership is uncertain.
+          required: true

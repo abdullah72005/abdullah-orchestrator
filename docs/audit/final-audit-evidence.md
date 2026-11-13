@@ -133,4 +133,4 @@ this is reported rather than claimed. Authenticated model execution was not test
 ```
 
 All model CLIs remain faked in the default suite; the V2 suite makes no model call.
-See `DELTA-AUDIT.md` for the final delta-audit corrections and before/after probes.
+See [`delta-audit.md`](delta-audit.md) for the final delta-audit corrections and before/after probes.

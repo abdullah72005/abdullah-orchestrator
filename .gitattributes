@@ -1,0 +1,14 @@
+# Normalize text to LF in the repository and in working trees.
+* text=auto eol=lf
+
+*.py    text diff=python
+*.md    text
+*.json  text
+*.jsonl text
+*.yml   text
+*.yaml  text
+*.toml  text
+*.svg   text
+
+# Test fixtures are preserved evidence; do not let Git rewrite or diff them.
+scripts/tests/fixtures/** linguist-generated=true

@@ -1,237 +1,320 @@
+<p align="center">
+  <img src="assets/icon.svg" width="64" height="64" alt="Abdullah Orchestrator icon">
+</p>
+
 # Abdullah Orchestrator
 
-A durable, quota-aware software engineering workflow for one interactive Codex
-or Claude conversation. A visible coordinator talks to the user and drives a
-bundled Python MCP supervisor. The supervisor owns execution state, process
-lifecycle, checkpoints, verification and recovery, while a separate strong
-Architect makes consequential decisions and cheap OpenCode Go workers perform
-exploration, implementation and independent review.
+**Durable, quota-aware multi-agent engineering from a single chat — with a deterministic Python supervisor, verified evidence, and recoverable checkpoints.**
 
-The supervisor is standard-library Python. It persists dispatch intent before
-launch, runs approved checks against the exact candidate checkout, records
-provenance, and fails closed when process ownership is uncertain.
+[![Tests](https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg)](https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Standard library only](https://img.shields.io/badge/runtime-stdlib%20only-success.svg)](#requirements)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## Components
+Abdullah Orchestrator turns one interactive Codex or Claude conversation into a
+disciplined engineering workflow. A cheap visible coordinator drives a bundled
+Python **supervisor**; a strong **Architect** plans and accepts; paid OpenCode Go
+**Explorer**, **Implementer**, and independent **Reviewer** workers do the
+bounded work. The supervisor — not the language model — owns state, process
+lifecycle, verification, and recovery.
 
-| Path | Purpose |
+It was built for long-running work on a real repository where a dropped chat,
+a wrong checkout, or an unverified "it works" is expensive.
+
+```
+        you
+         │
+         ▼
+┌──────────────────────────┐        stdio MCP         ┌────────────────────────────┐
+│ Visible coordinator      │ ◄──────────────────────► │ Python supervisor (stdlib) │
+│ Codex Luna / Claude chat │                          │ state · guard · evidence   │
+└──────────────────────────┘                          └─────────────┬──────────────┘
+                                                                   │ guarded process sessions
+                              ┌────────────────┬───────────────────┼───────────────────┐
+                              ▼                ▼                   ▼                   ▼
+                       ┌────────────┐   ┌────────────┐      ┌────────────┐      ┌────────────┐
+                       │ Architect  │   │ Explorer   │      │ Implementer│      │ Reviewer   │
+                       │ strong     │   │ Go, low    │      │ Go, high   │      │ Go, high   │
+                       │ plan/accept│   │ read-only  │      │ one writer │      │ read-only  │
+                       └────────────┘   └────────────┘      └────────────┘      └────────────┘
+```
+
+## Why this exists
+
+Most "agent loops" put state in the model's context. When the chat is
+interrupted, the context is compacted, or the wrong worktree is checked out,
+the loop silently loses correctness. Abdullah Orchestrator separates the two
+concerns:
+
+- **The model decides.** The Architect owns design, invariants, acceptance
+  criteria, and the final verdict.
+- **The supervisor enforces.** It persists dispatch intent *before* launch,
+  binds every verification result to the exact source snapshot, guards worker
+  process trees, and fails closed when ownership is uncertain.
+
+That split is what makes the workflow resumable, auditable, and safe to leave
+running for hours.
+
+## Highlights
+
+| Capability | What it means in practice |
 |---|---|
-| `SKILL.md` | Main skill discovered as `$abdullah-orchestrator` |
-| `agents/openai.yaml` | Agent interface metadata |
-| `scripts/orchestrator.py` | Supervisor CLI, stage workflow and stdio MCP server |
-| `scripts/install_wsl.py` | Installer and optional Codex MCP registration |
-| `scripts/config.example.json` | Editable default model, limit and permission config |
-| `references/` | Operation, role, contract and approved-handoff details |
-| `scripts/tests/` | Deterministic supervisor test suite and fixtures |
-| `MAINTENANCE.md` | Distribution, registration, backup and rollback notes |
+| **Durable runs** | Every stage, report, log, and checkpoint is on disk under a run ID. Recovery from a new chat is `runs → status → resume`. |
+| **Verified evidence** | Acceptance evidence is bound to git HEAD, dirty-file hashes, runtime inputs, environment values, config hash, toolchain identity, verification argv, and plan revision. Change any of them and old evidence is rejected. |
+| **Containment** | Workers run in a guarded session/process group with a lease pipe. Interrupt, reconcile, and completion all use one fail-closed containment gate. |
+| **Risk-based QA** | Mechanical work can skip the separate reviewer; ordinary work gets an independent review; high-risk work needs two distinct checks and a nonempty verification purpose. |
+| **Explicit cost control** | Strong-model calls are reserved for planning, consequential diagnosis, and acceptance. Recaps and status are deterministic and free. |
+| **Typed handoffs** | Every worker emits one JSON object against a generated, strict schema. Contract v2 fields are required; legacy reports cannot masquerade as fresh evidence. |
+| **OpenCode V1 + V2** | Generates the correct dialect for the installed CLI, validates effective V2 permissions through the real CLI, and refuses untested versions. |
+| **Human-only boundaries** | Plan approval, fallback authorization, retirement, and adoption are operator CLI actions — never MCP tools a model can call for itself. |
+
+## How a run works
+
+One conversation, one stage per visible foreground MCP call:
+
+| Stage | Agent | Produces |
+|---|---|---|
+| `plan` | Architect | Invariants, coherent batches, acceptance criteria, argv checks |
+| `explore` | Explorer | Read-only investigation when policy allows it |
+| `implement` | Implementer | One bounded batch in the authorized checkout |
+| `verify` | Supervisor | Executes the plan's argv against the exact candidate |
+| `review` | Reviewer | Independent findings with severity and disposition |
+| `accept` | Architect | Evidence-based verdict; correction wave if needed |
+| `diagnose` | Architect | Recovery plan for a blocked or uncertain run |
+| `integrate` | Architect | Final integration checks and closing assessment |
+
+The coordinator announces the worker, task, and expected output before each
+stage, then reports only the structured result. It never hides several stages
+inside one call and never claims completion without supervisor evidence.
 
 ## Requirements
 
-- Linux or WSL, Python 3.10+
+- Linux or WSL, **Python 3.10+** (standard library only — no pip install)
 - `git`
-- Codex CLI for Codex host mode; Claude Code CLI for Claude host mode
-- OpenCode CLI with a paid OpenCode Go account
-- Docker/Compose for projects whose verification uses containers
+- Codex CLI (Codex host) or Claude Code CLI (Claude host)
+- OpenCode CLI with a paid **OpenCode Go** account
+- Docker/Compose only for projects whose verification uses containers
 
-No extra Python packages are required.
-
-## Install
-
-Clone the repository anywhere on the Linux/WSL filesystem, then run the
-installer from the clone root:
+## Quick start
 
 ```bash
-git clone <REPOSITORY_URL> abdullah-orchestrator
+git clone https://github.com/abdullah72005/abdullah-orchestrator.git
 cd abdullah-orchestrator
 python3 scripts/install_wsl.py
 ```
 
-The installer:
+The installer links the skill into `~/.agents/skills/abdullah-orchestrator`
+(Codex) and `~/.claude/skills/abdullah-orchestrator` (Claude; use `--no-claude`
+to skip), refuses to overwrite unrelated files, and creates
+`~/.config/abdullah-orchestrator/config.json` without overwriting an existing
+config.
 
-- links the skill into `~/.agents/skills/abdullah-orchestrator` for Codex
-  discovery;
-- links it into `~/.claude/skills/abdullah-orchestrator` for Claude discovery
-  (disable with `--no-claude`);
-- refuses to overwrite unrelated files or symlinks;
-- creates `~/.config/abdullah-orchestrator/config.json` from the example,
-  without overwriting an existing config.
-
-## Configure
-
-Edit `~/.config/abdullah-orchestrator/config.json`. Confirm the paid Go account
-and the exact model and variant identifiers available in the installed catalog.
-The runtime fails visibly instead of silently downgrading models or switching
-billing routes.
-
-Validate the environment before a run:
+Edit the config and confirm the exact model/variant identifiers in your
+installed catalog, then run the preflight:
 
 ```bash
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
 ```
 
-`doctor` checks generated CLI options, configured models/variants and billing
-risk. It is a preflight check, not a model call.
-
-## Register the MCP server
+`doctor` checks CLI options, configured models/variants, billing route, and — on
+OpenCode V2 — the *effective* permissions the CLI reports. It does not launch a
+model session or prove entitlement.
 
 Register the stdio supervisor once per Codex profile:
 
 ```bash
 python3 scripts/install_wsl.py --register-codex
+# or manually:
+codex mcp add abdullah-orchestrator -- python3 "$PWD/scripts/orchestrator.py" mcp
 ```
 
-Or register it manually:
-
-```bash
-codex mcp add abdullah-orchestrator -- python3 <SKILL_DIR>/scripts/orchestrator.py mcp
-```
-
-Set the per-server timeout in `~/.codex/config.toml`, then restart Codex:
+Set the per-server timeout in `~/.codex/config.toml` and restart Codex:
 
 ```toml
 [mcp_servers.abdullah-orchestrator]
 command = "python3"
-args = ["<SKILL_DIR>/scripts/orchestrator.py", "mcp"]
+args = ["/absolute/path/to/abdullah-orchestrator/scripts/orchestrator.py", "mcp"]
 tool_timeout_sec = 18000
 ```
 
-Do not apply this timeout globally. Five hours deliberately exceeds the
-supervisor's four-hour stage caps so the client cannot race the supervisor at
-the boundary; it is a communication bound, not a stuck-worker detector. Keep it
-strictly above the largest configured `limits` value.
+Keep this bound strictly above the largest configured `limits` value. Five
+hours deliberately exceeds the supervisor's four-hour stage caps so the client
+cannot race the supervisor at the boundary. Do not apply it globally.
 
-## Use
+Open one Codex chat, invoke `$abdullah-orchestrator`, give it an absolute
+project path and a precise goal. Full walkthrough:
+[`docs/architecture.md`](docs/architecture.md).
 
-Open one Codex chat with the visible coordinator model, invoke
-`$abdullah-orchestrator`, and give it an absolute project path and precise goal.
-The coordinator calls `orchestrator_start` once, then `orchestrator_stage` once
-per engineering stage. Every stage is a separate visible foreground MCP call.
+## MCP surface
 
-Available MCP tools: `orchestrator_start`, `orchestrator_stage`,
-`orchestrator_status`, `orchestrator_recap`, `orchestrator_interrupt`,
-`orchestrator_amend`, `orchestrator_resume`, `orchestrator_reconcile` and
-`orchestrator_runs`.
+Nine tools, deliberately small:
 
-Plan approval and fallback authorization are deliberately **not** MCP tools. A
-model cannot approve its own plan or authorize its own fallback. Run them from
-an interactive operator terminal:
+| Tool | Purpose |
+|---|---|
+| `orchestrator_start` | Create durable run state. Does **not** dispatch a worker. |
+| `orchestrator_stage` | Run exactly one stage in the foreground. |
+| `orchestrator_status` | Deterministic compact status. No model call. |
+| `orchestrator_recap` | Quick or developer recap from persisted evidence. No model call. |
+| `orchestrator_interrupt` | Persist, terminate, and verify an interruption. |
+| `orchestrator_amend` | Record a requirement/correction amendment and pause safely. |
+| `orchestrator_resume` | Mark a paused run runnable. Does not execute a stage. |
+| `orchestrator_reconcile` | Clear an attempt only after containment proves it stopped. |
+| `orchestrator_runs` | List recent runs for recovery from a new chat. |
+
+Plan approval and fallback authorization are **not** MCP tools. They run in an
+interactive operator terminal and require the exact typed confirmation:
 
 ```bash
 python3 scripts/orchestrator.py approve-plan <ID> --confirm approve-plan:<ID>
-python3 scripts/orchestrator.py approve-fallback <ID> --role implementer   --confirm approve-fallback:<ID>
+python3 scripts/orchestrator.py approve-fallback <ID> --role implementer \
+  --confirm approve-fallback:<ID>
 ```
 
-The supervisor requires a TTY and the exact typed confirmation and records the
-actor, method and time in the journal. This is an operator-controlled boundary,
-not cryptographic proof: a same-user process that allocates a TTY and types the
-token can still pass it. Do not treat a typed message, an ordinary MCP call, or
-a model-authored shell command as human authorization.
+A model cannot approve its own plan or authorize its own fallback.
 
-Recovery from a new conversation is `orchestrator_runs` ->
-`orchestrator_status` -> `orchestrator_resume`, followed by
-`orchestrator_stage`. A verified interruption leaves the run `paused`; an
-unverified one leaves it `uncertain` and requires `orchestrator_reconcile`
-before any retry.
+## Interruption, recovery, and uncertainty
 
-The same operations are available from the CLI when MCP is unavailable:
-
-```bash
-python3 scripts/orchestrator.py start --project /abs/project --goal-file goal.txt --host codex
-python3 scripts/orchestrator.py stage <ID>
-python3 scripts/orchestrator.py status <ID>
-python3 scripts/orchestrator.py recap <ID> --detail quick
+```text
+running ──interrupt (verified)──► paused ──resume──► running
+   │
+   └──interrupt (unverified)──► uncertain ──reconcile (all stopped)──► paused
 ```
 
-See [`SKILL.md`](SKILL.md) and [`references/`](references/) for the complete
-workflow and contracts.
+- A **verified** stop preserves partial work and leaves the run `paused`.
+- An **unverified** stop leaves it `uncertain`. Do not retry and do not launch a
+  duplicate worker; reconcile first.
+- If no launch identity was ever persisted, the user must inspect the situation
+  and run the audited `reconcile <ID> --launch-missing --evidence '...'` path.
+- The MCP server has no cancel tool. Interrupt, verify `stopped: true`, then use
+  the explicit CLI `cancel` if the user authorizes it.
+
+Details: [`references/operation.md`](references/operation.md).
 
 ## State and configuration
 
-- Run state: `~/.local/state/abdullah-orchestrator/runs/<ID>`
-- Checkout lease registry: `~/.local/state/abdullah-orchestrator/runs-checkouts`
-- Configuration: `~/.config/abdullah-orchestrator/config.json`
+| What | Default |
+|---|---|
+| Run state | `~/.local/state/abdullah-orchestrator/runs/<ID>` |
+| Checkout leases | `~/.local/state/abdullah-orchestrator/runs-checkouts` |
+| Config | `~/.config/abdullah-orchestrator/config.json` |
 
-Override these with `ABDULLAH_STATE_DIR`, `ABDULLAH_CHECKOUT_REGISTRY` and
-`ABDULLAH_CONFIG`. Runtime state, generated configs and bytecode are not tracked
-by Git.
+Override with `ABDULLAH_STATE_DIR`, `ABDULLAH_CHECKOUT_REGISTRY`, and
+`ABDULLAH_CONFIG`. Runtime state, generated configs, and bytecode are not
+tracked by Git.
 
-Checkout conflicts expose the owner run ID and resolution commands. Use
-`checkout-status`, `retire` and `checkout-recover` for explicit operator
-resolution; `adopt` is the legacy state-adoption path. Sensitive CLI actions are
-disabled by default and must be enabled explicitly in the local config. These commands never launch a
-model and never kill live work.
+A run directory contains atomic `state.json`, an append-only `journal.jsonl`,
+per-job dispatch/report artifacts, verification logs, checkpoints, and the
+supervisor lock. The checkout registry names exactly one owner per working
+tree and exposes resolution commands instead of retrying a conflicting stage.
 
-## Verification security and provenance
+## Security model in one paragraph
 
-Verification runs only the plan's argv, never `shell=True`. The shipped policy
-rejects shell wrappers (`bash -lc`), interpreter expressions (`python3 -c`,
-`node -e`), indirect Docker execution and script-file execution by default.
-Legitimate commands such as `pytest -q`, `python3 -m unittest`,
-`git status --porcelain` and direct `docker compose run ...` remain usable.
+The Implementer is a broad-trust local development agent: it may edit the
+authorized checkout and run local shell/Docker commands. Explorer and Reviewer
+are read-only. Generated **V2** OpenCode profiles deny pushes, destructive Git,
+`docker compose down -v`, external directories, web access, subagents, and
+`.env` reads. Verification executes argv arrays, never `shell=True`, and the
+shipped command policy rejects shell wrappers, interpreter string evaluation,
+indirect Docker, and arbitrary script files unless an explicit scoped exception
+is recorded. **These are application-level permissions, not an OS sandbox.** Use
+a dedicated user or container for valuable repositories, and keep production
+credentials away from the workflow.
 
-Unusual checks require an explicit, scoped exception in
-`verification.command_policy.exceptions` with `argv_regex`, `reason`, `scope`
-and a non-model `authorized_by`. Exceptions are recorded with the exact command
-in the evidence. Disabling a rejection requires the documented
-`unsafe_acknowledged` string; it is never silent.
+Full threat model: [`docs/security-model.md`](docs/security-model.md).
 
-Command filtering is **not** filesystem, network or credential isolation. It
-only prevents known-obfuscated invocation forms. Use a dedicated user or
-container when real isolation is required.
+## Validation
 
-Acceptance evidence is bound to the source snapshot, git HEAD, runtime-input
-manifest, environment values, configuration hash, toolchain identity,
-verification argv, plan revision and candidate hash. Changing `NODE_ENV`, the
-toolchain, the config or an ignored executable invalidates old evidence instead
-of reusing it. `runtime_inputs.complete` means every discovered/declared input
-was hashed without truncation and every `required` input was found; it is not a
-proof of the complete runtime dependency graph. Declare project-specific inputs
-in `.abdullah/runtime-inputs.json` (`include`, `required`, `exclude`).
+- **579 deterministic tests** in the default suite (4 opt-in skips) covering
+  state transitions, containment, provenance, command policy, recovery,
+  report ingestion, permissions, and structured output. No model calls; model
+  CLIs are replaced with fakes and a guard blocks real `codex`, `claude`, or
+  `opencode` processes.
+- **A real end-to-end pilot** on 2026-11-13 completed a goal through Architect
+  plan → Implementer → supervisor verification (22 tests) → independent review
+  → Architect acceptance, using Codex `gpt-6.1-sol` and OpenCode Go
+  `deepseek-v4.1-flash` on OpenCode `v2.2.7`. The pilot surfaced three genuine
+  defects (invalid strict JSON schema, missing `contract_version`, and report
+  ingestion recovery); all were fixed with regression tests and are documented
+  in [`docs/validation.md`](docs/validation.md).
 
-## Trust boundary
-
-The Implementer may edit the authorized project and run local shell/Docker
-commands, but generated **V2** OpenCode profiles explicitly deny pushes,
-destructive Git operations, `docker compose down -v`, external directories, web
-access, subagents and `.env` reads. Explorer and Reviewer are read-only. The
-V1 profile format cannot express every pattern-level denial; V1 relies on the
-documented tool restrictions plus OS isolation for credential files. These are
-application-level permissions, not an OS sandbox; a malicious project can still
-abuse an allowed command. Push, deploy, production access, broad deletion and
-billing changes are never authorized by starting a run. Keep the workflow away
-from production credentials and sensitive host files.
-
-## OpenCode version support
-
-The supervisor supports the tested lines `>=1.18 <2.0` and `>=2.2 <3.0`
-(configurable with `runtime.opencode_supported`). It refuses unknown majors and
-untested ranges instead of claiming forward compatibility. For V2 it generates
-native `agents`/`permissions`/`shell`/`subagent` configuration, joins the
-variant into `provider/model#variant`, and adds `--standalone` so the model
-session stays inside the guarded process tree.
-
-`doctor` reports the detected version, dialect, version-policy result, generated
-command compatibility and effective worker profiles. On V2.2.x it verifies
-effective permissions with `opencode debug agents`; on V1 it uses
-`opencode debug agent`. Model execution and entitlement remain unverified by
-`doctor`.
-
-## Tests
+Reproduce the deterministic suite:
 
 ```bash
 python3 -m unittest discover -s scripts/tests
 ```
 
-The suite makes no real model calls; model CLIs are replaced with fakes and a
-guard prevents a real `codex`, `claude` or `opencode` process from launching.
-To exercise the real V2 CLI without a model call, point the opt-in suite at an
-isolated binary:
+The opt-in real-CLI suite makes no model call:
 
 ```bash
 ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
-  python3 -m pytest scripts/tests/test_opencode_v2_integration.py
+  python3 -m unittest discover -s scripts/tests -p "test_opencode_v2_integration.py"
 ```
 
-## Maintenance
+## Repository layout
 
-See [`MAINTENANCE.md`](MAINTENANCE.md) for distribution, backup, rollback and
-MCP registration details.
+```text
+.
+├── SKILL.md                  # Skill entry point (installation and operation)
+├── agents/openai.yaml        # Agent interface metadata
+├── scripts/
+│   ├── orchestrator.py       # Supervisor CLI + stdio MCP server
+│   ├── install_wsl.py        # Installer and Codex MCP registration
+│   ├── config.example.json   # Editable model, limit, permission defaults
+│   └── tests/                # 579-test deterministic suite and fixtures
+├── references/               # Operation, roles, contracts, approved handoff
+├── docs/
+│   ├── architecture.md       # Components, state model, stage lifecycle
+│   ├── security-model.md     # Trust boundaries and limitations
+│   ├── validation.md         # Test evidence and the real end-to-end pilot
+│   ├── maintenance.md        # Distribution, backup, rollback, upgrade
+│   └── audit/                # Independent-audit findings and before/after probes
+├── assets/icon.svg
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── SECURITY.md
+└── LICENSE
+```
+
+`scripts/orchestrator.py` is intentionally a single standard-library file: the
+skill is installed by symlinking the repository directory, and a single module
+keeps installation, import, and dependency surface trivial. The trade-off and
+module map are documented in [`docs/architecture.md`](docs/architecture.md).
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`SKILL.md`](SKILL.md) | The agent-facing skill: setup, operations, recovery, principles |
+| [`references/operation.md`](references/operation.md) | Detailed operation and trust boundaries |
+| [`references/contracts.md`](references/contracts.md) | Exact JSON contracts for plan, worker, reviewer, verdict |
+| [`references/roles.md`](references/roles.md) | Role responsibilities and escalation rules |
+| [`docs/architecture.md`](docs/architecture.md) | Internal design, state layout, failure handling |
+| [`docs/security-model.md`](docs/security-model.md) | Threat model, permissions, operator boundaries |
+| [`docs/validation.md`](docs/validation.md) | Test evidence and the real end-to-end pilot |
+| [`docs/maintenance.md`](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 |
+| [`docs/audit/`](docs/audit/) | Audit findings, corrections, and before/after probes |
+
+## Limitations
+
+- Single sequential writer. No nested Implementer agents, daemon installation,
+  database, or notifications.
+- Same-user trust boundary: the honor system behind human-only actions is real
+  but not cryptographic. A shell-capable process with the same OS account can
+  still edit config or import the module.
+- Application-level permissions are defense in depth, not an OS sandbox.
+  A process that clears its environment or changes user can escape the
+  verification survivor scan.
+- `runtime_inputs.complete` means the discovered/declared inputs were hashed
+  without truncation and required inputs were found. It is not a proof of the
+  complete runtime dependency graph.
+- `doctor` is a preflight check: it does not authenticate, prove entitlement, or
+  execute a model.
+
+## Contributing
+
+Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first;
+security reports should follow [`SECURITY.md`](SECURITY.md).
+
+## License
+
+[MIT](LICENSE) © Abdullah

@@ -24,9 +24,9 @@ codex mcp add abdullah-orchestrator -- python3 /abs/path/to/abdullah-orchestrato
 | `orchestrator_amend` | Persist an amendment; interrupt first if needed |
 | `orchestrator_resume` | Mark a paused run runnable; does not execute a stage |
 | `orchestrator_reconcile` | Clear a proven-stopped uncertain attempt; fails closed |
-| `orchestrator_approve_plan` | Approve a run awaiting human plan approval |
-| `orchestrator_approve_fallback` | One explicit, user-approved fallback dispatch |
 | `orchestrator_runs` | List recent runs for new-chat recovery |
+
+Plan approval and fallback authorization are deliberately **not** MCP tools. A model cannot approve its own plan or authorize its own fallback. The user runs `orchestrator.py approve-plan` or `approve-fallback` in an interactive terminal, with the exact typed confirmation. The MCP server rejects those names.
 
 Each `orchestrator_stage` call runs one of: plan, required explore, implement, verify, review, accept, diagnose, integrate. Codex displays the tool call, its native running indicator and elapsed time, then the structured result. Codex does **not** display an external worker's private reasoning, intermediate tool calls, or MCP progress notifications; do not patch the TUI to pretend otherwise. A stage tool call may run for several minutes; it must never contain several stages or an entire hours-long run.
 

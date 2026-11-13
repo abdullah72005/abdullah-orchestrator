@@ -10,4 +10,7 @@ config.json
 *.bak
 *.log
 runs/
+runs-checkouts/
+.pytest_cache/
+.coverage
 .DS_Store

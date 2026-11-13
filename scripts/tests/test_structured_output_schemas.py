@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -24,6 +25,10 @@ from unittest.mock import patch
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "orchestrator.py"
 FIXTURES = HERE / "fixtures"
+# Hermetic: never read the developer's live config or state.
+os.environ.pop("ABDULLAH_CHECKOUT_REGISTRY", None)
+os.environ.pop("ABDULLAH_STATE_DIR", None)
+os.environ["ABDULLAH_CONFIG"] = str(SRC.parent / "config.example.json")
 spec = importlib.util.spec_from_file_location("abdullah_orchestrator_schema", SRC)
 orc = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = orc

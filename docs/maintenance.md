@@ -1,11 +1,10 @@
 # Maintained source and distribution
 
-This Git repository is the canonical source. A common machine-local layout keeps
-the working source at `~/.local/src/abdullah-orchestrator` and the active
-installation at `~/.local/share/abdullah-orchestrator`; keep both copies in sync
-when making changes. A fresh clone can also be installed in place, because
-`scripts/install_wsl.py` links whichever directory contains it. Back up both
-copies before an update if that layout is in use:
+This Git repository is the canonical source. The installer links whichever
+directory contains `scripts/install_wsl.py`, so a fresh clone can be installed
+in place; an alternative machine-local layout keeps a working source under
+`~/.local/src` and the active installation under `~/.local/share`. Back up both
+copies before an update if that layout is in use.
 
 The checkout registry is `<state-root>-checkouts` (or `ABDULLAH_CHECKOUT_REGISTRY`).
 Back it up with the runs; never delete it while any run is active.
@@ -21,6 +20,9 @@ Run the full suite from the source directory before distributing:
 ```bash
 python3 -m unittest discover -s scripts/tests
 ```
+
+The suite is hermetic and does not read live configuration or run state, so
+exported `ABDULLAH_*` overrides do not change its result.
 
 Then copy the files into the installed directory (never overwrite the separate
 run-state or configuration directories) and rerun the same suite there.
@@ -148,7 +150,7 @@ suite:
 
 ```bash
 ABDULLAH_OPENCODE_V2_BIN=$(command -v opencode) \
-  python3 -m pytest scripts/tests/test_opencode_v2_integration.py
+  python3 -m unittest discover -s scripts/tests -p "test_opencode_v2_integration.py"
 ```
 
 No step in this handoff upgrades the global CLI automatically, replaces the

@@ -604,6 +604,14 @@ class Batch1Corrections(unittest.TestCase):
         self.assertTrue(Path(orc.DEFAULT_STATE).resolve().is_relative_to(self.root.resolve()))
         self.assertTrue(orc.leases_root().resolve().is_relative_to(self.root.resolve()))
 
+    def test_ambient_state_overrides_are_replaced_by_temp_paths(self):
+        # Documented ABDULLAH_* overrides for real runs must not leak into the
+        # suite; leases_root() derives from the patched state root.
+        for name in ("ABDULLAH_STATE_DIR", "ABDULLAH_CONFIG"):
+            with self.subTest(name=name):
+                self.assertTrue(Path(os.environ[name]).resolve().is_relative_to(self.root.resolve()))
+        self.assertNotIn("ABDULLAH_CHECKOUT_REGISTRY", os.environ)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,11 @@ import unittest
 from unittest.mock import patch
 
 SRC = Path(__file__).resolve().parents[1] / "orchestrator.py"
+# Tests must be hermetic: never read the developer's live config or state, even
+# when the documented ABDULLAH_* overrides are exported in the shell.
+os.environ.pop("ABDULLAH_CHECKOUT_REGISTRY", None)
+os.environ.pop("ABDULLAH_STATE_DIR", None)
+os.environ["ABDULLAH_CONFIG"] = str(SRC.parent / "config.example.json")
 spec = importlib.util.spec_from_file_location("abdullah_orchestrator", SRC)
 orc = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = orc
@@ -64,8 +69,19 @@ class ControlTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         # Every test is isolated from the live orchestrator state and its
-        # checkout registry.  This is also a tripwire: a test that rebinds
-        # DEFAULT_STATE outside this temporary root would fail immediately.
+        # checkout registry.  Ambient ABDULLAH_* overrides are replaced as
+        # well: leases_root() reads them dynamically, so exporting them for a
+        # real run must not leak into the suite.
+        env_patch = patch.dict(os.environ, {
+            "ABDULLAH_STATE_DIR": str(self.root / "runs"),
+            "ABDULLAH_CONFIG": str(self.root / "config.json"),
+        })
+        env_patch.start()
+        # An exported registry override would defeat state-root derivation.
+        os.environ.pop("ABDULLAH_CHECKOUT_REGISTRY", None)
+        self.addCleanup(env_patch.stop)
+        # This is also a tripwire: a test that rebinds DEFAULT_STATE outside
+        # this temporary root fails immediately.
         state_patch = patch.object(orc, "DEFAULT_STATE", self.root / "runs")
         state_patch.start()
         self.addCleanup(state_patch.stop)
