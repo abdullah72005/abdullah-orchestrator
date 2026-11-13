@@ -168,7 +168,7 @@ class CheckpointCSecurity(unittest.TestCase):
         project.mkdir(); project = baseline.setup_repo(project)
         with patch.object(orc, "DEFAULT_STATE", self.root / "new-contract-runs"):
             run_id, _folder, state = orc.create_run(project=str(project), goal="x",
-                                                    skip_doctor=True)
+                                                    host="codex", skip_doctor=True)
             self.assertEqual(state.get("contract_version_required"), 2)
             self.assertEqual(orc.load(run_id)[1]["contract_version_required"], 2)
 

@@ -903,6 +903,338 @@ def scrubbed_env():
     return env
 
 
+# ---------------------------------------------------------------------------
+# Shared route/billing preflight (Doctor and every dispatch use this)
+# ---------------------------------------------------------------------------
+
+SUBSCRIPTION_BILLINGS = frozenset({"subscription", "go"})
+EXPLICIT_BILLINGS = frozenset({"subscription", "api", "free", "local", "go"})
+CLAUDE_PROVIDER_FLAGS = (
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+)
+CLAUDE_BILLING_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
+) + CLAUDE_PROVIDER_FLAGS
+CODEX_BILLING_ENV = (
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE",
+    "CODEX_API_KEY", "CODEX_BASE_URL", "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+)
+INERT_CLOUD_ENV = (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
+    "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION",
+)
+CLAUDE_SETTINGS_FILES = (
+    ("user", Path("~/.claude/settings.json")),
+    ("project", Path(".claude/settings.json")),
+    ("local", Path(".claude/settings.local.json")),
+    ("managed-user", Path("~/.claude/managed-settings.json")),
+    ("managed-system", Path("/etc/claude-code/managed-settings.json")),
+)
+SETTINGS_HAZARD_KEYS = (
+    "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+    "forceLoginMethod", "forceLoginOrgUUID",
+)
+
+
+def _present(name):
+    value = os.environ.get(name)
+    return {"present": bool(value),
+            "sha256": hashlib.sha256(value.encode()).hexdigest()
+            if value else None}
+
+
+def _inspect_json_settings(path: Path):
+    """Return redacted influential keys, or an error; never expose values."""
+    if not path.is_file():
+        return None, None
+    try:
+        data = read_json(path)
+    except (OSError, ValueError) as exc:
+        return None, f"unreadable settings ({exc.__class__.__name__})"
+    if not isinstance(data, dict):
+        return None, "settings must be a JSON object"
+    observed = {"hazards": [], "env_names": []}
+    for key in SETTINGS_HAZARD_KEYS:
+        if key in data:
+            observed["hazards"].append(key)
+    env = data.get("env")
+    if env is not None and not isinstance(env, dict):
+        return None, "settings env must be an object"
+    for key in sorted((env or {}).keys()):
+        if key in CLAUDE_BILLING_ENV or key.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")):
+            observed["env_names"].append(key)
+    return observed, None
+
+
+def claude_billing_hazards(project=None):
+    """Detect observable routing that would defeat a subscription claim."""
+    reasons = []
+    observed = {"env": {}, "settings": [], "inert_cloud": []}
+    for name in CLAUDE_BILLING_ENV:
+        state = _present(name)
+        if state["present"]:
+            observed["env"][name] = state
+            if name in CLAUDE_PROVIDER_FLAGS:
+                reasons.append(f"{name} selects a provider-managed Claude route")
+            elif name in {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                          "ANTHROPIC_API_KEY"}:
+                reasons.append(f"{name} can override subscription authentication/billing")
+            elif name in {"ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"}:
+                reasons.append(f"{name} overrides the configured Claude model")
+            elif name in {"ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
+                          "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS"}:
+                reasons.append(f"{name} selects a hosted/cloud Claude route")
+    # Ambient AWS credentials are inert unless a provider flag/base URL selects
+    # Bedrock.  Do not block unrelated credentials merely because they exist.
+    flags = {name: os.environ.get(name) for name in CLAUDE_PROVIDER_FLAGS}
+    aws_selected = any(bool(value and value.lower() not in {"0", "false", "no"})
+                       for value in flags.values())
+    for name in INERT_CLOUD_ENV:
+        state = _present(name)
+        if state["present"]:
+            observed["inert_cloud"].append(name)
+            if aws_selected:
+                reasons.append(f"{name} is present alongside a provider-managed Claude route")
+    for scope, relative in CLAUDE_SETTINGS_FILES:
+        path = Path(project) / relative if project and scope in {"project", "local"} \
+            else relative.expanduser()
+        if scope in {"project", "local"} and project is None:
+            continue
+        observed_entry = {"scope": scope, "path": str(path), "present": path.is_file()}
+        if path.is_file():
+            data, error = _inspect_json_settings(path)
+            observed_entry["error"] = error
+            observed_entry["influential"] = data
+            if error:
+                reasons.append(f"{scope} Claude settings {error}: {path}")
+            elif data and (data["hazards"] or data["env_names"]):
+                reasons.append(
+                    f"{scope} Claude settings set billing-relevant keys: "
+                    + ", ".join(sorted(set(data["hazards"] + data["env_names"]))))
+        observed["settings"].append(observed_entry)
+    return reasons, observed
+
+
+def codex_billing_hazards():
+    reasons = []
+    observed = {"env": {}}
+    for name in CODEX_BILLING_ENV:
+        state = _present(name)
+        if state["present"]:
+            observed["env"][name] = state
+            reasons.append(f"{name} can override Codex subscription billing")
+    return reasons, observed
+
+
+def opencode_provider_observation(route):
+    """Redacted view of the effective OpenCode provider configuration."""
+    provider = route.get("worker_provider") or str(route.get("model", "")).split("/", 1)[0]
+    candidates = []
+    explicit = os.environ.get("OPENCODE_CONFIG")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.extend([Path("~/.config/opencode/opencode.json").expanduser(),
+                       Path("~/.config/opencode/opencode.jsonc").expanduser()])
+    observed = {"provider": provider, "config": [], "providers": [],
+                "available": False, "error": None}
+    for path in candidates:
+        if not path.is_file():
+            continue
+        observed["config"].append(str(path))
+        try:
+            text = path.read_text(encoding="utf-8")
+            # JSONC comments are not parsed here; an unreadable influential
+            # document fails closed instead of guessing at its meaning.
+            data = json.loads(text)
+        except (OSError, ValueError) as exc:
+            observed["error"] = f"unreadable OpenCode config ({exc.__class__.__name__})"
+            continue
+        observed["available"] = True
+        providers = data.get("provider") if isinstance(data, dict) else None
+        if isinstance(providers, dict):
+            observed["providers"] = sorted(providers.keys())
+            entry = providers.get(provider)
+            if isinstance(entry, dict):
+                options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+                observed["provider_configured"] = True
+                observed["endpoint_sha256"] = (
+                    hashlib.sha256(str(options.get("baseURL") or "").encode()).hexdigest()
+                    if options.get("baseURL") else None)
+                observed["auth_env_names"] = sorted(
+                    key for key in options if "key" in key.lower() or "token" in key.lower())
+                observed["model_count"] = len(entry.get("models") or {}) \
+                    if isinstance(entry.get("models"), dict) else 0
+    return observed
+
+
+def route_authorization_sha(route):
+    material = {key: route.get(key) for key in
+                ("provider", "worker_provider", "model", "effort", "billing")}
+    return content_hash(material)
+
+
+def route_authorization_status(state, role, route):
+    """Return the active human grant matching role, run and exact route."""
+    sha = route_authorization_sha(route)
+    if not isinstance(state, dict):
+        return {"required": True, "authorized": False, "route_sha256": sha,
+                "reason": "no durable run state authorizes this route"}
+    for entry in reversed(state.get("route_authorizations", [])):
+        if (entry.get("role") == role and entry.get("route_sha256") == sha
+                and int(entry.get("used", 0)) < int(entry.get("max_dispatches", 0))):
+            return {"required": True, "authorized": True, "route_sha256": sha,
+                    "grant_id": entry.get("id"),
+                    "remaining": int(entry.get("max_dispatches", 0))
+                    - int(entry.get("used", 0)),
+                    "attestation": entry.get("attestation")}
+    return {"required": True, "authorized": False, "route_sha256": sha,
+            "reason": "no matching human authorization grant with remaining dispatches"}
+
+
+def route_preflight(role, route, cfg=None, project=None, state=None):
+    """Classify billing and reject unapproved routing before any dispatch.
+
+    This is a deterministic application-level policy check.  It neither proves
+    entitlement nor enforces provider-side spend; it only refuses routes whose
+    billing cannot be established from configuration and explicit human
+    authorization.  Secret values are never recorded.
+    """
+    cfg = cfg or config()
+    billing = route.get("billing") or "unknown"
+    provider = route.get("provider")
+    result = {
+        "version": 1,
+        "role": role,
+        "provider": provider,
+        "worker_provider": route.get("worker_provider"),
+        "model": route.get("model"),
+        "billing": billing,
+        "classification": "unknown",
+        "ok": False,
+        "reasons": [],
+        "warnings": [],
+        "route_sha256": route_authorization_sha(route),
+        "observed": {},
+        "checked_at": now(),
+    }
+    if billing not in EXPLICIT_BILLINGS:
+        result["reasons"].append(f"billing {billing!r} is not an explicit supported value")
+        return result
+    if provider in {"codex", "claude"}:
+        subscription = billing in {"subscription"}
+        result["classification"] = "subscription" if subscription else billing
+        if subscription:
+            hazards, observed = (claude_billing_hazards(project) if provider == "claude"
+                                 else codex_billing_hazards())
+            result["observed"] = observed
+            if hazards:
+                result["reasons"].extend(hazards)
+                result["classification"] = "unprovable_subscription"
+                return result
+            result["ok"] = True
+            result["warnings"].append(
+                "Configuration-only check; subscription entitlement is not proven.")
+            return result
+        # Explicit API/usage billing for a strong host requires a human grant,
+        # and an environment variable is never consent.
+        authorization = route_authorization_status(state, role, route)
+        result["authorization"] = authorization
+        if not authorization["authorized"]:
+            result["reasons"].append(
+                "usage-billed strong route requires an explicit human `authorize-route` grant")
+            return result
+        result["ok"] = True
+        return result
+    if provider != "opencode":
+        result["reasons"].append(f"unsupported route provider {provider!r}")
+        return result
+    observation = opencode_provider_observation(route)
+    result["observed"] = observation
+    if billing == "go":
+        result["classification"] = "go_subscription"
+        if observation.get("error"):
+            result["warnings"].append(observation["error"])
+        result["ok"] = True
+        result["warnings"].append(
+            "OpenCode Go entitlement is attested by configuration only; no inference request was made.")
+        return result
+    result["classification"] = billing
+    if observation.get("error"):
+        result["reasons"].append(
+            "OpenCode provider configuration is unreadable; non-Go billing cannot be established")
+    if billing in {"subscription", "free", "local"}:
+        authorization = route_authorization_status(state, role, route)
+        result["authorization"] = authorization
+        attestation = (authorization.get("attestation") or "").strip()
+        if not authorization["authorized"]:
+            result["reasons"].append(
+                f"{billing} route requires an explicit human `authorize-route` grant")
+            return result
+        if not attestation:
+            result["reasons"].append(
+                f"{billing} route grant lacks an endpoint/auth-mode attestation")
+            return result
+        if billing == "local" and not observation.get("endpoint_sha256"):
+            result["reasons"].append(
+                "local route requires an explicitly reviewed local endpoint in OpenCode config")
+            return result
+        result["ok"] = not bool(observation.get("error"))
+        if result["ok"]:
+            result["warnings"].append(
+                "Billing classification is attested by a human grant, not provider settlement.")
+        return result
+    # api or unknown remote billing
+    authorization = route_authorization_status(state, role, route)
+    result["authorization"] = authorization
+    if not authorization["authorized"]:
+        result["reasons"].append(
+            "usage-billed worker route requires an explicit human `authorize-route` grant")
+        return result
+    result["ok"] = not bool(observation.get("error"))
+    if not result["ok"]:
+        result["reasons"].append(
+            "effective OpenCode provider routing is unreadable; do not claim billing safety")
+    return result
+
+
+def reserve_route_grant(state, run_dir, role, route):
+    """Atomically consume one grant before spawn; never auto-refund a crash."""
+    if not isinstance(state, dict):
+        return None
+    sha = route_authorization_sha(route)
+    for entry in reversed(state.get("route_authorizations", [])):
+        if (entry.get("role") == role and entry.get("route_sha256") == sha
+                and int(entry.get("used", 0)) < int(entry.get("max_dispatches", 0))):
+            entry["used"] = int(entry.get("used", 0)) + 1
+            entry.setdefault("consumptions", []).append({
+                "at": now(), "role": role, "route_sha256": sha,
+                "job_intent": "reserved_before_spawn"})
+            save(run_dir, state)
+            return entry
+    raise RuntimeError("Route authorization grant is missing or exhausted")
+
+
+def release_route_grant(state, run_dir, role, route, reason):
+    """Release only a reservation whose launch was proven never attempted."""
+    sha = route_authorization_sha(route)
+    for entry in reversed(state.get("route_authorizations", [])):
+        if (entry.get("role") == role and entry.get("route_sha256") == sha
+                and int(entry.get("used", 0)) > 0):
+            entry["used"] = int(entry.get("used", 0)) - 1
+            entry.setdefault("releases", []).append({
+                "at": now(), "reason": reason, "role": role,
+                "route_sha256": sha})
+            save(run_dir, state)
+            return entry
+    return None
+
+
 def _operator_action_allowed(action):
     """Fail closed on sensitive CLI actions from a model-owned context.
 
@@ -923,7 +1255,8 @@ def _operator_action_allowed(action):
     return True
 
 
-HUMAN_ONLY_ACTIONS = {"approve-plan", "approve-fallback"}
+HUMAN_ONLY_ACTIONS = {"approve-plan", "approve-fallback", "authorize-route",
+                      "approve-worker-fallback"}
 
 
 def require_human_operator(action, run_id, confirmation=None):
@@ -4511,8 +4844,6 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     """Persist intent -> spawn -> observe; never replay a completed command."""
     job_id = uuid.uuid4().hex[:12]
     archive = archive or (run_dir / "jobs")
-    jpath = archive / f"{kind}-{job_id}"
-    jpath.mkdir(parents=True, exist_ok=False)
     host = host or (state["host"] if state is not None else "codex")
     route = model_route(cfg, host, role)
     fallback = state.get("fallback_authorization") if state else None
@@ -4526,11 +4857,62 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         # One approved dispatch only; if it fails a new authorization is needed.
         state["fallback_authorization"] = None
         save(run_dir, state)
+    preflight = route_preflight(role, route, cfg, project, state)
+    if not preflight["ok"]:
+        archive.mkdir(parents=True, exist_ok=True)
+        rejection_path = archive / f"preflight-{job_id}.json"
+        rejection = {**preflight, "kind": kind, "job_id": job_id,
+                     "phase": (state or {}).get("phase"),
+                     "decision": "preflight_rejected",
+                     "active_job_created": False,
+                     "model_calls_counted": False}
+        atomic_json(rejection_path, rejection)
+        if state is not None:
+            state["preflight_rejection"] = {
+                **rejection, "path": str(rejection_path)}
+            state["status"] = "blocked"
+            state["pause_reason"] = (
+                "Dispatch blocked by billing/route preflight: "
+                + "; ".join(preflight["reasons"]))
+            save(run_dir, state)
+            journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
+                          role=role, kind=kind, path=str(rejection_path),
+                          reasons=preflight["reasons"],
+                          classification=preflight["classification"],
+                          route_sha256=preflight["route_sha256"])
+        raise RuntimeError(
+            "Dispatch blocked by billing/route preflight: "
+            + "; ".join(preflight["reasons"])
+            + f" (diagnostic: {rejection_path})")
+    authorization = preflight.get("authorization") or {}
+    reservation = None
+    if authorization.get("required") and route.get("billing") not in SUBSCRIPTION_BILLINGS:
+        try:
+            reservation = reserve_route_grant(state, run_dir, role, route)
+        except RuntimeError as exc:
+            archive.mkdir(parents=True, exist_ok=True)
+            rejection_path = archive / f"preflight-{job_id}.json"
+            rejection = {**preflight, "kind": kind, "job_id": job_id,
+                         "decision": "preflight_rejected",
+                         "reasons": [str(exc)], "active_job_created": False,
+                         "model_calls_counted": False}
+            atomic_json(rejection_path, rejection)
+            if state is not None:
+                state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
+                state["status"] = "blocked"
+                state["pause_reason"] = "Dispatch blocked: " + str(exc)
+                save(run_dir, state)
+                journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
+                              role=role, kind=kind, reasons=[str(exc)])
+            raise RuntimeError(f"Dispatch blocked: {exc}") from exc
+    jpath = archive / f"{kind}-{job_id}"
+    jpath.mkdir(parents=True, exist_ok=False)
     strong = route["provider"] in {"codex", "claude"}
     dispatch_snapshot = source_snapshot(project)
     atomic_json(jpath / "dispatch.json", {"kind": kind, "role": role, "route": route,
                                            "source": dispatch_snapshot,
                                            "decision_binding": decision_binding,
+                                           "preflight": preflight,
                                            "created_at": now()})
     continuation = None
     if state is not None and role != "architect":
@@ -4539,7 +4921,12 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             if not prior.get("reconciled") or not prior.get("termination_verified"):
                 raise RuntimeError(
                     "An unreconciled worker session cannot be reused; reconcile the exact attempt first")
-            continuation = prior["session_id"]
+            prior_sha = prior.get("route_sha256")
+            if prior_sha and prior_sha != route_authorization_sha(route):
+                # A session belongs to one exact route; fallback/new routes start fresh.
+                continuation = None
+            else:
+                continuation = prior["session_id"]
     prompt = prompt.replace("__ABDULLAH_PARENT_JOB__", job_id)
     cmd, env, output_format = cli_command(
         route["provider"] if strong else host, role, route, prompt, jpath, continuation,
@@ -4555,6 +4942,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             env["ABDULLAH_STAGE"] = kind
     job = {"id": job_id, "kind": kind, "role": role, "route": route, "status": "dispatched",
            "path": str(jpath), "created_at": now(), "pid": None,
+           "preflight": preflight,
            "amendment_epoch": (state.get("amendment_epoch", 0) if state is not None else 0),
            "launch_file": str(jpath / "launch.json"),
            "continued_session": continuation}
@@ -4564,15 +4952,13 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     timeout = cfg["limits"]["max_architect_seconds" if strong else "max_worker_seconds"]
     started = time.monotonic()
     out_file = jpath / "events.log"
-    if strong and route["provider"] == "claude" and route["billing"] == "subscription" and os.getenv("ANTHROPIC_API_KEY"):
-        raise RuntimeError("ANTHROPIC_API_KEY could route Claude Code to paid API billing; remove it or explicitly configure billing")
-    if strong and route["provider"] == "codex" and route["billing"] == "subscription" and os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is set: verify subscription billing before launching Codex Architect")
     proc = None
     lease_fd = None
     launch_file = jpath / "launch.json"
+    spawn_attempted = False
     try:
         with out_file.open("w", encoding="utf-8") as log:
+            spawn_attempted = True
             proc, lease_fd = _spawn_guarded(cmd, project, env, log,
                                             launch_file=launch_file)
             launch = _wait_launch(launch_file)
@@ -6995,6 +7381,11 @@ def doctor(project: Path, host="codex"):
     for role in ("explorer", "implementer", "reviewer"):
         checks["route"][role] = model_route(cfg, host, role)
     checks["route"]["architect"] = model_route(cfg, host, "architect")
+    checks["host"] = host
+    checks["billing_preflight"] = {}
+    for role, route in checks["route"].items():
+        checks["billing_preflight"][role] = route_preflight(
+            role, route, cfg, project, state=None)
     checks["generated_commands"] = probe_generated_commands(cfg, host, dialect, help_by_provider)
     # Deterministic contract validation is authoritative; live CLI
     # introspection is best-effort and reported separately.
@@ -7052,10 +7443,18 @@ def doctor(project: Path, host="codex"):
     )
     checks["execution_note"] = "Generated argv is checked against installed help and parsed using --help; no model session or authentication was exercised."
     checks["api_billing_risk"] = []
-    if host == "codex" and os.getenv("OPENAI_API_KEY"):
-        checks["api_billing_risk"].append("OPENAI_API_KEY is set")
-    if host == "claude" and os.getenv("ANTHROPIC_API_KEY"):
-        checks["api_billing_risk"].append("ANTHROPIC_API_KEY is set")
+    checks["route_authorization_required"] = []
+    for role, preflight in checks["billing_preflight"].items():
+        if not preflight["ok"]:
+            checks["api_billing_risk"].append(
+                f"{role}: " + "; ".join(preflight["reasons"]))
+        authorization = preflight.get("authorization") or {}
+        if authorization.get("required") and not authorization.get("authorized"):
+            checks["route_authorization_required"].append(role)
+    checks["billing_preflight_note"] = (
+        "Doctor reports the same deterministic route/billing classification used "
+        "before dispatch. No credential, model session or inference request is made; "
+        "subscription entitlement and provider-side spend are not proven.")
     profiles_cli_ok = (dialect is not None
                        and all(value is True for value in checks["worker_profiles_cli"].values()))
     checks["worker_profiles_cli_verified"] = profiles_cli_ok
@@ -7074,16 +7473,19 @@ def doctor(project: Path, host="codex"):
     return checks
 
 
-def create_run(*, project, goal=None, goal_file=None, host="codex",
+def create_run(*, project, goal=None, goal_file=None, host=None,
                plan_approval=False, require_explorer=False, approved_handoff=None,
                authorize_handoff=False, skip_doctor=False, interactive=False,
                allow_explorer=False, explorer_policy=None):
     """Create durable run state without dispatching a worker.
 
-    The interactive MCP surface uses this to return immediately, then invokes
-    exactly one foreground stage per tool call.  The legacy CLI still calls
-    `serve` after creation when background execution is requested.
+    ``host`` is the controlling interactive/strong host and must be supplied
+    explicitly.  It is validated before any state, lease or job artifact is
+    written; there is no silent Codex default.
     """
+    if not isinstance(host, str) or host not in {"codex", "claude"}:
+        raise ValueError(
+            "An explicit controlling host is required for a new run: codex or claude")
     cfg = config()
     project = Path(project).expanduser().resolve()
     if not project.is_dir():
@@ -7893,6 +8295,7 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
     progress = f"{'✓' if error is None else '⚠'} {label} | {summary} | {elapsed:.1f}s"
     return {"ok": error is None, "run_id": state.get("id"), "stage": stage,
             "agent": role, "agent_label": label, "task": task, "expected": expected,
+            "host": state.get("host"), "route": route_report(state, role),
             "status": status, "phase": state.get("phase"),
             "elapsed_seconds": round(elapsed, 2), "summary": summary,
             "report": compact_report(stage_report(state, stage)),
@@ -8006,7 +8409,7 @@ def stage_run(run_id, expected_phase=None):
         return stage_payload(folder, state, stage, role, task, expected, elapsed, error)
 
 
-def start_run(*, project, goal=None, goal_file=None, host="codex",
+def start_run(*, project, goal=None, goal_file=None, host=None,
               plan_approval=False, require_explorer=False, approved_handoff=None,
               authorize_handoff=False, skip_doctor=False, interactive=True,
               allow_explorer=False, explorer_policy=None):
@@ -8043,6 +8446,24 @@ def usage_line(usage):
     return " | ".join(parts)
 
 
+def route_report(state, role=None):
+    """Report the persisted host and resolved route without secrets."""
+    role = role if role is not None else (STAGES.get(state.get("phase")) or {}).get("role")
+    if role is None:
+        return {"role": None, "host": state.get("host"), "provider": "supervisor",
+                "worker_provider": None, "model": None, "effort": None,
+                "billing": None}
+    route = (state.get("model_routes") or {}).get(role)
+    if not isinstance(route, dict):
+        route = {"provider": "supervisor"}
+    return {"role": role, "host": state.get("host"),
+            "provider": route.get("provider"),
+            "worker_provider": route.get("worker_provider"),
+            "model": route.get("model"), "effort": route.get("effort"),
+            "billing": route.get("billing"),
+            "routing_fingerprint": route.get("routing_fingerprint")}
+
+
 def status_run(run_id):
     folder, state = load(run_id)
     job = state.get("active_job") or {}
@@ -8051,6 +8472,7 @@ def status_run(run_id):
         "ok": True, "run_id": run_id,
         "status": "checkout_conflict" if conflict else state.get("status"),
         "phase": state.get("phase"), "batch_index": state.get("batch_index", 0),
+        "host": state.get("host"), "route": route_report(state),
         "total_batches": len((state.get("plan") or {}).get("batches", [])),
         "batch": (current_batch(state) or {}).get("title"),
         "pause_reason": state.get("pause_reason"),
@@ -8522,15 +8944,20 @@ def amend_run(run_id, amendment, architect_review=False, kind="requirement"):
         _release_lock_file(stream)
 
 
-def resume_run(run_id):
+def resume_run(run_id, host=None):
     folder, state = load(run_id)
+    if host is not None and host != state.get("host"):
+        raise RuntimeError(
+            f"Resume host {host!r} contradicts the persisted controlling host "
+            f"{state.get('host')!r}; start a new run to change hosts")
     assert_state_compatible(state)
     with exclusive(folder):
         folder, state = load(run_id)
         modify_locked(folder, state, run_id, "resume")
         folder, state = load(run_id)
     return {"ok": True, "run_id": run_id, "status": state["status"],
-            "phase": state["phase"], "next_action": next_action_for(state),
+            "phase": state["phase"], "host": state.get("host"),
+            "next_action": next_action_for(state),
             "next": next_stage_preview(state)}
 
 
@@ -8595,6 +9022,56 @@ def approve_plan_run(run_id, confirmation=None):
             "next_action": next_action_for(state)}
 
 
+def authorize_route_run(run_id, role, max_dispatches=1, attestation=None,
+                        confirmation=None):
+    """Record a human-only, per-run route/billing authorization grant."""
+    authorization = require_human_operator("authorize-route", run_id, confirmation)
+    if role not in {"architect", "explorer", "implementer", "reviewer"}:
+        raise ValueError("Unknown route role")
+    try:
+        max_dispatches = int(max_dispatches)
+    except (TypeError, ValueError):
+        raise ValueError("--max-dispatches must be an integer")
+    if max_dispatches < 1 or max_dispatches > 1000:
+        raise ValueError("--max-dispatches must be between 1 and 1000")
+    folder, state = load(run_id)
+    with exclusive(folder):
+        folder, state = load(run_id)
+        if state.get("active_job") or state.get("active_check"):
+            raise RuntimeError("Reconcile active work before authorizing a route")
+        route = (state.get("model_routes") or {}).get(role)
+        if not isinstance(route, dict):
+            route = model_route(config(), state.get("host"), role)
+        billing = route.get("billing")
+        attestation = (attestation or "").strip()
+        if billing in {"subscription", "free", "local"} and not attestation:
+            raise ValueError(
+                f"{billing} routes require --attest describing the reviewed endpoint/auth mode")
+        entry = {
+            "id": uuid.uuid4().hex[:12],
+            "role": role,
+            "route_sha256": route_authorization_sha(route),
+            "route": {key: route.get(key) for key in
+                      ("provider", "worker_provider", "model", "effort", "billing")},
+            "max_dispatches": max_dispatches,
+            "used": 0,
+            "attestation": attestation or None,
+            "run_id": run_id,
+            "actor": authorization["actor"],
+            "method": authorization["method"],
+            "at": now(),
+            "scope": "role/run/exact-route; supervisor dispatch calls only",
+        }
+        state.setdefault("route_authorizations", []).append(entry)
+        save(folder, state)
+        journal_event(folder, state, "route_authorized", grant=entry)
+    return {"ok": True, "run_id": run_id, "grant": entry,
+            "human_authorization": authorization,
+            "limitations": ("Bounds supervisor dispatch attempts selected by this "
+                            "grant; it is not a token or dollar cap and cannot bound "
+                            "provider-side retries or auxiliary calls.")}
+
+
 def approve_fallback_run(run_id, role, confirmation=None):
     authorization = require_human_operator("approve-fallback", run_id, confirmation)
     folder, state = load(run_id)
@@ -8653,7 +9130,8 @@ MCP_TOOLS = [
      "inputSchema": _schema({
          "project": {"type": "string", "description": "Absolute development repository path"},
          "goal": {"type": "string", "description": "Precise engineering goal"},
-         "host": {"type": "string", "enum": ["codex", "claude"], "default": "codex"},
+         "host": {"type": "string", "enum": ["codex", "claude"],
+                  "description": "Explicit controlling host; required"},
          "plan_approval": {"type": "boolean", "default": False},
          "require_explorer": {"type": "boolean", "default": False},
          "allow_explorer": {"type": "boolean", "default": False},
@@ -8662,7 +9140,7 @@ MCP_TOOLS = [
                               "description": "Absolute JSON handoff path, only with explicit user approval"},
          "authorize_handoff": {"type": "boolean", "default": False},
          "skip_doctor": {"type": "boolean", "default": False}},
-         ["project", "goal"])},
+         ["project", "goal", "host"])},
     {"name": "orchestrator_stage", "description":
      "Run exactly ONE workflow stage in the foreground. The host displays its native "
      "running indicator. Announce the agent, task and expected output before calling. "
@@ -8698,8 +9176,11 @@ MCP_TOOLS = [
          "architect_review": {"type": "boolean", "default": False}},
          ["run_id", "amendment"])},
     {"name": "orchestrator_resume", "description":
-     "Resume a paused run after interruption/amendment. Does not execute a stage.",
-     "inputSchema": _schema({"run_id": {"type": "string"}}, ["run_id"])},
+     "Resume a paused run after interruption/amendment. Does not execute a stage. "
+     "An optional host must match the persisted controlling host.",
+     "inputSchema": _schema({"run_id": {"type": "string"},
+                             "host": {"type": "string", "enum": ["codex", "claude"]}},
+                            ["run_id"])},
     {"name": "orchestrator_reconcile", "description":
      "Reconcile an uncertain attempt only after its process session is proven stopped. "
      "Clears stale retry sessions. Fails closed when ownership is uncertain.",
@@ -8716,7 +9197,7 @@ def _mcp_tool_call(name, arguments):
     arguments = arguments or {}
     if name == "orchestrator_start":
         return start_run(project=arguments["project"], goal=arguments.get("goal"),
-                         host=arguments.get("host", "codex"),
+                         host=arguments["host"],
                          plan_approval=bool(arguments.get("plan_approval", False)),
                          require_explorer=bool(arguments.get("require_explorer", False)),
                          allow_explorer=bool(arguments.get("allow_explorer", False)),
@@ -8738,7 +9219,7 @@ def _mcp_tool_call(name, arguments):
                          bool(arguments.get("architect_review", False)),
                          kind=arguments.get("kind", "requirement"))
     if name == "orchestrator_resume":
-        return resume_run(arguments["run_id"])
+        return resume_run(arguments["run_id"], host=arguments.get("host"))
     if name == "orchestrator_reconcile":
         return reconcile_run(arguments["run_id"])
     if name in {"orchestrator_approve_plan", "orchestrator_approve_fallback"}:
@@ -8894,7 +9375,8 @@ def main(argv=None):
     s = subs.add_parser("start", help="Create and run a durable goal")
     s.add_argument("--project", required=True)
     s.add_argument("--goal-file", required=True)
-    s.add_argument("--host", choices=("codex", "claude"), default="codex")
+    s.add_argument("--host", choices=("codex", "claude"), required=True,
+                   help="Explicit controlling host for this new run")
     s.add_argument("--background", action="store_true")
     s.add_argument("--plan-approval", action="store_true")
     s.add_argument("--approved-handoff", help="Structured JSON handoff, explicitly approved by the user")
@@ -8911,6 +9393,9 @@ def main(argv=None):
         p.add_argument("run_id", nargs="?")
         if name == "approve-fallback":
             p.add_argument("--role", required=True, choices=("architect", "implementer", "explorer", "reviewer"))
+        if name == "resume":
+            p.add_argument("--host", choices=("codex", "claude"),
+                           help="Assert the persisted controlling host; a contradiction is refused")
         if name in ("approve-plan", "approve-fallback"):
             p.add_argument("--confirm", help="Exact typed confirmation, e.g. approve-plan:<run>")
         if name == "reconcile":
@@ -8968,6 +9453,15 @@ def main(argv=None):
     al.add_argument("--acknowledge", required=True)
     cp = subs.add_parser("compatibility", help="Read-only supervisor/config/state compatibility preview")
     cp.add_argument("run_id")
+    ar = subs.add_parser("authorize-route",
+                         help="Human-only per-run route/billing dispatch grant")
+    ar.add_argument("run_id")
+    ar.add_argument("--role", required=True,
+                    choices=("architect", "implementer", "explorer", "reviewer"))
+    ar.add_argument("--max-dispatches", type=int, default=1)
+    ar.add_argument("--attest",
+                    help="Reviewed endpoint/auth-mode attestation for subscription/free/local")
+    ar.add_argument("--confirm")
     mg = subs.add_parser("migrate-run", help="Explicit backup-first state migration")
     mg.add_argument("run_id")
     mg.add_argument("--backup-dir")
@@ -9081,11 +9575,21 @@ def main(argv=None):
                 raise ValueError("Provide exactly one run ID, either positional or --run")
             print(json.dumps(approve_plan_run(opts.run or opts.run_id, opts.confirm),
                              ensure_ascii=False, indent=2))
+        elif opts.command == "authorize-route":
+            print(json.dumps(authorize_route_run(
+                opts.run_id, opts.role, opts.max_dispatches, opts.attest,
+                opts.confirm), ensure_ascii=False, indent=2))
         elif opts.command == "approve-fallback":
             if bool(opts.run) == bool(opts.run_id):
                 raise ValueError("Provide exactly one run ID, either positional or --run")
             print(json.dumps(approve_fallback_run(opts.run or opts.run_id, opts.role,
                                                   opts.confirm),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "resume":
+            if bool(opts.run) == bool(opts.run_id):
+                raise ValueError("Provide exactly one run ID, either positional or --run")
+            print(json.dumps(resume_run(opts.run or opts.run_id,
+                                        getattr(opts, "host", None)),
                              ensure_ascii=False, indent=2))
         else:
             if bool(opts.run) == bool(opts.run_id):

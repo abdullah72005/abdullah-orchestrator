@@ -126,7 +126,8 @@ class Batch1Safety(unittest.TestCase):
 
     def _create(self, project, root):
         with patch.object(orc, "DEFAULT_STATE", root):
-            return orc.create_run(project=str(project), goal="batch1", skip_doctor=True)
+            return orc.create_run(project=str(project), goal="batch1", host="codex",
+                                  skip_doctor=True)
 
     def test_second_run_for_same_checkout_is_refused(self):
         project = self._repo("create-project")
@@ -144,7 +145,8 @@ class Batch1Safety(unittest.TestCase):
         def start(index):
             try:
                 return ("ok", orc.create_run(project=str(project),
-                                             goal=f"goal-{index}", skip_doctor=True)[0])
+                                             goal=f"goal-{index}", host="codex",
+                                             skip_doctor=True)[0])
             except Exception as exc:
                 return ("error", type(exc).__name__ + ": " + str(exc))
         with patch.object(orc, "DEFAULT_STATE", root):
@@ -172,7 +174,7 @@ class Batch1Safety(unittest.TestCase):
             saved["status"] = "complete"
             orc.save(folder, saved)
             second_id, _folder2, _state2 = orc.create_run(
-                project=str(project), goal="second", skip_doctor=True)
+                project=str(project), goal="second", host="codex", skip_doctor=True)
         self.assertNotEqual(first_id, second_id)
 
     def test_uncertain_run_keeps_lease_and_blocks_new_run(self):
@@ -184,7 +186,8 @@ class Batch1Safety(unittest.TestCase):
             saved.update(status="uncertain", active_check={"argv": ["true"]})
             orc.save(folder, saved)
             with self.assertRaises(orc.CheckoutOwnedError):
-                orc.create_run(project=str(project), goal="second", skip_doctor=True)
+                orc.create_run(project=str(project), goal="second", host="codex",
+                               skip_doctor=True)
 
     def test_final_status_with_uncertain_check_still_holds_lease(self):
         project = self._repo("final-uncertain-project")
@@ -195,7 +198,8 @@ class Batch1Safety(unittest.TestCase):
             saved.update(status="complete", active_check={"argv": ["true"]})
             orc.save(folder, saved)
             with self.assertRaises(orc.CheckoutOwnedError):
-                orc.create_run(project=str(project), goal="second", skip_doctor=True)
+                orc.create_run(project=str(project), goal="second", host="codex",
+                               skip_doctor=True)
 
     def test_missing_owner_state_requires_explicit_takeover(self):
         project = self._repo("missing-owner-project")
@@ -208,7 +212,8 @@ class Batch1Safety(unittest.TestCase):
                             {"run_id": "vanished-run", "project": str(project),
                              "checkout_key": identity["key"], "created_at": orc.now()})
             with self.assertRaisesRegex(orc.CheckoutOwnedError, "no readable state"):
-                orc.create_run(project=str(project), goal="second", skip_doctor=True)
+                orc.create_run(project=str(project), goal="second", host="codex",
+                               skip_doctor=True)
 
     def test_legacy_conflict_does_not_modify_state(self):
         project = self._repo("legacy-project")
@@ -378,7 +383,8 @@ class Batch1Safety(unittest.TestCase):
                 root = self.root / f"policy-runs-{index}"
                 with patch.object(orc, "DEFAULT_STATE", root):
                     _id, _folder, state = orc.create_run(
-                        project=str(project), goal="x", skip_doctor=True, **kwargs)
+                        project=str(project), goal="x", host="codex",
+                        skip_doctor=True, **kwargs)
                 expected = "on_demand" if kwargs.get("allow_explorer") else (
                     "required" if kwargs.get("require_explorer") else "none")
                 self.assertEqual(state["explorer_policy"], expected)

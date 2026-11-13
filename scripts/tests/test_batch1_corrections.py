@@ -139,7 +139,7 @@ class Batch1Corrections(unittest.TestCase):
         root = self.root / "retire-runs"
         with patch.object(orc, "DEFAULT_STATE", root):
             run_id, folder, state = orc.create_run(project=str(project), goal="x",
-                                                   skip_doctor=True)
+                                                   host="codex", skip_doctor=True)
             artifact = folder / "jobs" / "report.json"
             artifact.parent.mkdir(parents=True, exist_ok=True)
             artifact.write_text('{"keep":true}')
@@ -322,7 +322,7 @@ class Batch1Corrections(unittest.TestCase):
         def start(index):
             try:
                 return ("ok", orc.create_run(project=str(project), goal=f"g{index}",
-                                             skip_doctor=True)[0])
+                                             host="codex", skip_doctor=True)[0])
             except Exception as exc:
                 return ("error", str(exc))
         with patch.object(orc, "DEFAULT_STATE", root):

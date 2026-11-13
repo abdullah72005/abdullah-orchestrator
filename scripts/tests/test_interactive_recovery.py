@@ -527,7 +527,7 @@ class McpToolCallTests(unittest.TestCase):
                 "jsonrpc": "2.0", "id": 7, "method": "tools/call",
                 "params": {"name": "orchestrator_start", "arguments": {
                     "project": str(self.project), "goal": "MCP goal",
-                    "skip_doctor": True}}})
+                    "host": "codex", "skip_doctor": True}}})
             payload = json.loads(started["result"]["content"][0]["text"])
             self.assertTrue(payload["ok"])
             run_id = payload["run_id"]
@@ -609,7 +609,7 @@ class McpTransportTests(unittest.TestCase):
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
               "params": {"name": "orchestrator_start", "arguments": {
                   "project": str(self.project), "goal": "Cancel live work",
-                  "skip_doctor": True}}})
+                  "host": "codex", "skip_doctor": True}}})
         run_id = json.loads(recv()["result"]["content"][0]["text"])["run_id"]
         send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
               "params": {"name": "orchestrator_stage", "arguments": {"run_id": run_id}}})
