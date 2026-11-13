@@ -82,8 +82,8 @@ ROLE_POLICIES = {"plan": "architect", "decision": "architect", "diagnose": "arch
 SOURCE_PROVENANCE_VERSION = 2
 VERIFICATION_EVIDENCE_VERSION = 2
 SUPERVISOR_VERSION = "3.0.0"
-STATE_SCHEMA_VERSION = 2
-CONFIG_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 3
 # Stage kinds that must never write to the candidate checkout.  Only an
 # Implementer may edit source; legitimate Architect corrections are dispatched
 # as Implementer work instead of granting a strong model a write exception.
@@ -91,7 +91,8 @@ READ_ONLY_STAGE_KINDS = frozenset({"plan", "diagnose", "decision", "integration"
                                   "explorer", "reviewer"})
 DECISION_BINDING_VERSION = 1
 SENSITIVE_OPERATOR_COMMANDS = {"adopt", "retire", "checkout-recover",
-                               "acknowledge-legacy-evidence", "migrate-run", "cancel"}
+                               "acknowledge-legacy-evidence", "migrate-run", "cancel",
+                               "restore-run"}
 RUNTIME_INPUT_PATTERNS_CORE = (
     ".env", ".env.*", "*.env", "docker-compose*.yml", "docker-compose*.yaml",
     "compose*.yml", "compose*.yaml", "Dockerfile*", ".dockerignore",
@@ -228,6 +229,61 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _split_model_id(full, label):
+    if not isinstance(full, str) or not full.strip():
+        raise ValueError(f"{label}: model must be a nonempty provider/model string")
+    full = full.strip()
+    if "#" in full:
+        raise ValueError(
+            f"{label}: model must not embed a #variant; use the variant field")
+    provider, separator, model_id = full.partition("/")
+    if not separator or not provider or not model_id:
+        raise ValueError(f"{label}: model must be fully qualified as provider/model-id")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", provider):
+        raise ValueError(f"{label}: invalid provider prefix {provider!r}")
+    if not re.fullmatch(r"[A-Za-z0-9._:/@+-]+", model_id):
+        raise ValueError(f"{label}: invalid model id {model_id!r}")
+    return provider, model_id, full
+
+
+def normalize_worker_spec(role, spec, *, allow_fallback=True):
+    """Validate and normalize one per-role worker route without inference."""
+    if not isinstance(spec, dict):
+        raise ValueError(f"workers.{role} must be an object")
+    provider, model_id, full = _split_model_id(spec.get("model"), f"workers.{role}")
+    declared = spec.get("provider") or provider
+    if not isinstance(declared, str) or not declared.strip():
+        raise ValueError(f"workers.{role}.provider must be a string")
+    declared = declared.strip()
+    if declared != provider:
+        raise ValueError(
+            f"workers.{role}: provider {declared!r} does not match the model prefix {provider!r}")
+    variant = spec.get("variant", "")
+    if variant is None:
+        variant = ""
+    if not isinstance(variant, str):
+        raise ValueError(f"workers.{role}.variant must be a string")
+    billing = spec.get("billing", "go")
+    if billing not in EXPLICIT_BILLINGS:
+        raise ValueError(
+            f"workers.{role}.billing must be one of {sorted(EXPLICIT_BILLINGS)}")
+    route = {"provider": "opencode", "worker_provider": declared,
+             "model": full, "effort": variant.strip(), "billing": billing}
+    fallback = spec.get("fallback")
+    if fallback is not None:
+        if not allow_fallback:
+            raise ValueError(f"workers.{role}.fallback is not allowed here")
+        if not isinstance(fallback, dict):
+            raise ValueError(f"workers.{role}.fallback must be a complete route object")
+        fallback_route = normalize_worker_spec(
+            f"{role}.fallback", {**fallback, "fallback": None}, allow_fallback=False)
+        route["fallback_route"] = fallback_route
+    unknown = set(spec) - {"provider", "model", "variant", "billing", "fallback"}
+    if unknown:
+        raise ValueError(f"workers.{role}: unknown keys {sorted(unknown)}")
+    return route
+
+
 def config():
     source = CONFIG_PATH if CONFIG_PATH.exists() else HERE / "config.example.json"
     cfg = read_json(source)
@@ -256,9 +312,27 @@ def config():
         raise ValueError(
             "Container isolation profile is not implemented in this supervisor; "
             "fail closed instead of pretending it is active")
-    for role, val in cfg["workers"].items():
-        if val["billing"] != "go" or not val["model"].startswith("opencode-go/"):
-            raise ValueError(f"{role}: paid Go authorization is required; model={val['model']!r}")
+    for host in ("codex", "claude"):
+        spec = (cfg.get("architect") or {}).get(host)
+        if not isinstance(spec, dict):
+            raise ValueError(f"architect.{host} must be configured")
+        if not isinstance(spec.get("model"), str) or not spec["model"].strip():
+            raise ValueError(f"architect.{host}.model must be a nonempty string")
+        if not isinstance(spec.get("effort"), str):
+            raise ValueError(f"architect.{host}.effort must be a string")
+        if spec.get("auth") not in EXPLICIT_BILLINGS:
+            raise ValueError(
+                f"architect.{host}.auth must be one of {sorted(EXPLICIT_BILLINGS)}")
+    workers = cfg.get("workers")
+    if not isinstance(workers, dict):
+        raise ValueError("workers must be an object")
+    for role in ("explorer", "implementer", "reviewer"):
+        if role not in workers:
+            raise ValueError(f"workers.{role} is required")
+        normalize_worker_spec(role, workers[role])
+    extra_workers = set(workers) - {"explorer", "implementer", "reviewer"}
+    if extra_workers:
+        raise ValueError(f"Unknown worker roles: {sorted(extra_workers)}")
     if cfg["fallback"]["enabled"]:
         raise ValueError("Automatic fallback is prohibited. Fallback requires explicit run-specific approval.")
     if cfg["permissions"]["allow_push"] or cfg["permissions"]["allow_deploy"] or cfg["permissions"]["allow_production"]:
@@ -1176,10 +1250,24 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
         return result
     observation = opencode_provider_observation(route)
     result["observed"] = observation
+    pinned = route.get("routing_fingerprint")
+    if pinned:
+        current = routing_fingerprint(route)
+        result["current_routing_fingerprint"] = current
+        if current != pinned:
+            result["reasons"].append(
+                "pinned OpenCode provider routing material changed; review/migrate the run "
+                "instead of silently rerouting")
+            return result
     if billing == "go":
         result["classification"] = "go_subscription"
         if observation.get("error"):
             result["warnings"].append(observation["error"])
+        if observation.get("endpoint_sha256"):
+            result["reasons"].append(
+                "Go route points at a custom provider endpoint; subscription billing "
+                "cannot be attested")
+            return result
         result["ok"] = True
         result["warnings"].append(
             "OpenCode Go entitlement is attested by configuration only; no inference request was made.")
@@ -1203,6 +1291,12 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
         if billing == "local" and not observation.get("endpoint_sha256"):
             result["reasons"].append(
                 "local route requires an explicitly reviewed local endpoint in OpenCode config")
+            return result
+        if billing == "free" and observation.get("endpoint_sha256") and \
+                "endpoint" not in attestation.lower():
+            result["reasons"].append(
+                "free route uses a custom endpoint; attest the endpoint explicitly so "
+                "auxiliary paid routing is not hidden behind a free label")
             return result
         result["ok"] = not bool(observation.get("error"))
         if result["ok"]:
@@ -3534,12 +3628,47 @@ def schema(kind):
     return assert_report_schema_contract(kind, document)
 
 
+def routing_fingerprint(route, cfg=None):
+    """Redacted identity of provider routing material pinned into a run.
+
+    Endpoints/auth keys are hashed; unrelated providers and raw secrets are
+    excluded.  Unreadable effective configuration is represented explicitly so
+    a change from readable to unreadable is detected.
+    """
+    observation = opencode_provider_observation(route)
+    material = {
+        "provider": route.get("provider"),
+        "worker_provider": route.get("worker_provider"),
+        "model": route.get("model"),
+        "effort": route.get("effort"),
+        "billing": route.get("billing"),
+        "configuration": {
+            "available": observation.get("available"),
+            "provider_configured": observation.get("provider_configured"),
+            "endpoint_sha256": observation.get("endpoint_sha256"),
+            "auth_env_names": observation.get("auth_env_names"),
+            "model_count": observation.get("model_count"),
+            "error": bool(observation.get("error")),
+        },
+    }
+    return content_hash(material)
+
+
 def model_route(cfg, host, role):
     if role == "architect":
         spec = cfg["architect"][host]
-        return {"provider": host, "model": spec["model"], "effort": spec["effort"], "billing": spec["auth"]}
+        route = {"provider": host, "model": spec["model"],
+                 "effort": spec["effort"], "billing": spec["auth"]}
+        return route
+    if role not in {"explorer", "implementer", "reviewer"}:
+        raise ValueError(f"Unknown worker role {role!r}")
     spec = cfg["workers"][role]
-    return {"provider": "opencode", "model": spec["model"], "effort": spec["variant"], "billing": spec["billing"]}
+    route = normalize_worker_spec(role, spec)
+    route["routing_fingerprint"] = routing_fingerprint(route, cfg)
+    fallback = route.get("fallback_route")
+    if isinstance(fallback, dict):
+        fallback["routing_fingerprint"] = routing_fingerprint(fallback, cfg)
+    return route
 
 
 def _version_tuple(text):
@@ -3974,13 +4103,16 @@ def validate_worker_profile(role, dialect="v2"):
     return validate_v2_effective_permissions(role, profile.get("permissions"))
 
 
-def opencode_env(role, dialect):
+def opencode_env(role, dialect, allow_free=False):
     env = scrubbed_env()
     # Run-scoped read-only evidence access belongs to the Architect only; a
     # worker launched by the Architect (e.g. via `explore`) must not inherit it.
     for key in ("LEAN_CTX_READ_ONLY_ROOTS", "__LEAN_CTX_NO_DAEMON"):
         env.pop(key, None)
-    env["OPENCODE_DISABLE_FREE_MODELS"] = "1"
+    if not allow_free:
+        # Free-model discovery is disabled by default.  Only an explicitly
+        # authorized free route policy may remove this guard.
+        env["OPENCODE_DISABLE_FREE_MODELS"] = "1"
     agent_map = {f"abdullah-{role}": opencode_profile(role, dialect)}
     if dialect == "v1":
         inline = {"$schema": "https://opencode.ai/config.json",
@@ -4009,7 +4141,8 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None, evid
             cmd.extend(["--variant", route["effort"]])
         if resume_session:
             cmd.extend(["--session", resume_session])
-        return (cmd + [prompt], opencode_env(role, dialect), "jsonl")
+        return (cmd + [prompt], opencode_env(
+            role, dialect, allow_free=bool(route.get("free_authorized"))), "jsonl")
     schema_kind = path.name.split("-")[0]
     if schema_kind in {"decision", "diagnose", "integration"}:
         schema_kind = "decision"
@@ -4860,13 +4993,16 @@ def control(run_dir):
 
 
 def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, archive=None,
-               deadline=None, decision_binding=None):
+               deadline=None, decision_binding=None, route=None, grant_state=None,
+               grant_dir=None):
     """Persist intent -> spawn -> observe; never replay a completed command."""
     job_id = uuid.uuid4().hex[:12]
     archive = archive or (run_dir / "jobs")
     host = host or (state["host"] if state is not None else "codex")
-    route = model_route(cfg, host, role)
-    fallback = state.get("fallback_authorization") if state else None
+    authorization_state = grant_state or state
+    pinned = ((authorization_state or {}).get("model_routes") or {}).get(role)
+    route = copy.deepcopy(route or pinned or model_route(cfg, host, role))
+    fallback = authorization_state.get("fallback_authorization") if authorization_state else None
     if fallback and fallback.get("role") == role:
         selected = cfg["fallback"][host]
         if not selected["model"]:
@@ -4875,13 +5011,26 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                  "effort": selected["effort"], "billing": "subscription",
                  "fallback": True}
         # One approved dispatch only; if it fails a new authorization is needed.
-        state["fallback_authorization"] = None
-        save(run_dir, state)
+        authorization_state["fallback_authorization"] = None
+        save(grant_dir or run_dir, authorization_state)
+    worker_fallback = (authorization_state.get("worker_fallback_authorization")
+                       if authorization_state else None)
+    configured_fallback = route.get("fallback_route")
+    if (worker_fallback and worker_fallback.get("role") == role
+            and isinstance(configured_fallback, dict)):
+        if (worker_fallback.get("route_sha256")
+                == route_authorization_sha(configured_fallback)):
+            route = copy.deepcopy(configured_fallback)
+            authorization_state["worker_fallback_authorization"] = None
+            save(grant_dir or run_dir, authorization_state)
+        else:
+            raise RuntimeError(
+                "Worker fallback authorization does not match the configured exact route")
     strong = route["provider"] in {"codex", "claude"}
     timeout = remaining_budget(
         cfg["limits"]["max_architect_seconds" if strong else "max_worker_seconds"],
         deadline)
-    preflight = route_preflight(role, route, cfg, project, state)
+    preflight = route_preflight(role, route, cfg, project, authorization_state)
     if not preflight["ok"]:
         archive.mkdir(parents=True, exist_ok=True)
         rejection_path = archive / f"preflight-{job_id}.json"
@@ -4912,7 +5061,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     reservation = None
     if authorization.get("required") and route.get("billing") not in SUBSCRIPTION_BILLINGS:
         try:
-            reservation = reserve_route_grant(state, run_dir, role, route)
+            reservation = reserve_route_grant(
+                authorization_state, grant_dir or run_dir, role, route)
         except RuntimeError as exc:
             archive.mkdir(parents=True, exist_ok=True)
             rejection_path = archive / f"preflight-{job_id}.json"
@@ -4929,6 +5079,10 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
                               role=role, kind=kind, reasons=[str(exc)])
             raise RuntimeError(f"Dispatch blocked: {exc}") from exc
+    if route.get("billing") == "free":
+        # Only an explicitly authorized free route may leave free-model
+        # discovery enabled; the default remains disabled.
+        route["free_authorized"] = True
     jpath = archive / f"{kind}-{job_id}"
     jpath.mkdir(parents=True, exist_ok=False)
     dispatch_snapshot = source_snapshot(project)
@@ -4945,8 +5099,9 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 raise RuntimeError(
                     "An unreconciled worker session cannot be reused; reconcile the exact attempt first")
             prior_sha = prior.get("route_sha256")
-            if prior_sha and prior_sha != route_authorization_sha(route):
-                # A session belongs to one exact route; fallback/new routes start fresh.
+            if role == "reviewer" or (prior_sha
+                                      and prior_sha != route_authorization_sha(route)):
+                # Reviewer is always fresh; a session belongs to one exact route.
                 continuation = None
             else:
                 continuation = prior["session_id"]
@@ -5170,7 +5325,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     "mutation": job["source_mutation"]}
             if "rate_limited" in str(exc) and job.get("session_id"):
                 state["retry_session"] = {"role": role, "session_id": job["session_id"],
-                                          "job_id": job["id"]}
+                                          "job_id": job["id"],
+                                          "route_sha256": route_authorization_sha(route)}
             save(run_dir, state)
             journal_event(run_dir, state, "job_failed", job_id=job_id, kind=kind,
                           role=role, error=str(exc), interrupted=isinstance(exc, InterruptedError),
@@ -7059,7 +7215,9 @@ def recover_finished_dispatch(run_dir, state):
         state.setdefault("failed_jobs", []).append(job)
         if job.get("session_id") and job["role"] != "architect":
             state["retry_session"] = {"role": job["role"], "session_id": job["session_id"],
-                                      "job_id": job["id"]}
+                                      "job_id": job["id"],
+                                      "route_sha256": route_authorization_sha(
+                                          job.get("route") or {})}
         state["active_job"] = {**job, "status": "uncertain"}
         pause_with(run_dir, state, "Recovered rate-limited attempt; reconcile its side effects before retry", "uncertain")
         return True
@@ -7240,7 +7398,7 @@ def probe_generated_commands(cfg, host, dialect, help_by_provider):
 
 
 def parse_model_inventory(output):
-    """Parse OpenCode's verbose sequence of model IDs and JSON objects."""
+    """Parse OpenCode's verbose sequence of provider/model IDs and JSON objects."""
     result = {}
     decoder = json.JSONDecoder()
     text = output.strip()
@@ -7249,7 +7407,8 @@ def parse_model_inventory(output):
         if not separator:
             raise ValueError("Incomplete verbose model inventory")
         value, end = decoder.raw_decode(rest.lstrip())
-        if not isinstance(value, dict) or not name.startswith("opencode-go/"):
+        if (not isinstance(value, dict)
+                or not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._:/@+-]+", name.strip())):
             raise ValueError("Unexpected verbose model inventory")
         result[name.strip()] = value
         text = rest.lstrip()[end:].lstrip()
@@ -7260,17 +7419,18 @@ def parse_model_inventory_v2(output):
     """Parse V2 `opencode models` output (one provider/model ID per line).
 
     V2 does not expose reasoning variants through this command, so callers must
-    treat variant support as unverified.
+    treat variant support as unverified.  Any provider/model dialect is
+    accepted; the configured routes decide which names must be present.
     """
     models = {}
     for line in output.splitlines():
         token = line.strip()
         if not token or token.startswith("#") or " " in token:
             continue
-        if token.startswith("opencode-go/"):
+        if re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._:/@+-]+", token):
             models[token] = {}
     if not models:
-        raise ValueError("No opencode-go models in V2 model inventory")
+        raise ValueError("No provider/model entries in V2 model inventory")
     return models
 
 
@@ -7445,27 +7605,38 @@ def doctor(project: Path, host="codex"):
                 inv = subprocess.run(["opencode", "models"], cwd=project,
                                      capture_output=True, text=True, timeout=20, check=False)
             else:
-                inv = subprocess.run(["opencode", "models", "opencode-go", "--verbose"], cwd=project,
+                inv = subprocess.run(["opencode", "models", "--verbose"], cwd=project,
                                      capture_output=True, text=True, timeout=20, check=False)
             checks["model_inventory"] = "listed" if inv.returncode == 0 else "failed"
+            worker_routes = {role: checks["route"][role]
+                             for role in ("explorer", "implementer", "reviewer")}
+            configured_models = {route["model"] for route in worker_routes.values()}
+            checks["configured_route_models"] = sorted(configured_models)
             if inv.returncode == 0:
                 if dialect == "v2":
                     models = parse_model_inventory_v2(inv.stdout)
-                    checks["paid_go_model_listed"] = all(
-                        cfg["workers"][role]["model"] in models for role in cfg["workers"])
+                    checks["route_models_listed"] = all(
+                        model in models for model in configured_models)
                     # V2 `models` has no variant catalog output.
                     checks["variant_verified"] = "unavailable"
                 else:
                     models = parse_model_inventory(inv.stdout)
-                    checks["paid_go_model_listed"] = all(
-                        cfg["workers"][role]["model"] in models for role in cfg["workers"])
-                    checks["variant_verified"] = all(
-                        spec["variant"] in models.get(spec["model"], {}).get("variants", {})
-                        for spec in cfg["workers"].values())
+                    checks["route_models_listed"] = all(
+                        model in models for model in configured_models)
+                    variant_states = []
+                    for route in worker_routes.values():
+                        if not route["effort"]:
+                            variant_states.append(True)
+                            continue
+                        variant_states.append(
+                            route["effort"] in models.get(route["model"], {}).get("variants", {}))
+                    checks["variant_verified"] = all(variant_states)
             else:
-                checks["paid_go_model_listed"] = False
+                checks["route_models_listed"] = False
         except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
-            checks["paid_go_model_listed"] = False
+            checks["route_models_listed"] = False
+    checks.setdefault("route_models_listed", False)
+    checks["paid_go_model_listed"] = checks["route_models_listed"]
     checks.setdefault("variant_verified", "unavailable")
     checks["variant_note"] = (
         "Variants are checked against the installed OpenCode catalog when the CLI exposes "
@@ -7477,8 +7648,10 @@ def doctor(project: Path, host="codex"):
     checks["route_authorization_required"] = []
     for role, preflight in checks["billing_preflight"].items():
         if not preflight["ok"]:
-            checks["api_billing_risk"].append(
-                f"{role}: " + "; ".join(preflight["reasons"]))
+            hazards = [reason for reason in preflight["reasons"]
+                       if "authorize-route" not in reason]
+            if hazards:
+                checks["api_billing_risk"].append(f"{role}: " + "; ".join(hazards))
         authorization = preflight.get("authorization") or {}
         if authorization.get("required") and not authorization.get("authorized"):
             checks["route_authorization_required"].append(role)
@@ -7486,6 +7659,23 @@ def doctor(project: Path, host="codex"):
         "Doctor reports the same deterministic route/billing classification used "
         "before dispatch. No credential, model session or inference request is made; "
         "subscription entitlement and provider-side spend are not proven.")
+    checks["provider_availability"] = {}
+    for role, preflight in checks["billing_preflight"].items():
+        observed = preflight.get("observed") or {}
+        checks["provider_availability"][role] = {
+            "provider": preflight.get("provider"),
+            "worker_provider": preflight.get("worker_provider"),
+            "classification": preflight.get("classification"),
+            "configuration_available": observed.get("available"),
+            "provider_configured": observed.get("provider_configured"),
+            "auth_observability": observed.get("auth_env_names"),
+            "configuration_error": observed.get("error"),
+            "execution_verified": False,
+        }
+    checks["execution_verified"] = False
+    checks["execution_verified_note"] = (
+        "No provider route is execution-verified by Doctor; fake-CLI tests do not "
+        "establish authenticated entitlement, provider-side retries or billing.")
     profiles_cli_ok = (dialect is not None
                        and all(value is True for value in checks["worker_profiles_cli"].values()))
     checks["worker_profiles_cli_verified"] = profiles_cli_ok
@@ -7493,7 +7683,7 @@ def doctor(project: Path, host="codex"):
     schemas_ok = all(item["ok"] for item in checks["structured_output_schemas"].values())
     checks["ready"] = checks["valid_repo"] and all(checks["commands"][c] for c in required) and (
         all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and profiles_cli_ok and schemas_ok and (
-        checks.get("paid_go_model_listed") is True
+        checks.get("route_models_listed") is True
         and checks["variant_verified"] is not False) and not checks["api_billing_risk"]
     checks["compatibility_note"] = (
         "ready proves local configuration, version-policy, argv, contract checks, strict "
@@ -7571,6 +7761,7 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
                  "plan": None, "plan_version": None, "plan_revision": 0,
                  "plan_history": [], "batch_index": 0, "corrections": 0,
                  "single_batch_fast_path": True, "interactive": bool(interactive),
+                 "route_authorizations": [], "worker_fallback_authorization": None,
                  "correction": "", "active_job": None, "completed_jobs": [], "failed_jobs": [],
                  "accepted_batches": [], "accepted_history": [],
                  "review": None, "implementation": None,
@@ -7662,7 +7853,95 @@ def compatibility_run(run_id):
     return result
 
 
-def migrate_run(run_id, backup_dir=None):
+def _normalize_recorded_route(role, record):
+    """Normalize a route recorded by an older supervisor without today's config."""
+    if not isinstance(record, dict):
+        raise ValueError(f"Recorded {role} route is missing")
+    model = record.get("model")
+    if role == "architect":
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Recorded architect model is missing")
+        provider = record.get("provider")
+        if provider not in {"codex", "claude"}:
+            raise ValueError("Recorded architect route is not a supported strong host")
+        billing = record.get("billing")
+        if billing not in EXPLICIT_BILLINGS:
+            raise ValueError(f"Recorded architect route has unsupported billing {billing!r}")
+        effort = record.get("effort", record.get("variant", ""))
+        if effort is None:
+            effort = ""
+        if not isinstance(effort, str):
+            raise ValueError("Recorded architect route has invalid variant")
+        return {"provider": provider, "model": model.strip(), "effort": effort.strip(),
+                "billing": billing}
+    provider, model_id, full = _split_model_id(model, f"recorded {role}")
+    billing = record.get("billing")
+    if billing not in EXPLICIT_BILLINGS:
+        raise ValueError(f"Recorded {role} route has unsupported billing {billing!r}")
+    effort = record.get("effort", record.get("variant", ""))
+    if effort is None:
+        effort = ""
+    if not isinstance(effort, str):
+        raise ValueError(f"Recorded {role} route has invalid variant")
+    if provider == "opencode":
+        worker_provider = record.get("worker_provider") or \
+            str(model).split("/", 1)[0]
+    elif record.get("provider") == "opencode":
+        worker_provider = record.get("worker_provider") or provider
+    else:
+        worker_provider = record.get("worker_provider") or provider
+    if not worker_provider:
+        raise ValueError(f"Recorded {role} route has no worker provider identity")
+    if str(model).split("/", 1)[0] != worker_provider:
+        raise ValueError(
+            f"Recorded {role} route provider {worker_provider!r} contradicts model prefix")
+    route = {"provider": "opencode", "worker_provider": worker_provider,
+             "model": full, "effort": effort.strip(), "billing": billing,
+             "routing_fingerprint": record.get("routing_fingerprint")}
+    if isinstance(record.get("fallback_route"), dict):
+        route["fallback_route"] = _normalize_recorded_route(
+            f"{role}.fallback", record["fallback_route"])
+    return route
+
+
+def _reconstruct_migrated_routes(state, route_map=None):
+    """Rebuild routes only from recorded data or an explicit reviewed mapping."""
+    if route_map is not None:
+        if not isinstance(route_map, dict):
+            raise ValueError("--routes must contain an object keyed by role")
+        routes = {}
+        for role in ("architect", "explorer", "implementer", "reviewer"):
+            if role not in route_map:
+                raise ValueError(f"Explicit route mapping omits {role}")
+            routes[role] = _normalize_recorded_route(role, route_map[role])
+        return routes, "explicit_mapping"
+    recorded = state.get("model_routes") if isinstance(state.get("model_routes"), dict) else {}
+    routes = {}
+    missing = []
+    for role in ("architect", "explorer", "implementer", "reviewer"):
+        if isinstance(recorded.get(role), dict) and recorded[role].get("model"):
+            routes[role] = _normalize_recorded_route(role, recorded[role])
+        else:
+            missing.append(role)
+    # Older runs may lack model_routes but do record each dispatch route.
+    if missing:
+        jobs = list(state.get("completed_jobs", [])) + list(state.get("failed_jobs", []))
+        for role in list(missing):
+            candidates = [job for job in jobs
+                          if job.get("role") == role and isinstance(job.get("route"), dict)]
+            if candidates:
+                routes[role] = _normalize_recorded_route(role, candidates[-1]["route"])
+                missing.remove(role)
+    if missing:
+        raise RuntimeError(
+            "Insufficient recorded route information for migration: "
+            + ", ".join(missing)
+            + ". Provide an explicit --routes JSON mapping; today's defaults are "
+              "never used to infer a historical route.")
+    return routes, "recorded_routes"
+
+
+def migrate_run(run_id, backup_dir=None, route_map=None):
     """Explicit, backup-first migration; never called automatically."""
     _operator_action_allowed("migrate-run")
     folder, state = load(run_id)
@@ -7678,30 +7957,87 @@ def migrate_run(run_id, backup_dir=None):
         if previous["status"] == "current" and not previous["supervisor_changed"]:
             return {"ok": True, "run_id": run_id, "migrated": False,
                     "compatibility": previous, "backup": None}
+        routes, route_source = _reconstruct_migrated_routes(state, route_map)
         root = (Path(backup_dir).expanduser() if backup_dir
                 else DEFAULT_STATE.parent / "backups" / "migrations")
         root.mkdir(parents=True, exist_ok=True)
         backup = root / f"{run_id}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S')}.json"
         shutil.copy2(folder / "state.json", backup)
+        invalidated = []
+        preserved = list(state.get("completed_jobs", []))
+        remaining = []
+        for job in preserved:
+            if job.get("kind") in {"decision", "integration"}:
+                invalidated.append({**job, "status": "invalidated_by_migration",
+                                    "invalidated_at": now()})
+            else:
+                remaining.append(job)
+        state["completed_jobs"] = remaining
+        state.setdefault("migration_invalidated_jobs", []).extend(invalidated)
+        if invalidated:
+            state["last_consumed_job_id"] = invalidated[-1].get("id")
+            _record_invalidated_decision(
+                state, reason="state/config schema migration invalidated approvals",
+                kind="migration")
         state.update({"schema_version": STATE_SCHEMA_VERSION,
                       "supervisor_version": SUPERVISOR_VERSION,
                       "config_schema_version": CONFIG_SCHEMA_VERSION,
                       "config_sha256": configuration_provenance().get("sha256"),
+                      "model_routes": routes,
                       "migrated_at": now(),
-                      "migration_from": previous})
-        state.pop("check_progress", None)
+                      "migration_from": previous,
+                      "migration_route_source": route_source})
+        state["check_progress"] = None
         state.pop("verification_interrupted", None)
         state.pop("single_batch_verification", None)
+        state.pop("pending_decision_binding", None)
+        state.pop("decision_binding", None)
+        state.pop("final_decision_binding", None)
         state["verification"] = None
         state["review"] = None
         state["architect_verdict"] = None
+        state["final_verdict"] = None
+        state["final_evidence"] = None
+        state["worker_fallback_authorization"] = None
         if state.get("phase") in {"verify", "review", "accept"}:
             state["phase"] = "verify"
+        elif state.get("phase") == "integrate":
+            state["phase"] = "integrate"
         save(folder, state)
         journal_event(folder, state, "state_migrated", backup=str(backup),
-                      previous=previous)
+                      previous=previous, route_source=route_source)
     return {"ok": True, "run_id": run_id, "migrated": True,
-            "backup": str(backup), "compatibility": state_compatibility(state)}
+            "backup": str(backup), "route_source": route_source,
+            "compatibility": state_compatibility(state),
+            "invalidated_decisions": len(invalidated),
+            "rollback": f"restore-run {run_id} --backup {backup} --acknowledge restore"}
+
+
+def restore_run(run_id, backup, acknowledge):
+    """Restore a migrated run from its exact pre-migration backup."""
+    _operator_action_allowed("restore-run")
+    acknowledge = (acknowledge or "").strip()
+    if not acknowledge:
+        raise ValueError("restore-run requires --acknowledge")
+    folder, state = load(run_id)
+    if state.get("active_job") or state.get("active_check"):
+        raise RuntimeError("Cannot restore a run with active or uncertain execution")
+    source = Path(backup).expanduser().resolve()
+    if not source.is_file():
+        raise RuntimeError(f"Backup does not exist: {source}")
+    with exclusive(folder):
+        folder, latest = load(run_id)
+        if latest.get("active_job") or latest.get("active_check"):
+            raise RuntimeError("Run acquired active work during restore; refused")
+        shutil.copy2(source, folder / "state.json")
+        restored = read_json(folder / "state.json")
+        restored["restored_at"] = now()
+        restored["restore_acknowledge"] = acknowledge
+        save(folder, restored)
+        journal_event(folder, restored, "state_restored", backup=str(source),
+                      acknowledge=acknowledge)
+    return {"ok": True, "run_id": run_id, "backup": str(source),
+            "compatibility": state_compatibility(restored)}
 
 
 def do_status(run_id):
@@ -8002,8 +8338,12 @@ def explore(args):
         ts["parent_job_identity"] = job_identity(parent_job) if parent_job else None
         usage_before = copy.deepcopy(_usage_state(ts))
         before = source_snapshot(project)
+        explorer_route = copy.deepcopy((state.get("model_routes") or {}).get("explorer"))
         report, job = call_model(tracker, ts, cfg, "explorer", "explorer",
-                                 report_prompt("explorer", ctx), project, archive=folder / "explorations")
+                                 report_prompt("explorer", ctx), project,
+                                 archive=folder / "explorations",
+                                 route=explorer_route, grant_state=state,
+                                 grant_dir=folder)
         if signature(before) != signature(source_snapshot(project)):
             raise RuntimeError("Source changed during Explorer; inspect before using the report")
         usage_after = _usage_state(ts)
@@ -9103,6 +9443,37 @@ def authorize_route_run(run_id, role, max_dispatches=1, attestation=None,
                             "provider-side retries or auxiliary calls.")}
 
 
+def approve_worker_fallback_run(run_id, role, confirmation=None):
+    """Human-only one-dispatch consent for the exact configured worker fallback."""
+    authorization = require_human_operator("approve-worker-fallback", run_id, confirmation)
+    if role not in {"explorer", "implementer", "reviewer"}:
+        raise ValueError("Only worker roles support a route fallback")
+    folder, state = load(run_id)
+    with exclusive(folder):
+        folder, state = load(run_id)
+        if state.get("active_job") or state.get("active_check"):
+            raise RuntimeError("Reconcile active work before authorizing a fallback")
+        route = (state.get("model_routes") or {}).get(role) or {}
+        fallback = route.get("fallback_route")
+        if not isinstance(fallback, dict):
+            raise RuntimeError(f"No complete fallback route is configured for {role}")
+        state["worker_fallback_authorization"] = {
+            "role": role, "route_sha256": route_authorization_sha(fallback),
+            "approved_at": now(), "limit": "one dispatch",
+            "authorization": authorization,
+            "fallback_route": {key: fallback.get(key) for key in
+                               ("provider", "worker_provider", "model", "effort", "billing")},
+            "note": ("One dispatch only. A non-Go fallback still requires a matching "
+                     "authorize-route grant; session continuation does not cross routes."),
+        }
+        save(folder, state)
+        journal_event(folder, state, "worker_fallback_approved", role=role,
+                      route_sha256=state["worker_fallback_authorization"]["route_sha256"])
+    return {"ok": True, "run_id": run_id, "role": role,
+            "worker_fallback_authorization": state["worker_fallback_authorization"],
+            "human_authorization": authorization}
+
+
 def approve_fallback_run(run_id, role, confirmation=None):
     authorization = require_human_operator("approve-fallback", run_id, confirmation)
     folder, state = load(run_id)
@@ -9253,10 +9624,12 @@ def _mcp_tool_call(name, arguments):
         return resume_run(arguments["run_id"], host=arguments.get("host"))
     if name == "orchestrator_reconcile":
         return reconcile_run(arguments["run_id"])
-    if name in {"orchestrator_approve_plan", "orchestrator_approve_fallback"}:
+    if name in {"orchestrator_approve_plan", "orchestrator_approve_fallback",
+                "orchestrator_authorize_route", "orchestrator_approve_worker_fallback"}:
         raise RuntimeError(
             f"{name} is not available to model/MCP callers. A human must run "
-            "`orchestrator.py approve-plan|approve-fallback` in an interactive terminal.")
+            "`orchestrator.py approve-plan|approve-fallback|authorize-route|"
+            "approve-worker-fallback` in an interactive terminal.")
     if name == "orchestrator_runs":
         return list_runs(int(arguments.get("limit", 20)))
     raise ValueError(f"Unknown orchestrator tool: {name}")
@@ -9493,9 +9866,20 @@ def main(argv=None):
     ar.add_argument("--attest",
                     help="Reviewed endpoint/auth-mode attestation for subscription/free/local")
     ar.add_argument("--confirm")
+    af = subs.add_parser("approve-worker-fallback",
+                         help="Human-only one-dispatch consent for a configured worker fallback")
+    af.add_argument("run_id")
+    af.add_argument("--role", required=True,
+                    choices=("explorer", "implementer", "reviewer"))
+    af.add_argument("--confirm")
     mg = subs.add_parser("migrate-run", help="Explicit backup-first state migration")
     mg.add_argument("run_id")
     mg.add_argument("--backup-dir")
+    mg.add_argument("--routes", help="Explicit JSON route mapping when recorded routes are insufficient")
+    rs = subs.add_parser("restore-run", help="Restore a migrated run from its exact backup")
+    rs.add_argument("run_id")
+    rs.add_argument("--backup", required=True)
+    rs.add_argument("--acknowledge", required=True)
     rt = subs.add_parser("retire", help="Administratively retire an inactive run; never kills work")
     rt.add_argument("run_id")
     rt.add_argument("--reason", required=True)
@@ -9589,7 +9973,13 @@ def main(argv=None):
             print(json.dumps(compatibility_run(opts.run_id),
                              ensure_ascii=False, indent=2))
         elif opts.command == "migrate-run":
-            print(json.dumps(migrate_run(opts.run_id, opts.backup_dir),
+            route_map = None
+            if opts.routes:
+                route_map = json.loads(Path(opts.routes).expanduser().read_text(encoding="utf-8"))
+            print(json.dumps(migrate_run(opts.run_id, opts.backup_dir, route_map),
+                             ensure_ascii=False, indent=2))
+        elif opts.command == "restore-run":
+            print(json.dumps(restore_run(opts.run_id, opts.backup, opts.acknowledge),
                              ensure_ascii=False, indent=2))
         elif opts.command == "retire":
             print(json.dumps(retire_run(opts.run_id, opts.reason, opts.acknowledge),
@@ -9606,6 +9996,9 @@ def main(argv=None):
                 raise ValueError("Provide exactly one run ID, either positional or --run")
             print(json.dumps(approve_plan_run(opts.run or opts.run_id, opts.confirm),
                              ensure_ascii=False, indent=2))
+        elif opts.command == "approve-worker-fallback":
+            print(json.dumps(approve_worker_fallback_run(
+                opts.run_id, opts.role, opts.confirm), ensure_ascii=False, indent=2))
         elif opts.command == "authorize-route":
             print(json.dumps(authorize_route_run(
                 opts.run_id, opts.role, opts.max_dispatches, opts.attest,

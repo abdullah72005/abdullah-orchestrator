@@ -21,6 +21,18 @@ class CheckpointCSecurity(unittest.TestCase):
     def _cfg(self):
         return copy.deepcopy(self.cfg)
 
+    def _routes(self):
+        return {
+            "architect": {"provider": "codex", "model": "gpt-6.1-sol",
+                          "effort": "high", "billing": "subscription"},
+            "explorer": {"provider": "opencode", "model": "opencode-go/explorer",
+                         "effort": "low", "billing": "go"},
+            "implementer": {"provider": "opencode", "model": "opencode-go/implementer",
+                            "effort": "high", "billing": "go"},
+            "reviewer": {"provider": "opencode", "model": "opencode-go/reviewer",
+                         "effort": "high", "billing": "go"},
+        }
+
     def test_newer_config_schema_is_refused(self):
         cfg = self._cfg(); cfg["schema_version"] = 999
         with patch.object(orc, "read_json", return_value=cfg):
@@ -103,6 +115,7 @@ class CheckpointCSecurity(unittest.TestCase):
 
     def test_compatibility_preview_is_read_only(self):
         legacy = dict(self.state); legacy.pop("schema_version", None)
+        legacy.update(model_routes=self._routes())
         orc.save(self.rundir, legacy)
         before = (self.rundir / "state.json").read_bytes()
         result = orc.compatibility_run("test-run00")
@@ -112,6 +125,7 @@ class CheckpointCSecurity(unittest.TestCase):
 
     def test_explicit_migration_backs_up_before_writing(self):
         legacy = dict(self.state); legacy.pop("schema_version", None)
+        legacy.update(model_routes=self._routes())
         legacy.update(status="paused", active_job=None, active_check=None)
         orc.save(self.rundir, legacy)
         backup_dir = self.root / "migration-backups"
@@ -130,6 +144,7 @@ class CheckpointCSecurity(unittest.TestCase):
         legacy = dict(self.state)
         legacy.pop("schema_version", None)
         legacy.update(phase="verify", status="paused",
+                      model_routes=self._routes(),
                       check_progress={"identity": {"old": True}},
                       verification={"path": "/tmp/old", "passed": True})
         orc.save(self.rundir, legacy)
@@ -142,6 +157,7 @@ class CheckpointCSecurity(unittest.TestCase):
 
     def test_migration_resets_review_accept_but_not_integrate(self):
         legacy = dict(self.state); legacy.pop("schema_version", None)
+        legacy.update(model_routes=self._routes())
         legacy.update(phase="accept", status="paused", batch_index=0,
                       plan={"batches": [{"title": "x"}]}, verification=None,
                       single_batch_verification={"path": "old"})
@@ -151,6 +167,7 @@ class CheckpointCSecurity(unittest.TestCase):
         self.assertEqual(saved["phase"], "verify")
         self.assertNotIn("single_batch_verification", saved)
         legacy = dict(self.state); legacy.pop("schema_version", None)
+        legacy.update(model_routes=self._routes())
         legacy.update(phase="integrate", status="paused", batch_index=1,
                       plan={"batches": [{"title": "x"}]}, verification=None)
         orc.save(self.rundir, legacy)
@@ -210,6 +227,7 @@ class CheckpointCSecurity(unittest.TestCase):
 
     def test_supervisor_or_config_change_blocks_stage_until_migration(self):
         changed = dict(self.state); changed["supervisor_version"] = "0.0.1"
+        changed["model_routes"] = self._routes()
         orc.save(self.rundir, changed)
         with self.assertRaisesRegex(RuntimeError, "execution-compatible"):
             orc.assert_state_compatible(changed)

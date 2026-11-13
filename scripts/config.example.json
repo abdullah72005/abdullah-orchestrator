@@ -13,16 +13,19 @@
   },
   "workers": {
     "explorer": {
+      "provider": "opencode-go",
       "model": "opencode-go/deepseek-v4.1-flash",
       "variant": "low",
       "billing": "go"
     },
     "implementer": {
+      "provider": "opencode-go",
       "model": "opencode-go/deepseek-v4.1-flash",
       "variant": "high",
       "billing": "go"
     },
     "reviewer": {
+      "provider": "opencode-go",
       "model": "opencode-go/deepseek-v4.1-flash",
       "variant": "high",
       "billing": "go"
@@ -121,7 +124,7 @@
       "exceptions": []
     }
   },
-  "schema_version": 2,
+  "schema_version": 3,
   "runtime": {
     "supervisor_version": "3.0.0",
     "opencode_version": "auto",

@@ -361,8 +361,9 @@ class OpenCodeV2(unittest.TestCase):
         models = orc.parse_model_inventory_v2(
             "opencode-go/deepseek-v4.1-flash\nopencode-go/glm-5.3\nother/model\n")
         self.assertIn("opencode-go/deepseek-v4.1-flash", models)
+        self.assertIn("other/model", models)
         with self.assertRaises(ValueError):
-            orc.parse_model_inventory_v2("other/model\n")
+            orc.parse_model_inventory_v2("")
 
     def test_v2_doctor_introspection_uses_debug_agents(self):
         role = "explorer"
