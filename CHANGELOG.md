@@ -6,6 +6,54 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-11-13
+
+Closes audit findings AOR-01 through AOR-07 and adds reviewed multi-provider
+OpenCode worker routes. Supervisors report `SUPERVISOR_VERSION 3.1.0`, state and
+config schema `3`, and verification evidence `2`. This is an implementation
+candidate for independent audit, not a published release.
+
+### Fixed
+
+- **AOR-01**: acceptance/integration approvals are bound before dispatch to exact
+  source, plan content/revision, and verification-record bytes, then revalidated
+  after return and on cached/recovered consumption. Stale approvals are durably
+  invalidated instead of reused.
+- **AOR-02**: read-only stages (`plan`, `diagnose`, `decision`, `integration`,
+  `explorer`, `reviewer`) cannot mutate source across dispatch/completion;
+  mutations block with preserved artifacts and diagnostics, including failure
+  and recovery paths.
+- **AOR-03**: explicit user-scoped Claude MCP registration with conflict
+  detection and rollback of only the created artifact.
+- **AOR-04**: new runs require an explicit controlling host; status reports host
+  and resolved route separately; resume rejects contradictory hosts.
+- **AOR-05**: one redacted billing/route preflight shared by Doctor and dispatch
+  fails closed on subscription overrides and unreadable settings.
+- **AOR-06**: Claude foreground host snippets and a whole-stage deadline that
+  clips sequential checks and the strong call to remaining time.
+- **AOR-07**: preflight rejection is durable with no active job or counted model
+  call.
+
+### Added
+
+- Per-role OpenCode provider routes, exact-route variants, pinned routing
+  fingerprints, and one-dispatch fallback consent.
+- Human-only per-run API route grants with atomic reservations.
+- Generalized model-inventory parsing and Doctor billing/auth/availability
+  reporting.
+- Backup-first schema-3 migration with recorded-route reconstruction, explicit
+  mapping fallback, approval/check invalidation, and `restore-run`.
+- Offline adversarial suites for acceptance integrity, stage invariants,
+  dispatch safety, Claude setup, stage deadlines, worker routes, migration and
+  full fake Claude/Codex campaign paths.
+
+### Compatibility
+
+- Existing Go configuration is normalized in memory; no global rewrite.
+- Schema-2 paused runs require explicit migration. Historical completed history
+  is preserved but is not retroactively recertified.
+- Report contract v2 is unchanged.
+
 ## [3.0.0] — 2026-11-13
 
 First public release of the supervisor that passed the real end-to-end pilot
@@ -81,5 +129,6 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v3.0.0

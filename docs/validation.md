@@ -10,7 +10,9 @@ reproduce or challenge the claims.
 python3 -m unittest discover -s scripts/tests
 ```
 
-- **579 tests**, 4 opt-in skips, roughly 3 minutes on a laptop.
+- **656 tests**, 4 opt-in skips, roughly 6 minutes on a laptop (Python 3.10.12;
+  CI also targets 3.12/3.13). Counts are from the v3.1 candidate run recorded
+  below; `pytest` may show a different skip distribution.
 - No model calls. A guard replaces `codex`, `claude`, and `opencode` with fakes
   and raises if a test tries to launch a real model CLI.
 - Tests are hermetic: exported `ABDULLAH_CONFIG`, `ABDULLAH_STATE_DIR`, and
@@ -25,11 +27,17 @@ Coverage areas:
 | Containment | guard sessions, descendants, reused PIDs, zombies, escaped processes, reconciliation |
 | Checkout ownership | leases, conflicts, retirement, orphan recovery, adoption, WSL inode fallback |
 | Verification provenance | source/env/config/toolchain drift, runtime-input manifests, Docker source proof, legacy evidence |
+| Acceptance integrity (AOR-01) | `test_v31_acceptance_integrity.py`: late check-executable/source/env/config/runtime/plan drift, evidence-byte replacement, new-record/new-decision, bound crash recovery |
+| Read-only stage invariants (AOR-02) | `test_v31_stage_invariants.py`: real Git/fake CLIs, tracked/staged/untracked/HEAD mutation, malformed/nonzero failure paths, recovered-report mismatch |
+| Host and dispatch preflight (AOR-04/05/07) | `test_v31_dispatch_safety.py`: missing host, contradictory resume, provider flags, settings helper/malformed settings, inert AWS creds, durable rejection without a job, spawn-failure distinction, Doctor parity |
+| Claude setup and stage deadline (AOR-03/06) | `test_v31_claude_setup.py`, `test_v31_stage_deadline.py`: idempotent/conflicting registration, rollback, foreground snippets, whole-stage clipping |
+| Worker providers and migration | `test_v31_worker_routes.py`, `test_v31_route_migration.py`: mixed routes, grants, fallback, session boundaries, endpoint drift, recorded-route migration, rollback, newer schemas |
+| Full campaign paths | `test_v31_campaign_integration.py`: fake Codex and Claude multi-batch runs, late drift with fresh checks |
 | Command policy | shell wrappers, interpreter strings, indirect Docker, scoped exceptions, bypass acknowledgements |
 | Report contracts | strict schemas, contract v2, invalid JSONL, recovery without a model call |
 | OpenCode dialects | V1/V2 profile generation, effective-permission validation, glob-overlap rejection |
 | Usage accounting | nested OpenCode usage, derived/partial totals, bounded 429 detection |
-| MCP surface | nine tools, no approval tools, cancellation, recovery guidance |
+| MCP surface | nine tools, no approval/grant tools, cancellation, recovery guidance |
 | Security regressions | credential env scrubbing, API-billing fail-closed, sensitive CLI gating |
 
 The opt-in real-CLI suite makes no model call:
@@ -43,7 +51,36 @@ It checks generated V2 configuration against the real binary's
 `opencode debug agents` output, including that appended `allow` rules cannot
 reopen mandatory denies.
 
-## 2. Real end-to-end pilot
+## 2. v3.1 candidate evidence
+
+The v3.1 batch was validated entirely offline:
+
+```
+python3 -m compileall -q scripts
+python3 -m unittest discover -s scripts/tests -v
+```
+
+The final candidate run and exact counts are recorded in the delivery report and
+`docs/agent-handoffs/orchestrator-v3-1/independent-auditor-handoff.md`. Fake
+`codex`, `claude`, and `opencode` executables exercise real supervisor code,
+temporary Git checkouts, real `run_checks` records and real process containment.
+They do **not** prove authenticated model behavior.
+
+Evidence classes are kept separate:
+
+| Class | What it establishes | v3.1 status |
+|---|---|---|
+| Source inspection | Code paths and guards exist as described | Performed by Implementer; independent Architect review pending |
+| Offline fake-CLI tests | Deterministic supervisor behavior and failure paths | Executed; see counts above |
+| Installed-CLI introspection | Generated argv/help and V2 agent/permission shapes | Optional suite; skipped when the binary is absent |
+| Historical pilot claims | A real v3.0.0 run completed | Historical, not v3.1 recertification |
+| Authenticated E2E | Real Claude/Codex stages, Esc/reconnect, new provider routes | **Not executed**; requires separate bounded human authorization |
+
+## 3. Historical real end-to-end pilot (v3.0.0)
+
+This pilot predates v3.1 and is retained as historical evidence, not as proof
+that the v3.1 acceptance-binding, host-gating, stage-deadline, installer, or
+provider-route changes were exercised live.
 
 On **2026-11-13**, the complete implementation ran a real goal through a real
 Codex conversation on an isolated copy of the repository. Nothing was installed
@@ -110,7 +147,7 @@ decision call was made — acceptance did not silently reuse a failed job.
 - Recovery was exercised: the run survived two supervisor restarts and resumed
   from persisted state without repeating completed stages.
 
-## 3. Independent audit trail
+## 4. Independent audit trail
 
 The implementation was audited in stages before this release. Documents are
 preserved in [`docs/audit/`](audit/):
@@ -133,25 +170,33 @@ Highlights of what changed as a result:
 - Partial token totals are labelled instead of being reported as complete.
 - Scoped command exceptions require a project identity.
 
-## 4. What is not verified
+## 5. What is not verified
 
 Be explicit with reviewers and users:
 
 - **Authenticated model execution is not covered by the default suite.** The
-  pilot proves one real path; it is not a compatibility matrix.
-- **Claude host mode** was not exercised end-to-end. Its flags and permission
-  modes are implemented and unit-tested, but no real Claude run is part of this
+  historical pilot proves one real v3.0.0 path; it is not a compatibility matrix
+  and does not recertify v3.1.
+- **Claude host mode** was not exercised end-to-end. Registration, rollback,
+  snippets, flags and a whole-stage deadline are covered by fake-CLI tests; no
+  real Claude long stage, Esc/cancel/reconnect or `/mcp` UX is part of this
   evidence.
 - **OpenCode V1** profile generation is unit-tested; the pilot used V2.2.7.
+- **New provider routes and fallback** are exercised with fake CLIs and route
+  policy tests, not with paid/local provider accounts. Billing classifications
+  are attested policy, not provider settlement; no dollar/token cap is proven.
+- **Installed-CLI introspection** is optional and may be skipped when the binary
+  is absent; `test_opencode_v2_integration.py` keeps those skips separate.
 - **OS isolation is not provided.** Permissions and containment are
   application-level; a dedicated user/container remains the operator's job.
 - **Long-duration behavior** (multi-hour stages, host sleep, network partition)
-  is covered by design and deterministic tests, not by a timed production run.
+  is covered by design and deterministic timing tests, not by a timed production
+  run. Same-user write-and-restore between snapshots is not detectable.
 - **Docker verification** was unit-tested with synthetic Compose evidence; the
   pilot project did not use containers.
 - **`doctor`** does not authenticate, prove entitlement, or run a model.
 
-## 5. Reproducing the checks
+## 6. Reproducing the checks
 
 ```bash
 # deterministic suite (offline)

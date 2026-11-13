@@ -81,7 +81,7 @@ ROLE_POLICIES = {"plan": "architect", "decision": "architect", "diagnose": "arch
                  "implementer": "implementer", "reviewer": "independent reviewer"}
 SOURCE_PROVENANCE_VERSION = 2
 VERIFICATION_EVIDENCE_VERSION = 2
-SUPERVISOR_VERSION = "3.0.0"
+SUPERVISOR_VERSION = "3.1.0"
 STATE_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 3
 # Stage kinds that must never write to the candidate checkout.  Only an
@@ -3369,7 +3369,7 @@ def report_prompt(kind, context):
               "inside string values as \\\" (or use single quotes); no trailing commas or "
               "comments. Do not invent files, tests or results; raise uncertainty instead "
               "of guessing. Keep the task bounded.")
-    available = max(200, budget - len(prefix) - len(suffix))
+    available = max(1000, budget - len(prefix) - len(suffix))
     payload = _bounded_context(context, available)
     return prefix + payload + suffix
 
@@ -9517,7 +9517,7 @@ def list_runs(limit=20):
 # ---------------------------------------------------------------------------
 
 MCP_SERVER_NAME = "abdullah-orchestrator"
-MCP_SERVER_VERSION = "2.0-interactive"
+MCP_SERVER_VERSION = "3.1-interactive"
 
 
 def _schema(properties, required):

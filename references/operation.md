@@ -14,7 +14,47 @@ Interactive foreground mode is the default. The user opens **one Codex chat** wi
 codex mcp add abdullah-orchestrator -- python3 /abs/path/to/abdullah-orchestrator/scripts/orchestrator.py mcp
 ```
 
-`install_wsl.py --register-codex` can perform that registration. The MCP server exposes small foreground tools:
+`install_wsl.py --register-codex` can perform that registration. New runs must
+name their controlling host explicitly (`orchestrator_start` requires `host:
+codex|claude`; the CLI requires `start --host`). There is no silent Codex
+default, and resume refuses a host that contradicts the persisted run.
+
+For Claude Code, register the same stdio server as a user-scoped server only
+when explicitly requested:
+
+```bash
+python3 scripts/install_wsl.py --register-claude
+```
+
+The installer uses `claude mcp add --scope user --transport stdio
+abdullah-orchestrator -- <python> <SKILL>/scripts/orchestrator.py mcp`. It
+treats an identical registration as a no-op, refuses to overwrite a conflicting
+server, distinguishes inspection/CLI failure from "server absent", and rolls
+back only an artifact created by that invocation. It does not edit real host
+settings. Merge these snippets manually and verify with `/mcp`:
+
+```json
+{
+  "env": {"CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"},
+  "mcpServers": {
+    "abdullah-orchestrator": {
+      "type": "stdio",
+      "command": "<PYTHON>",
+      "args": ["<SKILL>/scripts/orchestrator.py", "mcp"],
+      "timeout": 18000000
+    }
+  }
+}
+```
+
+`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` belongs in the controlling interactive
+host (environment or host settings), not merely the MCP child environment.
+
+A whole foreground stage is bounded by `limits.max_stage_seconds`; individual
+checks and the strong call are clipped to the remaining budget, so a sequence of
+individually legal children cannot outlive the interactive host timeout.
+
+The MCP server exposes small foreground tools:
 
 | Tool | Purpose |
 |---|---|
@@ -28,7 +68,7 @@ codex mcp add abdullah-orchestrator -- python3 /abs/path/to/abdullah-orchestrato
 | `orchestrator_reconcile` | Clear a proven-stopped uncertain attempt; fails closed |
 | `orchestrator_runs` | List recent runs for new-chat recovery |
 
-Plan approval and fallback authorization are deliberately **not** MCP tools. A model cannot approve its own plan or authorize its own fallback. The user runs `orchestrator.py approve-plan` or `approve-fallback` in an interactive terminal, with the exact typed confirmation. The MCP server rejects those names.
+Plan approval, fallback authorization, route grants and worker-fallback consent are deliberately **not** MCP tools. A model cannot approve its own plan, authorize its own fallback, or grant its own billed route. The user runs `orchestrator.py approve-plan`, `approve-fallback`, `authorize-route`, or `approve-worker-fallback` in an interactive terminal, with the exact typed confirmation. The MCP server rejects those names.
 
 Each `orchestrator_stage` call runs one of: plan, required explore, implement, verify, review, accept, diagnose, integrate. Codex displays the tool call, its native running indicator and elapsed time, then the structured result. Codex does **not** display an external worker's private reasoning, intermediate tool calls, or MCP progress notifications; do not patch the TUI to pretend otherwise. A stage tool call may run for several minutes; it must never contain several stages or an entire hours-long run.
 
@@ -41,7 +81,7 @@ args = ["<SKILL_DIR>/scripts/orchestrator.py", "mcp"]
 tool_timeout_sec = 18000
 ```
 
-The previously observed 300-second default is too short for a legitimate foreground stage. Five hours deliberately exceeds the supervisor's four-hour `max_worker_seconds`, `max_architect_seconds` and `max_check_seconds` caps, so the client cannot race the supervisor at the boundary; keep the MCP bound strictly above the largest configured stage cap. This is a **communication** upper bound, not a stuck-worker detector. The supervisor's `limits.max_worker_seconds`, `max_architect_seconds` and `max_check_seconds` bound execution; the guard, process-session liveness checks, user interruption and reconciliation handle exits, hangs and uncertain ownership. A running Codex session keeps its old client configuration, so restart after editing the file.
+The previously observed 300-second default is too short for a legitimate foreground stage. Five hours deliberately exceeds the default `limits.max_stage_seconds` (17,000 s) and the per-child caps (14,400 s), leaving bounded cleanup before the host timeout. Keep the MCP bound strictly above the largest configured stage cap. This is a **communication** upper bound, not a stuck-worker detector. `limits.max_stage_seconds` bounds the whole stage; the guard, process-session liveness checks, user interruption and reconciliation handle exits, hangs and uncertain ownership. A running Codex session keeps its old client configuration, so restart after editing the file.
 
 Cancellation is not an MCP tool. Interrupt first with `orchestrator_interrupt` (or the host's Esc cancel) and confirm `stopped: true`; then, only with explicit user authorization, the CLI `cancel <ID>` writes a cancellation control request that a running supervisor consumes. A paused run is preserved for audit.
 

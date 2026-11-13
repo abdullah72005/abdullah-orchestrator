@@ -30,32 +30,32 @@ chmod 600 ~/.config/abdullah-orchestrator/config.json
 |---|---|---|
 | Codex Architect model and effort | Yes | Passed through unchanged; confirm it exists in the installed catalog |
 | Claude Architect model and effort | Yes | Passed through unchanged; confirm it exists in the installed catalog |
-| Explorer / Implementer / Reviewer model | Yes | Must be an `opencode-go/...` model ID |
+| Explorer / Implementer / Reviewer model | Yes | Fully qualified `provider/model-id`; prefix and declared provider must match |
+| Explorer / Implementer / Reviewer provider | Yes | Any OpenCode provider; recorded as `worker_provider` |
 | Explorer / Implementer / Reviewer variant | Yes | Set per role; `doctor` verifies it on V1 where the catalog exposes variants |
-| Worker billing route | Declared as `go` | Other values are rejected |
-| Fallback models | Yes (stored) | Automatic fallback is disabled; each use needs explicit operator approval |
+| Worker billing route | Yes | `go`, `subscription`, `api`, `free`, or `local`; non-Go routes require explicit per-run authorization |
+| Worker fallback | Yes (stored) | Complete exact alternate route; one dispatch needs human consent |
 | Limits, permissions, risk policy, verification | Yes | Security-critical values have fail-closed minimums |
-| Worker **provider** (OpenCode Zen, Anthropic API, etc.) | **No, not in 3.0.0** | Worker routes are hard-wired to OpenCode Go |
+| Worker **provider** | **Yes, schema 3** | OpenCode remains the sole worker runtime; no native Codex/Claude worker backend |
 
-This is deliberate: the project's cost model assumes cheap paid-Go workers
-separate from the strong subscription Architect. The supervisor fails closed
-instead of silently switching a worker to a billed API route. Supporting another
-worker provider would be a code change (route construction, model inventory,
-billing accounting, permission tests), not just a config edit.
+This keeps the existing Go default while allowing reviewed alternatives. Every
+non-Go route needs a human authorization grant before dispatch; an environment
+variable is never consent. The supervisor still does not silently switch a
+worker to an API-billed or remote route.
 
 ## The configuration shape
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "architect": {
     "codex":  {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
     "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
   },
   "workers": {
-    "explorer":    {"model": "opencode-go/deepseek-v4.1-flash", "variant": "low",  "billing": "go"},
-    "implementer": {"model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"},
-    "reviewer":    {"model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
+    "explorer":    {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "low",  "billing": "go"},
+    "implementer": {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"},
+    "reviewer":    {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
   },
   "fallback": {
     "enabled": false,
@@ -69,6 +69,7 @@ billing accounting, permission tests), not just a config edit.
     "max_worker_seconds": 14400,
     "max_architect_seconds": 14400,
     "max_check_seconds": 14400,
+    "max_stage_seconds": 17000,
     "max_explorer_calls_per_run": 8,
     "max_context_chars": 200000
   }
@@ -107,44 +108,61 @@ Example — move the Codex Architect to a different high-effort model:
 }
 ```
 
-## Worker models
+## Worker models and providers
 
 Each worker role resolves to:
 
 ```text
-provider = opencode
-model    = workers.<role>.model
-effort   = workers.<role>.variant
-billing  = workers.<role>.billing
+provider       = opencode           # worker runtime discriminator
+worker_provider= workers.<role>.provider (or the model prefix)
+model          = workers.<role>.model
+effort         = workers.<role>.variant
+billing        = workers.<role>.billing
+routing fingerprint = redacted provider/config material pinned at run creation
 ```
 
-Validation requires both:
+Validation requires:
 
-1. `workers.<role>.billing == "go"`
-2. `workers.<role>.model` starts with `opencode-go/`
+1. `model` is fully qualified as `provider/model-id` (split on the first `/`).
+2. Any declared `provider` equals the model prefix.
+3. `billing` is one of `go`, `subscription`, `api`, `free`, `local`.
+4. `variant` is a string and never embedded in `model` with `#`.
+5. The three required roles exist and no unknown worker roles/keys appear.
 
-A different model **within OpenCode Go** is fully supported. For example, if
-your catalog lists `opencode-go/glm-5.3`:
+The legacy Go configuration remains valid: omitting `provider` derives
+`opencode-go` from the model prefix, and `billing: "go"` is the Go subscription.
 
-```json
-{
-  "workers": {
-    "explorer":    {"model": "opencode-go/glm-5.3", "variant": "low",  "billing": "go"},
-    "implementer": {"model": "opencode-go/glm-5.3", "variant": "high", "billing": "go"},
-    "reviewer":    {"model": "opencode-go/glm-5.3", "variant": "high", "billing": "go"}
-  }
-}
+### Billing and authorization
+
+| Billing | Dispatch requirement |
+|---|---|
+| `go` | Existing Go configuration authorization; no new grant |
+| `subscription` / `free` / `local` | Human `authorize-route` grant with an endpoint/auth-mode attestation; `local` needs a reviewed local endpoint; `free` with a custom endpoint must explicitly attest that endpoint |
+| `api` | Human `authorize-route` grant bound to role, run and exact route |
+| unknown | Rejected |
+
+A grant is created outside the model context:
+
+```bash
+python3 scripts/orchestrator.py authorize-route <RUN_ID> --role implementer \
+  --max-dispatches 3 --attest "reviewed local endpoint, no auxiliary calls" \
+  --confirm authorize-route:<RUN_ID>
 ```
 
-Roles may use different models. A typical quota split is a cheap low-variant
-Explorer and the stronger high-variant Implementer/Reviewer.
+Each supervisor dispatch atomically consumes one grant before spawn. A crash
+after reservation is conservative and is not refunded. Grants bound call
+attempts, not tokens or provider-side retries; there is no dollar cap claim.
+Nested Explorer dispatches consume the run's Explorer grant.
+
+`doctor` reports `route_authorization_required` without treating the absence of
+a per-run grant as a configuration defect—grants are run-scoped.
 
 ### Discovering valid IDs and variants
 
-OpenCode V1 exposes a verbose Go catalog including variants:
+OpenCode V1 exposes a verbose catalog including variants:
 
 ```bash
-opencode models opencode-go --verbose
+opencode models --verbose
 ```
 
 OpenCode V2 lists model IDs but does not expose variants:
@@ -153,31 +171,59 @@ OpenCode V2 lists model IDs but does not expose variants:
 opencode models
 ```
 
-`doctor` uses the command matching the detected dialect and reports:
+`doctor` reports:
 
 | Field | Meaning |
 |---|---|
-| `paid_go_model_listed` | Every configured worker model appeared in the catalog |
+| `route_models_listed` | Every configured worker model appeared in the catalog |
+| `paid_go_model_listed` | Compatibility alias of the same result |
 | `variant_verified` | `true`/`false` on V1; `unavailable` on V2 |
-| `model_inventory` | `listed`, `failed`, or `unavailable` |
-| `route` | The exact resolved route for each role |
+| `provider_availability` | Redacted configuration/availability/auth-observability per role |
+| `execution_verified` | Always `false`; Doctor makes no model call |
+| `route` | The resolved pinned route for each role |
 
-On V2, `variant_verified: "unavailable"` is expected and is not a failure —
-variants are still passed as `provider/model#variant`, but the CLI cannot
-confirm them. On V1, a missing variant makes `doctor` report not-ready.
+On V2, `variant_verified: "unavailable"` is expected and is not a failure.
+On V1, a missing configured variant makes `doctor` report not-ready.
 
-### Why Go-only
+### Worker fallback
 
-The worker provider restriction is a safety property, not an oversight:
+A role may include a complete `fallback` route:
 
-- paid Go is a separate, capped quota from the strong subscription Architect;
-- an accidental API-key environment variable cannot silently move workers to
-  billed API calls;
-- usage accounting can label `go` versus `subscription` honestly.
+```json
+{
+  "implementer": {
+    "provider": "opencode-go",
+    "model": "opencode-go/deepseek-v4.1-flash",
+    "variant": "high",
+    "billing": "go",
+    "fallback": {
+      "provider": "opencode-go",
+      "model": "opencode-go/glm-5.3",
+      "variant": "high",
+      "billing": "go"
+    }
+  }
+}
+```
 
-If you need a different worker provider, treat it as a design change rather than
-a config edit. It must also extend route construction, `doctor` inventory,
-billing labels, and permission tests.
+Fallback is never automatic on rate limits, provider errors or free quota.
+A human authorizes exactly one dispatch:
+
+```bash
+python3 scripts/orchestrator.py approve-worker-fallback <RUN_ID> --role implementer \
+  --confirm approve-worker-fallback:<RUN_ID>
+```
+
+A non-Go fallback still needs its own route grant. Sessions never continue
+across routes; the Reviewer always gets a fresh session.
+
+### Pinned routes and provider drift
+
+Routes, variants, billing and a redacted routing fingerprint are pinned at run
+creation. Dispatch consumes those pins, including nested Explorer calls. If the
+effective OpenCode provider configuration/endpoint/auth mode changes, preflight
+rejects dispatch until the operator reviews/migrates the run. Editing the config
+after creation still makes the run `config_changed`; it never silently reroutes.
 
 ## Fallback models
 
@@ -202,8 +248,13 @@ tool.
 | `max_worker_seconds` | Hard cap for one worker stage |
 | `max_architect_seconds` | Hard cap for one Architect call |
 | `max_check_seconds` | Hard cap for one verification command |
+| `max_stage_seconds` | One whole foreground stage (all checks plus the strong call); child timeouts are clipped to remaining time |
 | `max_explorer_calls_per_run` | Nested Explorer budget |
 | `max_context_chars` | Handoff compaction budget |
+
+`max_stage_seconds` should stay below the interactive host's MCP timeout. The
+default 17,000 s leaves bounded cleanup inside a five-hour (18,000 s) host
+timeout. The previous per-child caps are still enforced independently.
 
 Keep the Codex MCP `tool_timeout_sec` strictly above the largest of the three
 stage caps. Raising a stage cap without raising the MCP timeout lets the client
@@ -242,7 +293,7 @@ Unknown risk classes fail closed.
 ```json
 {
   "runtime": {
-    "supervisor_version": "3.0.0",
+    "supervisor_version": "3.1.0",
     "opencode_version": "auto",
     "opencode_supported": [">=1.18 <2.0", ">=2.2 <3.0"]
   }
@@ -250,6 +301,9 @@ Unknown risk classes fail closed.
 ```
 
 - `supervisor_version`, when set, must equal the running supervisor version.
+  Upgrading the supervisor therefore requires an explicit config edit; the
+  supervisor does not silently reinterpret a pin. Prefer keeping runs and config
+  on the same release and migrate paused runs explicitly.
 - `opencode_version` is `auto` or an explicit pin such as `2.2.7`; a pin must
   match the installed CLI.
 - `opencode_supported` is the tested range list. Unknown majors and untested
@@ -268,11 +322,12 @@ silently ignored.
 
 | Rule | Rejected value |
 |---|---|
-| Config schema | Newer than `2` |
-| Supervisor version | When set, anything other than `3.0.0` |
-| Worker billing | Not `"go"` |
-| Worker model | Not prefixed `opencode-go/` |
-| Fallback | `enabled: true` |
+| Config schema | Newer than `3`; schema 2 is normalized in memory |
+| Supervisor version | When set, anything other than `3.1.0` |
+| Worker billing | Not `go`, `subscription`, `api`, `free`, or `local` |
+| Worker model | Not `provider/model-id`, or declared provider mismatch |
+| Worker variant | Embedded `#variant` or non-string |
+| Fallback | `enabled: true` (strong-host automatic fallback) |
 | Push/deploy/production | Any `true` |
 | Verification gates | `require_checks: false` or `require_docker_source_proof: false` |
 | Isolation | `isolation_profile` other than `"host"`, or container profile enabled |
@@ -292,6 +347,36 @@ configuration that produced it.
 If you must change models for future work, finish or retire the current run and
 start a new one.
 
+## Migrating a schema-2 run
+
+Schema 3 does not reinterpret an old run automatically. Pause it, then run:
+
+```bash
+python3 scripts/orchestrator.py compatibility <RUN_ID>
+python3 scripts/orchestrator.py migrate-run <RUN_ID> --backup-dir ~/backups/abdullah
+```
+
+Migration backs up `state.json` first, reconstructs routes only from the run's
+recorded `model_routes`/job routes, and refuses with an actionable error when
+that evidence is insufficient. In that case provide a reviewed mapping:
+
+```bash
+python3 scripts/orchestrator.py migrate-run <RUN_ID> --routes routes.json
+```
+
+`routes.json` must map `architect`, `explorer`, `implementer`, and `reviewer` to
+complete historical routes. Migration never uses today's defaults, never
+reroutes an active run, and invalidates verification, review, cached decisions
+and check progress (including integration). Completed history is preserved and
+may require new checks/decisions, not retroactive recertification.
+
+Rollback is explicit and uses the exact backup:
+
+```bash
+python3 scripts/orchestrator.py restore-run <RUN_ID> \
+  --backup <BACKUP_PATH> --acknowledge restore
+```
+
 ## Recipes
 
 ### Use a different Go model for implementation only
@@ -306,7 +391,7 @@ start a new one.
 }
 ```
 
-Then run `doctor` and confirm `paid_go_model_listed: true`.
+Then run `doctor` and confirm `route_models_listed: true`.
 
 ### Use a different Claude Architect
 
@@ -318,11 +403,39 @@ Then run `doctor` and confirm `paid_go_model_listed: true`.
 }
 ```
 
+### Use a reviewed non-Go Implementer route
+
+```json
+{
+  "workers": {
+    "implementer": {
+      "provider": "opencode-zen",
+      "model": "opencode-zen/some-model",
+      "variant": "high",
+      "billing": "api"
+    }
+  }
+}
+```
+
+Start the run, then authorize the exact route before the Implementer stage:
+
+```bash
+python3 scripts/orchestrator.py authorize-route <RUN_ID> --role implementer \
+  --max-dispatches 3 --confirm authorize-route:<RUN_ID>
+```
+
+An unapproved route fails in preflight with no active job and no counted model
+call.
+
 ### Allow a longer stage
 
 ```json
 {
-  "limits": {"max_worker_seconds": 21600, "max_architect_seconds": 21600}
+  "limits": {"max_stage_seconds": 21600,
+             "max_worker_seconds": 21600,
+             "max_architect_seconds": 21600,
+             "max_check_seconds": 21600}
 }
 ```
 

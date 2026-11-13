@@ -34,15 +34,46 @@ described as a limitation.
 - **No stale acceptance.** Verification evidence is bound to source, runtime
   inputs, environment, config, toolchain, argv, and plan revision. Drift
   invalidates it.
+- **Decisions are bound to exact bytes.** Before an acceptance/integration
+  Architect dispatch, the supervisor records source identity, plan hash/
+  revision, and the SHA256 of each supervisor verification record. The binding
+  is revalidated before any accepted batch, completion, cached decision or
+  recovered decision. A new verification record cannot reuse an older approval;
+  a stale approval is durably recorded and discarded, and fresh checks/decision
+  are required.
+- **Read-only stages cannot write source.** Planner, diagnosis, decision,
+  integration, Explorer and Reviewer dispatches compare HEAD, index, tracked
+  dirty files and untracked source between dispatch and completion (and again
+  when consuming cached/recovered reports). A mutation blocks progression,
+  preserves every artifact and reports changed paths/hashes without content or
+  automatic rollback. A pre-existing dirty tree is allowed if unchanged. This
+  is boundary observation, not OS write prevention: a same-user write restored
+  to identical bytes before observation is not detected.
+- **Explicit host and shared billing preflight.** New runs require an explicit
+  `codex` or `claude` host; resume refuses a contradictory host. One
+  deterministic preflight is shared by dispatch and `doctor`. It rejects
+  observable subscription overrides (API keys, endpoints, Bedrock/Vertex/
+  Foundry/Mantle/AWS provider flags, settings helpers, unreadable settings)
+  and unapproved non-Go worker routes before an active job or model call is
+  recorded. Rejections are durable `preflight_rejected` diagnostics with no
+  phantom job.
+- **Worker routes are pinned and granted.** Per-role OpenCode providers are
+  allowed only with explicit billing classification. API/usage routes need a
+  human-only, per-run grant; reservations are consumed atomically before spawn
+  and collapse conservatively after a crash. Effective provider configuration
+  changes are detected by a redacted fingerprint and require operator review.
+  There is no dollar/token cap claim and no automatic fallback.
 - **No silent downgrade.** A missing model, variant, subscription, or supported
   CLI version fails visibly; the supervisor does not fall back to a free model
   or an API-billed route.
 - **No model-owned sensitive actions.** `adopt`, `retire`,
-  `checkout-recover`, `acknowledge-legacy-evidence`, `migrate-run`, `cancel`, and
-  `--launch-missing` refuse to run when `ABDULLAH_JOB_ID`, `ABDULLAH_RUN_ID`,
-  `ABDULLAH_CHECK_TOKEN`, or parent-job markers show a worker context. They are
-  also disabled by default via
-  `authorization.sensitive_cli_enabled: false`.
+  `checkout-recover`, `acknowledge-legacy-evidence`, `migrate-run`, `restore-run`,
+  `cancel`, `approve-plan`, `approve-fallback`, `authorize-route`,
+  `approve-worker-fallback`, and `--launch-missing` refuse to run when
+  `ABDULLAH_JOB_ID`, `ABDULLAH_RUN_ID`, `ABDULLAH_CHECK_TOKEN`, or parent-job
+  markers show a worker context. Sensitive CLI commands are also disabled by
+  default via `authorization.sensitive_cli_enabled: false`; human-only approvals
+  additionally require an interactive TTY and exact typed confirmation.
 
 ## Worker permissions
 
@@ -137,7 +168,17 @@ allowed command from touching files, the network, or credentials.
    may be undetectable without cgroups; treat it as a limitation and reconcile
    by hand.
 7. **`doctor` is preflight.** It does not authenticate, prove entitlement, or
-   execute a model.
+   execute a model. Provider availability/auth observability are redacted and
+   may be unavailable; `execution_verified` remains false.
+8. **Billing enforcement is application-level.** Route grants bound supervisor
+   dispatch attempts. They do not bound token cost, provider-internal retries,
+   auxiliary provider calls, custom plugins/gateways, or tariff changes. A
+   provider named `ollama` may serve a remote/cloud model; local classification
+   requires an explicitly reviewed endpoint attestation. Do not claim a hard
+   dollar cap or universal provider-side fallback prevention.
+9. **Boundary snapshots are not continuous immutability.** A same-user process
+   can write and restore identical bytes between observations. Read-only source
+   checks certify observed dispatch/completion state, not an OS sandbox.
 
 ## Recommended deployment
 

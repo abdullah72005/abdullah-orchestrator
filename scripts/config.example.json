@@ -126,7 +126,7 @@
   },
   "schema_version": 3,
   "runtime": {
-    "supervisor_version": "3.0.0",
+    "supervisor_version": "3.1.0",
     "opencode_version": "auto",
     "opencode_supported": [
       ">=1.18 <2.0",

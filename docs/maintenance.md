@@ -42,6 +42,17 @@ codex mcp add abdullah-orchestrator -- python3 ~/.local/share/abdullah-orchestra
 explicitly requested. Restart Codex after registration. `codex mcp list` should
 show the server; use `codex mcp remove abdullah-orchestrator` to unregister it.
 
+For Claude Code, `python3 scripts/install_wsl.py --register-claude` adds a
+user-scoped stdio server through the official CLI:
+`claude mcp add --scope user --transport stdio abdullah-orchestrator -- <python>
+<SKILL>/scripts/orchestrator.py mcp`. It is idempotent for an identical
+registration, reports conflicts instead of overwriting, distinguishes a missing
+server from a CLI/config failure, and rolls back only its own partial artifact.
+Verify with `claude mcp get abdullah-orchestrator` and `/mcp`. Merge the printed
+host snippet manually: `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` for the
+interactive host and per-server `"timeout": 18000000`. The installer never
+rewrites real host settings.
+
 Set the per-server tool timeout in `~/.codex/config.toml`; do not set it
 globally for every MCP server:
 
@@ -55,12 +66,12 @@ tool_timeout_sec = 18000
 `tool_timeout_sec` is Codex's maximum wait for one foreground `tools/call`. The
 previously observed 300-second default is too short for a legitimate Architect,
 Implementer or Reviewer stage. 18,000 seconds (five hours) deliberately exceeds
-the supervisor's four-hour `max_worker_seconds`, `max_architect_seconds` and
-`max_check_seconds` caps, so the client cannot race the supervisor at the
-four-hour boundary. This is a communication upper bound, not a stuck-worker
-detector: those `limits` bound execution, while the guard, process-session
-liveness checks, interruption and reconciliation handle exits, hangs and
-uncertain ownership.
+the default whole-stage cap `limits.max_stage_seconds` (17,000 s) and the
+per-child caps (14,400 s), leaving bounded cleanup at the host boundary. This is
+a communication upper bound, not a stuck-worker detector: the stage deadline
+and per-child caps bound execution, while the guard, process-session liveness
+checks, interruption and reconciliation handle exits, hangs and uncertain
+ownership.
 
 For unusual workloads, keep `tool_timeout_sec` strictly above the largest
 configured stage cap. Raise the corresponding `limits` values first, then the
@@ -88,6 +99,21 @@ tar -xzf ~/.local/state/abdullah-orchestrator/backups/<stamp>/installed.tar.gz -
 Run the restored suite, then re-run `scripts/install_wsl.py` if the skill link
 target moved. Run state and `~/.config/abdullah-orchestrator/config.json` are
 separate and are not part of these archives; never delete them during rollback.
+
+### Run-state schema rollback
+
+Schema-3 migration is backup-first. `migrate-run` prints the exact backup path
+and a `restore-run` command. Restore only a paused/uncertain-free run:
+
+```bash
+python3 scripts/orchestrator.py restore-run <RUN_ID> \
+  --backup <BACKUP_JSON> --acknowledge restore
+```
+
+The restored state is the old schema and may require a different supervisor
+version; do not mix a schema-2 state with schema-3 execution. Config pins are
+intentional: update `runtime.supervisor_version` explicitly when upgrading, and
+prefer a new run when changing worker providers.
 
 ## OpenCode V1 to V2 upgrade handoff
 

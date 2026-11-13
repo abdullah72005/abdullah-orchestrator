@@ -143,8 +143,9 @@ tool_timeout_sec = 18000
 ```
 
 Keep this bound strictly above the largest configured `limits` value. Five
-hours deliberately exceeds the supervisor's four-hour stage caps so the client
-cannot race the supervisor at the boundary. Do not apply it globally.
+hours deliberately exceeds the default whole-stage (`max_stage_seconds`) and
+per-child caps so the host cannot race the supervisor at the boundary. Do not
+apply it globally.
 
 Open one Codex chat, invoke `$abdullah-orchestrator`, give it an absolute
 project path and a precise goal. Full walkthrough:
@@ -189,13 +190,17 @@ Then confirm with `doctor`:
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/repo
 ```
 
-`doctor` reports `paid_go_model_listed`, `variant_verified`, and the resolved
-route per role. Worker **providers** are intentionally fixed to paid OpenCode Go
-in 3.0.0 — `billing` must be `go` and the model must start with
-`opencode-go/`; any other value is rejected rather than silently moving work to
-an API-billed route. Architect models and all worker model IDs/variants are
-fully editable. Set them before starting a run: changing the config mid-run
-marks the run `config_changed` and blocks further stages.
+`doctor` reports `route_models_listed` (and the compatibility alias
+`paid_go_model_listed`), `variant_verified`, `billing_preflight`,
+`provider_availability`, and the resolved pinned route per role. The default
+configuration remains paid OpenCode Go. Schema 3 allows per-role OpenCode
+providers with explicit billing (`go`, `subscription`, `api`, `free`, `local`),
+but any non-Go route requires a human `authorize-route` grant before dispatch;
+unknown/unapproved routes are rejected rather than silently moving work to API
+billing. Architect models and all worker model IDs/variants are editable. Set
+them before starting a run: changing the config mid-run marks the run
+`config_changed` and blocks further stages. New runs must name their host
+explicitly (`host: codex|claude`).
 
 Complete reference, limits, fallback, and recipes:
 [`docs/configuration.md`](docs/configuration.md).
@@ -206,7 +211,7 @@ Nine tools, deliberately small:
 
 | Tool | Purpose |
 |---|---|
-| `orchestrator_start` | Create durable run state. Does **not** dispatch a worker. |
+| `orchestrator_start` | Create durable run state; requires an explicit `host` (`codex`|`claude`). Does **not** dispatch a worker. |
 | `orchestrator_stage` | Run exactly one stage in the foreground. |
 | `orchestrator_status` | Deterministic compact status. No model call. |
 | `orchestrator_recap` | Quick or developer recap from persisted evidence. No model call. |

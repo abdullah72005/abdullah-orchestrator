@@ -15,7 +15,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from test_orchestrator import ControlTests, orc
+import test_orchestrator as baseline
+orc = baseline.orc
 
 
 def make_plan(count=1, checks=None):
@@ -31,8 +32,8 @@ def make_plan(count=1, checks=None):
 
 
 class AcceptanceIntegrityTests(unittest.TestCase):
-    setUp = ControlTests.setUp
-    tearDown = ControlTests.tearDown
+    setUp = baseline.ControlTests.setUp
+    tearDown = baseline.ControlTests.tearDown
 
     def install_check(self, name="v31check"):
         bin_dir = self.root / "check-bin"
@@ -296,7 +297,7 @@ class AcceptanceIntegrityTests(unittest.TestCase):
         plan = make_plan(1)
         batch_ref = self.prepare(plan)
 
-        def approve(_dir, state, _cfg, _kind, extra=None):
+        def approve(_dir, state, _cfg, _kind, extra=None, **kwargs):
             references = [state["single_batch_verification"], state["verification"]]
             state["decision_binding"] = orc.make_decision_binding(
                 state, self.project, references)

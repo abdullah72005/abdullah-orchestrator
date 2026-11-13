@@ -14,7 +14,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from test_orchestrator import ControlTests, dead_process_identity, orc
+import test_orchestrator as baseline
+orc = baseline.orc
 
 
 FAKE_CLI = r'''#!/usr/bin/env python3
@@ -97,11 +98,11 @@ def install_fake_clis(root: Path):
 
 
 class StageInvariantTests(unittest.TestCase):
-    setUp = ControlTests.setUp
-    tearDown = ControlTests.tearDown
+    setUp = baseline.ControlTests.setUp
+    tearDown = baseline.ControlTests.tearDown
 
     def setUp(self):
-        ControlTests.setUp(self)
+        baseline.ControlTests.setUp(self)
         self.fakebin = install_fake_clis(self.root)
         self.env = {"PATH": str(self.fakebin) + ":" + os.environ["PATH"],
                     "OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": ""}

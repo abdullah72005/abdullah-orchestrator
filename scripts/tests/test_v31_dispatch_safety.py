@@ -10,15 +10,18 @@ import unittest
 from unittest.mock import patch
 
 import test_orchestrator as baseline
-from test_orchestrator import ControlTests, orc
+orc = baseline.orc
 
 
 SECRET = "sk-v31-super-secret-value"
 
 
-class DispatchSafetyTests(ControlTests):
+class DispatchSafetyTests(unittest.TestCase):
+    setUp = baseline.ControlTests.setUp
+    tearDown = baseline.ControlTests.tearDown
+
     def setUp(self):
-        ControlTests.setUp(self)
+        baseline.ControlTests.setUp(self)
         self.addCleanup(lambda: os.environ.pop("OPENAI_API_KEY", None))
         self.addCleanup(lambda: os.environ.pop("ANTHROPIC_API_KEY", None))
 

@@ -39,7 +39,7 @@ Legacy detached `start --background` mode is optional, is **not** the default, a
    tool_timeout_sec = 18000
    ```
 
-   Do not apply this timeout globally. Codex's 300-second default is too short for a legitimate Architect, Implementer or Reviewer stage. Five hours deliberately exceeds the supervisor's four-hour worker, Architect and verification caps so the host cannot race the supervisor at the boundary; it is a communication upper bound, not a stuck-worker detector.
+   Do not apply this timeout globally. Codex's 300-second default is too short for a legitimate Architect, Implementer or Reviewer stage. Five hours deliberately exceeds the default whole-stage (`max_stage_seconds`, 17,000 s) and per-child caps so the host cannot race the supervisor at the boundary; it is a communication upper bound, not a stuck-worker detector.
 5. Restart Codex, open **one** chat with Luna Medium, and invoke `$abdullah-orchestrator`.
 
 The runtime selects OpenCode V1 or V2 configuration based on the installed CLI version, supports the tested ranges `>=1.18 <2.0` and `>=2.2 <3.0`, and rejects untested versions. It never silently switches from paid Go to free models or from subscription auth to billed API credentials.
@@ -48,7 +48,7 @@ The runtime selects OpenCode V1 or V2 configuration based on the installed CLI v
 
 Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrator_runs` takes `run_id`. Do not invent tool names or bypass these operations with ad-hoc supervisor commands.
 
-1. **Start a run** — `orchestrator_start` with the absolute `project` and a precise `goal`. Optional arguments: `host` (`codex`|`claude`), `plan_approval`, `require_explorer`, `allow_explorer`, `explorer_policy` (`none`|`on_demand`|`required`), `approved_handoff` plus `authorize_handoff`, `skip_doctor`. New and legacy runs default to `explorer_policy=none` unless permission is explicit. It creates durable state and does **not** dispatch a worker.
+1. **Start a run** — `orchestrator_start` with the absolute `project`, a precise `goal`, and the required controlling `host` (`codex` or `claude`). Other optional arguments: `plan_approval`, `require_explorer`, `allow_explorer`, `explorer_policy` (`none`|`on_demand`|`required`), `approved_handoff` plus `authorize_handoff`, `skip_doctor`. New and legacy runs default to `explorer_policy=none` unless permission is explicit. It creates durable state and does **not** dispatch a worker.
 2. **Execute one stage** — `orchestrator_stage` with `run_id`. It runs exactly one of plan, explore, implement, verify, review, accept, diagnose or integrate. Announce the agent, task and expected output first. Never hide several stages in one call.
 3. **Inspect status** — `orchestrator_status` with `run_id`. Deterministic compact status, active job/check, next action and run directory; makes no model call.
 4. **Interrupt or pause** — `orchestrator_interrupt` with `run_id` and a short `reason`. Persists the interruption, terminates the process session and descendants, verifies termination and preserves changes. A verified stop leaves `paused`; an unverified stop leaves `uncertain`.
@@ -66,7 +66,7 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
 
 For every engineering task use this loop:
 
-1. Call `orchestrator_start` with the absolute project path and precise goal.
+1. Call `orchestrator_start` with the absolute project path, precise goal, and explicit `host`.
 2. Call `orchestrator_stage` once per stage. Announce first, in a compact message, exactly what the user's example shows:
 
    **Starting Architect — Sol High**
@@ -158,7 +158,7 @@ All run commands accept either a positional `<ID>` or `--run <ID>`, never both. 
 All model routes are read from `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`) on every operation:
 
 - **Architect** — `architect.codex` and `architect.claude` select the model and effort for each host. The value is passed through unchanged, so confirm it against the installed Codex/Claude catalog; keep `auth: "subscription"`.
-- **Workers** — `workers.explorer`, `workers.implementer` and `workers.reviewer` select `model` and `variant`. The model must be an `opencode-go/...` ID with `billing: "go"`; variant selects the reasoning effort. Different roles may use different Go models.
-- **Discovery** — `opencode models opencode-go --verbose` (V1, includes variants) or `opencode models` (V2, IDs only), then `python3 scripts/orchestrator.py doctor --project <abs>` to confirm `paid_go_model_listed`, `variant_verified` and resolved routes.
+- **Workers** — `workers.explorer`, `workers.implementer` and `workers.reviewer` select a fully qualified `provider/model` ID, an optional `provider` (must match the prefix), `variant`, and `billing`. The default remains `opencode-go/...` with `billing: "go"`. Non-Go routes (`subscription`, `api`, `free`, `local`) require an explicit human `authorize-route` grant bound to the role, run and exact route; a route-scoped fallback needs separate one-dispatch consent.
+- **Discovery** — `opencode models --verbose` (V1, includes variants) or `opencode models` (V2, IDs only), then `python3 scripts/orchestrator.py doctor --project <abs>` to confirm `route_models_listed`, `variant_verified`, `billing_preflight`, `provider_availability` and resolved routes.
 
-Worker **providers** are fixed to paid OpenCode Go in 3.0.0: any other billing value or model prefix is rejected rather than silently moving work to API billing. Do not claim otherwise, do not edit the config on the user's behalf, and do not bypass validation. Configuration is user-owned: show exact values and ask before changing it. Set routes before `orchestrator_start`; editing the config mid-run marks the run `config_changed` and blocks further stages. Full reference: `docs/configuration.md`.
+Worker routes are pinned at creation with a redacted provider/config fingerprint. The supervisor never silently switches provider, model, variant or billing, and never claims a dollar cap. Do not edit the config on the user's behalf or bypass validation. Configuration is user-owned: show exact values and ask before changing it. Set routes before `orchestrator_start`; editing the config mid-run marks the run `config_changed` and blocks further stages. A new run requires an explicit `host: "codex"` or `"claude"`. Full reference: `docs/configuration.md`.

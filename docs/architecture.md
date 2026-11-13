@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the implementation that ships in `scripts/orchestrator.py`
-(supervisor version **3.0.0**). It is written for someone who needs to modify,
+(supervisor version **3.1.0**, state/config schema 3). It is written for someone who needs to modify,
 audit, or debug the workflow — not as marketing material.
 
 ## Design goals
@@ -229,17 +229,25 @@ Every route is resolved from configuration at call time:
 ```text
 architect -> provider = host, model = architect.<host>.model,
              effort = architect.<host>.effort, billing = .auth
-worker    -> provider = "opencode", model = workers.<role>.model,
+worker    -> provider = "opencode", worker_provider = workers.<role>.provider
+             (or model prefix), model = workers.<role>.model,
              effort = workers.<role>.variant, billing = .billing
 ```
 
-Architect models may be any catalog model for the selected host. Worker routes
-are deliberately restricted to `opencode-go/...` with `billing: "go"`; the
-validator rejects anything else before a run starts, and `doctor` checks the
-model (and, on V1, the variant) against the installed inventory. The model ID
-and variant themselves are fully configurable per role. There is no other
-worker-provider path in 3.0.0; adding one would touch route construction,
-billing accounting, inventory parsing, and permission tests.
+Architect models may be any catalog model for the selected host. Worker model
+IDs are fully qualified `provider/model-id`, split on the first slash; a declared
+provider must match the prefix. The default remains `opencode-go/...` with
+`billing: "go"`. Schema 3 accepts `subscription`, `api`, `free`, and `local`
+billing only with explicit human authorization: non-Go dispatch requires a
+per-run `authorize-route` grant (attestation for non-API classifications), and
+the grant is consumed atomically before spawn. Routes, variants, billing and a
+redacted provider/config fingerprint are pinned per run. Route-scoped fallback
+is opt-in, one dispatch, and never inherits a session from another route.
+
+`doctor` checks configured models (and, on V1, variants) against the installed
+inventory, reports redacted provider availability/auth observability, and never
+executes inference. Billing is policy/attestation, not inferred from a model
+name; there is no hard dollar cap.
 
 The supervisor supports tested OpenCode lines `>=1.18 <2.0` and `>=2.2 <3.0`
 (configurable). It refuses unknown majors and untested ranges. On V2 it:
@@ -260,11 +268,11 @@ entitlement or execution.
 
 | Identifier | Value | Meaning |
 |---|---|---|
-| `SUPERVISOR_VERSION` | `3.0.0` | Release version of the supervisor |
-| `STATE_SCHEMA_VERSION` | `2` | On-disk run state shape |
-| `CONFIG_SCHEMA_VERSION` | `2` | Configuration shape |
+| `SUPERVISOR_VERSION` | `3.1.0` | Release version of the supervisor |
+| `STATE_SCHEMA_VERSION` | `3` | On-disk run state shape |
+| `CONFIG_SCHEMA_VERSION` | `3` | Configuration shape |
 | `VERIFICATION_EVIDENCE_VERSION` | `2` | Verification evidence shape |
-| `MCP_SERVER_VERSION` | `2.0-interactive` | MCP tool-surface revision, reported in `serverInfo` |
+| `MCP_SERVER_VERSION` | `3.1-interactive` | MCP tool-surface revision, reported in `serverInfo` |
 
 The MCP version describes the protocol/tool surface and is intentionally not the
 release version. `compatibility` compares the supervisor, config, and state
