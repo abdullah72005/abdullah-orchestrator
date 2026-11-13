@@ -97,8 +97,9 @@ compatibility. On 2026-11-12 the verified latest stable V2 release was
 **v2.2.7**. The GitHub `releases/latest` endpoint still reported `v1.19.5`, so
 `opencode upgrade` without a target will not reach V2. Always pass the target.
 
-Observed installation on this machine: the curl installer, executable
-`~/.opencode/bin/opencode`, detected version `1.18.35`.
+The pre-upgrade installation observed during this work was installed with the
+curl installer (executable `~/.opencode/bin/opencode`, detected version
+`1.18.35`). That is a historical observation, not a requirement for your host.
 
 Before upgrading, back up configuration, credentials and session state. V2
 keeps the same locations:
