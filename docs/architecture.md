@@ -239,6 +239,20 @@ The supervisor supports tested OpenCode lines `>=1.18 <2.0` and `>=2.2 <3.0`
 compatibility, and worker profiles. It is a preflight check, not proof of
 entitlement or execution.
 
+## Version identifiers
+
+| Identifier | Value | Meaning |
+|---|---|---|
+| `SUPERVISOR_VERSION` | `3.0.0` | Release version of the supervisor |
+| `STATE_SCHEMA_VERSION` | `2` | On-disk run state shape |
+| `CONFIG_SCHEMA_VERSION` | `2` | Configuration shape |
+| `VERIFICATION_EVIDENCE_VERSION` | `2` | Verification evidence shape |
+| `MCP_SERVER_VERSION` | `2.0-interactive` | MCP tool-surface revision, reported in `serverInfo` |
+
+The MCP version describes the protocol/tool surface and is intentionally not the
+release version. `compatibility` compares the supervisor, config, and state
+versions; it refuses newer state schemas.
+
 ## Why one large module?
 
 `orchestrator.py` is ~8.6k lines. The alternative — a package — would require
