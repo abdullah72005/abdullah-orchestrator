@@ -2162,28 +2162,152 @@ def validate_handoff(handoff, project, authorized, goal=None):
     return plan
 
 
-def parse_json_object(text):
-    text = text.strip()
+class ReportIngestionError(ValueError):
+    """A classified report-boundary failure that preserves its diagnostics.
+
+    ``code`` is stable enough for tests, journals and operator triage; the
+    exception text remains readable for the existing CLI error path.
+    """
+
+    def __init__(self, code, message, **details):
+        self.code = code
+        self.details = details
+        super().__init__(f"{code}: {message}")
+
+
+def _json_candidates(text):
+    """Parsed JSON objects from one assistant message, with provenance.
+
+    The order is deliberate: a whole-message object, then fenced blocks, then
+    balanced objects embedded in prose. Tool output never passes through here.
+    """
+    text = (text or "").strip()
+    candidates = []
+
+    def add(value, method, start, end):
+        if isinstance(value, dict):
+            candidates.append({"value": value, "method": method,
+                               "start": start, "end": end})
+
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
+        whole = json.loads(text)
     except (ValueError, TypeError):
-        pass
-    block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    if block:
-        return parse_json_object(block.group(1))
-    # Find a balanced JSON object in a response with incidental surrounding text.
+        whole = None
+    if isinstance(whole, dict):
+        add(whole, "whole", 0, len(text))
+        return candidates
+    for match in re.finditer(r"```(?:json)?[ \t]*\r?\n?(.*?)```", text, re.S):
+        body = match.group(1).strip()
+        try:
+            value = json.loads(body)
+        except (ValueError, TypeError):
+            continue
+        add(value, "fenced", match.start(1), match.end(1))
     decoder = json.JSONDecoder()
     for index, char in enumerate(text):
-        if char == "{":
-            try:
-                value, _ = decoder.raw_decode(text[index:])
-                if isinstance(value, dict):
-                    return value
-            except ValueError:
-                pass
-    raise ValueError("No JSON report found")
+        if char != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except ValueError:
+            continue
+        add(value, "embedded", index, index + end)
+    return candidates
+
+
+def parse_json_object(text):
+    candidates = _json_candidates(text)
+    if candidates:
+        return candidates[0]["value"]
+    raise ReportIngestionError(
+        "report_missing", "No JSON report found in the assistant text",
+        text_chars=len(text or ""))
+
+
+def repair_unescaped_string_quotes(text):
+    """Escape literal double quotes inside JSON string values.
+
+    This is *never* used for live ingestion. It exists for explicit recovery of
+    a preserved report: the repair is deterministic, returns every changed
+    offset, and the caller must still parse and semantically validate the
+    result. A quote is treated as closing only when the next non-space byte is
+    a JSON structural delimiter.
+    """
+    out = []
+    ops = []
+    in_string = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if not in_string:
+            out.append(char)
+            if char == '"':
+                in_string = True
+            index += 1
+            continue
+        if char == "\\":
+            out.append(char)
+            if index + 1 < len(text):
+                out.append(text[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if char == '"':
+            lookahead = index + 1
+            while lookahead < len(text) and text[lookahead] in " \t\r\n":
+                lookahead += 1
+            following = text[lookahead] if lookahead < len(text) else ""
+            if following in ",:}]" or following == "":
+                out.append('"')
+                in_string = False
+            else:
+                out.append('\\"')
+                ops.append({"index": index, "next": following,
+                            "reason": "unescaped quote inside a string value"})
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out), ops
+
+
+def _report_shape_hint(kind, text):
+    keys = REPORT_KEYS.get(kind or "") or ()
+    return ("{" in text and bool(keys)
+            and sum(f'"{key}"' in text for key in keys) >= 2)
+
+
+def _looks_like_report(kind, value):
+    if not isinstance(value, dict) or not kind:
+        return True
+    return len(REPORT_KEYS.get(kind, set()) & set(value)) >= 2
+
+
+def _json_field_near(text, position):
+    field = None
+    for match in re.finditer(r'"([A-Za-z0-9_]+)"\s*:\s*"', text[:position]):
+        field = match.group(1)
+    return field
+
+
+def _describe_invalid_json(text):
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as exc:
+        excerpt = text[max(0, exc.pos - 70):exc.pos + 70]
+        return {
+            "reason": exc.msg,
+            "line": exc.lineno,
+            "column": exc.colno,
+            "char": exc.pos,
+            "field": _json_field_near(text, exc.pos),
+            "excerpt": excerpt,
+            "likely_unescaped_quote": (
+                '"' in excerpt and exc.msg.startswith("Expecting")),
+            "truncated": ("Unterminated" in exc.msg
+                          or not text.rstrip().endswith("}")),
+        }
+    return {"reason": "not valid JSON", "truncated": False}
 
 
 def normalize_report(kind, result):
@@ -2591,11 +2715,12 @@ def report_prompt(kind, context):
         budget = 200000
     prefix = (f"You are Abdullah Orchestrator's {kind} role. Follow these policies:\n"
               + role_text(kind) + "\n\nTask and evidence:\n")
-    suffix = ("\n\nReply with ONE valid JSON object matching the appropriate role contract, no Markdown. "
-              "Set contract_version to 2 and include every field required by that version; "
-              "legacy reports without it are accepted only as marked legacy evidence. "
-              "Do not invent file contents or test results. Do not silently change requirements. "
-              "Raise consequential uncertainty instead of guessing. Keep the task bounded.")
+    suffix = ("\n\nReply with ONE valid JSON object, no Markdown. Set contract_version to 2 "
+              "and include every required field. The final message must be the JSON object "
+              "itself, with no prose before or after it. Escape every literal double quote "
+              "inside string values as \\\" (or use single quotes); no trailing commas or "
+              "comments. Do not invent files, tests or results; raise uncertainty instead "
+              "of guessing. Keep the task bounded.")
     available = max(200, budget - len(prefix) - len(suffix))
     payload = _bounded_context(context, available)
     return prefix + payload + suffix
@@ -3535,11 +3660,281 @@ def is_rate_limited(raw: str):
                               or HTTP_429_PAT.search(messages)))
 
 
-def extract_cli_report(format_name, out: str, path: Path):
+def _opencode_event_session(event):
+    if not isinstance(event, dict):
+        return None
+    session_id = event.get("sessionID")
+    if not session_id and isinstance(event.get("part"), dict):
+        session_id = event["part"].get("sessionID")
+    return session_id
+
+
+def _opencode_events(raw, diagnostics):
+    events = []
+    malformed = []
+    for number, line in enumerate((raw or "").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except ValueError:
+            malformed.append({"line": number, "chars": len(stripped)})
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+        elif isinstance(event, list):
+            events.extend(item for item in event if isinstance(item, dict))
+    if not events and (raw or "").strip():
+        try:
+            whole = json.loads(raw)
+        except ValueError:
+            whole = None
+        if isinstance(whole, dict):
+            events = [whole]
+        elif isinstance(whole, list):
+            events = [item for item in whole if isinstance(item, dict)]
+    if malformed:
+        diagnostics["malformed_transport_lines"] = malformed[:20]
+    return events
+
+
+def _opencode_error_event(events):
+    """Only explicit provider error events; success metadata is not inspected."""
+    for event in events:
+        kind = str(event.get("type") or "").lower()
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        if (kind in {"error", "provider_error", "provider-error"}
+                or event.get("error") or part.get("error")):
+            message = (_error_message_text([event])
+                       or str(event.get("error") or part.get("error") or "")
+                       or "OpenCode emitted a provider error event")
+            return {"message": message[:1000], "event_type": kind or "error",
+                    "part_id": part.get("id")}
+    return None
+
+
+def _finalize_opencode_report(kind, value, part, session_id, method, diagnostics,
+                              require_contract, repaired_text=None, repair_ops=None):
+    if require_contract:
+        version = value.get("contract_version")
+        if version != 2:
+            raise ReportIngestionError(
+                "contract_version_mismatch",
+                f"{kind} report declared contract_version={version!r}; exactly 2 is required",
+                expected=2, got=version, candidate=value,
+                part_id=part.get("part_id"), message_id=part.get("message_id"))
+    try:
+        validate_report(kind, value)
+    except ValueError as exc:
+        try:
+            required = set(schema(kind).get("required") or ())
+        except (ValueError, RuntimeError, KeyError, TypeError):
+            required = set(REPORT_KEYS[kind])
+        raise ReportIngestionError(
+            "report_schema_invalid", str(exc),
+            missing=sorted(required - set(value)),
+            candidate=value, part_id=part.get("part_id"),
+            message_id=part.get("message_id")) from None
+    diagnostics["selected"] = {
+        "part_id": part.get("part_id"), "message_id": part.get("message_id"),
+        "chars": part.get("chars"), "sha256": part.get("sha256"),
+        "method": method,
+    }
+    diagnostics["candidate"] = value
+    diagnostics["report_sha256"] = content_hash(value)
+    if repaired_text is not None:
+        diagnostics["repair"] = {
+            "method": "escape-unescaped-string-quotes",
+            "ops": repair_ops or [],
+            "repaired_text_sha256": hashlib.sha256(
+                repaired_text.encode("utf-8")).hexdigest(),
+        }
+    return value, session_id
+
+
+def _invalid_opencode_report(kind, text, part, session_id, diagnostics,
+                             require_contract, repair_unescaped):
+    detail = _describe_invalid_json(text)
+    evidence = {
+        "part_id": part.get("part_id"), "message_id": part.get("message_id"),
+        "text_chars": part.get("chars"), "text_sha256": part.get("sha256"),
+        "json_error": detail,
+        "text_preview": text[:1200],
+    }
+    if detail.get("truncated"):
+        raise ReportIngestionError(
+            "report_truncated",
+            f"the {kind} report text ended before a complete JSON object",
+            **evidence)
+    if repair_unescaped:
+        repaired, operations = repair_unescaped_string_quotes(text)
+        if operations:
+            try:
+                value = json.loads(repaired)
+            except ValueError:
+                pass
+            else:
+                diagnostics.setdefault("repair", {})["ops"] = operations
+                return _finalize_opencode_report(
+                    kind, value, part, session_id, "repaired", diagnostics,
+                    require_contract, repaired_text=repaired,
+                    repair_ops=operations)
+    message = (f"the {kind} report is not valid JSON ({detail.get('reason')} at "
+               f"line {detail.get('line')} column {detail.get('column')})")
+    if detail.get("likely_unescaped_quote"):
+        message += "; likely an unescaped double quote inside a string value"
+    if detail.get("field"):
+        message += f" in field {detail['field']!r}"
+    raise ReportIngestionError("report_invalid_json", message, **evidence)
+
+
+def extract_opencode_report(raw, expected_session=None, kind=None,
+                            require_terminal=False, require_contract=False,
+                            diagnostics=None, repair_unescaped=False):
+    """Extract exactly one authoritative report from an OpenCode JSONL stream.
+
+    Transport envelopes are parsed separately from assistant text. Only
+    ``text`` parts of the authoritative session are candidates; tool output,
+    prose and multiple messages are never concatenated or mistaken for the
+    report. Strict callers require a terminal ``step_finish`` after the final
+    text and an exact ``contract_version: 2`` declaration.
+    """
+    diagnostics = diagnostics if diagnostics is not None else {}
+    diagnostics["transport"] = "opencode-jsonl"
+    events = _opencode_events(raw, diagnostics)
+    diagnostics["event_count"] = len(events)
+    if not events:
+        if not (raw or "").strip():
+            raise ReportIngestionError("empty_output", "the OpenCode process produced no output")
+        raise ReportIngestionError(
+            "transport_invalid",
+            "the OpenCode stream contained no JSON event envelopes")
+    provider_error = _opencode_error_event(events)
+    if provider_error:
+        raise ReportIngestionError(
+            "provider_error", provider_error["message"],
+            **{key: value for key, value in provider_error.items()
+               if key != "message"})
+
+    text_parts = []
+    for index, event in enumerate(events):
+        if event.get("type") != "text":
+            continue
+        part = event.get("part")
+        if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+            continue
+        text = part["text"]
+        text_parts.append({
+            "index": index, "session_id": _opencode_event_session(event),
+            "part_id": part.get("id"), "message_id": part.get("messageID"),
+            "text": text, "chars": len(text),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        })
+    diagnostics["text_parts"] = [
+        {key: value for key, value in part.items() if key != "text"}
+        for part in text_parts]
+    if not text_parts:
+        raise ReportIngestionError(
+            "no_assistant_text",
+            "OpenCode JSONL contained no assistant text events")
+    if not any(part["text"].strip() for part in text_parts):
+        raise ReportIngestionError("empty_output", "all assistant text events were empty")
+
+    sessions = sorted({part["session_id"] for part in text_parts if part["session_id"]})
+    diagnostics["sessions"] = sessions
+    if expected_session:
+        if set(sessions) - {expected_session}:
+            raise ReportIngestionError(
+                "session_mismatch",
+                "assistant text came from a different OpenCode session than the recorded job",
+                expected=expected_session, observed=sessions)
+        session_id = expected_session
+    elif len(sessions) == 1:
+        session_id = sessions[0]
+    elif len(sessions) > 1:
+        raise ReportIngestionError(
+            "session_mismatch",
+            "assistant text was spread across multiple OpenCode sessions",
+            observed=sessions)
+    else:
+        session_id = None
+
+    terminal = None
+    for index, event in enumerate(events):
+        if str(event.get("type") or "").lower() not in {"step_finish", "step-finish"}:
+            continue
+        event_session = _opencode_event_session(event)
+        if expected_session and event_session and event_session != expected_session:
+            raise ReportIngestionError(
+                "session_mismatch",
+                "terminal completion belonged to a different OpenCode session",
+                expected=expected_session, observed=event_session)
+        if session_id and event_session not in {None, session_id}:
+            continue
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        terminal = {
+            "index": index,
+            "reason": str(part.get("reason") or event.get("reason") or ""),
+            "snapshot": part.get("snapshot"), "part_id": part.get("id"),
+            "session_id": event_session,
+        }
+    diagnostics["terminal_completion"] = terminal
+    if require_terminal:
+        final_text_index = max(part["index"] for part in text_parts)
+        if terminal is None or terminal["index"] < final_text_index:
+            raise ReportIngestionError(
+                "missing_terminal_completion",
+                "OpenCode ended without a terminal step_finish after the final assistant text")
+        if terminal["reason"].lower() not in {"", "stop", "end", "complete", "completed"}:
+            raise ReportIngestionError(
+                "missing_terminal_completion",
+                f"OpenCode terminal step_finish reported reason {terminal['reason']!r}",
+                reason=terminal["reason"])
+
+    if not kind:
+        for part in reversed(text_parts):
+            candidates = _json_candidates(part["text"])
+            if candidates:
+                return candidates[0]["value"], session_id
+        raise ReportIngestionError(
+            "report_missing", "No JSON object was present in assistant text")
+
+    unseen_json = []
+    for part in reversed(text_parts):
+        body = part["text"].strip()
+        if not body:
+            continue
+        candidates = _json_candidates(body)
+        shaped = [candidate for candidate in candidates
+                  if _looks_like_report(kind, candidate["value"])]
+        if shaped:
+            chosen = shaped[0]
+            return _finalize_opencode_report(
+                kind, chosen["value"], part, session_id, chosen["method"],
+                diagnostics, require_contract)
+        if _report_shape_hint(kind, body):
+            return _invalid_opencode_report(
+                kind, body, part, session_id, diagnostics,
+                require_contract, repair_unescaped)
+        unseen_json.extend(candidate["value"] for candidate in candidates)
+    raise ReportIngestionError(
+        "report_missing",
+        f"assistant text contained no {kind} JSON report"
+        + (" (JSON objects were present but none matched the report contract)"
+           if unseen_json else ""),
+        candidate_keys=[sorted(value)[:12] for value in unseen_json[:5]])
+
+
+def extract_cli_report(format_name, out: str, path: Path, kind=None,
+                       expected_session=None, require_terminal=False,
+                       require_contract=False, diagnostics=None,
+                       repair_unescaped=False):
     if format_name == "codex":
         report_file = path / "last-message.json"
         if not report_file.exists():
-            raise ValueError("Codex returned no final response")
+            raise ReportIngestionError(
+                "missing_final_message", "Codex returned no final response")
         return parse_json_object(report_file.read_text(encoding="utf-8")), None
     if format_name == "claude":
         data = parse_json_object(out)
@@ -3549,20 +3944,12 @@ def extract_cli_report(format_name, out: str, path: Path):
             return parse_json_object(data["result"]), data.get("session_id")
         if "verdict" in data or "batches" in data:
             return data, data.get("session_id")
-        raise ValueError("Claude returned no structured report")
-    parts = []
-    session_id = None
-    for line in out.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        session_id = event.get("sessionID") or session_id
-        if event.get("type") == "text" and isinstance(event.get("part"), dict):
-            parts.append(event["part"].get("text", ""))
-    if not parts:
-        raise ValueError("OpenCode JSONL contained no assistant text events")
-    return parse_json_object("".join(parts)), session_id
+        raise ReportIngestionError(
+            "missing_final_message", "Claude returned no structured report")
+    return extract_opencode_report(
+        out, expected_session=expected_session, kind=kind,
+        require_terminal=require_terminal, require_contract=require_contract,
+        diagnostics=diagnostics, repair_unescaped=repair_unescaped)
 
 
 def _count(value):
@@ -4022,24 +4409,37 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 raise InterruptedError(f"Run {action} requested")
             error = "rate_limited" if is_rate_limited(output) else "failed"
             raise RuntimeError(f"{error}: {role} exited {proc.returncode}; consult {out_file}")
-        report, session_id = extract_cli_report(output_format, output, jpath)
-        job["reported_usage"] = extract_reported_usage(output, output_format)
         check_kind = "plan" if kind == "plan" else "decision" if role == "architect" else role
+        require_contract = bool(state is not None
+                                and state.get("contract_version_required", 0) >= 2)
+        ingestion = {}
+        try:
+            report, session_id = extract_cli_report(
+                output_format, output, jpath, kind=check_kind,
+                expected_session=continuation, require_terminal=True,
+                require_contract=require_contract, diagnostics=ingestion)
+        except ReportIngestionError as exc:
+            ingestion.update({"error": str(exc), "code": exc.code})
+            atomic_json(jpath / "report-ingestion.json", ingestion)
+            if ingestion.get("candidate") is not None:
+                atomic_json(jpath / "rejected-report.json", ingestion["candidate"])
+            raise
+        atomic_json(jpath / "report-ingestion.json", ingestion)
+        job["reported_usage"] = extract_reported_usage(output, output_format)
         atomic_json(jpath / "raw_report.json", report)
         report, normalization = normalize_report(check_kind, report)
         atomic_json(jpath / "normalization.json", normalization)
         report = validate_report(check_kind, report)
         contract_version = report.get("contract_version", 0)
-        if (state is not None and state.get("contract_version_required", 0) >= 2
-                and contract_version < 2):
+        if require_contract and contract_version != 2:
             if "contract_version" not in report:
                 raise RuntimeError(
                     f"Newly dispatched {check_kind} reports must declare "
                     "contract_version: 2; the generated output schema omitted "
                     "or failed to require it, so the report cannot be emitted")
             raise RuntimeError(
-                "Newly dispatched workers must return contract_version: 2; "
-                "legacy reports are not accepted for new jobs")
+                f"Newly dispatched workers must return contract_version: 2; "
+                f"got {contract_version!r}")
         atomic_json(jpath / "report.json", report)
         final_snapshot = source_snapshot(project)
         atomic_json(jpath / "completion.json", {"final_snapshot": final_snapshot, "session_id": session_id})
@@ -4709,6 +5109,347 @@ def cached_job_report(run_dir, state, kind):
     return read_json(path)
 
 
+def _opencode_data_root(data_root=None):
+    if data_root:
+        return Path(data_root)
+    return Path(os.environ.get("OPENCODE_DATA_DIR",
+                               Path.home() / ".local/share/opencode"))
+
+
+def _git_optional(gitdir, arguments, timeout=20):
+    try:
+        proc = subprocess.run(
+            ["git", "--git-dir", str(gitdir), *arguments],
+            capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _snapshot_tree_entries(tree_hash, data_root=None):
+    """Find an OpenCode snapshot tree and return its blob map.
+
+    A missing snapshot store is not fatal for normal jobs, but it is fatal for
+    recovery because it is the only independent record of the worker's final
+    worktree at exit time.
+    """
+    root = _opencode_data_root(data_root) / "snapshot"
+    if not root.is_dir():
+        return None, "OpenCode snapshot store is unavailable"
+    for project_dir in sorted(root.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        for gitdir in sorted(project_dir.iterdir()):
+            if not (gitdir / "objects").is_dir():
+                continue
+            if _git_optional(gitdir, ["cat-file", "-t", tree_hash]) is None:
+                continue
+            listing = _git_optional(gitdir, ["ls-tree", "-r", "-z", tree_hash])
+            if listing is None:
+                continue
+            entries = {}
+            for record in listing.split("\0"):
+                if not record:
+                    continue
+                meta, _, path = record.partition("\t")
+                fields = meta.split()
+                if len(fields) != 3 or fields[1] != "blob":
+                    continue
+                entries[path] = {"mode": fields[0], "blob": fields[2]}
+            return entries, None
+    return None, f"OpenCode snapshot tree {tree_hash} was not found"
+
+
+def _project_tree_entries(project):
+    entries = {}
+    for path in sorted(Path(project).rglob("*")):
+        relative = path.relative_to(project)
+        if any(part in {".git", "__pycache__", ".pytest_cache", ".mypy_cache"}
+               for part in relative.parts):
+            continue
+        if path.is_file() and path.suffix not in {".pyc", ".pyo"}:
+            data = path.read_bytes()
+            digest = hashlib.sha1(
+                b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+            entries[relative.as_posix()] = digest
+    return entries
+
+
+def _verify_snapshot_tree(tree_hash, project, data_root=None):
+    entries, error = _snapshot_tree_entries(tree_hash, data_root)
+    if error:
+        return False, error
+    actual = _project_tree_entries(project)
+    expected = {path: meta["blob"] for path, meta in entries.items()}
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    changed = sorted(path for path in set(expected) & set(actual)
+                     if expected[path] != actual[path])
+    if missing or extra or changed:
+        return False, {
+            "missing": missing[:20], "extra": extra[:20], "changed": changed[:20]}
+    return True, {"tree": tree_hash, "files": len(expected)}
+
+
+def _opencode_text_for_part(raw, part_id):
+    for line in (raw or "").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") != "text":
+            continue
+        part = event.get("part")
+        if isinstance(part, dict) and part.get("id") == part_id:
+            return part.get("text")
+    return None
+
+
+def _journal_failure(folder, job_id):
+    path = Path(folder) / JOURNAL_FILE
+    matches = []
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("job_id") == job_id and event.get("event") == "job_failed":
+                matches.append(event)
+    return matches[-1] if matches else None
+
+
+def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
+                   acknowledge=None, data_root=None):
+    """Re-extract a preserved worker report without any model call.
+
+    Identity, process completion, session, contract, source snapshot and
+    evidence freshness are all checked. The failed job stays failed; recovery
+    adds separate artifacts and a provenance record, never a fabricated
+    completed-job entry.
+    """
+    folder, state = load(run_id)
+    jobs = [job for job in state.get("failed_jobs", [])
+            if job.get("id") == job_id]
+    if len(jobs) != 1:
+        raise RuntimeError(f"Failed job {job_id} was not found exactly once")
+    job = jobs[0]
+    kind = job.get("kind")
+    if kind not in {"implementer", "explorer", "reviewer"}:
+        raise RuntimeError(f"Report recovery is not supported for job kind {kind!r}")
+    jpath = Path(job.get("path", ""))
+    if jpath.name != f"{kind}-{job_id}" or jpath.parent != Path(folder) / "jobs":
+        raise RuntimeError("Failed job path does not match its recorded identity")
+    if state.get("status") not in PAUSED_STATES:
+        raise RuntimeError("Report recovery requires a paused, non-running run")
+    if state.get("active_job"):
+        raise RuntimeError("Reconcile the active job before recovering a report")
+    lease = state.get("project_lease") or {}
+    if (lease.get("status") != "active" or lease.get("run_id") != run_id
+            or Path(lease.get("project", "")).resolve()
+            != Path(state.get("project", "")).resolve()):
+        raise RuntimeError("The run does not own its recorded project checkout lease")
+    same_kind = [item for item in state.get("failed_jobs", [])
+                 if item.get("kind") == kind]
+    if not same_kind or same_kind[-1].get("id") != job_id:
+        raise RuntimeError("A newer failed job of the same kind exists")
+    for completed in state.get("completed_jobs", []):
+        if (completed.get("role") == job.get("role")
+                and completed.get("created_at", "") > job.get("created_at", "")):
+            raise RuntimeError("Newer completed work exists for this role")
+    failure = _journal_failure(folder, job_id)
+    if failure is None:
+        raise RuntimeError("The journal has no failure record for this job")
+    if failure.get("batch_index") != state.get("batch_index"):
+        raise RuntimeError("The recorded job belongs to a different batch")
+    expected_phase = {"implementer": "implement", "explorer": "explore",
+                      "reviewer": "review"}[kind]
+    if state.get("phase") != expected_phase:
+        raise RuntimeError(
+            f"Run phase {state.get('phase')!r} cannot consume a recovered {kind} report")
+
+    execution_file = jpath / "execution.json"
+    launch_file = jpath / "launch.json"
+    if not execution_file.is_file() or not launch_file.is_file():
+        raise RuntimeError("Recorded execution or launch identity is missing")
+    execution = read_json(execution_file)
+    launch = read_json(launch_file)
+    if execution.get("returncode") != 0:
+        raise RuntimeError(
+            f"Recorded process did not exit successfully: {execution.get('returncode')!r}")
+    if launch.get("phase") != "exited" or launch.get("returncode") != 0:
+        raise RuntimeError("Launch record does not prove normal process completion")
+    events_file = jpath / "events.log"
+    if not events_file.is_file():
+        raise RuntimeError("Preserved OpenCode event stream is missing")
+    raw = events_file.read_text(encoding="utf-8", errors="replace")
+    events_sha = hashlib.sha256(events_file.read_bytes()).hexdigest()
+    diagnostics = {}
+    try:
+        report, session_id = extract_cli_report(
+            "jsonl", raw, jpath, kind=kind,
+            expected_session=job.get("session_id"), require_terminal=True,
+            require_contract=True, diagnostics=diagnostics,
+            repair_unescaped=repair_unescaped)
+    except ReportIngestionError as exc:
+        return {"ok": False, "code": exc.code, "error": str(exc),
+                "details": {key: value for key, value in exc.details.items()
+                            if key not in {"candidate", "text_preview"}},
+                "events_sha256": events_sha, "applied": False}
+    if job.get("session_id") and session_id != job["session_id"]:
+        return {"ok": False, "code": "session_mismatch",
+                "error": "Recovered report session does not match the failed job",
+                "observed": session_id, "expected": job["session_id"],
+                "events_sha256": events_sha, "applied": False}
+
+    project = Path(state["project"]).resolve()
+    before = source_snapshot(project)
+    report_files = {str(item) for item in report.get("files", [])}
+    changed = set((before.get("changed") or {}).keys())
+    unreported = sorted(changed - report_files)
+    if unreported:
+        return {"ok": False, "code": "unreported_source_changes",
+                "error": "Source files changed by the worker are absent from the report",
+                "files": unreported, "applied": False}
+    missing_files = sorted(item for item in report_files
+                           if not (project / item).is_file())
+    if missing_files:
+        return {"ok": False, "code": "reported_file_missing",
+                "error": "The report names files that are not present",
+                "files": missing_files, "applied": False}
+    terminal = diagnostics.get("terminal_completion") or {}
+    tree_hash = terminal.get("snapshot")
+    if not tree_hash:
+        return {"ok": False, "code": "source_unverified",
+                "error": "The terminal event recorded no OpenCode snapshot tree",
+                "applied": False}
+    tree_ok, tree_detail = _verify_snapshot_tree(tree_hash, project, data_root)
+    if not tree_ok:
+        return {"ok": False, "code": "source_unverified",
+                "error": "The OpenCode final snapshot does not match the current project",
+                "detail": tree_detail, "applied": False}
+    after = source_snapshot(project)
+    if signature(before) != signature(after):
+        return {"ok": False, "code": "source_changed_during_recovery",
+                "error": "Source changed while the report was being recovered",
+                "applied": False}
+
+    selected = diagnostics.get("selected") or {}
+    raw_text = _opencode_text_for_part(raw, selected.get("part_id"))
+    if raw_text is None:
+        return {"ok": False, "code": "raw_report_missing",
+                "error": "The selected assistant text part is missing from the event stream",
+                "applied": False}
+    repair = diagnostics.get("repair") or {"method": "none", "ops": []}
+    result = {
+        "ok": True, "run_id": run_id, "job_id": job_id, "kind": kind,
+        "role": job.get("role"), "session_id": session_id,
+        "report": report, "report_sha256": content_hash(report),
+        "events_path": str(events_file), "events_sha256": events_sha,
+        "raw_text_sha256": hashlib.sha256(
+            raw_text.encode("utf-8")).hexdigest(),
+        "repair": repair, "snapshot_tree": tree_hash,
+        "snapshot_tree_files": tree_detail.get("files"),
+        "source_signature": signature(before), "git_head": before.get("git_head"),
+        "changed": before.get("changed"), "batch_index": state.get("batch_index"),
+        "applied": False,
+    }
+    if not apply:
+        return result
+    expected_ack = f"recover-report:{run_id}:{job_id}"
+    if (acknowledge or "").strip() != expected_ack:
+        raise RuntimeError(
+            f"Applying recovery requires --acknowledge {expected_ack}")
+    _operator_action_allowed("recover-report")
+    report_path = jpath / "recovered-report.json"
+    text_path = jpath / "recovered-report-text.json"
+    recovery_path = jpath / "recovery.json"
+    atomic_json(report_path, report)
+    repaired_text = None
+    if repair.get("ops"):
+        repaired_text, _ = repair_unescaped_string_quotes(raw_text)
+    atomic_json(text_path, {
+        "original_sha256": result["raw_text_sha256"],
+        "original_text": raw_text,
+        "repaired_sha256": (hashlib.sha256(repaired_text.encode("utf-8")).hexdigest()
+                            if repaired_text is not None else None),
+        "repaired_text": repaired_text,
+        "repair": repair,
+    })
+    record = {
+        "version": 1, "run_id": run_id, "job_id": job_id, "kind": kind,
+        "role": job.get("role"), "applied_at": now(),
+        "actor": _operator_actor(), "report_path": str(report_path),
+        "text_path": str(text_path), "report_sha256": result["report_sha256"],
+        "events_sha256": events_sha,
+        "raw_text_sha256": result["raw_text_sha256"],
+        "session_id": session_id, "snapshot_tree": tree_hash,
+        "snapshot_tree_files": tree_detail.get("files"),
+        "source_signature": result["source_signature"],
+        "source": {"git_head": before.get("git_head"),
+                   "changed": before.get("changed"),
+                   "runtime_inputs": before.get("runtime_inputs")},
+        "batch_index": state.get("batch_index"),
+        "repair": repair,
+        "note": ("Report was re-extracted from the preserved failed job. The "
+                 "failed job remains failed; this record does not claim that "
+                 "the worker succeeded or that tests were verified."),
+    }
+    atomic_json(recovery_path, record)
+    with exclusive(folder):
+        folder, latest = load(run_id)
+        if (latest.get("status") not in PAUSED_STATES or latest.get("active_job")
+                or latest.get("batch_index") != record.get("batch_index")):
+            raise RuntimeError(
+                "Run state changed during report recovery; retry explicitly")
+        if not any(item.get("id") == job_id
+                   for item in latest.get("failed_jobs", [])):
+            raise RuntimeError("Failed job disappeared during report recovery")
+        latest.setdefault("report_recoveries", []).append({
+            **record, "recovery_path": str(recovery_path)})
+        save(folder, latest)
+        journal_event(folder, latest, "report_recovered", job_id=job_id,
+                      kind=kind, role=job.get("role"), session_id=session_id,
+                      repaired=bool(repair.get("ops")), snapshot_tree=tree_hash,
+                      report_sha256=result["report_sha256"],
+                      events_sha256=events_sha)
+    result.update({"applied": True, "recovery_path": str(recovery_path),
+                   "report_path": str(report_path), "text_path": str(text_path)})
+    return result
+
+
+def cached_recovered_job_report(run_dir, state, kind):
+    """A validated recovery record may feed the next stage without a model call."""
+    records = [record for record in state.get("report_recoveries", [])
+               if record.get("kind") == kind]
+    if not records:
+        return None
+    record = records[-1]
+    if record.get("job_id") == state.get("last_consumed_recovery_job_id"):
+        return None
+    if state.get("active_job"):
+        raise RuntimeError("Recovered report cannot be consumed while a job is active")
+    report_path = Path(record.get("report_path", ""))
+    recovery_path = Path(record.get("recovery_path", ""))
+    if not report_path.is_file() or not recovery_path.is_file():
+        raise RuntimeError("Recovered report artifacts are missing")
+    if content_hash(read_json(report_path)) != record.get("report_sha256"):
+        raise RuntimeError("Recovered report changed after recovery")
+    if record.get("source_signature") != signature(
+            source_snapshot(Path(state["project"]))):
+        raise RuntimeError(
+            "Candidate changed after report recovery; inspect before resuming")
+    report = read_json(report_path)
+    report = validate_report(kind, report)
+    if report.get("contract_version") != 2:
+        raise RuntimeError("Recovered report does not declare contract_version 2")
+    job = next((item for item in state.get("failed_jobs", [])
+                if item.get("id") == record.get("job_id")), None)
+    if job is None:
+        raise RuntimeError("Recovered job no longer exists in the failed-job history")
+    return report, job
+
+
 def consume_last(state):
     jobs = state.get("completed_jobs", [])
     if jobs:
@@ -5072,7 +5813,13 @@ def advance(run_dir, state, cfg):
         return
     if stage == "explore":
         report = cached_job_report(run_dir, state, "explorer")
+        recovered = None
         if report is None:
+            recovered = cached_recovered_job_report(run_dir, state, "explorer")
+        if recovered is not None:
+            report, job = recovered
+            state["last_consumed_recovery_job_id"] = job["id"]
+        elif report is None:
             context = {"project": str(project), "goal": state["goal"], "plan": state["plan"],
                        "instruction": "Inspect the starter project and identify relevant files and risks without editing."}
             report, job = call_model(run_dir, state, cfg, "explorer", "explorer",
@@ -5107,7 +5854,13 @@ def advance(run_dir, state, cfg):
             ),
         }
         report = cached_job_report(run_dir, state, "implementer")
+        recovered = None
         if report is None:
+            recovered = cached_recovered_job_report(run_dir, state, "implementer")
+        if recovered is not None:
+            report, job = recovered
+            state["last_consumed_recovery_job_id"] = job["id"]
+        elif report is None:
             report, job = call_model(run_dir, state, cfg, "implementer", "implementer",
                                      report_prompt("implementer", context), project)
         else:
@@ -5164,7 +5917,13 @@ def advance(run_dir, state, cfg):
                        "List severity-ordered findings, evidence, and unexamined areas."
                    )}
         report = cached_job_report(run_dir, state, "reviewer")
+        recovered = None
         if report is None:
+            recovered = cached_recovered_job_report(run_dir, state, "reviewer")
+        if recovered is not None:
+            report, job = recovered
+            state["last_consumed_recovery_job_id"] = job["id"]
+        elif report is None:
             report, _ = call_model(run_dir, state, cfg, "reviewer", "reviewer",
                                    report_prompt("reviewer", context), project)
         state["review"] = report
@@ -7651,6 +8410,16 @@ def main(argv=None):
     er.add_argument("--evidence")
     rv = subs.add_parser("reconcile-verification", help="Reconcile an unchanged interrupted correction and pause at verification")
     rv.add_argument("run_id")
+    rr = subs.add_parser("recover-report",
+                         help="Re-extract a preserved worker report without a model call")
+    rr.add_argument("run_id")
+    rr.add_argument("--job", required=True, help="Failed job ID whose events are preserved")
+    rr.add_argument("--apply", action="store_true",
+                    help="Persist recovery artifacts and a provenance record")
+    rr.add_argument("--repair-unescaped-quotes", action="store_true",
+                    help="Deterministically escape literal quotes inside JSON strings")
+    rr.add_argument("--acknowledge",
+                    help="Exact typed confirmation: recover-report:<run>:<job>")
     subs.add_parser("mcp", help="Run the stdio MCP server for one interactive Codex conversation")
     st = subs.add_parser("stage", help="Run exactly one workflow stage in the foreground")
     st.add_argument("run_id", nargs="?")
@@ -7735,6 +8504,11 @@ def main(argv=None):
                    launch_missing=opts.launch_missing, evidence=opts.evidence)
         elif opts.command == "reconcile-verification":
             modify(opts.run_id, "reconcile", retry_verification=True)
+        elif opts.command == "recover-report":
+            print(json.dumps(recover_report(
+                opts.run_id, opts.job, apply=opts.apply,
+                repair_unescaped=opts.repair_unescaped_quotes,
+                acknowledge=opts.acknowledge), ensure_ascii=False, indent=2))
         elif opts.command == "mcp":
             mcp_serve()
         elif opts.command == "stage":

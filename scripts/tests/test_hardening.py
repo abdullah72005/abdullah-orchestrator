@@ -69,6 +69,7 @@ if '--session' not in sys.argv:
     print('429 rate limit'); sys.exit(2)
 assert sys.argv[sys.argv.index('--session') + 1] == 'ses_retry'
 print(json.dumps({'sessionID':'ses_retry','type':'text','part':{'text':json.dumps({'status':'complete','summary':'resumed'})}}))
+print(json.dumps({'sessionID':'ses_retry','type':'step_finish','part':{'reason':'stop'}}))
 ''')
         fake.chmod(0o755)
         self.state['phase'] = 'implement'
@@ -219,6 +220,7 @@ else:
     report = {'contract_version':2, 'status':'complete', 'summary':role, 'findings':[], 'evidence':['app.py:1'], 'files':['app.py'], 'tests':[], 'unknowns':[], 'blocker':''} if role == 'reviewer' else {'contract_version':2, 'status':'complete', 'summary':role, 'files':['app.py'], 'tests':[], 'evidence':['app.py:1'], 'unknowns':[], 'blocker':''}
     if role == 'explorer': report.update(files=['app.py'], tests=[], evidence=['app.py:1'], unknowns=[], blocker='')
     print(json.dumps({'type':'text','sessionID':'fake-session', 'part':{'text':json.dumps(report)}}))
+    print(json.dumps({'type':'step_finish','sessionID':'fake-session', 'part':{'reason':'stop'}}))
 ''')
         fake.chmod(0o755)
         (fakebin / 'codex').symlink_to(fake)

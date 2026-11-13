@@ -280,6 +280,8 @@ else:
               'evidence':['app.py:1'], 'unknowns':[], 'blocker':''}
     print(json.dumps({'type':'text','sessionID':'fake-session',
                       'part':{'text':json.dumps(report)}}))
+    print(json.dumps({'type':'step_finish','sessionID':'fake-session',
+                      'part':{'reason':'stop'}}))
 ''')
     fake.chmod(0o755)
     for name in ("codex", "opencode"):

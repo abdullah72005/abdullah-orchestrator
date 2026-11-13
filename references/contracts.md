@@ -2,6 +2,8 @@
 
 Every model must emit one standalone **JSON object** in the final response; process exit, report validity, evidence and acceptance are distinct.
 
+Emit valid JSON: escape double quotes inside string values; no trailing commas or comments.
+
 ## Plan
 `{"contract_version":2,"status":"complete|blocked","summary":"...","invariants":["..."],"batches":[{"title":"...","goal":"...","acceptance":["..."],"checks":[["pytest","-q"]],"risk":"mechanical|ordinary|high","verification_purpose":null}],"blocker":"..."}`
 

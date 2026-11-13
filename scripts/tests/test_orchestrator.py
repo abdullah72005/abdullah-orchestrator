@@ -444,7 +444,9 @@ class ControlTests(unittest.TestCase):
             "print(json.dumps({'type':'text', 'sessionID':'ses_realtest', "
             "'part':{'type':'text', 'text':json.dumps({"
             "'status':'complete','summary':'Found callsites','files':['app.py'],"
-            "'tests':[],'evidence':['app.py:1'],'unknowns':[],'blocker':''})}}))\n")
+            "'tests':[],'evidence':['app.py:1'],'unknowns':[],'blocker':''})}}))\n"
+            "print(json.dumps({'type':'step_finish', 'sessionID':'ses_realtest', "
+            "'part':{'type':'step-finish','reason':'stop'}}))\n")
         fake.chmod(0o755)
         with patch.dict(orc.os.environ, {"PATH": f"{fakebin}:{orc.os.environ['PATH']}"}):
             report, job = orc.call_model(self.rundir, self.state, self.cfg, "explorer", "explorer",
