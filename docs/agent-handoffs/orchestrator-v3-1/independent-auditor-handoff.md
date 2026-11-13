@@ -7,11 +7,12 @@ was performed by the Implementer.
 - Worktree: `/home/abdullah/.local/src/abdullah-orchestrator-v3-1`
 - Branch: `design/orchestrator-v3-1`
 - Review baseline: `1b8e10e5c1b2c08a236b68450cb5b2a1a610416d`
-- Candidate source commits before this handoff file:
-  `e223ca1` (acceptance integrity), `076caeb` (host/preflight),
-  `e6cab3c` (Claude setup/stage deadline), `a3f6202` (worker routes/migration).
-- The commit that adds this file is the documentation tip; use `git log` and
-  `git diff 1b8e10e..HEAD` for the exact final range.
+- Candidate source/evidence HEAD: `9eb49ef` (docs: finalize v3.1.0 integration
+  evidence and audit handoff). This handoff-file update is a docs-only child of
+  that commit; use the branch tip for review.
+- Candidate commits: `e223ca1` (acceptance integrity), `076caeb` (host/preflight),
+  `e6cab3c` (Claude setup/stage deadline), `a3f6202` (worker routes/migration),
+  `9eb49ef` (integration evidence/docs).
 - Authoritative brief: `docs/agent-handoffs/orchestrator-v3-1/batch-01.md`
 - Approved design: `docs/agent-handoffs/orchestrator-v3-1/architecture.md`
 
@@ -71,7 +72,7 @@ Last full offline run before the final documentation/handoff commit:
 - Interpreter: Python 3.10.12
 - `python3 -m compileall -q scripts`: exit 0
 - `python3 -m unittest discover -s scripts/tests`: **656 tests**, 4 skipped,
-  exit 0, ~378 s
+  exit 0, ~291–379 s across recorded runs
 - The 4 skips are the optional installed-CLI V2 introspection suite; they are
   reported separately and are not counted as passed.
 - No paid requests, authenticated E2E, real installer execution or Doctor
