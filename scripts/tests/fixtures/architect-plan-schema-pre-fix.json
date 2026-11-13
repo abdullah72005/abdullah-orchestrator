@@ -1,0 +1,92 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "batches": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "checks": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "goal": {
+            "type": "string"
+          },
+          "risk": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verification_purpose": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "goal",
+          "acceptance",
+          "checks",
+          "risk"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "blocker": {
+      "type": "string"
+    },
+    "contract_version": {
+      "type": "integer"
+    },
+    "invariants": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "required_exploration": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "scope_satisfied": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "job_id",
+        "scope_satisfied"
+      ],
+      "type": "object"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "contract_version",
+    "status",
+    "summary",
+    "invariants",
+    "batches",
+    "blocker",
+    "required_exploration"
+  ],
+  "type": "object"
+}

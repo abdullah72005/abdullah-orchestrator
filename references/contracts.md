@@ -3,9 +3,11 @@
 Every model must emit one standalone **JSON object** in the final response; process exit, report validity, evidence and acceptance are distinct.
 
 ## Plan
-`{"contract_version":2,"status":"complete|blocked","summary":"...","invariants":["..."],"batches":[{"title":"...","goal":"...","acceptance":["..."],"checks":[["pytest","-q"]],"risk":"mechanical|ordinary|high"}],"blocker":"..."}`
+`{"contract_version":2,"status":"complete|blocked","summary":"...","invariants":["..."],"batches":[{"title":"...","goal":"...","acceptance":["..."],"checks":[["pytest","-q"]],"risk":"mechanical|ordinary|high","verification_purpose":null}],"blocker":"..."}`
 
 Contract v2 requires a nonempty invariant list and nonempty acceptance criteria per batch. Reports without `contract_version: 2` are accepted only as marked legacy evidence. Checks remain argv arrays; wrappers, interpreter code strings and indirect Docker execution are recorded by the supervisor command policy.
+
+`verification_purpose` is part of the batch schema and is always emitted: a specific, nonempty description of what the checks prove for `"risk":"high"` batches, and `null` otherwise. The supervisor rejects a high-risk batch whose purpose is missing, empty or null; a non-high-risk batch may leave it null.
 
 When required exploration is in scope, include `"required_exploration":{"job_id":"...","scope_satisfied":true}` only if the Architect dispatched and consumed that Explorer and it covers the required scope; otherwise use an empty job_id and false.
 

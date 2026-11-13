@@ -2601,8 +2601,173 @@ def report_prompt(kind, context):
     return prefix + payload + suffix
 
 
-def schema(kind):
-    # OpenAI's constrained output accepts simple JSON schemas; validate semantics locally.
+# Strict structured-output (OpenAI Codex `--output-schema`, Claude
+# `--json-schema`) compatibility. These providers reject a schema before any
+# model call when an object is not closed or a declared property is not
+# required, so a deterministic preflight must run before dispatch.
+STRUCTURED_OUTPUT_NODE_KEYS = {
+    "type", "description", "properties", "required", "additionalProperties",
+    "items", "enum", "$defs", "definitions", "$ref"}
+STRUCTURED_OUTPUT_DENIED_KEYS = {
+    "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "const",
+    "patternProperties", "propertyNames", "dependentRequired",
+    "dependentSchemas", "unevaluatedProperties", "unevaluatedItems",
+    "minProperties", "maxProperties", "contains", "minContains",
+    "maxContains", "minItems", "maxItems", "uniqueItems", "minLength",
+    "maxLength", "pattern", "format", "minimum", "maximum",
+    "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "default",
+    "examples", "title", "deprecated", "readOnly", "writeOnly",
+    "additionalItems", "propertyDependencies"}
+STRUCTURED_OUTPUT_TYPES = {"string", "integer", "number", "boolean", "array", "object", "null"}
+STRUCTURED_OUTPUT_KINDS = ("plan", "implementer", "explorer", "reviewer", "decision")
+_STRUCTURED_TYPE_PYTHON = {"string": str, "integer": int, "number": (int, float),
+                           "boolean": bool}
+
+
+def _structured_type_values(raw_type):
+    values = raw_type if isinstance(raw_type, list) else [raw_type]
+    return values if all(isinstance(item, str) for item in values) else None
+
+
+def _structured_enum_matches(value, kind):
+    if value is None:
+        return True
+    expected = _STRUCTURED_TYPE_PYTHON[kind]
+    if isinstance(value, bool) and kind in {"integer", "number"}:
+        return False
+    return isinstance(value, expected)
+
+
+def _check_structured_node(node, path, errors):
+    """Validate one schema node; append deterministic, location-aware errors."""
+    if not isinstance(node, dict):
+        errors.append(f"{path} must be a JSON Schema object")
+        return
+    for key in sorted(node):
+        if key in STRUCTURED_OUTPUT_DENIED_KEYS:
+            errors.append(f"{path}.{key} is not supported by strict structured outputs")
+        elif key not in STRUCTURED_OUTPUT_NODE_KEYS:
+            errors.append(f"{path}.{key} is not a supported structured-output keyword")
+    if "$ref" in node:
+        if not isinstance(node["$ref"], str) or not node["$ref"].strip():
+            errors.append(f"{path}.$ref must be a nonempty definition reference")
+        extra = sorted(set(node) - {"$ref", "description"})
+        if extra:
+            errors.append(f"{path} combines $ref with unsupported sibling keys {extra}")
+        return
+    for defs_key in ("$defs", "definitions"):
+        definitions = node.get(defs_key)
+        if definitions is None:
+            continue
+        if not isinstance(definitions, dict) or not definitions:
+            errors.append(f"{path}.{defs_key} must be a nonempty object of definitions")
+            continue
+        for name, definition in definitions.items():
+            _check_structured_node(definition, f"{path}.{defs_key}.{name}", errors)
+    if "type" not in node:
+        errors.append(f"{path}.type is required")
+        return
+    values = _structured_type_values(node["type"])
+    if not values:
+        errors.append(f"{path}.type must be a string or a list of type strings")
+        return
+    if len(set(values)) != len(values):
+        errors.append(f"{path}.type repeats a type")
+        return
+    unknown = sorted(set(values) - STRUCTURED_OUTPUT_TYPES)
+    if unknown:
+        errors.append(f"{path}.type uses unsupported types {unknown}")
+        return
+    non_null = [item for item in values if item != "null"]
+    if len(non_null) != 1:
+        errors.append(f"{path}.type must name exactly one type, optionally with null")
+        return
+    kind = non_null[0]
+    nullable = "null" in values
+    if kind == "object":
+        properties = node.get("properties")
+        if not isinstance(properties, dict):
+            errors.append(f"{path}.properties must be an object mapping names to schemas")
+            properties = {}
+        if node.get("additionalProperties") is not False:
+            suffix = " (missing)" if "additionalProperties" not in node else ""
+            errors.append(f"{path}.additionalProperties must be false{suffix}")
+        required = node.get("required")
+        if not isinstance(required, list) or not all(
+                isinstance(item, str) and item for item in required):
+            errors.append(f"{path}.required must be an array of property names")
+            required = []
+        elif len(set(required)) != len(required):
+            errors.append(f"{path}.required repeats a property name")
+        missing = [name for name in properties if name not in required]
+        if missing:
+            errors.append(
+                f"{path}.required is required to include every key in properties; "
+                f"missing {missing}")
+        extra = [name for name in required if name not in properties]
+        if extra:
+            errors.append(f"{path}.required names properties that are not declared: {extra}")
+        if "items" in node or "enum" in node:
+            errors.append(f"{path} uses array/scalar keywords on an object schema")
+        for name, definition in properties.items():
+            _check_structured_node(definition, f"{path}.properties.{name}", errors)
+        return
+    if kind == "array":
+        if "items" not in node:
+            errors.append(f"{path}.items is required for an array schema")
+        else:
+            _check_structured_node(node["items"], f"{path}.items", errors)
+        if any(key in node for key in ("properties", "required", "additionalProperties", "enum")):
+            errors.append(f"{path} uses object/scalar keywords on an array schema")
+        return
+    for key in ("properties", "required", "additionalProperties", "items"):
+        if key in node:
+            errors.append(f"{path}.{key} is not valid on a {kind} schema")
+    if "enum" in node:
+        enum = node["enum"]
+        if not isinstance(enum, list) or not enum:
+            errors.append(f"{path}.enum must be a nonempty array")
+        elif not all(_structured_enum_matches(item, kind) for item in enum):
+            errors.append(f"{path}.enum contains values that are not valid {kind} values")
+        elif not nullable and not any(item is not None for item in enum):
+            errors.append(f"{path}.enum only allows null on a non-nullable schema")
+
+
+def validate_structured_output_schema(document, label="schema"):
+    """Fail closed when a generated schema would be rejected by the provider.
+
+    Strong hosts enforce strict structured outputs: every object is closed with
+    ``additionalProperties: false`` and lists *every* property in ``required``.
+    Optional data therefore has to be a required nullable field instead of an
+    omitted key. The check is recursive (properties, array items, definitions)
+    and raises before any paid model call is made.
+    """
+    errors = []
+    _check_structured_node(document, label, errors)
+    if isinstance(document, dict):
+        values = _structured_type_values(document.get("type"))
+        if values is None or "object" not in values:
+            errors.append(f"{label}.type must be object at the schema root")
+    if errors:
+        raise ValueError(
+            f"Incompatible structured-output schema {label!r}: " + " | ".join(errors))
+    return document
+
+
+def structured_output_schema_status():
+    """Deterministic compatibility report for every schema the orchestrator sends."""
+    status = {}
+    for kind in STRUCTURED_OUTPUT_KINDS:
+        try:
+            schema(kind)
+        except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+            status[kind] = {"ok": False, "error": str(exc)}
+        else:
+            status[kind] = {"ok": True}
+    return status
+
+
+def _report_schema(kind):
     if kind == "plan":
         return {"type": "object", "properties": {
             "contract_version": {"type": "integer"},
@@ -2613,8 +2778,16 @@ def schema(kind):
                 "acceptance": {"type": "array", "items": {"type": "string"}},
                 "checks": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
                 "risk": {"type": "string"},
-                "verification_purpose": {"type": "string"},
-            }, "required": ["title", "goal", "acceptance", "checks", "risk"], "additionalProperties": False}},
+                # Optional by policy (required nonempty only for high-risk
+                # batches), so it must be a required nullable field: strict
+                # structured outputs reject an optional property.
+                "verification_purpose": {
+                    "type": ["string", "null"],
+                    "description": ("What the checks prove for a high-risk batch; "
+                                    "must be a nonempty string when risk is high, "
+                                    "otherwise null.")},
+            }, "required": ["title", "goal", "acceptance", "checks", "risk",
+                            "verification_purpose"], "additionalProperties": False}},
             "blocker": {"type": "string"},
             "required_exploration": {"type":"object", "properties":{"job_id":{"type":"string"},"scope_satisfied":{"type":"boolean"}}, "required":["job_id","scope_satisfied"], "additionalProperties":False},
         }, "required": ["contract_version", "status", "summary", "invariants", "batches", "blocker", "required_exploration"], "additionalProperties": False}
@@ -2643,6 +2816,11 @@ def schema(kind):
         }, "required": ["location", "claim", "reason"], "additionalProperties": False}},
     }, "required": ["verdict", "reason", "inspected", "correction", "dismissed_findings"],
         "additionalProperties": False}
+
+
+def schema(kind):
+    """Return a provider-compatible report schema or fail before dispatch."""
+    return validate_structured_output_schema(_report_schema(kind), f"report:{kind}")
 
 
 def model_route(cfg, host, role):
@@ -5568,15 +5746,17 @@ def doctor(project: Path, host="codex"):
     profiles_cli_ok = (dialect is not None
                        and all(value is True for value in checks["worker_profiles_cli"].values()))
     checks["worker_profiles_cli_verified"] = profiles_cli_ok
+    checks["structured_output_schemas"] = structured_output_schema_status()
+    schemas_ok = all(item["ok"] for item in checks["structured_output_schemas"].values())
     checks["ready"] = checks["valid_repo"] and all(checks["commands"][c] for c in required) and (
-        all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and profiles_cli_ok and (
+        all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and profiles_cli_ok and schemas_ok and (
         checks.get("paid_go_model_listed") is True
         and checks["variant_verified"] is not False) and not checks["api_billing_risk"]
     checks["compatibility_note"] = (
-        "ready proves local configuration, version-policy, argv, contract checks and ordered "
-        "V2 application-permission effects from CLI introspection. Application permissions are "
-        "not OS-level isolation. It does not prove authenticated model execution, entitlement, "
-        "or enforcement by every tool runtime."
+        "ready proves local configuration, version-policy, argv, contract checks, strict "
+        "structured-output schema compatibility and ordered V2 application-permission effects "
+        "from CLI introspection. Application permissions are not OS-level isolation. It does "
+        "not prove authenticated model execution, entitlement, or enforcement by every tool runtime."
     )
     return checks
 
