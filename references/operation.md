@@ -2,6 +2,8 @@
 
 Copy the **entire** skill directory onto the WSL filesystem. Run `python3 scripts/install_wsl.py`, edit `~/.config/abdullah-orchestrator/config.json`, then `python3 scripts/orchestrator.py doctor --project /abs/dev/repo`. Requires Python 3.10+, git, Codex CLI, OpenCode CLI, and Docker/Compose for Docker projects; Claude Code CLI only for Claude mode. No extra Python dependencies.
 
+Model routes are configured, not hard-coded: `architect.<host>` selects the strong model/effort, and `workers.<role>.model`/`.variant` selects the paid Go worker. Worker models must be `opencode-go/...` with `billing: "go"`; other routes are rejected. Set them before starting a run, because changing the config mid-run marks the run `config_changed` and blocks stages. Full reference: [`../docs/configuration.md`](../docs/configuration.md).
+
 The installer links this one skill into `~/.agents/skills/abdullah-orchestrator` (Codex) and `~/.claude/skills/abdullah-orchestrator` (Claude), refuses to overwrite unrelated files, and never modifies the user's original two skills or global OpenCode settings.
 
 ## One conversation, visible stages

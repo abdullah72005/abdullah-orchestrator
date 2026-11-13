@@ -153,6 +153,12 @@ python3 <SKILL_DIR>/scripts/orchestrator.py cancel <ID>
 
 All run commands accept either a positional `<ID>` or `--run <ID>`, never both. For example `resume <ID>` and `resume --run <ID>` are equivalent.
 
-## Provisional model configuration
+## Model configuration
 
-Codex Architect: GPT-6.1 Sol high. Claude Architect: Opus 5.5 high. Workers: **paid OpenCode Go** DeepSeek V4.1 Flash; Implementer high, Explorer low, Reviewer high *if these variants exist in the installed catalog*. The runtime must fail visibly instead of silently downgrading if the exact variant or Go subscription is unavailable. All values are editable.
+All model routes are read from `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`) on every operation:
+
+- **Architect** — `architect.codex` and `architect.claude` select the model and effort for each host. The value is passed through unchanged, so confirm it against the installed Codex/Claude catalog; keep `auth: "subscription"`.
+- **Workers** — `workers.explorer`, `workers.implementer` and `workers.reviewer` select `model` and `variant`. The model must be an `opencode-go/...` ID with `billing: "go"`; variant selects the reasoning effort. Different roles may use different Go models.
+- **Discovery** — `opencode models opencode-go --verbose` (V1, includes variants) or `opencode models` (V2, IDs only), then `python3 scripts/orchestrator.py doctor --project <abs>` to confirm `paid_go_model_listed`, `variant_verified` and resolved routes.
+
+Worker **providers** are fixed to paid OpenCode Go in 3.0.0: any other billing value or model prefix is rejected rather than silently moving work to API billing. Do not claim otherwise, do not edit the config on the user's behalf, and do not bypass validation. Configuration is user-owned: show exact values and ask before changing it. Set routes before `orchestrator_start`; editing the config mid-run marks the run `config_changed` and blocks further stages. Full reference: `docs/configuration.md`.

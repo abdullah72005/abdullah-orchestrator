@@ -224,6 +224,23 @@ model-owned worker context.
 
 ## Model and CLI compatibility
 
+Every route is resolved from configuration at call time:
+
+```text
+architect -> provider = host, model = architect.<host>.model,
+             effort = architect.<host>.effort, billing = .auth
+worker    -> provider = "opencode", model = workers.<role>.model,
+             effort = workers.<role>.variant, billing = .billing
+```
+
+Architect models may be any catalog model for the selected host. Worker routes
+are deliberately restricted to `opencode-go/...` with `billing: "go"`; the
+validator rejects anything else before a run starts, and `doctor` checks the
+model (and, on V1, the variant) against the installed inventory. The model ID
+and variant themselves are fully configurable per role. There is no other
+worker-provider path in 3.0.0; adding one would touch route construction,
+billing accounting, inventory parsing, and permission tests.
+
 The supervisor supports tested OpenCode lines `>=1.18 <2.0` and `>=2.2 <3.0`
 (configurable). It refuses unknown majors and untested ranges. On V2 it:
 

@@ -18,6 +18,10 @@ Python **supervisor**; a strong **Architect** plans and accepts; paid OpenCode G
 bounded work. The supervisor — not the language model — owns state, process
 lifecycle, verification, and recovery.
 
+Every model identifier is configurable in one JSON file: Architect models per
+host, and worker models/variants within the paid OpenCode Go catalog. See
+[Model configuration](#configure-models).
+
 It was built for long-running work on a real repository where a dropped chat,
 a wrong checkout, or an unverified "it works" is expensive.
 
@@ -110,7 +114,8 @@ to skip), refuses to overwrite unrelated files, and creates
 config.
 
 Edit the config and confirm the exact model/variant identifiers in your
-installed catalog, then run the preflight:
+installed catalog ([full configuration reference](docs/configuration.md)), then
+run the preflight:
 
 ```bash
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
@@ -144,6 +149,56 @@ cannot race the supervisor at the boundary. Do not apply it globally.
 Open one Codex chat, invoke `$abdullah-orchestrator`, give it an absolute
 project path and a precise goal. Full walkthrough:
 [`docs/architecture.md`](docs/architecture.md).
+
+## Configure models
+
+Everything lives in `~/.config/abdullah-orchestrator/config.json` (or
+`ABDULLAH_CONFIG`). Routes resolve deterministically:
+
+| Role | Config field | Constraint |
+|---|---|---|
+| Architect (Codex host) | `architect.codex.model` / `.effort` | Passed through; confirm it is in the Codex catalog |
+| Architect (Claude host) | `architect.claude.model` / `.effort` | Passed through; confirm it is in the Claude catalog |
+| Explorer | `workers.explorer.model` / `.variant` | `opencode-go/...`, billing `go` |
+| Implementer | `workers.implementer.model` / `.variant` | `opencode-go/...`, billing `go` |
+| Reviewer | `workers.reviewer.model` / `.variant` | `opencode-go/...`, billing `go` |
+
+Example — pin the Implementer to a different Go model while keeping the cheaper
+Explorer:
+
+```json
+{
+  "workers": {
+    "explorer":    {"model": "opencode-go/deepseek-v4.1-flash", "variant": "low",  "billing": "go"},
+    "implementer": {"model": "opencode-go/glm-5.3",             "variant": "high", "billing": "go"},
+    "reviewer":    {"model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
+  }
+}
+```
+
+Discover valid IDs before editing:
+
+```bash
+opencode models opencode-go --verbose   # V1: includes variants
+opencode models                         # V2: IDs only
+```
+
+Then confirm with `doctor`:
+
+```bash
+python3 scripts/orchestrator.py doctor --project /absolute/path/to/repo
+```
+
+`doctor` reports `paid_go_model_listed`, `variant_verified`, and the resolved
+route per role. Worker **providers** are intentionally fixed to paid OpenCode Go
+in 3.0.0 — `billing` must be `go` and the model must start with
+`opencode-go/`; any other value is rejected rather than silently moving work to
+an API-billed route. Architect models and all worker model IDs/variants are
+fully editable. Set them before starting a run: changing the config mid-run
+marks the run `config_changed` and blocks further stages.
+
+Complete reference, limits, fallback, and recipes:
+[`docs/configuration.md`](docs/configuration.md).
 
 ## MCP surface
 
@@ -264,6 +319,7 @@ ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
 ├── references/               # Operation, roles, contracts, approved handoff
 ├── docs/
 │   ├── architecture.md       # Components, state model, stage lifecycle
+│   ├── configuration.md      # Models, limits, permissions, recipes
 │   ├── security-model.md     # Trust boundaries and limitations
 │   ├── validation.md         # Test evidence and the real end-to-end pilot
 │   ├── maintenance.md        # Distribution, backup, rollback, upgrade
@@ -289,6 +345,7 @@ module map are documented in [`docs/architecture.md`](docs/architecture.md).
 | [`references/contracts.md`](references/contracts.md) | Exact JSON contracts for plan, worker, reviewer, verdict |
 | [`references/roles.md`](references/roles.md) | Role responsibilities and escalation rules |
 | [`docs/architecture.md`](docs/architecture.md) | Internal design, state layout, failure handling |
+| [`docs/configuration.md`](docs/configuration.md) | Models, limits, permissions, fallback, recipes |
 | [`docs/security-model.md`](docs/security-model.md) | Threat model, permissions, operator boundaries |
 | [`docs/validation.md`](docs/validation.md) | Test evidence and the real end-to-end pilot |
 | [`docs/maintenance.md`](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 |

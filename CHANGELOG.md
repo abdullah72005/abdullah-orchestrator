@@ -75,6 +75,9 @@ state schema `2`, config schema `2`, verification evidence `2`.
 
 - Rewritten README, architecture, security model, validation, maintenance, and
   audit index.
+- Added a model and workflow configuration guide covering configurable
+  architect/worker models, the paid-Go worker constraint, limits, fallback, and
+  recipes.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
