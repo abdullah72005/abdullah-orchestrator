@@ -179,6 +179,26 @@ def now():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def stage_deadline(cfg):
+    """One whole foreground stage budget (all checks plus the strong call)."""
+    limits = (cfg or {}).get("limits", {})
+    seconds = limits.get("max_stage_seconds")
+    if seconds in (None, "", 0):
+        return None
+    return time.monotonic() + float(seconds)
+
+
+def remaining_budget(configured, deadline):
+    """Clip a child timeout to the remaining whole-stage budget."""
+    configured = float(configured)
+    if deadline is None:
+        return configured
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.05:
+        raise TimeoutError("Whole-stage deadline exceeded before the next child")
+    return max(0.05, min(configured, remaining))
+
+
 def _fsync_directory(path: Path):
     try:
         descriptor = os.open(path, os.O_RDONLY)
@@ -4857,6 +4877,10 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         # One approved dispatch only; if it fails a new authorization is needed.
         state["fallback_authorization"] = None
         save(run_dir, state)
+    strong = route["provider"] in {"codex", "claude"}
+    timeout = remaining_budget(
+        cfg["limits"]["max_architect_seconds" if strong else "max_worker_seconds"],
+        deadline)
     preflight = route_preflight(role, route, cfg, project, state)
     if not preflight["ok"]:
         archive.mkdir(parents=True, exist_ok=True)
@@ -4907,7 +4931,6 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             raise RuntimeError(f"Dispatch blocked: {exc}") from exc
     jpath = archive / f"{kind}-{job_id}"
     jpath.mkdir(parents=True, exist_ok=False)
-    strong = route["provider"] in {"codex", "claude"}
     dispatch_snapshot = source_snapshot(project)
     atomic_json(jpath / "dispatch.json", {"kind": kind, "role": role, "route": route,
                                            "source": dispatch_snapshot,
@@ -4949,7 +4972,6 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     if state is not None:
         state["active_job"] = job
         save(run_dir, state)
-    timeout = cfg["limits"]["max_architect_seconds" if strong else "max_worker_seconds"]
     started = time.monotonic()
     out_file = jpath / "events.log"
     proc = None
@@ -5360,7 +5382,7 @@ def _escaped_live(stats):
         {"pid": stat.get("pid"), "pid_start": stat.get("starttime")})]
 
 
-def run_checks(run_dir, state, cfg, project, batch, final=False):
+def run_checks(run_dir, state, cfg, project, batch, final=False, deadline=None):
     commands = batch.get("checks", [])
     if not commands:
         raise RuntimeError("No required verification commands in the approved brief")
@@ -5397,10 +5419,10 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
         evidence = progress["evidence"]
     if progress.get("finished"):
         return evidence
-    timeout = cfg["limits"]["max_check_seconds"]
     for index, cmd in enumerate(commands):
         if index < len(evidence["commands"]):
             continue
+        check_timeout = remaining_budget(cfg["limits"]["max_check_seconds"], deadline)
         if not isinstance(cmd, list) or not cmd or not all(isinstance(i, str) for i in cmd):
             raise ValueError("Verification checks must be argv arrays")
         # Exactly the plan's argv, never shell=True. Wrapper, interpreter and
@@ -5463,7 +5485,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False):
                         state["active_check"]["termination"] = termination
                         save(run_dir, state)
                         raise InterruptedError(f"Run {action} requested during verification")
-                    if time.monotonic() - started_check > timeout:
+                    if time.monotonic() - started_check > check_timeout:
                         termination = terminate_identity(state["active_check"], grace=5)
                         try:
                             proc.wait(timeout=8)
@@ -5781,7 +5803,7 @@ def validate_acceptance_references(state, project, references):
     return current
 
 
-def strong_call(run_dir, state, cfg, kind, extra=None):
+def strong_call(run_dir, state, cfg, kind, extra=None, deadline=None):
     context = architect_context(run_dir, state, kind, extra)
     binding = None
     if kind in {"decision", "integration"}:
@@ -5870,7 +5892,8 @@ def strong_call(run_dir, state, cfg, kind, extra=None):
     report, job = call_model(
         run_dir, state, cfg, "architect", kind,
         report_prompt("plan" if kind == "plan" else "decision", context),
-        Path(state["project"]), host=state["host"], decision_binding=binding)
+        Path(state["project"]), host=state["host"], decision_binding=binding,
+        deadline=deadline)
     if kind in {"decision", "integration"}:
         references = []
         if extra and isinstance(extra.get("batch_evidence"), dict):
@@ -6556,7 +6579,7 @@ def reviewer_verification_package(reference, current, run_id=None, plan_version=
                                          plan_version=plan_version)
 
 
-def advance(run_dir, state, cfg):
+def advance(run_dir, state, cfg, deadline=None):
     """One durable transition. Persist after each completed transition."""
     # Defense in depth: every production entry point already verifies this, but
     # an internal caller must not execute a stage against an unowned checkout.
@@ -6566,7 +6589,8 @@ def advance(run_dir, state, cfg):
     stage = state["phase"]
     if stage == "diagnose":
         verdict = cached_job_report(run_dir, state, "diagnose") or strong_call(
-            run_dir, state, cfg, "diagnose", {"failure": state["diagnosis_reason"]})
+            run_dir, state, cfg, "diagnose", {"failure": state["diagnosis_reason"]},
+            deadline=deadline)
         consume_last(state)
         state["diagnosis_verdict"] = verdict
         if verdict["verdict"] != "changes_required":
@@ -6597,7 +6621,8 @@ def advance(run_dir, state, cfg):
             state["exploration"] = None
             state.pop("required_exploration_job", None)
             state.pop("verification_interrupted", None)
-        plan = cached_job_report(run_dir, state, "plan") or strong_call(run_dir, state, cfg, "plan")
+        plan = cached_job_report(run_dir, state, "plan") or strong_call(
+            run_dir, state, cfg, "plan", deadline=deadline)
         if plan["status"] == "blocked":
             consume_last(state)
             pause_with(run_dir, state, plan.get("blocker") or "Architect cannot plan the goal")
@@ -6656,7 +6681,8 @@ def advance(run_dir, state, cfg):
             context = {"project": str(project), "goal": state["goal"], "plan": state["plan"],
                        "instruction": "Inspect the starter project and identify relevant files and risks without editing."}
             report, job = call_model(run_dir, state, cfg, "explorer", "explorer",
-                                     report_prompt("explorer", context), project)
+                                     report_prompt("explorer", context), project,
+                                     deadline=deadline)
         state["exploration"] = report
         consume_last(state)
         if report["status"] != "complete":
@@ -6695,7 +6721,8 @@ def advance(run_dir, state, cfg):
             state["last_consumed_recovery_job_id"] = job["id"]
         elif report is None:
             report, job = call_model(run_dir, state, cfg, "implementer", "implementer",
-                                     report_prompt("implementer", context), project)
+                                     report_prompt("implementer", context), project,
+                                     deadline=deadline)
         else:
             job = state["completed_jobs"][-1]
         state["implementation"] = report
@@ -6711,7 +6738,7 @@ def advance(run_dir, state, cfg):
         return
     if stage == "verify":
         batch = state["plan"]["batches"][state["batch_index"]]
-        evidence = run_checks(run_dir, state, cfg, project, batch)
+        evidence = run_checks(run_dir, state, cfg, project, batch, deadline=deadline)
         if not evidence["passed"]:
             if evidence.get("error") or not evidence.get("source_unchanged", True):
                 state["check_progress"] = None
@@ -6758,7 +6785,8 @@ def advance(run_dir, state, cfg):
             state["last_consumed_recovery_job_id"] = job["id"]
         elif report is None:
             report, _ = call_model(run_dir, state, cfg, "reviewer", "reviewer",
-                                   report_prompt("reviewer", context), project)
+                                   report_prompt("reviewer", context), project,
+                                   deadline=deadline)
         state["review"] = report
         consume_last(state)
         if report["status"] != "complete":
@@ -6829,7 +6857,7 @@ def advance(run_dir, state, cfg):
             if not state.get("single_batch_verification"):
                 state["single_batch_verification"] = copy_evidence(state["verification"])
                 save(run_dir, state)
-            final_evidence = run_checks(run_dir, state, cfg, project, {"title": "feature integration", "checks": state["plan"]["batches"][0]["checks"]}, final=True)
+            final_evidence = run_checks(run_dir, state, cfg, project, {"title": "feature integration", "checks": state["plan"]["batches"][0]["checks"]}, final=True, deadline=deadline)
             if not final_evidence.get("passed") or final_evidence.get("candidate_hash") != signature(current) or not final_evidence.get("source_unchanged"):
                 state["check_progress"] = None
                 pause_with(run_dir, state, "Final verification failed or candidate changed", failure_phase(state))
@@ -6849,7 +6877,8 @@ def advance(run_dir, state, cfg):
                       "batch_evidence": state["single_batch_verification"],
                       "integration_instruction": "Also inspect end-to-end feature integration and all original requirements."}
                      if single else None)
-            verdict = strong_call(run_dir, state, cfg, "decision", extra)
+            verdict = strong_call(run_dir, state, cfg, "decision", extra,
+                                  deadline=deadline)
         state["architect_verdict"] = verdict
         consume_last(state)
         current = source_snapshot(project)
@@ -6912,7 +6941,8 @@ def advance(run_dir, state, cfg):
                 if check not in unique:
                     unique.append(check)
         combined = {"title": "feature integration", "checks": unique}
-        evidence = run_checks(run_dir, state, cfg, project, combined, final=True)
+        evidence = run_checks(run_dir, state, cfg, project, combined, final=True,
+                              deadline=deadline)
         if not evidence["passed"]:
             state["check_progress"] = None
             pause_with(run_dir, state, "Feature integration verification failed: " +
@@ -6950,7 +6980,8 @@ def advance(run_dir, state, cfg):
         if verdict is None:
             verdict = strong_call(
                 run_dir, state, cfg, "integration",
-                {"accepted_batches": state["accepted_batches"], "final_evidence": evidence})
+                {"accepted_batches": state["accepted_batches"], "final_evidence": evidence},
+                deadline=deadline)
         consume_last(state)
         try:
             validate_acceptance_references(state, project, references)
@@ -7144,7 +7175,7 @@ def serve(run_id):
                 pause_with(run_dir, state, f"User requested {request}", "cancelled" if request == "cancel" else "paused")
                 return
             try:
-                advance(run_dir, state, cfg)
+                advance(run_dir, state, cfg, deadline=stage_deadline(cfg))
             except CheckoutOwnedError as exc:
                 # Do not write a legacy run just to report an ownership race.
                 print(json.dumps({"ok": False, "run_id": run_id,
@@ -8388,7 +8419,7 @@ def stage_run(run_id, expected_phase=None):
         started = time.monotonic()
         error = None
         try:
-            advance(folder, state, cfg)
+            advance(folder, state, cfg, deadline=stage_deadline(cfg))
         except CheckoutOwnedError as exc:
             return _checkout_conflict_payload(folder, state, exc)
         except InterruptedError as exc:

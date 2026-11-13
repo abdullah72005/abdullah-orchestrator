@@ -281,7 +281,7 @@ class ControlTests(unittest.TestCase):
                     {"title": "second", "goal": "Edit again", "acceptance": ["Changed"], "checks": [["true"]], "risk": "ordinary"},
                 ], "blocker": ""}
 
-        def strong(_dir, state, _cfg, kind, extra=None):
+        def strong(_dir, state, _cfg, kind, extra=None, **kwargs):
             calls.append(kind)
             if kind == "plan":
                 return plan
@@ -294,7 +294,7 @@ class ControlTests(unittest.TestCase):
                 return {"status": "complete", "summary": "Updated code", "files": ["app.py"]}, {"id": "job"}
             return {"status": "complete", "summary": "Independent check", "findings": []}, {"id": "review"}
 
-        def verify(_dir, state, _cfg, project, batch, final=False):
+        def verify(_dir, state, _cfg, project, batch, final=False, deadline=None):
             calls.append("final" if final else "check")
             snapshot = orc.source_snapshot(project)
             fingerprint = orc.signature(snapshot)

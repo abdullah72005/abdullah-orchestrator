@@ -46,6 +46,7 @@
     "max_worker_seconds": 14400,
     "max_architect_seconds": 14400,
     "max_check_seconds": 14400,
+    "max_stage_seconds": 17000,
     "max_explorer_calls_per_run": 8,
     "max_context_chars": 200000
   },
