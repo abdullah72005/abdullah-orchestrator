@@ -318,6 +318,132 @@ class DispatchSafetyTests(unittest.TestCase):
         self.assertFalse(contaminated["ok"])
         self.assertNotIn(SECRET, json.dumps(contaminated))
 
+    def managed_preflight(self, managed, extra=None):
+        home = self.root / "managed-home"
+        home.mkdir(exist_ok=True)
+        env = {"HOME": str(home)}
+        env.update(extra or {})
+        with patch.object(orc, "CLAUDE_MANAGED_SETTINGS_FILES", (managed,)):
+            return self.claude_preflight(env)
+
+    def managed_layout(self, base_present=False):
+        index = getattr(self, "_managed_index", 0)
+        self._managed_index = index + 1
+        managed = self.root / f"managed-policy-{index}" / "managed-settings.json"
+        managed.parent.mkdir(parents=True)
+        dropins = managed.parent / "managed-settings.d"
+        dropins.mkdir()
+        if base_present:
+            managed.write_text(json.dumps({"apiKeyHelper": "/bin/print-secret"}))
+        return managed, dropins
+
+    def test_managed_dropin_is_inspected_when_base_file_is_absent(self):
+        managed, dropins = self.managed_layout(base_present=False)
+        (dropins / "10-route.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_BASE_URL": "https://" + SECRET + ".invalid"}}))
+        result = self.managed_preflight(managed)
+        self.assertFalse(result["ok"])
+        reasons = " ".join(result["reasons"])
+        self.assertIn("10-route.json", reasons)
+        self.assertIn("ANTHROPIC_BASE_URL", reasons)
+        self.assertNotIn(SECRET, json.dumps(result))
+        env = {name: "" for name in orc.CLAUDE_BILLING_ENV}
+        env["HOME"] = str(self.root / "dropin-home")
+        (self.root / "dropin-home").mkdir()
+        with patch.dict(os.environ, env), \
+                patch.object(orc, "CLAUDE_MANAGED_SETTINGS_FILES", (managed,)):
+            with self.assertRaisesRegex(RuntimeError, "preflight"):
+                orc.call_model(self.rundir, self.state, self.cfg, "architect",
+                               "plan", "prompt", self.project, host="claude")
+        self.assertIsNone(self.state["active_job"])
+        for path in self.rundir.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(SECRET, path.read_text(errors="replace"), str(path))
+
+    def test_managed_dropins_are_ordered_and_hidden_or_non_json_ignored(self):
+        managed, dropins = self.managed_layout(base_present=True)
+        (dropins / "20-endpoint.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_AUTH_TOKEN": "placeholder"}}))
+        (dropins / "10-model.json").write_text(json.dumps({"model": "claude-haiku"}))
+        (dropins / ".hidden.json").write_text(json.dumps({"apiKeyHelper": "/bin/x"}))
+        (dropins / "notes.txt").write_text("not policy")
+        result = self.managed_preflight(managed)
+        self.assertFalse(result["ok"])
+        reasons = " ".join(result["reasons"])
+        self.assertIn("apiKeyHelper", reasons)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", reasons)
+        self.assertIn("model", reasons)
+        managed_entries = [entry for entry in result["observed"]["settings"]
+                           if str(entry["scope"]).startswith("managed")]
+        names = [Path(entry["path"]).name for entry in managed_entries]
+        self.assertEqual(names, ["managed-settings.json", "10-model.json",
+                                 "20-endpoint.json"])
+
+    def test_malformed_and_non_object_managed_dropins_fail_closed(self):
+        cases = {"bad-json": "{not json", "array": "[]"}
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                managed, dropins = self.managed_layout(base_present=False)
+                (dropins / f"{name}.json").write_text(text)
+                result = self.managed_preflight(managed)
+                self.assertFalse(result["ok"])
+                self.assertIn(name, " ".join(result["reasons"]))
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file permissions")
+    def test_unreadable_managed_dropin_fails_closed(self):
+        managed, dropins = self.managed_layout(base_present=False)
+        secret_file = dropins / "10-secret.json"
+        secret_file.write_text(json.dumps({"env": {
+            "ANTHROPIC_BASE_URL": "https://" + SECRET + ".invalid"}}))
+        secret_file.chmod(0)
+        self.addCleanup(secret_file.chmod, 0o600)
+        result = self.managed_preflight(managed)
+        self.assertFalse(result["ok"])
+        reasons = " ".join(result["reasons"])
+        self.assertIn("10-secret.json", reasons)
+        self.assertIn("unreadable", reasons)
+        self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_unreadable_managed_directory_fails_closed(self):
+        managed, dropins = self.managed_layout(base_present=False)
+        with patch.object(orc.os, "scandir", side_effect=PermissionError("denied")):
+            result = self.managed_preflight(managed)
+        self.assertFalse(result["ok"])
+        reasons = " ".join(result["reasons"])
+        self.assertIn("managed-settings.d", reasons)
+        self.assertIn("unreadable", reasons)
+
+    def test_clean_dropin_and_authorized_alternate_classification(self):
+        for name, payload in (("10-theme.json", {"theme": "dark"}),
+                              ("20-clean.json", {"env": {}})):
+            with self.subTest(name=name):
+                managed, dropins = self.managed_layout(base_present=False)
+                (dropins / name).write_text(json.dumps(payload))
+                clean = self.managed_preflight(managed)
+                self.assertTrue(clean["ok"], clean["reasons"])
+                self.assertEqual(clean["classification"], "subscription")
+                self.addCleanup(lambda: [p.unlink() for p in dropins.glob("*.json")])
+        managed, dropins = self.managed_layout(base_present=False)
+        (dropins / "10-route.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_BASE_URL": "https://authorized.invalid"}}))
+        alternate = {"provider": "claude", "model": "claude-opus-5-5",
+                     "effort": "high", "billing": "api"}
+        self.state["route_authorizations"] = [{
+            "id": "claude-dropin-api", "role": "architect",
+            "route_sha256": orc.route_authorization_sha(alternate),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "authorized alternate API route",
+            "actor": {"user": "operator"}}]
+        with patch.object(orc, "CLAUDE_MANAGED_SETTINGS_FILES", (managed,)):
+            env = {name: "" for name in orc.CLAUDE_BILLING_ENV}
+            env.update({"HOME": str(self.root / "dropin-home"),
+                        "ANTHROPIC_BASE_URL": "https://authorized.invalid"})
+            with patch.dict(os.environ, env):
+                authorized = orc.route_preflight(
+                    "architect", alternate, self.cfg, self.project, self.state)
+        self.assertTrue(authorized["ok"], authorized["reasons"])
+        self.assertEqual(authorized["classification"], "api")
+
     def test_clean_subscription_passes_and_authorized_alternate_remains_available(self):
         home = self.root / "claude-empty-home"
         home.mkdir()

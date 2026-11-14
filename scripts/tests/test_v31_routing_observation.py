@@ -55,6 +55,33 @@ output.write_text(json.dumps(report))
 '''
 
 
+CAPTURE_CLI = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if '--version' in args:
+    print(os.environ.get('FAKE_OPENCODE_VERSION', '1.18.35'))
+    sys.exit(0)
+if pathlib.Path(sys.argv[0]).name != 'opencode':
+    sys.exit(4)
+if 'models' in args:
+    print('local/probe-model')
+    sys.exit(0)
+if '--help' in args:
+    print('--agent --model --format --auto --session --variant --standalone')
+    sys.exit(0)
+capture = pathlib.Path(os.environ['FAKE_CAPTURE'])
+capture.write_text(json.dumps({'argv': args,
+                               'config': os.environ.get('OPENCODE_CONFIG_CONTENT')}))
+report = {'contract_version': 2, 'status': 'complete', 'summary': 'explored',
+          'files': ['app.py'], 'tests': [], 'evidence': ['app.py:1'],
+          'unknowns': [], 'blocker': ''}
+print(json.dumps({'type': 'text', 'sessionID': 'ses-capture',
+                  'part': {'text': json.dumps(report)}}))
+print(json.dumps({'type': 'step_finish', 'sessionID': 'ses-capture',
+                  'part': {'reason': 'stop'}}))
+'''
+
+
 class RoutingObservationTests(unittest.TestCase):
     setUp = baseline.ControlTests.setUp
     tearDown = baseline.ControlTests.tearDown
@@ -224,6 +251,303 @@ class RoutingObservationTests(unittest.TestCase):
                                "explorer", "prompt", self.project)
         self.assertIsNone(self.state["active_job"])
         self.assertFalse(history.exists())
+
+
+class EffectiveChildRoutingTests(unittest.TestCase):
+    """The observed route must equal the configuration the child actually runs."""
+
+    setUp = baseline.ControlTests.setUp
+    tearDown = baseline.ControlTests.tearDown
+
+    def setUp(self):
+        baseline.ControlTests.setUp(self)
+        self.home = self.root / "child-home"
+        self.home.mkdir()
+        self.bin_dir = self.root / "capture-bin"
+        self.bin_dir.mkdir()
+        script = self.bin_dir / "capture.py"
+        script.write_text(CAPTURE_CLI)
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        (self.bin_dir / "opencode").symlink_to(script)
+        self.capture = self.root / "capture.json"
+        self.env_patch = patch.dict(os.environ, {
+            "PATH": str(self.bin_dir) + ":" + os.environ["PATH"],
+            "HOME": str(self.home), "OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": "",
+            "XDG_CONFIG_HOME": "", "OPENCODE_CONFIG": "",
+            "OPENCODE_CONFIG_DIR": "", "OPENCODE_CONFIG_CONTENT": "",
+            "ZEN_BASE": "", "REVIEW_ROUTE_KEY": "",
+            "FAKE_CAPTURE": str(self.capture)})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR",
+                     "OPENCODE_CONFIG_CONTENT", "ZEN_BASE", "REVIEW_ROUTE_KEY"):
+            os.environ.pop(name, None)
+
+    def configure_local(self, dialect):
+        cfg = orc.read_json(orc.HERE / "config.example.json")
+        cfg["runtime"]["opencode_version"] = "1.18.35" if dialect == "v1" else "2.2.7"
+        cfg["workers"]["explorer"] = {
+            "provider": "local", "model": "local/probe-model",
+            "variant": "low", "billing": "local"}
+        orc.atomic_json(orc.CONFIG_PATH, cfg)
+        self.cfg = orc.config()
+        self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
+        os.environ["FAKE_OPENCODE_VERSION"] = cfg["runtime"]["opencode_version"]
+        self.addCleanup(lambda: os.environ.pop("FAKE_OPENCODE_VERSION", None))
+        return cfg
+
+    def ambient_local(self, dialect, endpoint="http://127.0.0.1:11434/v1"):
+        if dialect == "v1":
+            return {"provider": {"local": {
+                "options": {"baseURL": endpoint},
+                "models": {"probe-model": {}}}}}
+        return {"providers": {"local": {
+            "settings": {"baseURL": endpoint},
+            "models": {"probe-model": {}}}}}
+
+    def dispatch_local(self, dialect, ambient):
+        self.configure_local(dialect)
+        os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(ambient)
+        self.addCleanup(lambda: os.environ.pop("OPENCODE_CONFIG_CONTENT", None))
+        route = orc.model_route(self.cfg, "codex", "explorer", project=self.project)
+        self.state["model_routes"] = {"explorer": route}
+        self.state["route_authorizations"] = [{
+            "id": "grant-local-" + dialect, "role": "explorer",
+            "route_sha256": orc.route_authorization_sha(route),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "reviewed local loopback endpoint",
+            "actor": {"user": "tester"}, "at": orc.now()}]
+        orc.save(self.rundir, self.state)
+        return route
+
+    @staticmethod
+    def provider_container(dialect, content):
+        return content["provider" if dialect == "v1" else "providers"]["local"]
+
+    def test_fake_child_receives_the_approved_provider_for_both_dialects(self):
+        for dialect in ("v1", "v2"):
+            with self.subTest(dialect=dialect):
+                self.capture.unlink(missing_ok=True)
+                ambient = self.ambient_local(dialect)
+                route = self.dispatch_local(dialect, ambient)
+                pinned = route["routing_fingerprint"]
+                report, job = orc.call_model(
+                    self.rundir, self.state, self.cfg, "explorer", "explorer",
+                    "prompt", self.project)
+                self.assertTrue(self.capture.is_file(), report)
+                captured = json.loads(self.capture.read_text())
+                content = json.loads(captured["config"])
+                provider = self.provider_container(dialect, content)
+                options_key = "options" if dialect == "v1" else "settings"
+                self.assertEqual(provider[options_key]["baseURL"],
+                                 "http://127.0.0.1:11434/v1")
+                self.assertIn("probe-model", provider["models"])
+                container_key = "agent" if dialect == "v1" else "agents"
+                self.assertEqual(content[container_key]["abdullah-explorer"],
+                                 orc.opencode_profile("explorer", dialect))
+                self.assertIn("--model", captured["argv"])
+                selector = captured["argv"][captured["argv"].index("--model") + 1]
+                self.assertTrue(selector.startswith("local/probe-model"))
+                self.assertEqual(dialect == "v2", "--standalone" in captured["argv"])
+                self.assertEqual(dialect == "v1", "--variant" in captured["argv"])
+                # The pinned preflight identity must be reproducible from what
+                # the child actually received, not from a substituted inline env.
+                os.environ["OPENCODE_CONFIG_CONTENT"] = captured["config"]
+                recomputed = orc.routing_fingerprint(
+                    route, self.cfg, project=self.project, role="explorer")
+                self.assertEqual(recomputed, pinned)
+                self.assertEqual(job["preflight"]["current_routing_fingerprint"], pinned)
+
+    def test_inline_expansion_uses_the_child_environment_and_project_cwd(self):
+        self.configure_local("v1")
+        route = orc.model_route(self.cfg, "codex", "explorer", project=self.project)
+        (self.project / "endpoint.txt").write_text("http://127.0.0.1:9999/v1")
+        os.environ["ZEN_BASE"] = "http://127.0.0.1:8888/v1"
+        self.addCleanup(lambda: os.environ.pop("ZEN_BASE", None))
+        file_ambient = {"provider": {"local": {
+            "options": {"baseURL": "{file:endpoint.txt}"},
+            "models": {"probe-model": {}}}}}
+        os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(file_ambient)
+        self.addCleanup(lambda: os.environ.pop("OPENCODE_CONFIG_CONTENT", None))
+        observed = orc.opencode_provider_observation(
+            route, project=self.project, cfg=self.cfg, role="explorer")
+        self.assertEqual(observed["endpoint_source"], "provider")
+        self.assertEqual(observed["endpoint_sha256"], orc.hashlib.sha256(
+            b"http://127.0.0.1:9999/v1").hexdigest())
+        env_ambient = {"provider": {"local": {
+            "options": {"baseURL": "{env:ZEN_BASE}"},
+            "models": {"probe-model": {}}}}}
+        os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(env_ambient)
+        observed = orc.opencode_provider_observation(
+            route, project=self.project, cfg=self.cfg, role="explorer")
+        self.assertEqual(observed["endpoint_sha256"], orc.hashlib.sha256(
+            b"http://127.0.0.1:8888/v1").hexdigest())
+        # The wrapper strips credential variables from the child environment; a
+        # declared name must not be observed as an authenticated endpoint.
+        os.environ["OPENAI_API_KEY"] = "http://should-not-resolve.invalid/v1"
+        self.addCleanup(lambda: os.environ.pop("OPENAI_API_KEY", None))
+        stripped = {"provider": {"local": {
+            "options": {"baseURL": "{env:OPENAI_API_KEY}"},
+            "models": {"probe-model": {}}}}}
+        os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(stripped)
+        observed = orc.opencode_provider_observation(
+            route, project=self.project, cfg=self.cfg, role="explorer")
+        self.assertIsNone(observed["endpoint_sha256"])
+
+    def test_ambient_inline_controls_cannot_weaken_generated_profile(self):
+        self.configure_local("v1")
+        ambient = self.ambient_local("v1")
+        ambient.update({
+            "agent": {"abdullah-explorer": {"permission": {"*": "allow"}}},
+            "permission": {"bash": "allow"},
+            "subagent_depth": 3})
+        os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(ambient)
+        self.addCleanup(lambda: os.environ.pop("OPENCODE_CONFIG_CONTENT", None))
+        route = orc.model_route(self.cfg, "codex", "explorer", project=self.project)
+        self.state["route_authorizations"] = [{
+            "id": "grant-local", "role": "explorer",
+            "route_sha256": orc.route_authorization_sha(route),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "reviewed local loopback endpoint"}]
+        result = orc.route_preflight("explorer", route, self.cfg, self.project,
+                                     self.state, run_dir=self.rundir)
+        self.assertTrue(result["ok"], result["reasons"])
+        warnings = " ".join(result["warnings"])
+        for control in ("agent", "permission", "subagent_depth"):
+            self.assertIn(control, warnings)
+        content = json.loads(
+            orc.opencode_env("explorer", "v1")["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(content["agent"]["abdullah-explorer"],
+                         orc.opencode_profile("explorer", "v1"))
+        self.assertNotIn("permission", content)
+        self.assertEqual(content["subagent_depth"], 0)
+        self.assertIn("local", content["provider"])
+
+    def test_file_defined_worker_agent_conflict_fails_closed_before_spawn(self):
+        self.configure_local("v1")
+        (self.project / "opencode.json").write_text(json.dumps({
+            "provider": {"local": {"options": {
+                "baseURL": "http://127.0.0.1:11434/v1"},
+                "models": {"probe-model": {}}}},
+            "agent": {"abdullah-explorer": {"permission": {"*": "allow"},
+                                            "tools": {"write": True}}}}))
+        route = orc.model_route(self.cfg, "codex", "explorer", project=self.project)
+        self.state["model_routes"] = {"explorer": route}
+        self.state["route_authorizations"] = [{
+            "id": "grant-local", "role": "explorer",
+            "route_sha256": orc.route_authorization_sha(route),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "reviewed local loopback endpoint"}]
+        orc.save(self.rundir, self.state)
+        result = orc.route_preflight("explorer", route, self.cfg, self.project,
+                                     self.state, run_dir=self.rundir)
+        self.assertFalse(result["ok"])
+        self.assertIn("abdullah-explorer", " ".join(result["reasons"]))
+        with self.assertRaisesRegex(RuntimeError, "preflight"):
+            orc.call_model(self.rundir, self.state, self.cfg, "explorer",
+                           "explorer", "prompt", self.project)
+        self.assertIsNone(self.state["active_job"])
+        self.assertFalse(self.capture.exists())
+
+    def test_auth_environment_availability_is_part_of_the_pin_for_both_dialects(self):
+        for dialect in ("v1", "v2"):
+            with self.subTest(dialect=dialect):
+                self.configure_local(dialect)
+                options_key = "options" if dialect == "v1" else "settings"
+                container = "provider" if dialect == "v1" else "providers"
+                data = {container: {"local": {
+                    options_key: {"baseURL": "http://127.0.0.1:11434/v1"},
+                    "env": ["REVIEW_ROUTE_KEY"],
+                    "models": {"probe-model": {}}}}}
+                path = self.project / "opencode.json"
+                path.write_text(json.dumps(data))
+                route = orc.model_route(self.cfg, "codex", "explorer",
+                                        project=self.project)
+                absent_pin = route["routing_fingerprint"]
+                os.environ["REVIEW_ROUTE_KEY"] = "dummy-not-a-real-key"
+                self.addCleanup(lambda: os.environ.pop("REVIEW_ROUTE_KEY", None))
+                present_pin = orc.routing_fingerprint(
+                    route, self.cfg, project=self.project)
+                self.assertNotEqual(absent_pin, present_pin)
+                blocked = orc.route_preflight(
+                    "explorer", route, self.cfg, self.project, self.state,
+                    run_dir=self.rundir)
+                self.assertFalse(blocked["ok"])
+                self.assertIn("routing material changed", " ".join(blocked["reasons"]))
+                self.assertNotIn("dummy-not-a-real-key", json.dumps(blocked))
+                del os.environ["REVIEW_ROUTE_KEY"]
+                self.assertEqual(
+                    orc.routing_fingerprint(route, self.cfg,
+                                            project=self.project),
+                    absent_pin)
+
+    def test_go_route_model_and_variant_endpoint_overrides_are_not_subscription(self):
+        for dialect in ("v1", "v2"):
+            options_key = "options" if dialect == "v1" else "settings"
+            container = "provider" if dialect == "v1" else "providers"
+            for layer in ("model", "variant", "remap"):
+                with self.subTest(dialect=dialect, layer=layer):
+                    self.configure_local(dialect)
+                    model = {"modelID": "go-model"}
+                    if layer == "model":
+                        model[options_key] = {
+                            "baseURL": "https://proxy.invalid/v1"}
+                    elif layer == "variant":
+                        model["variants"] = {"low": {options_key: {
+                            "baseURL": "https://variant.invalid/v1"}}}
+                    else:
+                        model["modelID"] = "remapped-upstream"
+                    data = {container: {"opencode-go": {
+                        options_key: {}, "models": {"go-model": model}}}}
+                    (self.project / "opencode.json").write_text(json.dumps(data))
+                    route = {"provider": "opencode",
+                             "worker_provider": "opencode-go",
+                             "model": "opencode-go/go-model", "effort": "low",
+                             "billing": "go"}
+                    result = orc.route_preflight("explorer", route, self.cfg,
+                                                 self.project, self.state,
+                                                 run_dir=self.rundir)
+                    self.assertFalse(result["ok"])
+                    self.assertNotEqual(result["classification"], "go_subscription")
+                    self.assertRegex(" ".join(result["reasons"]),
+                                     "model|variant|remap|endpoint|package|canonical")
+                    # An accurately classified explicit grant may still dispatch.
+                    grant_route = dict(route, billing="api")
+                    self.state["route_authorizations"] = [{
+                        "id": "grant-go-override", "role": "explorer",
+                        "route_sha256": orc.route_authorization_sha(grant_route),
+                        "max_dispatches": 1, "used": 0,
+                        "attestation": "reviewed custom proxy endpoint"}]
+                    authorized = orc.route_preflight(
+                        "explorer", grant_route, self.cfg, self.project,
+                        self.state, run_dir=self.rundir)
+                    self.assertTrue(authorized["ok"], authorized["reasons"])
+                    self.assertEqual(authorized["classification"], "api")
+
+    def test_unchanged_go_route_remains_a_subscription_without_a_grant(self):
+        for dialect in ("v1", "v2"):
+            with self.subTest(dialect=dialect):
+                self.configure_local(dialect)
+                options_key = "options" if dialect == "v1" else "settings"
+                container = "provider" if dialect == "v1" else "providers"
+                data = {
+                    container: {
+                        "opencode-go": {
+                            options_key: {},
+                            "models": {"go-model": {}},
+                        }
+                    }
+                }
+                (self.project / "opencode.json").write_text(json.dumps(data))
+                route = {"provider": "opencode",
+                         "worker_provider": "opencode-go",
+                         "model": "opencode-go/go-model", "effort": "low",
+                         "billing": "go"}
+                result = orc.route_preflight("explorer", route, self.cfg,
+                                             self.project, self.state,
+                                             run_dir=self.rundir)
+                self.assertTrue(result["ok"], result["reasons"])
+                self.assertEqual(result["classification"], "go_subscription")
 
 
 if __name__ == "__main__":

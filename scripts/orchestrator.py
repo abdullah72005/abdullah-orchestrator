@@ -1103,14 +1103,50 @@ def _claude_config_dir():
 
 def _claude_settings_paths(project=None):
     root = _claude_config_dir()
-    entries = [("user", root / "settings.json")]
+    entries = [("user", root / "settings.json", False)]
     if project is not None:
         entries.extend([
-            ("project", Path(project) / ".claude" / "settings.json"),
-            ("local", Path(project) / ".claude" / "settings.local.json"),
+            ("project", Path(project) / ".claude" / "settings.json", False),
+            ("local", Path(project) / ".claude" / "settings.local.json", False),
         ])
-    entries.extend(("managed", path) for path in CLAUDE_MANAGED_SETTINGS_FILES)
     return entries
+
+
+def _managed_settings_entries():
+    """Base managed file then documented sibling ``*.d/*.json`` fragments.
+
+    Claude reads ``managed-settings.d/*.json`` even when the base file is
+    absent, so those inspectable local fragments are part of the effective
+    policy.  Missing base files are benign; an unreadable file or directory is
+    not, because it would silently hide a routing override.
+    """
+    entries = []
+    errors = []
+    for configured in CLAUDE_MANAGED_SETTINGS_FILES:
+        base = Path(configured)
+        entries.append(("managed", base, False))
+        dropins = base.parent / (base.stem + ".d")
+        try:
+            with os.scandir(dropins) as scan:
+                names = sorted(
+                    item.name for item in scan
+                    if item.name.endswith(".json")
+                    and not item.name.startswith(".")
+                    and item.is_file())
+        except FileNotFoundError:
+            continue
+        except NotADirectoryError:
+            errors.append(
+                f"managed settings path {dropins} is not a directory")
+            continue
+        except OSError as exc:
+            errors.append(
+                f"unreadable managed settings directory {dropins} "
+                f"({exc.__class__.__name__})")
+            continue
+        entries.extend((f"managed drop-in {name}", dropins / name, True)
+                       for name in names)
+    return entries, errors
 
 
 def _present(name):
@@ -1149,9 +1185,10 @@ def claude_billing_hazards(project=None):
     reasons = []
     observed = {"env": {}, "settings": [], "inert_cloud": [],
                 "config_dir": str(_claude_config_dir()),
+                "managed_errors": [],
                 "managed_sources": (
-                    "local settings files only; server/MDM-delivered managed "
-                    "settings are not observable here")}
+                    "local settings files and managed-settings.d fragments only; "
+                    "server/MDM-delivered managed settings are not observable here")}
     for name in CLAUDE_BILLING_ENV:
         state = _present(name)
         if state["present"]:
@@ -1181,22 +1218,32 @@ def claude_billing_hazards(project=None):
             observed["inert_cloud"].append(name)
             if aws_selected:
                 reasons.append(f"{name} is present alongside a provider-managed Claude route")
-    for scope, path in _claude_settings_paths(project):
+    managed_entries, managed_errors = _managed_settings_entries()
+    observed["managed_errors"] = managed_errors
+    reasons.extend(f"Claude policy inspection failed: {error}"
+                   for error in managed_errors)
+    for scope, path, listed in _claude_settings_paths(project) + managed_entries:
         observed_entry = {"scope": scope, "path": str(path), "present": path.is_file()}
-        if path.is_file():
-            data, error = _inspect_json_settings(path)
-            observed_entry["error"] = error
-            observed_entry["influential"] = data
-            if error:
-                reasons.append(f"{scope} Claude settings {error}: {path}")
-            elif data and (data["hazards"] or data["env_names"]):
+        if not observed_entry["present"]:
+            if listed:
+                error = "missing or unreadable"
+                observed_entry["error"] = error
+                reasons.append(f"{scope} Claude settings file is {error}: {path}")
+            observed["settings"].append(observed_entry)
+            continue
+        data, error = _inspect_json_settings(path)
+        observed_entry["error"] = error
+        observed_entry["influential"] = data
+        if error:
+            reasons.append(f"{scope} Claude settings {error}: {path}")
+        elif data and (data["hazards"] or data["env_names"]):
+            reasons.append(
+                f"{scope} Claude settings set billing/routing keys: "
+                + ", ".join(sorted(set(data["hazards"] + data["env_names"]))))
+            if "CLAUDE_CONFIG_DIR" in data["env_names"]:
                 reasons.append(
-                    f"{scope} Claude settings set billing/routing keys: "
-                    + ", ".join(sorted(set(data["hazards"] + data["env_names"]))))
-                if "CLAUDE_CONFIG_DIR" in data["env_names"]:
-                    reasons.append(
-                        f"{scope} Claude settings change CLAUDE_CONFIG_DIR; the effective "
-                        "settings directory cannot be established from this process")
+                    f"{scope} Claude settings change CLAUDE_CONFIG_DIR; the effective "
+                    "settings directory cannot be established from this process")
         observed["settings"].append(observed_entry)
     return reasons, observed
 
@@ -1279,18 +1326,23 @@ def _strip_jsonc(text):
     return "".join(result)
 
 
-def _expand_opencode_value(value, base_dir):
-    """Expand documented {env:...}/{file:...} references for hashing only."""
+def _expand_opencode_value(value, base_dir, env=None):
+    """Expand documented {env:...}/{file:...} references for hashing only.
+
+    ``env`` must be the child environment so a declared variable name is never
+    mistaken for an available credential.
+    """
+    env = os.environ if env is None else env
     if isinstance(value, dict):
-        return {key: _expand_opencode_value(item, base_dir)
+        return {key: _expand_opencode_value(item, base_dir, env)
                 for key, item in value.items()}
     if isinstance(value, list):
-        return [_expand_opencode_value(item, base_dir) for item in value]
+        return [_expand_opencode_value(item, base_dir, env) for item in value]
     if not isinstance(value, str):
         return value
 
     def env_replace(match):
-        return os.environ.get(match.group(1), "")
+        return env.get(match.group(1), "")
 
     def file_replace(match):
         raw = match.group(1)
@@ -1388,70 +1440,232 @@ def _opencode_endpoint(settings):
     return None
 
 
-def opencode_provider_observation(route, project=None, dialect=None, cfg=None):
-    """Redacted view of the effective OpenCode provider configuration.
+# Top-level routing material that may be carried from an ambient inline config
+# into the generated worker configuration.  Worker control blocks (agent
+# permissions, subagent depth) are never copied: the generated profile owns them.
+OPENCODE_ROUTING_KEYS = {
+    "v1": ("provider", "model", "small_model", "smallModel",
+           "disabled_providers", "enabled_providers"),
+    "v2": ("providers", "model", "small_model", "smallModel"),
+}
+OPENCODE_CONTROL_KEYS = {
+    "v1": frozenset({"agent", "agents", "permission", "permissions",
+                     "subagent_depth"}),
+    "v2": frozenset({"agent", "agents", "permission", "permissions",
+                     "experimental"}),
+}
+GO_REMAP_KEYS = ("package", "canonical")
 
-    Reads every applicable documented config location, honors JSONC and
-    ``{env:...}``/``{file:...}`` expansion, and uses the selected installed
-    dialect's provider shape.  Only redacted routing material is hashed; raw
-    secrets never leave this function.
+
+def _opencode_generated_controls(role, dialect):
+    """The permission/agent controls the wrapper must retain authority over."""
+    agent_map = {f"abdullah-{role}": opencode_profile(role, dialect)}
+    if dialect == "v1":
+        return {"agent": agent_map, "subagent_depth": 0}
+    return {"agents": agent_map, "experimental": {"subagent_depth": 0}}
+
+
+def _opencode_inline_partition(raw, dialect):
+    """Split ambient inline config into preserved routing and dropped controls."""
+    if not raw:
+        return {}, [], [], False, None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}, [], [], False, (
+            "OPENCODE_CONFIG_CONTENT is not valid JSON; effective routing "
+            "cannot be established")
+    if not isinstance(data, dict):
+        return {}, [], [], False, ("OPENCODE_CONFIG_CONTENT is not a JSON object")
+    routing_keys = OPENCODE_ROUTING_KEYS[dialect]
+    controls = OPENCODE_CONTROL_KEYS[dialect]
+    preserved = {key: copy.deepcopy(data[key]) for key in routing_keys if key in data}
+    neutralized = sorted(key for key in data if key in controls)
+    dropped = sorted(key for key in data
+                     if key not in routing_keys and key not in controls
+                     and key != "$schema")
+    return preserved, neutralized, dropped, True, None
+
+
+def opencode_child_inline(role, dialect, ambient=None):
+    """Exact OPENCODE_CONFIG_CONTENT the dispatched worker receives.
+
+    Supported routing fields survive; generated worker controls are applied
+    last so ambient inline agents/settings cannot weaken them.
     """
-    provider = _route_worker_provider(route)
-    if dialect is None:
-        dialect = _opencode_dialect_for_observation(cfg)
-    observed = {"provider": provider, "config": [], "providers": [],
-                "available": False, "error": None, "dialect": dialect,
-                "effective_files": [], "sources": []}
-    if dialect not in {"v1", "v2"}:
-        observed["error"] = (
-            "Cannot establish the installed OpenCode dialect; effective provider "
-            "routing is unprovable (configure an exact runtime.opencode_version "
-            "or install a supported CLI)")
-        return observed
+    raw = os.environ.get("OPENCODE_CONFIG_CONTENT") if ambient is None else ambient
+    preserved, neutralized, dropped, had_inline, error = _opencode_inline_partition(
+        raw, dialect)
+    inline = {"$schema": "https://opencode.ai/config.json"}
+    if not error:
+        inline.update(preserved)
+        if role is not None:
+            inline.update(_opencode_generated_controls(role, dialect))
+    return inline, {"preserved": sorted(preserved), "neutralized": neutralized,
+                    "dropped": dropped, "had_inline": had_inline,
+                    "error": error}
+
+
+def _opencode_control_conflict(merged, role):
+    """Refuse file-level agents that would shadow the generated worker agent."""
+    if role is None:
+        return None
+    name = f"abdullah-{role}"
+    for key in ("agent", "agents"):
+        agents = merged.get(key)
+        if isinstance(agents, dict) and name in agents:
+            return (
+                f"OpenCode config defines worker agent {name!r}, which would "
+                "override the generated ordered permissions and subagent "
+                "restrictions; rename or remove that agent before dispatch")
+    return None
+
+
+def _opencode_child_config(role, dialect, project=None, *, child_env=None):
+    """Effective config the child sees: documented files plus our inline block."""
+    child_env = scrubbed_env() if child_env is None else child_env
     merged = {}
-    explicit_error = None
+    files = []
+    explicit = os.environ.get("OPENCODE_CONFIG")
+    explicit_path = Path(explicit).expanduser() if explicit else None
     for path in _opencode_config_files(project):
         if not path.is_file():
-            if path == Path(os.environ.get("OPENCODE_CONFIG", "")).expanduser() \
-                    and os.environ.get("OPENCODE_CONFIG"):
-                explicit_error = f"OPENCODE_CONFIG file is missing: {path}"
+            if explicit_path is not None and path == explicit_path:
+                return {"config": {}, "files": files, "inline": {},
+                        "error": f"OPENCODE_CONFIG file is missing: {path}"}
             continue
-        observed["effective_files"].append(str(path))
+        files.append(str(path))
         try:
             text = path.read_text(encoding="utf-8")
             if path.suffix == ".jsonc":
                 text = _strip_jsonc(text)
             data = json.loads(text)
         except (OSError, ValueError) as exc:
-            observed["error"] = (
-                f"unreadable influential OpenCode config {path} "
-                f"({exc.__class__.__name__}); routing cannot be established")
-            return observed
+            return {"config": {}, "files": files, "inline": {},
+                    "error": (f"unreadable influential OpenCode config {path} "
+                              f"({exc.__class__.__name__}); routing cannot be "
+                              "established")}
         if not isinstance(data, dict):
-            observed["error"] = f"OpenCode config {path} is not a JSON object"
-            return observed
-        base = path.parent
-        _deep_merge(merged, _expand_opencode_value(data, base))
-        observed["config"].append(str(path))
-        observed["sources"].append(str(path))
-    inline = os.environ.get("OPENCODE_CONFIG_CONTENT")
-    if inline:
-        try:
-            data = json.loads(inline)
-        except ValueError:
-            observed["error"] = (
-                "OPENCODE_CONFIG_CONTENT is not valid JSON; effective routing "
-                "cannot be established")
-            return observed
-        if not isinstance(data, dict):
-            observed["error"] = "OPENCODE_CONFIG_CONTENT is not a JSON object"
-            return observed
-        _deep_merge(merged, _expand_opencode_value(data, Path.cwd()))
-        observed["sources"].append("OPENCODE_CONFIG_CONTENT")
-    if explicit_error:
-        observed["error"] = explicit_error
+            return {"config": {}, "files": files, "inline": {},
+                    "error": f"OpenCode config {path} is not a JSON object"}
+        _deep_merge(merged, _expand_opencode_value(data, path.parent, child_env))
+    conflict = _opencode_control_conflict(merged, role)
+    if conflict:
+        return {"config": {}, "files": files, "inline": {}, "error": conflict}
+    inline, meta = opencode_child_inline(role, dialect)
+    if meta["error"]:
+        return {"config": {}, "files": files, "inline": meta, "error": meta["error"]}
+    inline_base = Path(project).expanduser().resolve() if project else Path.cwd()
+    _deep_merge(merged, _expand_opencode_value(inline, inline_base, child_env))
+    return {"config": merged, "files": files, "inline": meta, "error": None}
+
+
+def _opencode_layer_settings(layer, dialect):
+    if not isinstance(layer, dict):
+        return {}
+    value = layer.get("options" if dialect == "v1" else "settings")
+    return value if isinstance(value, dict) else {}
+
+
+def _opencode_route_layers(dialect, entry, model_id, variant):
+    """Provider, then selected model, then selected variant material."""
+    layers = [("provider", entry)]
+    models = entry.get("models") if isinstance(entry, dict) else None
+    model_entry = (models.get(model_id)
+                   if isinstance(models, dict) and model_id else None)
+    if isinstance(model_entry, (dict, str)):
+        layers.append(("model", model_entry))
+    variant_entry = None
+    if isinstance(model_entry, dict) and variant:
+        variants = model_entry.get("variants")
+        if isinstance(variants, dict):
+            variant_entry = variants.get(variant)
+    if isinstance(variant_entry, (dict, str)):
+        layers.append(("variant", variant_entry))
+    return layers, model_entry, variant_entry
+
+
+def _opencode_effective_endpoint(dialect, entry, model_id, variant):
+    """Most specific configured endpoint, matching documented precedence."""
+    layers, _, _ = _opencode_route_layers(dialect, entry, model_id, variant)
+    for source, layer in reversed(layers):
+        endpoint = _opencode_endpoint(_opencode_layer_settings(layer, dialect))
+        if endpoint:
+            return endpoint, source
+    return None, None
+
+
+def _opencode_go_qualification(provider, entry, model_id, model_entry,
+                               variant_entry, endpoint, endpoint_source):
+    """Reasons an inspectable remap cannot qualify for legacy Go consent."""
+    if not isinstance(entry, dict):
+        return {"qualified": True, "reasons": []}
+    reasons = []
+    if endpoint:
+        reasons.append(
+            f"effective endpoint is overridden by {endpoint_source} settings")
+    for key in GO_REMAP_KEYS:
+        if entry.get(key):
+            reasons.append(f"provider remaps {key}")
+    for layer, layer_entry in (("model", model_entry),
+                               ("variant", variant_entry)):
+        if not isinstance(layer_entry, dict):
+            continue
+        for key in GO_REMAP_KEYS:
+            if layer_entry.get(key):
+                reasons.append(f"{layer} remaps {key}")
+        for key, expected in (("modelID", model_id), ("providerID", provider)):
+            value = layer_entry.get(key)
+            if value in {None, ""}:
+                continue
+            if str(value) != str(expected):
+                reasons.append(f"{layer} remaps {key}")
+    return {"qualified": not reasons, "reasons": reasons}
+
+
+def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
+                                  role=None):
+    """Redacted view of the effective OpenCode provider configuration.
+
+    Reads every applicable documented config location, honors JSONC and
+    ``{env:...}``/``{file:...}`` expansion in the child environment, and models
+    the same generated inline block that :func:`opencode_env` sends.  Only
+    redacted routing material is hashed; raw secrets never leave this function.
+    """
+    provider = _route_worker_provider(route)
+    if dialect is None:
+        dialect = _opencode_dialect_for_observation(cfg)
+    observed = {"provider": provider, "config": [], "providers": [],
+                "available": False, "error": None, "dialect": dialect,
+                "effective_files": [], "sources": [],
+                "inline_preserved": [], "inline_neutralized": [],
+                "inline_dropped": []}
+    if dialect not in {"v1", "v2"}:
+        observed["error"] = (
+            "Cannot establish the installed OpenCode dialect; effective provider "
+            "routing is unprovable (configure an exact runtime.opencode_version "
+            "or install a supported CLI)")
         return observed
-    observed["available"] = bool(observed["effective_files"] or inline)
+    child_env = scrubbed_env()
+    composition = _opencode_child_config(role, dialect, project,
+                                         child_env=child_env)
+    if composition.get("error"):
+        observed["effective_files"] = composition.get("files") or []
+        observed["error"] = composition["error"]
+        return observed
+    observed["effective_files"] = composition["files"]
+    observed["config"] = list(composition["files"])
+    observed["sources"] = list(composition["files"])
+    meta = composition.get("inline") or {}
+    observed["inline_preserved"] = meta.get("preserved", [])
+    observed["inline_neutralized"] = meta.get("neutralized", [])
+    observed["inline_dropped"] = meta.get("dropped", [])
+    if meta.get("had_inline"):
+        observed["sources"].append("OPENCODE_CONFIG_CONTENT")
+    observed["available"] = bool(composition["files"] or meta.get("had_inline"))
+    merged = composition["config"]
+    model_id = str(route.get("model") or "").split("/", 1)[-1]
+    variant = str(route.get("effort") or "")
     container_key = "provider" if dialect == "v1" else "providers"
     providers = merged.get(container_key)
     if isinstance(providers, dict):
@@ -1459,11 +1673,12 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None):
         entry = providers.get(provider)
         if isinstance(entry, dict):
             observed["provider_configured"] = True
-            option_key = "options" if dialect == "v1" else "settings"
-            settings = entry.get(option_key)
-            if not isinstance(settings, dict):
-                settings = {}
-            endpoint = _opencode_endpoint(settings)
+            settings = _opencode_layer_settings(entry, dialect)
+            _, model_entry, variant_entry = _opencode_route_layers(
+                dialect, entry, model_id, variant)
+            endpoint, endpoint_source = _opencode_effective_endpoint(
+                dialect, entry, model_id, variant)
+            observed["endpoint_source"] = endpoint_source
             observed["endpoint_sha256"] = (
                 hashlib.sha256(_without_url_credentials(endpoint).encode()).hexdigest()
                 if endpoint else None)
@@ -1474,6 +1689,16 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None):
                 {str(name) for name in env_names}
                 | {str(key) for key in settings
                    if SECRET_ROUTING_KEY.search(str(key))})
+            layer_auth = {}
+            for layer_name, layer_entry in (("model", model_entry),
+                                            ("variant", variant_entry)):
+                layer_settings = _opencode_layer_settings(layer_entry, dialect)
+                keys = sorted(str(key) for key in layer_settings
+                              if SECRET_ROUTING_KEY.search(str(key)))
+                layer_auth[layer_name] = {
+                    "keys": keys,
+                    "present": any(layer_settings[key] not in {None, ""}
+                                   for key in keys)}
             observed["auth_mode_sha256"] = content_hash({
                 "env": observed["auth_env_names"],
                 "package": entry.get("package"),
@@ -1484,18 +1709,20 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None):
                     value not in {None, ""} for key, value in settings.items()
                     if SECRET_ROUTING_KEY.search(str(key))),
                 "env_available": {
-                    str(name): bool(os.environ.get(str(name)))
+                    str(name): bool(child_env.get(str(name)))
                     for name in env_names},
+                "layers": layer_auth,
             })
             models = entry.get("models")
             if not isinstance(models, dict):
                 models = {}
             observed["model_count"] = len(models)
-            model_id = str(route.get("model") or "").split("/", 1)[-1]
-            selected_model = models.get(model_id)
             observed["model_sha256"] = content_hash(
-                _redacted_routing_material(selected_model if selected_model is not None
+                _redacted_routing_material(model_entry if model_entry is not None
                                            else {}))
+            observed["go_route"] = _opencode_go_qualification(
+                provider, entry, model_id, model_entry, variant_entry,
+                endpoint, endpoint_source)
             routing_material = {
                 "dialect": dialect,
                 "provider": provider,
@@ -1503,8 +1730,14 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None):
                 "config_files": observed["effective_files"],
                 "provider_entry": _redacted_routing_material(entry),
                 "selected_model": _redacted_routing_material(
-                    selected_model if selected_model is not None else {}),
-                "route_variant": route.get("effort", ""),
+                    model_entry if model_entry is not None else {}),
+                "selected_variant": _redacted_routing_material(
+                    variant_entry if variant_entry is not None else {}),
+                "route_variant": variant,
+                "endpoint_source": endpoint_source,
+                "inline_routing": _redacted_routing_material(
+                    {key: merged.get(key) for key in OPENCODE_ROUTING_KEYS[dialect]
+                     if key in merged}),
                 "top_level": {
                     key: _redacted_routing_material(merged.get(key))
                     for key in ("model", "small_model", "smallModel",
@@ -1516,15 +1749,17 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None):
 
 
 def routing_fingerprint(route, cfg=None, project=None, dialect=None,
-                        observation=None):
+                        observation=None, role=None):
     """Redacted identity of provider routing material pinned into a run.
 
     Endpoints/auth keys are hashed; unrelated providers and raw secrets are
     excluded.  Unreadable effective configuration is represented explicitly so
-    a change from readable to unreadable is detected.
+    a change from readable to unreadable is detected.  Authentication mode is
+    bound in every branch, because an env name and an available credential are
+    different effective routes.
     """
     observation = observation or opencode_provider_observation(
-        route, project=project, dialect=dialect, cfg=cfg)
+        route, project=project, dialect=dialect, cfg=cfg, role=role)
     material = {
         "provider": route.get("provider"),
         "worker_provider": route.get("worker_provider"),
@@ -1541,12 +1776,13 @@ def routing_fingerprint(route, cfg=None, project=None, dialect=None,
             "provider_configured": observation.get("provider_configured"),
             "endpoint_sha256": observation.get("endpoint_sha256"),
             "auth_env_names": observation.get("auth_env_names"),
-            "auth_mode_sha256": observation.get("auth_mode_sha256"),
             "model_sha256": observation.get("model_sha256"),
             "model_count": observation.get("model_count"),
             "error": bool(observation.get("error")),
             "dialect": observation.get("dialect"),
         }
+    if observation.get("auth_mode_sha256"):
+        material["auth_mode_sha256"] = observation["auth_mode_sha256"]
     return content_hash(material)
 
 
@@ -1560,11 +1796,12 @@ def model_route(cfg, host, role, project=None):
         raise ValueError(f"Unknown worker role {role!r}")
     spec = cfg["workers"][role]
     route = normalize_worker_spec(role, spec, legacy_go=True)
-    route["routing_fingerprint"] = routing_fingerprint(route, cfg, project=project)
+    route["routing_fingerprint"] = routing_fingerprint(
+        route, cfg, project=project, role=role)
     fallback = route.get("fallback_route")
     if isinstance(fallback, dict):
         fallback["routing_fingerprint"] = routing_fingerprint(
-            fallback, cfg, project=project)
+            fallback, cfg, project=project, role=role)
     return route
 
 
@@ -1835,7 +2072,8 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
             "billing 'go' is only valid for the unchanged OpenCode Go provider; "
             f"provider {worker_provider!r} requires explicit api/subscription/free/local billing")
         return result
-    observation = opencode_provider_observation(route, project=project, cfg=cfg)
+    observation = opencode_provider_observation(route, project=project, cfg=cfg,
+                                                role=role)
     result["observed"] = observation
     if observation.get("error"):
         # Unreadable or uninspectable effective routing is never a warning: it
@@ -1843,10 +2081,15 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
         result["reasons"].append(observation["error"])
         result["classification"] = "unprovable_routing"
         return result
+    if observation.get("inline_neutralized"):
+        result["warnings"].append(
+            "ambient OPENCODE_CONFIG_CONTENT control keys were replaced by the "
+            "generated worker controls: "
+            + ", ".join(observation["inline_neutralized"]))
     pinned = route.get("routing_fingerprint")
     if pinned:
         current = routing_fingerprint(route, cfg, project=project,
-                                      observation=observation)
+                                      observation=observation, role=role)
         result["current_routing_fingerprint"] = current
         if current != pinned:
             result["reasons"].append(
@@ -1854,6 +2097,16 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
                 "instead of silently rerouting")
             return result
     if billing == "go":
+        qualification = observation.get("go_route") or {
+            "qualified": True, "reasons": []}
+        if not qualification.get("qualified", True):
+            result["classification"] = "unqualified_go_route"
+            result["reasons"].append(
+                "Go route has an inspectable routing override that cannot qualify "
+                "for legacy Go consent ("
+                + "; ".join(qualification.get("reasons") or [])
+                + "); use explicit api/subscription billing with `authorize-route`")
+            return result
         result["classification"] = "go_subscription"
         if observation.get("endpoint_sha256"):
             result["reasons"].append(
@@ -4681,13 +4934,11 @@ def opencode_env(role, dialect, allow_free=False):
         # Free-model discovery is disabled by default.  Only an explicitly
         # authorized free route policy may remove this guard.
         env["OPENCODE_DISABLE_FREE_MODELS"] = "1"
-    agent_map = {f"abdullah-{role}": opencode_profile(role, dialect)}
-    if dialect == "v1":
-        inline = {"$schema": "https://opencode.ai/config.json",
-                  "agent": agent_map, "subagent_depth": 0}
-    else:
-        inline = {"$schema": "https://opencode.ai/config.json",
-                  "agents": agent_map, "experimental": {"subagent_depth": 0}}
+    # The inline block is generated from the same boundary the preflight
+    # observation/fingerprint use, so an approved provider is not discarded.
+    inline, meta = opencode_child_inline(role, dialect)
+    if meta.get("error"):
+        raise RuntimeError(meta["error"])
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(inline)
     return env
 
@@ -8625,7 +8876,8 @@ def migrate_run(run_id, backup_dir=None, route_map=None):
         for role in ("explorer", "implementer", "reviewer"):
             route = routes[role]
             previous_pin = route.get("routing_fingerprint")
-            route["routing_fingerprint"] = routing_fingerprint(route, project=project)
+            route["routing_fingerprint"] = routing_fingerprint(
+                route, project=project, role=role)
             route["routing_pin_source"] = "migration_observation"
             pin_records[role] = {"previous": previous_pin,
                                  "current": route["routing_fingerprint"]}
@@ -8633,7 +8885,7 @@ def migrate_run(run_id, backup_dir=None, route_map=None):
             if isinstance(fallback, dict):
                 previous_fallback = fallback.get("routing_fingerprint")
                 fallback["routing_fingerprint"] = routing_fingerprint(
-                    fallback, project=project)
+                    fallback, project=project, role=role)
                 fallback["routing_pin_source"] = "migration_observation"
                 pin_records[f"{role}.fallback"] = {
                     "previous": previous_fallback,
