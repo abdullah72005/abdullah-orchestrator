@@ -315,7 +315,7 @@ class ControlTests(unittest.TestCase):
             fingerprint = orc.signature(snapshot)
             evidence_path = self.root / "mock-verification.json"
             orc.atomic_json(evidence_path, {"evidence_version": 2,
-                "provenance": {"version": 2, "source": snapshot,
+                "provenance": {"version": orc.SOURCE_PROVENANCE_VERSION, "source": snapshot,
                     "configuration": snapshot.get("configuration"),
                     "environment": snapshot.get("environment"),
                     "toolchain": snapshot.get("toolchain"),

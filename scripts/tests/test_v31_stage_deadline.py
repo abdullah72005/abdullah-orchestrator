@@ -38,13 +38,53 @@ class StageDeadlineTests(unittest.TestCase):
         self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
         orc.save(self.rundir, self.state)
 
-    def test_sequential_checks_are_clipped_to_one_stage_deadline(self):
-        self.configure_stage(1.2)
+    def test_expired_budget_before_next_child_blocks_verification(self):
+        # Deterministic seam: a genuinely expired whole-stage deadline.  No
+        # substring of the safe runtime wording is required.
+        self.configure_stage(1.0)
         plan = {"contract_version": 2, "status": "complete", "summary": "plan",
                 "invariants": ["Keep behavior"],
                 "batches": [{"title": "one", "goal": "g", "acceptance": ["a"],
-                             "checks": [[sys.executable, "-c", "import time; time.sleep(1)"],
-                                        [sys.executable, "-c", "import time; time.sleep(1)"]],
+                             "checks": [[sys.executable, "-c", "pass"]],
+                             "risk": "ordinary"}],
+                "blocker": ""}
+        self.state.update(phase="verify", plan=plan,
+                          plan_version=orc.content_hash(plan), batch_index=0,
+                          single_batch_fast_path=False)
+        orc.save(self.rundir, self.state)
+        expired = orc.time.monotonic() - 1.0
+        with patch.object(orc, "stage_deadline", lambda cfg: expired):
+            result = orc.stage_run("test-run00")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "verify")
+        self.assertTrue(result["pause_reason"])
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertIn(state["status"], {"uncertain", "blocked"})
+        self.assertEqual(state["phase"], "verify")
+        self.assertIsNone(state.get("verification"))
+        self.assertIsNone(state.get("active_job"))
+        self.assertIsNone(state.get("active_check"))
+        self.assertFalse(state.get("completed_jobs"))
+        self.assertFalse(state.get("accepted_batches"))
+        # No Reviewer/worker is dispatched after an expired pre-child budget.
+        with patch.object(orc, "stage_deadline", lambda cfg: expired):
+            again = orc.stage_run("test-run00")
+        after = orc.read_json(self.rundir / "state.json")
+        self.assertFalse(again["ok"])
+        self.assertEqual(after["phase"], "verify")
+        self.assertNotEqual(after["phase"], "review")
+        self.assertFalse(after.get("completed_jobs"))
+        self.assertIsNone(after.get("verification"))
+
+    def test_already_started_check_is_terminated_at_clipped_deadline(self):
+        self.configure_stage(1.5)
+        plan = {"contract_version": 2, "status": "complete", "summary": "plan",
+                "invariants": ["Keep behavior"],
+                "batches": [{"title": "one", "goal": "g", "acceptance": ["a"],
+                             "checks": [[sys.executable, "-c",
+                                         "import time; time.sleep(0.3)"],
+                                        [sys.executable, "-c",
+                                         "import time; time.sleep(30)"]],
                              "risk": "ordinary"}],
                 "blocker": ""}
         self.state.update(phase="verify", plan=plan,
@@ -54,21 +94,29 @@ class StageDeadlineTests(unittest.TestCase):
         result = orc.stage_run("test-run00")
         self.assertFalse(result["ok"])
         self.assertEqual(result["stage"], "verify")
-        self.assertIn("timed out", (result["pause_reason"] or "").lower())
+        self.assertTrue(result["pause_reason"])
         state = orc.read_json(self.rundir / "state.json")
         self.assertIn(state["status"], {"uncertain", "blocked"})
         self.assertEqual(state["phase"], "verify")
         self.assertIsNone(state.get("verification"))
-        # Both check logs exist; the second was killed by the clipped budget.
+        self.assertFalse(state.get("accepted_batches"))
+        # The first check completed; the second was clipped and terminated.
         logs = sorted((self.rundir / "jobs").glob("check-*.log"))
         self.assertGreaterEqual(len(logs), 1)
-        self.assertTrue(any(item["returncode"] != 0
-                            for item in state.get("check_progress", {}).get("evidence", {}).get("commands", []))
-                        or state.get("active_check") or state.get("pause_reason"))
-        # A timed-out stage must not advance to review.
+        evidence = (state.get("check_progress") or {}).get("evidence") or {}
+        commands = evidence.get("commands") or []
+        self.assertTrue(commands)
+        self.assertEqual(commands[0]["returncode"], 0)
+        # A timed-out stage must not advance to review or acceptance and must
+        # not dispatch a Reviewer/worker on the next stage attempt.
         again = orc.stage_run("test-run00")
+        after = orc.read_json(self.rundir / "state.json")
         self.assertFalse(again["ok"])
-        self.assertNotEqual(again["stage"], "review")
+        self.assertNotIn(again["stage"], {"review", "accept"})
+        self.assertEqual(after["phase"], "verify")
+        self.assertIsNone(after.get("verification"))
+        self.assertFalse(any(job.get("role") in {"reviewer", "implementer"}
+                             for job in after.get("completed_jobs", [])))
 
     def test_decision_child_is_clipped_to_the_remaining_stage_budget(self):
         self.configure_stage(0.7)

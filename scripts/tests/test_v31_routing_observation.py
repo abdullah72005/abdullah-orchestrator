@@ -66,6 +66,16 @@ if '--version' in args:
     sys.exit(0)
 if pathlib.Path(sys.argv[0]).name != 'opencode':
     sys.exit(4)
+if 'debug' in args and 'config' in args:
+    project = pathlib.Path.cwd() / 'opencode.json'
+    documents = []
+    if project.is_file():
+        documents.append({'type': 'document', 'path': str(project),
+                          'info': json.loads(project.read_text())})
+    documents.append({'type': 'document',
+                      'info': json.loads(os.environ.get('OPENCODE_CONFIG_CONTENT') or '{}')})
+    print(json.dumps(documents))
+    sys.exit(0)
 if 'models' in args:
     print('local/probe-model')
     sys.exit(0)
@@ -395,7 +405,10 @@ class EffectiveChildRoutingTests(unittest.TestCase):
         os.environ["OPENCODE_CONFIG_CONTENT"] = json.dumps(stripped)
         observed = orc.opencode_provider_observation(
             route, project=self.project, cfg=self.cfg, role="explorer")
-        self.assertIsNone(observed["endpoint_sha256"])
+        # A stripped credential must not resolve into a routing endpoint; the
+        # unresolved expansion is unprovable rather than an implicit default.
+        self.assertIn("unresolved endpoint", observed["error"])
+        self.assertNotIn("endpoint_sha256", observed)
 
     def test_ambient_inline_controls_cannot_weaken_generated_profile(self):
         self.configure_local("v1")

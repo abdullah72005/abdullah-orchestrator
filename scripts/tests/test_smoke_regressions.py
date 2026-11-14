@@ -10,8 +10,13 @@ from test_orchestrator import ControlTests, orc
 class SmokeRegressions(ControlTests):
     def test_real_unittest_bytecode_does_not_invalidate_checks(self):
         (self.project / 'test_sample.py').write_text('import unittest\nclass TestSample(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n')
-        evidence = orc.run_checks(self.rundir, self.state, self.cfg, self.project,
-                                  {'title': 'tests', 'checks': [[sys.executable, '-m', 'unittest', 'discover', '-v']]})
+        # The suite may run with PYTHONDONTWRITEBYTECODE=1; this regression
+        # specifically needs real interpreter bytecode to be created.
+        import os
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('PYTHONDONTWRITEBYTECODE', None)
+            evidence = orc.run_checks(self.rundir, self.state, self.cfg, self.project,
+                                      {'title': 'tests', 'checks': [[sys.executable, '-m', 'unittest', 'discover', '-v']]})
         self.assertTrue(evidence['passed'])
         self.assertEqual(evidence['commands'][0]['returncode'], 0)
         self.assertTrue((self.project / '__pycache__').is_dir())
