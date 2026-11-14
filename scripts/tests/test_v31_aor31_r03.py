@@ -292,6 +292,14 @@ class AccountMetadataIdentityTests(R03Base):
         self.assertFalse(before["active"] or after["active"])
         self.assertEqual(before["routing_sha256"], after["routing_sha256"])
         self.assertNotEqual(before["sha256"], after["sha256"])
+        # The same pin and dispatch boundary must still launch after ordinary
+        # history activity; the fake CLI never writes to the account store.
+        self.state["model_routes"] = {"explorer": route}
+        orc.save(self.rundir, self.state)
+        orc.call_model(self.rundir, self.state, self.cfg, "explorer",
+                       "explorer", "prompt", self.project, route=route)
+        self.assertTrue(self.history.exists())
+        self.assertFalse((self.state.get("usage") or {}).get("strong_calls"))
 
     def test_benign_empty_store_initialization_keeps_the_pin(self):
         self.configure("1.18.35")
