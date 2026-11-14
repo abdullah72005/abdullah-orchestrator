@@ -1,0 +1,230 @@
+test_cold_version_query_cancellation_is_distinct (test_v31_aor31_r02.InspectorLifecycleTests) ... ok
+test_cold_version_query_respects_auto_and_pinned_deadlines (test_v31_aor31_r02.InspectorLifecycleTests) ... test_denied_termination_retains_ownership_and_fails_closed (test_v31_aor31_r02.InspectorLifecycleTests) ... /usr/lib/python3.10/subprocess.py:1072: ResourceWarning: subprocess 1890307 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_leader_exits_with_live_closed_stdio_child_is_contained (test_v31_aor31_r02.InspectorLifecycleTests) ... /usr/lib/python3.10/subprocess.py:767: ResourceWarning: unclosed file <_io.TextIOWrapper name=4 encoding='UTF-8'>
+  _cleanup()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/lib/python3.10/subprocess.py:767: ResourceWarning: unclosed file <_io.TextIOWrapper name=6 encoding='UTF-8'>
+  _cleanup()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+FAIL
+test_other_process_group_same_session_is_contained (test_v31_aor31_r02.InspectorLifecycleTests) ... FAIL
+test_session_escaping_descendant_is_tracked_and_contained (test_v31_aor31_r02.InspectorLifecycleTests) ... FAIL
+test_absent_and_malformed_account_stores (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_account_store_without_active_selection_is_still_unprovable (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_active_account_store_is_inspected_read_only_and_refused (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_automatic_plugin_source_blocks_before_v2_inspection (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_automatic_plugin_sources_refuse_in_v1 (test_v31_aor31_r02.V1SourceBoundaryTests) ... test_clean_legacy_go_controls_remain_subscription (test_v31_aor31_r02.V1SourceBoundaryTests) ... ERROR
+test_model_id_remap_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_model_provider_api_custom_url_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_provider_api_custom_url_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_provider_npm_package_remap_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_relative_custom_config_directory_is_resolved_in_child_cwd (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_relative_explicit_config_is_resolved_in_child_cwd (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_unmodeled_nested_provider_routing_keys_refuse (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_unreadable_account_file_is_unprovable (test_v31_aor31_r02.V1SourceBoundaryTests) ... FAIL
+test_failed_version_query_refuses_before_spawn (test_v31_aor31_r02.VersionBoundaryTests) ... ok
+test_matching_v1_pin_dispatches_with_v1_controls (test_v31_aor31_r02.VersionBoundaryTests) ... ok
+test_matching_v2_pin_dispatches_standalone_with_empty_variant (test_v31_aor31_r02.VersionBoundaryTests) ... ok
+test_pinned_v1_binary_v2_refuses_before_spawn (test_v31_aor31_r02.VersionBoundaryTests) ... FAIL
+test_pinned_v2_binary_v1_refuses_before_spawn (test_v31_aor31_r02.VersionBoundaryTests) ... FAIL
+test_unsupported_actual_version_refuses_before_spawn (test_v31_aor31_r02.VersionBoundaryTests) ... ok
+
+======================================================================
+ERROR: test_cold_version_query_respects_auto_and_pinned_deadlines (test_v31_aor31_r02.InspectorLifecycleTests) (pin='auto')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 490, in test_cold_version_query_respects_auto_and_pinned_deadlines
+    orc.call_model(self.rundir, self.state, self.cfg,
+  File "/tmp/opencode/aor31-red-161683d/scripts/orchestrator.py", line 7260, in call_model
+    raise RuntimeError(
+RuntimeError: Dispatch blocked by billing/route preflight: Cannot establish the installed OpenCode dialect; effective provider routing is unprovable (configure an exact runtime.opencode_version or install a supported CLI) (diagnostic: /tmp/tmpf01svc5_/runs/test-run00/jobs/preflight-656f9dc3f194.json)
+
+======================================================================
+ERROR: test_cold_version_query_respects_auto_and_pinned_deadlines (test_v31_aor31_r02.InspectorLifecycleTests) (pin='2.2.7')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 490, in test_cold_version_query_respects_auto_and_pinned_deadlines
+    orc.call_model(self.rundir, self.state, self.cfg,
+  File "/tmp/opencode/aor31-red-161683d/scripts/orchestrator.py", line 7260, in call_model
+    raise RuntimeError(
+RuntimeError: Dispatch blocked by billing/route preflight: normalized OpenCode routing inspection is unavailable (stage_deadline_expired); effective routing is unprovable (diagnostic: /tmp/tmpf01svc5_/runs/test-run00/jobs/preflight-440d07ab7c4c.json)
+
+======================================================================
+ERROR: test_clean_legacy_go_controls_remain_subscription (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 379, in test_clean_legacy_go_controls_remain_subscription
+    self.assertEqual(result["observed"]["boundary"]["plugin_sources"], [])
+KeyError: 'plugin_sources'
+
+======================================================================
+FAIL: test_leader_exits_with_live_closed_stdio_child_is_contained (test_v31_aor31_r02.InspectorLifecycleTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 407, in test_leader_exits_with_live_closed_stdio_child_is_contained
+    self.assertTrue(_wait_dead(self, pid),
+AssertionError: False is not true : inspector descendant survived a successful leader exit
+
+======================================================================
+FAIL: test_other_process_group_same_session_is_contained (test_v31_aor31_r02.InspectorLifecycleTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 445, in test_other_process_group_same_session_is_contained
+    self.assertTrue(_wait_dead(self, pid))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_session_escaping_descendant_is_tracked_and_contained (test_v31_aor31_r02.InspectorLifecycleTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 427, in test_session_escaping_descendant_is_tracked_and_contained
+    self.assertTrue(_wait_dead(self, pid),
+AssertionError: False is not true : setsid descendant escaped whole-execution ownership
+
+======================================================================
+FAIL: test_absent_and_malformed_account_stores (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 325, in test_absent_and_malformed_account_stores
+    self.assertFalse(broken["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_account_store_without_active_selection_is_still_unprovable (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 304, in test_account_store_without_active_selection_is_still_unprovable
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_active_account_store_is_inspected_read_only_and_refused (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 285, in test_active_account_store_is_inspected_read_only_and_refused
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_automatic_plugin_source_blocks_before_v2_inspection (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 369, in test_automatic_plugin_source_blocks_before_v2_inspection
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_automatic_plugin_sources_refuse_in_v1 (test_v31_aor31_r02.V1SourceBoundaryTests) (directory='plugins')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 352, in test_automatic_plugin_sources_refuse_in_v1
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_automatic_plugin_sources_refuse_in_v1 (test_v31_aor31_r02.V1SourceBoundaryTests) (directory='plugin')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 352, in test_automatic_plugin_sources_refuse_in_v1
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_model_id_remap_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 202, in test_model_id_remap_is_not_go_consent
+    self.assert_unqualified(
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 179, in assert_unqualified
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_model_provider_api_custom_url_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 191, in test_model_provider_api_custom_url_is_not_go_consent
+    self.assert_unqualified(
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 179, in assert_unqualified
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_provider_api_custom_url_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 186, in test_provider_api_custom_url_is_not_go_consent
+    self.assert_unqualified(
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 179, in assert_unqualified
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_provider_npm_package_remap_is_not_go_consent (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 197, in test_provider_npm_package_remap_is_not_go_consent
+    self.assert_unqualified(
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 179, in assert_unqualified
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_relative_custom_config_directory_is_resolved_in_child_cwd (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 253, in test_relative_custom_config_directory_is_resolved_in_child_cwd
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_relative_explicit_config_is_resolved_in_child_cwd (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 233, in test_relative_explicit_config_is_resolved_in_child_cwd
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_unmodeled_nested_provider_routing_keys_refuse (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 213, in test_unmodeled_nested_provider_routing_keys_refuse
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_unreadable_account_file_is_unprovable (test_v31_aor31_r02.V1SourceBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 335, in test_unreadable_account_file_is_unprovable
+    with self.assertRaisesRegex(RuntimeError, "uninspectable|preflight"):
+AssertionError: RuntimeError not raised
+
+======================================================================
+FAIL: test_pinned_v1_binary_v2_refuses_before_spawn (test_v31_aor31_r02.VersionBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 97, in test_pinned_v1_binary_v2_refuses_before_spawn
+    self.assert_refused(self.native_v2_route(),
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 87, in assert_refused
+    with self.assertRaisesRegex(RuntimeError, pattern):
+AssertionError: RuntimeError not raised
+
+======================================================================
+FAIL: test_pinned_v2_binary_v1_refuses_before_spawn (test_v31_aor31_r02.VersionBoundaryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 107, in test_pinned_v2_binary_v1_refuses_before_spawn
+    self.assert_refused(route, "does not match pinned|unprovable")
+  File "/tmp/opencode/aor31-red-161683d/scripts/tests/test_v31_aor31_r02.py", line 87, in assert_refused
+    with self.assertRaisesRegex(RuntimeError, pattern):
+AssertionError: RuntimeError not raised
+
+----------------------------------------------------------------------
+Ran 26 tests in 39.327s
+
+FAILED (failures=19, errors=3)

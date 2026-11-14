@@ -73,8 +73,12 @@ described as a limitation.
   source boundary or authoritative V2 normalized inspection; a V2 inspector
   failure, malformed output, plugin skip, unresolved endpoint expansion,
   account/remote/unknown material or unreadable influential input is
-  `unprovable_routing`, never an implicit Go/default approval. There is no
-  dollar/token cap claim and no automatic fallback.
+  `unprovable_routing`, never an implicit Go/default approval. The prepared
+  launch is generated only from the resolved executable's validated version;
+  an actual-version mismatch, unsupported or failed version query, uninspected
+  account store, or automatic plugin code refuses before any inference child,
+  accounting or grant consumption. There is no dollar/token cap claim and no
+  automatic fallback.
 - **Source mutation and containment are separate gates.** A read-only stage's
   observed source edit blocks only when the whole execution is proven stopped;
   a live escaped child keeps exact `uncertain` ownership. A leader exit, error

@@ -1,0 +1,5 @@
+python: Python 3.10.12
+opencode: opencode v2.2.7
+correction_base: 161683d6f51249a99e5964dee9b8c927600fb3e4
+original_base: b9139946db5684e3e48724b9e1060af355362e82
+branch: design/orchestrator-v3-1

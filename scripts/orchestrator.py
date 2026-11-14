@@ -26,6 +26,7 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1382,6 +1383,13 @@ def _redacted_routing_material(value, key=""):
 
 
 OPENCODE_INSPECTION_TIMEOUT = 20.0
+# A cold version probe is whole-stage work too: it is contained like the config
+# inspector and clipped by the remaining monotonic stage budget.
+OPENCODE_VERSION_PROBE_TIMEOUT = 10.0
+# Automatic plugin discovery: any discovered plugin file is unmodeled code that
+# may change routing, so the scan is bounded and its identities are bound.
+OPENCODE_PLUGIN_DIR_NAMES = ("plugin", "plugins")
+OPENCODE_PLUGIN_SCAN_LIMIT = 256
 # Retained only so older diagnostics can clear a named object.  Inspection
 # results are never reused across observations: cached output cannot prove that
 # an uninspected parent/remote source did not change.
@@ -1433,13 +1441,22 @@ def _opencode_config_sources(project, dialect):
     ``OPENCODE_CONFIG_DIR``.  Explicit ``OPENCODE_CONFIG`` follows the global
     layer in both dialects.  Manifest order is ``kind/path`` records; later
     records win under the dialect's own overlay rules.
+
+    Relative explicit/custom-directory paths are resolved against the child's
+    project cwd (the process cwd OpenCode itself will see), never against the
+    supervisor's cwd.
     """
     project_path = (Path(project).expanduser().resolve()
                     if project is not None else Path.cwd().resolve())
+
+    def child_path(value):
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else (project_path / path)
+
     explicit = os.environ.get("OPENCODE_CONFIG")
-    explicit_path = Path(explicit).expanduser() if explicit else None
+    explicit_path = child_path(explicit) if explicit else None
     custom_dir = os.environ.get("OPENCODE_CONFIG_DIR")
-    custom_path = Path(custom_dir).expanduser() if custom_dir else None
+    custom_path = child_path(custom_dir) if custom_dir else None
     project_disabled = (_opencode_env_flag("OPENCODE_DISABLE_PROJECT_CONFIG")
                         or _opencode_env_flag("OPENCODE_CONFIG_PROJECT_DISABLE"))
     sources = []
@@ -1513,14 +1530,25 @@ def _deep_merge(target, update):
             target[key] = copy.deepcopy(value)
 
 
-def _opencode_dialect_for_observation(cfg=None):
+def _opencode_dialect_for_observation(cfg=None, *, deadline=None, cancel=None):
+    """Dialect of the resolved executable, never of the configured pin alone.
+
+    A pin is a constraint on the installed CLI, not evidence of its dialect.
+    Cancellation and whole-stage expiry propagate so callers can report them as
+    distinct outcomes instead of falling back to a pinned dialect.
+    """
     cfg = cfg or config()
-    policy = opencode_version_policy(cfg)
-    pin = str(policy.get("pin") or "auto").strip()
-    if pin.lower() != "auto":
-        parsed = _version_tuple(pin)
-        if parsed:
-            return "v1" if parsed[0] == 1 else "v2" if parsed[0] == 2 else None
+    identity = _opencode_binary_identity(deadline=deadline, cancel=cancel)
+    if identity.get("available"):
+        version = str((identity.get("version") or {}).get("text") or "").strip()
+        if not version:
+            return None
+        try:
+            return opencode_dialect(version=version, cfg=cfg)
+        except RuntimeError:
+            return None
+    # No resolved executable exists.  Ask OpenCode itself (still not the pin);
+    # this compatibility path is used by non-dispatch callers such as Doctor.
     try:
         return opencode_dialect(cfg=cfg)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
@@ -1964,23 +1992,42 @@ def _opencode_fold_documents(documents, dialect):
     return merged
 
 
-@functools.lru_cache(maxsize=16)
-def _opencode_binary_version_cached(resolved, fingerprint):
+def _opencode_binary_version_cached(resolved, fingerprint, *, deadline=None,
+                                    cancel=None):
+    """Contained ``--version`` metadata for one executable identity.
+
+    Cold work runs through the same bounded containment as config inspection
+    and must fit the remaining whole-stage budget; cancellation and expiry
+    propagate as their own outcomes.  Callers thread one identity through a
+    dispatch rather than reusing metadata across executions.
+    """
+    timeout = OPENCODE_VERSION_PROBE_TIMEOUT
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            raise InspectionDeadlineExpired(
+                "Whole-stage deadline expired before OpenCode version inspection")
+        timeout = min(timeout, remaining)
     try:
-        proc = subprocess.run([resolved, "--version"], capture_output=True,
-                              text=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    text = (proc.stdout or proc.stderr or "").strip()
-    return {"returncode": proc.returncode, "text": text[:120],
+        returncode, out, err = _opencode_run_bounded(
+            [str(resolved), "--version"], Path.cwd(), scrubbed_env(), timeout,
+            cancel=cancel, deadline=deadline)
+    except (InspectionCancelled, InspectionDeadlineExpired):
+        raise
+    except (OSError, TimeoutError, subprocess.SubprocessError) as exc:
+        return {"returncode": None, "text": "", "sha256": None,
+                "error": exc.__class__.__name__}
+    text = (out or err or "").strip()
+    return {"returncode": returncode, "text": text[:120],
             "sha256": hashlib.sha256(text.encode()).hexdigest() if text else None}
 
 
-def _opencode_binary_version(resolved, fingerprint):
-    return _opencode_binary_version_cached(resolved, tuple(fingerprint))
+def _opencode_binary_version(resolved, fingerprint, *, deadline=None, cancel=None):
+    return _opencode_binary_version_cached(
+        resolved, tuple(fingerprint), deadline=deadline, cancel=cancel)
 
 
-def _opencode_binary_identity():
+def _opencode_binary_identity(*, deadline=None, cancel=None):
     resolved = shutil.which("opencode")
     if not resolved:
         return {"available": False, "path": None}
@@ -1992,11 +2039,59 @@ def _opencode_binary_identity():
     fingerprint = (stat.st_dev, stat.st_ino, stat.st_size,
                    stat.st_mtime_ns, stat.st_ctime_ns)
     return {"available": True, "path": real,
+            "resolved": resolved,
             "fingerprint": list(fingerprint),
-            "version": _opencode_binary_version(real, fingerprint)}
+            "version": _opencode_binary_version(
+                real, fingerprint, deadline=deadline, cancel=cancel)}
+
+
+def _opencode_validated_dialect(cfg=None, *, deadline=None, cancel=None,
+                                identity=None):
+    """Validate the actual resolved executable against support/pin policy.
+
+    Returns ``{"dialect", "identity", "error"}``.  A missing, failed or
+    unreadable version query is never resolved through the configured pin.
+    """
+    cfg = cfg or config()
+    identity = identity or _opencode_binary_identity(
+        deadline=deadline, cancel=cancel)
+    result = {"dialect": None, "identity": identity, "error": None}
+    if not identity.get("available"):
+        result["error"] = (
+            "installed OpenCode executable is unavailable; the effective "
+            "dialect and permission contract cannot be established")
+        return result
+    version = identity.get("version") or {}
+    text = str(version.get("text") or "").strip()
+    if version.get("error"):
+        result["error"] = (
+            "the resolved OpenCode executable's version query failed ("
+            + str(version["error"]) + "); a configured pin is not evidence of "
+            "the installed dialect and this route is unprovable")
+        return result
+    if version.get("returncode") != 0:
+        result["error"] = (
+            "the resolved OpenCode executable's version query exited "
+            f"{version.get('returncode')!r}; a configured pin is not evidence "
+            "of the installed dialect and this route is unprovable")
+        return result
+    if not text:
+        result["error"] = (
+            "the resolved OpenCode executable returned no version text; a "
+            "configured pin is not evidence of the installed dialect and this "
+            "route is unprovable")
+        return result
+    try:
+        result["dialect"] = opencode_dialect(version=text, cfg=cfg)
+    except RuntimeError as exc:
+        result["error"] = (
+            str(exc) + "; the resolved executable is authoritative and a "
+            "configured pin cannot override its supported range or dialect")
+    return result
 
 
 OPENCODE_INSPECTION_POLL_SECONDS = 0.05
+OPENCODE_INSPECTION_TRACK_LIMIT = 512
 
 
 class InspectionCancelled(RuntimeError):
@@ -2011,11 +2106,86 @@ class InspectionContainmentError(RuntimeError):
     """The inspector process tree could not be proven stopped."""
 
 
+def _opencode_track_descendants(pid, tracked):
+    """Record descendant identities before a fast-exiting leader can reparent."""
+    for child in _descendant_pids(pid):
+        if child in tracked:
+            continue
+        if len(tracked) >= OPENCODE_INSPECTION_TRACK_LIMIT:
+            raise InspectionContainmentError(
+                "OpenCode inspector descendant tracking exceeded its bound")
+        identity = process_identity(child)
+        if identity:
+            tracked[child] = identity.get("pid_start")
+
+
+def _opencode_tracked_live(tracked):
+    live = []
+    for pid, start in tracked.items():
+        stat = process_stat(pid)
+        if not stat or stat["state"] in {"Z", "X", "x"}:
+            continue
+        if start is not None and stat["starttime"] != start:
+            continue
+        live.append(pid)
+    return live
+
+
+def _opencode_signal_tracked(tracked, sig):
+    for pid in _opencode_tracked_live(tracked):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def _opencode_contain_inspector(proc, identity, tracked):
+    """Prove the whole inspection tree stopped, even after leader exit."""
+    try:
+        proc.poll()
+    except OSError:
+        pass
+    job = {"pid": identity.get("pid"), "pid_start": identity.get("pid_start"),
+           "pgid": identity.get("pgid"), "sid": identity.get("sid")}
+    result = terminate_identity(job, grace=2)
+    _opencode_signal_tracked(tracked, signal.SIGTERM)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and _opencode_tracked_live(tracked):
+        time.sleep(0.05)
+    if _opencode_tracked_live(tracked):
+        _opencode_signal_tracked(tracked, signal.SIGKILL)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and _opencode_tracked_live(tracked):
+            time.sleep(0.05)
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+    for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    remaining = _opencode_tracked_live(tracked)
+    stopped = result.get("stopped") is True and not remaining
+    return stopped, result, remaining
+
+
 def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None):
-    """Contained, cancellable inspector execution; never attaches to a daemon."""
+    """Contained, cancellable inspection; never attaches to a daemon.
+
+    Ownership covers the whole execution, including a leader that exits
+    successfully while a descendant remains alive.  Descendants are recorded
+    independently of leader liveness and every owned process must be proven
+    stopped before this helper can succeed.
+    """
     proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True)
+    identity = process_identity(proc.pid) or {
+        "pid": proc.pid, "pgid": proc.pid, "sid": proc.pid}
+    tracked = {}
     started = time.monotonic()
     limit = max(0.1, float(timeout))
     out = err = ""
@@ -2031,6 +2201,7 @@ def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None
             if elapsed >= limit:
                 raise TimeoutError(
                     f"OpenCode config inspection exceeded {limit:.1f}s")
+            _opencode_track_descendants(proc.pid, tracked)
             wait = min(OPENCODE_INSPECTION_POLL_SECONDS,
                        max(0.01, limit - elapsed))
             if deadline is not None:
@@ -2041,23 +2212,14 @@ def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None
             except subprocess.TimeoutExpired:
                 continue
     finally:
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
-            try:
-                proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    raise InspectionContainmentError(
-                        f"OpenCode inspector process {proc.pid} could not be proven stopped")
+        contained, details, remaining = _opencode_contain_inspector(
+            proc, identity, tracked)
+        if not contained:
+            raise InspectionContainmentError(
+                "OpenCode inspector process tree "
+                f"{identity.get('pid')} could not be proven stopped"
+                + (f"; remaining {remaining}" if remaining else "")
+                + (f"; {details.get('reason')}" if details.get("reason") else ""))
     if proc.returncode is None:
         raise InspectionContainmentError(
             f"OpenCode inspector process {proc.pid} did not exit after containment")
@@ -2073,9 +2235,11 @@ def _opencode_routing_view(info):
 
 def _opencode_inspected_documents(project, role, dialect, child_env, inline_bytes,
                                   source_records, *, deadline=None,
-                                  cancel=None, adapter_config=None):
+                                  cancel=None, adapter_config=None,
+                                  identity=None):
     """Normalized, non-inference V2 config documents from the installed CLI."""
-    identity = _opencode_binary_identity()
+    identity = identity or _opencode_binary_identity(
+        deadline=deadline, cancel=cancel)
     result = {"ok": False, "reason": None, "documents": [], "identity": identity,
               "entry_paths": [], "cancelled": False, "expired": False}
     if dialect != "v2":
@@ -2085,7 +2249,7 @@ def _opencode_inspected_documents(project, role, dialect, child_env, inline_byte
         result["reason"] = "binary_unavailable"
         return result
     version = identity.get("version") or {}
-    if version.get("returncode") not in (0, None):
+    if version.get("error") or version.get("returncode") not in (0, None):
         result["reason"] = "binary_version_failed"
         return result
     if isinstance(adapter_config, dict) and (
@@ -2179,6 +2343,160 @@ def _opencode_data_dir(child_env):
     return Path(child_env.get("HOME") or Path.home()) / ".local/share/opencode"
 
 
+def _opencode_plugin_dirs(project_path, dialect):
+    """Applicable automatic plugin directories for the dialect's loader."""
+    dirs = []
+    seen = set()
+
+    def add(path):
+        resolved = Path(path).expanduser()
+        if str(resolved) not in seen:
+            seen.add(str(resolved))
+            dirs.append(resolved)
+
+    custom = os.environ.get("OPENCODE_CONFIG_DIR")
+    custom_path = None
+    if custom:
+        candidate = Path(custom).expanduser()
+        custom_path = (candidate if candidate.is_absolute()
+                       else project_path / candidate)
+    project_disabled = (_opencode_env_flag("OPENCODE_DISABLE_PROJECT_CONFIG")
+                        or _opencode_env_flag("OPENCODE_CONFIG_PROJECT_DISABLE"))
+    if dialect == "v2":
+        global_dir = custom_path or _opencode_xdg_global_dir()
+        for name in OPENCODE_PLUGIN_DIR_NAMES:
+            add(global_dir / name)
+        if not project_disabled:
+            for directory in _opencode_project_chain(project_path, "v2"):
+                for name in OPENCODE_PLUGIN_DIR_NAMES:
+                    add(directory / ".opencode" / name)
+        return dirs
+    global_dir = _opencode_xdg_global_dir()
+    for name in OPENCODE_PLUGIN_DIR_NAMES:
+        add(global_dir / name)
+        add(Path.home() / ".opencode" / name)
+    if custom_path is not None:
+        for name in OPENCODE_PLUGIN_DIR_NAMES:
+            add(custom_path / name)
+    if not project_disabled:
+        for directory in _opencode_project_chain(project_path, "v1"):
+            for name in OPENCODE_PLUGIN_DIR_NAMES:
+                add(directory / ".opencode" / name)
+    return dirs
+
+
+def _opencode_plugin_sources(project_path, dialect):
+    """Bounded identities of automatic plugin code; never executes it."""
+    records = []
+    error = None
+    for directory in _opencode_plugin_dirs(project_path, dialect):
+        stack = [directory]
+        visited = set()
+        while stack:
+            current = stack.pop()
+            try:
+                real = current.resolve()
+            except OSError:
+                real = current
+            if str(real) in visited:
+                continue
+            visited.add(str(real))
+            try:
+                entries = list(os.scandir(current))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                error = (f"plugin directory {current} cannot be inspected "
+                         f"({exc.__class__.__name__})")
+                return records, error
+            for entry in sorted(entries, key=lambda item: item.name):
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=True):
+                    if entry.is_symlink():
+                        error = (f"automatic plugin source {entry.path} is a "
+                                 "link whose target cannot be proven")
+                        return records, error
+                    continue
+                if len(records) >= OPENCODE_PLUGIN_SCAN_LIMIT:
+                    error = ("automatic OpenCode plugin discovery exceeded its "
+                             f"bounded limit of {OPENCODE_PLUGIN_SCAN_LIMIT} files")
+                    return records, error
+                try:
+                    digest = _sha256_file(Path(entry.path))
+                except OSError as exc:
+                    error = (f"automatic plugin source {entry.path} cannot be "
+                             f"read ({exc.__class__.__name__})")
+                    return records, error
+                records.append({"kind": "plugin", "path": entry.path,
+                                "sha256": digest})
+    return records, error
+
+
+def _opencode_account_store(child_env, project_path):
+    """Read-only metadata identity for the CLI's SQLite account store.
+
+    Only table presence/counts and active selection are inspected.  Credential
+    and token columns are never selected, printed or hashed.
+    """
+    configured = str(child_env.get("OPENCODE_DB") or "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_absolute():
+            path = project_path / path
+    else:
+        path = _opencode_data_dir(child_env) / "opencode.db"
+    path = path.resolve()
+    if not path.exists():
+        return None, []
+    record = {"kind": "account_store", "path": str(path), "present": True,
+              "sha256": None, "tables": [], "accounts": 0, "active": False}
+    try:
+        record["sha256"] = _sha256_file(path)
+    except OSError:
+        return record, [f"unreadable OpenCode account store {path}"]
+    if not path.is_file():
+        return record, [f"unreadable OpenCode account store {path} (not a file)"]
+    try:
+        uri = path.as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.25)
+    except (sqlite3.Error, ValueError):
+        return record, [f"unreadable OpenCode account store {path}"]
+    try:
+        tables = sorted(row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"))
+        record["tables"] = [str(name) for name in tables]
+        accounts = 0
+        if "account" in tables:
+            accounts = int(connection.execute(
+                "SELECT COUNT(*) FROM account").fetchone()[0])
+        record["accounts"] = accounts
+        active = False
+        if "account_state" in tables:
+            rows = connection.execute(
+                "SELECT active_account_id, active_org_id FROM account_state"
+            ).fetchall()
+            active = any(
+                (account not in (None, "") or organization not in (None, ""))
+                for account, organization in rows)
+        record["active"] = active
+    except sqlite3.Error:
+        return record, [f"unreadable OpenCode account store {path}"]
+    finally:
+        connection.close()
+    hazards = []
+    if record["accounts"]:
+        hazards.append(
+            "OpenCode account store contains account metadata whose routing "
+            f"cannot be inspected ({path})")
+    if record["active"]:
+        hazards.append(
+            "OpenCode account store selects an active account/organization "
+            f"whose routing cannot be inspected ({path})")
+    return record, hazards
+
+
 def _opencode_external_routing_hazards(child_env):
     """Uninspectable account/remote/managed sources that can change routing."""
     hazards = []
@@ -2217,7 +2535,7 @@ def _opencode_external_routing_hazards(child_env):
 
 
 def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
-                               deadline=None, cancel=None):
+                               deadline=None, cancel=None, identity=None):
     """One shared effective-routing context for preflight and real dispatch.
 
     V1 and an authoritative V2 normalized inspection are the only routing
@@ -2241,6 +2559,13 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
     if deadline is not None and deadline - time.monotonic() <= 0.05:
         return {**base, "expired": True,
                 "error": "Whole-stage deadline expired before routing inspection"}
+    try:
+        executable = (identity if identity is not None else
+                      _opencode_binary_identity(deadline=deadline, cancel=cancel))
+    except InspectionCancelled as exc:
+        return {**base, "cancelled": True, "error": str(exc)}
+    except InspectionDeadlineExpired as exc:
+        return {**base, "expired": True, "error": str(exc)}
     full_inline, inline_meta = opencode_child_inline(role, dialect)
     inline_bytes = json.dumps(full_inline)
     sources = _opencode_config_sources(project_path, dialect)
@@ -2284,21 +2609,42 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
         return {**base, "error": conflict, "records": records,
                 "documents": documents, "sources": sources, "inline": meta,
                 "full_inline": full_inline, "inline_bytes": inline_bytes,
-                "executable": _opencode_binary_identity()}
+                "executable": executable}
     plugins = adapter_config.get("plugins") or adapter_config.get("plugin")
+    plugin_records, plugin_error = _opencode_plugin_sources(project_path, dialect)
     inspection = None
     boundary = {"adapter_complete": False, "external_hazards": [],
-                "plugin_config_present": bool(plugins)}
+                "plugin_config_present": bool(plugins or plugin_records),
+                "plugin_sources": plugin_records}
+    if plugin_error:
+        return {**base, "records": records, "documents": documents,
+                "sources": sources, "inline": meta,
+                "full_inline": full_inline, "inline_bytes": inline_bytes,
+                "executable": executable, "boundary": boundary,
+                "error": ("automatic OpenCode plugin sources cannot be "
+                          "established: " + plugin_error)}
+    if plugins or plugin_records:
+        # Unknown plugin code may alter routing.  It is never executed to prove
+        # its safety, and declared lists alone do not cover automatic discovery.
+        detail = ("declares plugin configuration" if plugins
+                  else "contains automatic plugin sources")
+        return {**base, "records": records, "documents": documents,
+                "sources": sources, "inline": meta,
+                "full_inline": full_inline, "inline_bytes": inline_bytes,
+                "executable": executable, "boundary": boundary,
+                "error": ("OpenCode " + detail + "; normalized routing cannot "
+                          "be inspected safely and is unprovable")}
     if dialect == "v2":
         inspection = _opencode_inspected_documents(
             project_path, role, dialect, child_env, inline_bytes, records,
-            deadline=deadline, cancel=cancel, adapter_config=adapter_config)
+            deadline=deadline, cancel=cancel, adapter_config=adapter_config,
+            identity=executable)
         if inspection.get("cancelled") or inspection.get("expired"):
             return {**base, "records": records, "documents": documents,
                     "sources": sources, "inline": meta,
                     "full_inline": full_inline, "inline_bytes": inline_bytes,
-                    "inspection": inspection,
-                    "executable": _opencode_binary_identity(),
+                    "inspection": inspection, "executable": executable,
+                    "boundary": boundary,
                     "cancelled": bool(inspection.get("cancelled")),
                     "expired": bool(inspection.get("expired")),
                     "error": ("Routing inspection cancelled" if
@@ -2315,8 +2661,7 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
             return {**base, "records": records, "documents": documents,
                     "sources": sources, "inline": meta,
                     "full_inline": full_inline, "inline_bytes": inline_bytes,
-                    "inspection": inspection,
-                    "executable": _opencode_binary_identity(),
+                    "inspection": inspection, "executable": executable,
                     "boundary": boundary, "error": error}
         try:
             inspected_config = _opencode_fold_documents(
@@ -2334,39 +2679,40 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
         boundary["adapter_complete"] = True
     else:
         hazards = _opencode_external_routing_hazards(child_env)
+        account_record, account_hazards = _opencode_account_store(
+            child_env, project_path)
+        if account_record is not None:
+            records.append(account_record)
+        hazards = sorted(set(hazards) | set(account_hazards))
         boundary["external_hazards"] = hazards
-        if plugins:
-            return {**base, "records": records, "documents": documents,
-                    "sources": sources, "inline": meta,
-                    "full_inline": full_inline, "inline_bytes": inline_bytes,
-                    "boundary": boundary,
-                    "error": ("OpenCode configuration declares plugins; effective "
-                              "routing is unprovable without safe inspection")}
+        boundary["account_store"] = account_record
         if hazards:
             return {**base, "records": records, "documents": documents,
                     "sources": sources, "inline": meta,
                     "full_inline": full_inline, "inline_bytes": inline_bytes,
-                    "boundary": boundary,
+                    "executable": executable, "boundary": boundary,
                     "error": ("uninspectable external OpenCode routing sources: "
                               + "; ".join(hazards))}
         boundary["adapter_complete"] = True
         merged = adapter_config
     files = [Path(record["path"]) for record in records
-             if record.get("present") and record.get("path")]
+             if record.get("present") and record.get("path")
+             and record.get("kind") != "account_store"]
     return {"error": None, "records": records, "documents": documents,
             "sources": sources, "inline": meta, "config": merged,
             "files": files, "inspection": inspection, "boundary": boundary,
-            "executable": _opencode_binary_identity(),
+            "executable": executable,
             "child_env": child_env, "project": project_path, "dialect": dialect,
             "full_inline": full_inline, "inline_bytes": inline_bytes,
             "cancelled": False, "expired": False}
 
 
 def _opencode_launch_context(role, dialect, project, *, allow_free=False,
-                             deadline=None, cancel=None):
+                             deadline=None, cancel=None, identity=None):
     """Immutable launch environment prepared before authorization."""
     context = _opencode_prepared_context(
-        role, dialect, project, deadline=deadline, cancel=cancel)
+        role, dialect, project, deadline=deadline, cancel=cancel,
+        identity=identity)
     if context.get("cancelled") or context.get("expired"):
         return {"context": context, "env": None}
     env = dict(context.get("child_env") or scrubbed_env())
@@ -2475,16 +2821,32 @@ def _opencode_route_layers(dialect, entry, model_id, variant):
     return layers, model_entry, variant_entry, error
 
 
+def _opencode_layer_endpoint(layer, dialect):
+    """Endpoint for one provider/model/variant layer in its own dialect."""
+    if not isinstance(layer, dict):
+        return None
+    endpoint = _opencode_endpoint(_opencode_layer_settings(layer, dialect))
+    if endpoint:
+        return endpoint
+    if dialect == "v1":
+        for value in (layer.get("api"),
+                      (layer.get("provider") or {}).get("api")
+                      if isinstance(layer.get("provider"), dict) else None):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def _opencode_effective_endpoint(dialect, layers):
     """Most specific configured endpoint, matching documented precedence."""
     for source, layer in reversed(layers):
-        endpoint = _opencode_endpoint(_opencode_layer_settings(layer, dialect))
+        endpoint = _opencode_layer_endpoint(layer, dialect)
         if endpoint:
             return endpoint, source
     return None, None
 
 
-def _opencode_go_qualification(provider, entry, model_id, model_entry,
+def _opencode_go_qualification(dialect, provider, entry, model_id, model_entry,
                                variant_entry, endpoint, endpoint_source):
     """Reasons an inspectable remap cannot qualify for legacy Go consent."""
     if not isinstance(entry, dict):
@@ -2496,13 +2858,50 @@ def _opencode_go_qualification(provider, entry, model_id, model_entry,
     for key in GO_REMAP_KEYS:
         if entry.get(key):
             reasons.append(f"provider remaps {key}")
+    if dialect == "v1":
+        npm = entry.get("npm")
+        if isinstance(npm, str) and npm.strip():
+            reasons.append("provider remaps the SDK npm package")
     for layer, layer_entry in (("model", model_entry),
                                ("variant", variant_entry)):
+        if isinstance(layer_entry, str):
+            if layer_entry.strip():
+                reasons.append(
+                    f"{layer} remaps the selected model to {layer_entry!r}")
+            continue
         if not isinstance(layer_entry, dict):
             continue
         for key in GO_REMAP_KEYS:
             if layer_entry.get(key):
                 reasons.append(f"{layer} remaps {key}")
+        if dialect == "v1":
+            for key, label in (("api", "api"), ("npm", "SDK npm package")):
+                value = layer_entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    reasons.append(f"{layer} remaps {label}")
+            nested = layer_entry.get("provider")
+            if isinstance(nested, dict):
+                if isinstance(nested.get("api"), str) and nested["api"].strip():
+                    reasons.append(f"{layer} remaps provider.api")
+                if isinstance(nested.get("npm"), str) and nested["npm"].strip():
+                    reasons.append(f"{layer} remaps provider.npm")
+                unmodeled = sorted(
+                    str(key) for key in nested
+                    if key not in {"api", "npm", "id", "modelID", "providerID"})
+                if unmodeled:
+                    reasons.append(
+                        f"{layer} exposes unmodeled provider routing keys: "
+                        + ", ".join(unmodeled))
+                for key, expected in (("id", model_id), ("modelID", model_id),
+                                      ("providerID", provider)):
+                    value = nested.get(key)
+                    if value in {None, ""}:
+                        continue
+                    if str(value) != str(expected):
+                        reasons.append(f"{layer}.provider remaps {key}")
+            value = layer_entry.get("id")
+            if value not in {None, ""} and str(value) != str(model_id):
+                reasons.append(f"{layer} remaps id")
         for key, expected in (("modelID", model_id), ("providerID", provider)):
             value = layer_entry.get(key)
             if value in {None, ""}:
@@ -2525,24 +2924,43 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
     all bound into ``routing_material_sha256``; raw secrets never leave here.
     """
     provider = _route_worker_provider(route)
-    if dialect is None:
-        dialect = _opencode_dialect_for_observation(cfg)
+    prepared_context = ((prepared or {}).get("context")
+                        if isinstance(prepared, dict) else None)
     observed = {"provider": provider, "config": [], "providers": [],
                 "available": False, "error": None, "dialect": dialect,
                 "effective_files": [], "sources": [],
                 "inline_preserved": [], "inline_neutralized": [],
                 "inline_dropped": [], "inspection": None,
                 "inspection_reason": None}
+    if dialect is None and isinstance(prepared_context, dict):
+        dialect = prepared_context.get("dialect")
+    if dialect is None:
+        try:
+            validated = _opencode_validated_dialect(
+                cfg, deadline=deadline, cancel=cancel)
+        except InspectionCancelled as exc:
+            observed["cancel_requested"] = True
+            observed["error"] = str(exc)
+            return observed
+        except InspectionDeadlineExpired as exc:
+            observed["deadline_expired"] = True
+            observed["error"] = str(exc)
+            return observed
+        dialect = validated.get("dialect")
+        observed["executable"] = validated.get("identity")
+        observed["dialect_error"] = validated.get("error")
+    observed["dialect"] = dialect
     if dialect not in {"v1", "v2"}:
         observed["error"] = (
-            "Cannot establish the installed OpenCode dialect; effective provider "
-            "routing is unprovable (configure an exact runtime.opencode_version "
-            "or install a supported CLI)")
+            observed.get("dialect_error")
+            or "Cannot establish the installed OpenCode dialect; effective "
+               "provider routing is unprovable (install a supported CLI; a "
+               "configured pin is not evidence of the installed dialect)")
         return observed
-    context = ((prepared or {}).get("context")
-               if isinstance(prepared, dict) and prepared.get("context")
+    context = (prepared_context if isinstance(prepared_context, dict)
                else _opencode_prepared_context(
-                   role, dialect, project, deadline=deadline, cancel=cancel))
+                   role, dialect, project, deadline=deadline, cancel=cancel,
+                   identity=observed.get("executable")))
     observed["effective_files"] = [str(path) for path in context.get("files") or []]
     observed["boundary"] = context.get("boundary")
     observed["cancel_requested"] = bool(context.get("cancelled"))
@@ -2701,7 +3119,7 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
             _redacted_routing_material(model_entry if model_entry is not None
                                        else {}))
         observed["go_route"] = _opencode_go_qualification(
-            provider, entry, model_id, model_entry, variant_entry,
+            dialect, provider, entry, model_id, model_entry, variant_entry,
             endpoint, endpoint_source)
         routing_material.update({
             "endpoint_source": endpoint_source,
@@ -2765,7 +3183,7 @@ def routing_fingerprint(route, cfg=None, project=None, dialect=None,
     return content_hash(material)
 
 
-def model_route(cfg, host, role, project=None):
+def model_route(cfg, host, role, project=None, *, dialect=None):
     if role == "architect":
         spec = cfg["architect"][host]
         route = {"provider": host, "model": spec["model"],
@@ -2776,11 +3194,11 @@ def model_route(cfg, host, role, project=None):
     spec = cfg["workers"][role]
     route = normalize_worker_spec(role, spec, legacy_go=True)
     route["routing_fingerprint"] = routing_fingerprint(
-        route, cfg, project=project, role=role)
+        route, cfg, project=project, role=role, dialect=dialect)
     fallback = route.get("fallback_route")
     if isinstance(fallback, dict):
         fallback["routing_fingerprint"] = routing_fingerprint(
-            fallback, cfg, project=project, role=role)
+            fallback, cfg, project=project, role=role, dialect=dialect)
     return route
 
 
@@ -3112,7 +3530,8 @@ def route_authorization_status(state, role, route, *, run_dir=None):
 
 
 def route_preflight(role, route, cfg=None, project=None, state=None, *,
-                    run_dir=None, deadline=None, prepared=None, cancel=None):
+                    run_dir=None, deadline=None, prepared=None, cancel=None,
+                    dialect=None):
     """Classify billing and reject unapproved routing before any dispatch.
 
     This is a deterministic application-level policy check.  It neither proves
@@ -3181,7 +3600,7 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
         return result
     observation = opencode_provider_observation(
         route, project=project, cfg=cfg, role=role, deadline=deadline,
-        prepared=prepared, cancel=cancel)
+        prepared=prepared, cancel=cancel, dialect=dialect)
     result["observed"] = observation
     result["route_material_sha256"] = observation.get("routing_material_sha256")
     if observation.get("error"):
@@ -5874,9 +6293,12 @@ def opencode_dialect(version=None, pinned=None, cfg=None):
     cfg = cfg or config()
     policy = opencode_version_policy(cfg)
     if version is None:
-        result = subprocess.run(["opencode", "--version"], capture_output=True,
-                                text=True, timeout=10, check=False)
-        version = (result.stdout or result.stderr).strip()
+        identity = _opencode_binary_identity()
+        version = str((identity.get("version") or {}).get("text") or "").strip()
+        if not version:
+            raise RuntimeError(
+                "Unable to establish the installed OpenCode version; refusing "
+                "to generate an unverified permission contract")
     parsed = _version_tuple(version)
     if parsed is None:
         raise RuntimeError(f"Unrecognized OpenCode version {version!r}; cannot enforce worker permissions")
@@ -6269,7 +6691,15 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None,
                 evidence_root=None, prepared=None):
     if route["provider"] == "opencode":
         prepared_context = (prepared or {}).get("context") or {}
-        dialect = prepared_context.get("dialect") or opencode_dialect()
+        dialect = prepared_context.get("dialect")
+        if dialect not in {"v1", "v2"}:
+            # Never authorize a dialect from the configured pin: only the
+            # resolved executable's validated dialect may generate controls.
+            dialect = _opencode_dialect_for_observation()
+        if dialect not in {"v1", "v2"}:
+            raise RuntimeError(
+                "Cannot establish the resolved OpenCode dialect for this "
+                "command; refusing to generate an unverified permission contract")
         selector = route["model"]
         if dialect == "v2" and route["effort"]:
             selector += f"#{route['effort']}"
@@ -7218,13 +7648,24 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     authoritative_dir = grant_dir or run_dir
     launch = None
     if not strong:
-        dialect = _opencode_dialect_for_observation(cfg)
+        cancel_run = (lambda: _run_cancel_requested(authoritative_dir))
+        try:
+            validated = _opencode_validated_dialect(
+                cfg, deadline=deadline, cancel=cancel_run)
+        except InspectionCancelled as exc:
+            raise InterruptedError(
+                "Run pause/cancel requested during OpenCode version inspection") from exc
+        except InspectionDeadlineExpired as exc:
+            raise TimeoutError(
+                "Whole-stage deadline expired during OpenCode version inspection") from exc
+        dialect = validated.get("dialect")
         if dialect in {"v1", "v2"}:
             launch = _opencode_launch_context(
                 role, dialect, project,
                 allow_free=route.get("billing") == "free",
                 deadline=deadline,
-                cancel=(lambda: _run_cancel_requested(authoritative_dir)))
+                cancel=cancel_run,
+                identity=validated.get("identity"))
             if launch["context"].get("cancelled"):
                 raise InterruptedError(
                     "Run pause/cancel requested during routing inspection")
@@ -9719,7 +10160,8 @@ def probe_generated_commands(cfg, host, dialect, help_by_provider, project=None)
     outcomes = {}
     with tempfile.TemporaryDirectory(prefix="abdullah-doctor-") as tmp:
         root = Path(tmp)
-        cases = [(role, kind, model_route(cfg, host, role, project=project), False)
+        cases = [(role, kind, model_route(cfg, host, role, project=project,
+                                          dialect=dialect), False)
                  for role, kind in (("architect", "plan"), ("architect", "decision"),
                                     ("architect", "diagnose"), ("architect", "integration"),
                                     ("explorer", "explorer"), ("implementer", "implementer"),
@@ -9739,8 +10181,11 @@ def probe_generated_commands(cfg, host, dialect, help_by_provider, project=None)
                 # cli_command detects OpenCode's actual version; this avoids any
                 # substitution of the command being checked.
                 path = root / (kind + "-probe")
+                prepared = ({"context": {"dialect": dialect}}
+                            if provider == "opencode" and dialect else None)
                 command, env, _ = cli_command(host, role, route, "doctor prompt", path,
-                                              "doctor-session" if provider == "opencode" else None)
+                                              "doctor-session" if provider == "opencode" else None,
+                                              prepared=prepared)
                 compatible = validate_cli_arguments(command, help_by_provider.get(provider, ""))
                 if compatible:
                     result = subprocess.run(command[:-1] + ["--help"], env=env, cwd=root,
@@ -9925,13 +10370,15 @@ def doctor(project: Path, host="codex"):
         except (OSError, subprocess.TimeoutExpired):
             checks["cli_compatible"][host] = False
     for role in ("explorer", "implementer", "reviewer"):
-        checks["route"][role] = model_route(cfg, host, role, project=project)
-    checks["route"]["architect"] = model_route(cfg, host, "architect", project=project)
+        checks["route"][role] = model_route(cfg, host, role, project=project,
+                                            dialect=dialect)
+    checks["route"]["architect"] = model_route(cfg, host, "architect", project=project,
+                                               dialect=dialect)
     checks["host"] = host
     checks["billing_preflight"] = {}
     for role, route in checks["route"].items():
         checks["billing_preflight"][role] = route_preflight(
-            role, route, cfg, project, state=None)
+            role, route, cfg, project, state=None, dialect=dialect)
     checks["generated_commands"] = probe_generated_commands(cfg, host, dialect,
                                                             help_by_provider, project)
     # Deterministic contract validation is authoritative; live CLI

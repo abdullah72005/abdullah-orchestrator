@@ -75,7 +75,13 @@ class ControlTests(unittest.TestCase):
         env_patch = patch.dict(os.environ, {
             "ABDULLAH_STATE_DIR": str(self.root / "runs"),
             "ABDULLAH_CONFIG": str(self.root / "config.json"),
+            # Tests must never read a live user's OpenCode config/account/plugin
+            # boundary (or any other HOME-derived state).
+            "HOME": str(self.root / "home"),
+            "XDG_CONFIG_HOME": "", "XDG_DATA_HOME": "",
         })
+        (self.root / "home").mkdir()
+        (self.root / "home" / ".local" / "state").mkdir(parents=True)
         env_patch.start()
         # An exported registry override would defeat state-root derivation.
         os.environ.pop("ABDULLAH_CHECKOUT_REGISTRY", None)

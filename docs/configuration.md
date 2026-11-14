@@ -166,8 +166,17 @@ The supported source boundary is version-aware:
   explicit `OPENCODE_CONFIG`; project `opencode.json(c)` from the Git worktree
   root downward; project `.opencode` directories nearest-first (outermost wins);
   `$HOME/.opencode`; late `OPENCODE_CONFIG_DIR`; inline content; Linux managed
-  files. V1 `debug` initialization can write schema/dependency files, so it is
-  not executed for billing inspection.
+  files. Relative explicit/custom-directory paths are resolved against the
+  child's project cwd, not the supervisor's cwd. V1 `debug` initialization can
+  write schema/dependency files, so it is not executed for billing inspection.
+  The adapter accounts for native provider/model `api` URLs, `npm`/SDK and
+  `modelID`/`id` remaps, and refuses nested provider routing shapes it does not
+  model. The SQLite account store selected by `OPENCODE_DB` (or the default data
+  directory) is inspected read-only for account-table presence and active
+  account/organization selection; credentials are never selected or logged.
+  Automatic plugin files under applicable global/project `.opencode/plugin(s)`
+  directories are discovered, hashed and refused as uninspectable code. A
+  declared plugin list alone is not a complete plugin boundary.
 - **V2.2.7** uses the installed binary's ordered, non-inference
   `debug config --standalone` documents. That normalizer walks project config
   from the filesystem root (including a parent above the Git root), applies
@@ -202,15 +211,17 @@ authenticated entitlement.
 
 For `billing: "go"`, preflight resolves the selected provider, model and variant
 endpoint in documented precedence order (provider, then model, then selected
-variant) and inspects package/canonical and model/provider remaps. Any custom
-endpoint or remap outside the unchanged Go default is classified
-`unqualified_go_route` and refused before spawn; the same route can still be
-dispatched with explicit `api`/`subscription` billing and an `authorize-route`
-grant. The unchanged default (no inspectable override) remains a legacy Go
-subscription without a new grant only when the applicable source boundary is
-fully observed. A V2 inspector failure or a V1 plugin/external-routing hazard is
-`unprovable_routing`; it never becomes a Go approval. This is a configuration
-check, not proof of Go settlement or entitlement.
+variant) and inspects package/canonical, native V1 `api`/`npm`, and
+`modelID`/`id`/provider remaps. Any custom endpoint or remap outside the
+unchanged Go default is classified `unqualified_go_route` and refused before
+spawn; the same route can still be dispatched with explicit
+`api`/`subscription` billing and an `authorize-route` grant. The unchanged
+default (no inspectable override) remains a legacy Go subscription without a new
+grant only when the applicable source boundary — including account metadata and
+automatic plugin sources — is fully observed. A V2 inspector failure, a
+plugin/account hazard or any version-boundary failure is `unprovable_routing`; it
+never becomes a Go approval. This is a configuration check, not proof of Go
+settlement or entitlement.
 
 Variant configuration is dialect-specific. V1 keeps a dictionary keyed by
 variant id; supported V2 uses an array of objects such as
@@ -441,10 +452,16 @@ Unknown risk classes fail closed.
   supervisor does not silently reinterpret a pin. Prefer keeping runs and config
   on the same release and migrate paused runs explicitly.
 - `opencode_version` is `auto` or an explicit pin such as `2.2.7`; a pin must
-  match the installed CLI.
+  match the installed CLI. The supervisor validates the **resolved executable's**
+  reported version against the tested ranges and the pin before it generates or
+  authorizes a prepared permission profile. A pin is a constraint, not evidence
+  of the installed dialect: a mismatch, unsupported actual version, failed version
+  query or missing executable is `unprovable_routing` and never falls back to the
+  pinned dialect.
 - `opencode_supported` is the tested range list. Unknown majors and untested
   ranges are refused; the supervisor does not generate a permission contract it
-  cannot verify.
+  cannot verify. Cold version and configuration inspection run inside the same
+  whole-stage deadline, cancellation and process-tree containment as dispatch.
 
 ## Authorization
 
