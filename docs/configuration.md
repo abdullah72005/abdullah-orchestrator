@@ -183,6 +183,16 @@ grant. The unchanged default (no inspectable override) remains a legacy Go
 subscription without a new grant. This is a configuration check, not proof of
 Go settlement or entitlement.
 
+Variant configuration is dialect-specific. V1 keeps a dictionary keyed by
+variant id; supported V2 uses an array of objects such as
+`{"id": "low", "settings": {"baseURL": "..."}}`, and the selected entry is
+applied last. A present-but-uninspectable `variants` value (wrong type,
+non-object entries, missing/blank ids or duplicate ids) fails closed as
+`unprovable_routing`; it is never treated as an unchanged Go default. When a
+well-formed array simply lacks the selected id, there is no variant override to
+apply; the documented V2 behavior is a model-resolution error, not a silent
+repoint of the route.
+
 ### Billing and authorization
 
 | Billing | Dispatch requirement |
@@ -239,8 +249,10 @@ opencode models
 | `execution_verified` | Always `false`; Doctor makes no model call |
 | `route` | The resolved pinned route for each role |
 
-On V2, `variant_verified: "unavailable"` is expected and is not a failure.
-On V1, a missing configured variant makes `doctor` report not-ready.
+On V2, `variant_verified: "unavailable"` is expected and is not a failure: the
+V2 `models` command does not list variants. Configured variants are still read
+by preflight from the V2 array form above. On V1, a missing configured variant
+makes `doctor` report not-ready.
 
 ### Worker fallback
 

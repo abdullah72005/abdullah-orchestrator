@@ -89,6 +89,25 @@ stage but together time out without completion, and added a mixed
 API/free/Go fake stage path driven through the real human authorization helpers
 (`test_v31_campaign_integration.py`).
 
+## Round 3 correction matrix (Architect fix-b01-r03)
+
+Bounded V2 selected-variant schema correction. Round 1 and Round 2 corrections
+were preserved and re-exercised by the same suites.
+
+| Finding | Correction | Permanent evidence |
+|---|---|---|
+| F5c V2 selected variant ignored | `_opencode_selected_variant` resolves V1 dictionary variants by key and supported V2 array variants by unique `id`. The selected entry feeds endpoint precedence, authentication observation, model/provider/package remap checks and Go qualification. | `test_v31_routing_observation.py::test_v2_variant_selection_is_by_id_not_position`, `::test_selected_v2_variant_auth_and_remap_are_observed`, `::test_captured_v2_variant_fixture_resolves_the_selected_endpoint`; red baseline showed the provider/model endpoint instead of the selected variant |
+| Uninspectable V2 variant shape | Wrong type, non-object entries, missing/blank ids and duplicate ids produce an observation error and `unprovable_routing` before spawn. An explicit API grant cannot convert that shape into an approved route. | `::test_invalid_v2_variant_shapes_fail_closed_before_spawn` (seven shapes including explicit null, API-grant refusal, no active job); red baseline approved several shapes as Go or returned a different classification |
+| Captured schema fixture | A sanitized V2.2.7 `debug config --standalone` normalization is stored with its input. The offline regression reads the recorded normalized document; an opt-in binary test re-runs the real CLI in a disposable credential-free environment and compares the document. | `scripts/tests/fixtures/opencode-v2.2.7-variant-config.json`; `test_opencode_v2_integration.py::test_captured_variant_config_normalizes_to_the_recorded_document`; captured output `/tmp/opencode/ao-r03-v2-config-capture.json` |
+| Benign V2 variant settings | Valid array variants carrying only reasoning settings leave the unchanged Go route as `go_subscription` without a new grant. | `::test_benign_v2_variant_settings_keep_default_go_subscription` |
+| Explicit authorized custom route | The same custom V2 variant endpoint with `api` billing and an exact human grant still dispatches through the fake CLI, with unchanged V2 selector/standalone arguments and generated worker profile. | `::test_authorized_custom_v2_variant_dispatches_without_go_bypass` |
+
+The real V2.2.7 probe preserved the array-shaped provider/model/variant with
+its `baseURL`; the dictionary-shaped equivalent normalized to `providers: {}`
+even though the CLI exited 0. Configuration acceptance therefore requires
+inspecting normalized output, not the exit code. No inference, credential use,
+provider charge or entitlement check was performed.
+
 ## Provider compatibility matrix
 
 | Route form | Config | Dispatch policy | Evidence status |
@@ -100,7 +119,7 @@ API/free/Go fake stage path driven through the real human authorization helpers
 | Local route | explicit route + reviewed endpoint | Human grant; endpoint required in effective config | Offline policy tests only; a provider named “ollama” is not automatically local |
 | Per-role fallback | complete `fallback` object | `authorize-route --fallback` for the exact alternate grant plus separate one-dispatch `approve-worker-fallback` consent | Offline fake-CLI tests incl missing/changed/exhausted alternate |
 | Schema-2 recorded routes | `migrate-run` | Reconstructed only from recorded routes/jobs or explicit mapping; explicit migration initializes routing pins | Offline migration tests incl rollback |
-| Effective routing | V1/V2 config locations | One composition boundary for files + preserved ambient inline routing + generated controls; JSONC, child-env/file expansion; unreadable fails closed; auth mode and model/variant endpoints pinned | Offline temporary configs plus captured fake-child `OPENCODE_CONFIG_CONTENT`; arbitrary plugins/gateways unverified |
+| Effective routing | V1/V2 config locations | One composition boundary for files + preserved ambient inline routing + generated controls; JSONC, child-env/file expansion; unreadable or malformed variant shapes fail closed; V1 dictionary and V2 array variants resolved by selected id; auth mode and model/variant endpoints pinned | Offline temporary configs, captured V2.2.7 normalized variant fixture, opt-in binary normalization check and captured fake-child `OPENCODE_CONFIG_CONTENT`; arbitrary plugins/gateways unverified |
 | Authenticated Claude/Codex E2E | real host | Not executed | **Unverified** |
 
 `subscription` entitlement, provider settlement, auxiliary provider calls and
@@ -109,30 +128,40 @@ attempts, not tokens or dollars. There is no hard spend-cap claim.
 
 ## Verification snapshot
 
-Round 2 correction evidence (offline; no paid model, install or live Doctor):
+Round 3 correction evidence (offline except the opt-in staged-binary
+introspection; no paid model, install or live Doctor):
 
-- Interpreter: Python 3.10.12
-- `python3 -m compileall -q scripts`: exit 0
-- Routing regressions:
+- Interpreter: Python 3.10.12; correction base `7bd998a`.
+- Red at that exact base with the final tests and fixture present (a clean
+  `git archive 7bd998a` copy, unmodified base `scripts/orchestrator.py`):
   `python3 -m unittest discover -s scripts/tests -p 'test_v31_routing_observation.py' -v`
-  — **13 tests**, exit 0.
+  — **19 tests, 14 failures**, exit 1
+  (`/tmp/opencode/ao-r03-red-routing-final.log`). The V2 dictionary fixture was
+  approved as Go, the array fixture was ignored, and all seven malformed-shape
+  subtests were approved or classified differently.
+- Green routing:
+  `python3 -m unittest discover -s scripts/tests -p 'test_v31_routing_observation.py' -v`
+  — **19 tests**, OK, 7.2 s.
 - Claude dispatch regressions:
   `python3 -m unittest discover -s scripts/tests -p 'test_v31_dispatch_safety.py' -v`
-  — **27 tests**, exit 0.
+  — **27 tests**, OK, 4.2 s.
 - Focused v3.1: `python3 -m unittest discover -s scripts/tests -p 'test_v31_*.py' -v`
-  — **129 tests**, exit 0, 141.6 s.
-- `test_p1_03_permission_overlap.py` 23 and `test_checkpoint_a_containment.py` 25 —
-  both exit 0. Round 1 targeted F1–F4/F7–F9 suites remain inside the v3.1 and
-  full runs.
+  — **135 tests**, OK, 145.7 s.
+- `test_p1_03_permission_overlap.py` — **23 tests**, OK, 0.4 s.
+- `python3 -m compileall -q scripts`: exit 0.
+- Opt-in staged binary, disposable credential-free HOME/XDG/environment,
+  `ABDULLAH_OPENCODE_V2_BIN=/tmp/ocv2/opencode` (opencode v2.2.7):
+  `test_opencode_v2_integration.py` — **5 tests**, OK, 12.8 s. This includes the
+  captured variant-config normalization check; it makes no model call.
 - Full offline suite:
-  `python3 -m unittest discover -s scripts/tests -v` — **708 tests**,
-  4 skipped, exit 0, 366.0 s.
-- The 4 skips are the optional installed-CLI V2 introspection suite; they are
+  `python3 -m unittest discover -s scripts/tests -v` — **715 tests**,
+  5 skipped, OK, 358.8 s, exit 0.
+- The 5 skips are the optional installed-CLI V2 introspection suite; they are
   reported separately and are not counted as passed.
-- Baseline red probes from Round 1 are preserved under
-  `/tmp/opencode/ao-red-evidence/`; Round 2 red runs are under
-  `/tmp/opencode/ao-red-r02/`. Temporary evidence is not a production test
-  contract.
+- Captured normalized V2.2.7 configuration evidence:
+  `/tmp/opencode/ao-r03-v2-config-capture.json`. Round 1 and Round 2 red probes
+  remain under `/tmp/opencode/ao-red-evidence/` and `/tmp/opencode/ao-red-r02/`.
+  Temporary evidence is not a production test contract.
 - No paid requests, authenticated E2E, real installer execution or Doctor
   against live config were performed.
 
@@ -172,6 +201,9 @@ document as Architect approval.
 5. Exactly-once side effects, price/quota accuracy and arbitrary
    plugin/gateway/auxiliary route behavior remain outside the supervisor's
    guarantees; the routing fingerprint covers inspectable configuration only.
+   V2 variant resolution was validated against a captured V2.2.7 normalized
+   configuration; other V2 builds and V1 real-binary variant introspection were
+   not exercised.
 6. CI compatibility targets Python 3.10/3.12/3.13; only 3.10.12 was available
    locally. CI must run under separately authorized push.
 7. Docker verification evidence is synthetic in the offline suite.
