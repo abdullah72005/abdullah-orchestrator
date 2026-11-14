@@ -29,10 +29,11 @@ Coverage areas:
 | Verification provenance | source/env/config/toolchain drift, runtime-input manifests, Docker source proof, legacy evidence |
 | Acceptance integrity (AOR-01) | `test_v31_acceptance_integrity.py`: late check-executable/source/env/config/runtime/plan drift, evidence-byte replacement, new-record/new-decision, bound crash recovery |
 | Read-only stage invariants (AOR-02) | `test_v31_stage_invariants.py`: real Git/fake CLIs, tracked/staged/untracked/HEAD mutation, malformed/nonzero failure paths, recovered-report mismatch |
-| Host and dispatch preflight (AOR-04/05/07) | `test_v31_dispatch_safety.py`: missing host, contradictory resume, provider flags, settings helper/malformed settings, inert AWS creds, durable rejection without a job, spawn-failure distinction, Doctor parity |
-| Claude setup and stage deadline (AOR-03/06) | `test_v31_claude_setup.py`, `test_v31_stage_deadline.py`: idempotent/conflicting registration, rollback, foreground snippets, whole-stage clipping |
-| Worker providers and migration | `test_v31_worker_routes.py`, `test_v31_route_migration.py`: mixed routes, grants, fallback, session boundaries, endpoint drift, recorded-route migration, rollback, newer schemas |
-| Full campaign paths | `test_v31_campaign_integration.py`: fake Codex and Claude multi-batch runs, late drift with fresh checks |
+| Host and dispatch preflight (AOR-04/05/07) | `test_v31_dispatch_safety.py`: missing host, contradictory resume, provider flags, settings helper/malformed settings, inert AWS creds, durable rejection without a job, spawn-failure distinction, Doctor parity; alternate `CLAUDE_CONFIG_DIR`, provider-managed host, managed settings, fallback/model routing keys, post-Doctor contamination, authorized alternate billing |
+| Claude setup and stage deadline (AOR-03/06) | `test_v31_claude_setup.py`, `test_v31_stage_deadline.py`: idempotent/conflicting registration, rollback, separate settings/MCP-store destinations and timeout path, whole-stage clipping, genuine accept-stage checks+decision timeout |
+| Worker providers and migration | `test_v31_worker_routes.py`, `test_v31_route_migration.py`: mixed routes, non-Go `go`/missing-billing rejection before spawn, bounded non-Go subscription grants, fallback, session boundaries, effective V1/V2 project routing drift, JSONC/env expansion, unreadable config fail-closed, migration pins, restore validation/write-failure, rollback, newer schemas |
+| Durable grants across processes | `test_v31_grant_ledger.py`: real separate-process parent→`explore` path, stale parent save, concurrent reservation bound, replay idempotence, public `authorize-route --fallback` sequence |
+| Full campaign paths | `test_v31_campaign_integration.py`: fake Codex and Claude multi-batch runs, mixed API/free/Go routes through real human authorization helpers, late drift with fresh checks |
 | Command policy | shell wrappers, interpreter strings, indirect Docker, scoped exceptions, bypass acknowledgements |
 | Report contracts | strict schemas, contract v2, invalid JSONL, recovery without a model call |
 | OpenCode dialects | V1/V2 profile generation, effective-permission validation, glob-overlap rejection |
@@ -65,6 +66,18 @@ The final candidate run and exact counts are recorded in the delivery report and
 `codex`, `claude`, and `opencode` executables exercise real supervisor code,
 temporary Git checkouts, real `run_checks` records and real process containment.
 They do **not** prove authenticated model behavior.
+
+### Correction round r01
+
+The Architect's nine-blocking-finding correction round was reproduced on the
+baseline (`bfd9a8b`) with disposable probes, then covered by permanent tests:
+escaped-child source mutation/containment, non-Go `billing: go` and missing
+billing, non-Go subscription grant consumption, separate-process nested grant
+durability, effective V1/V2 routing/fingerprint drift, Claude alternate
+config-dir/provider-managed/managed/fallback hazards, public API fallback
+authorization, separate Claude settings/user-MCP destinations, and restore
+validation. Exact red/green commands and counts are in the Implementer report and
+auditor handoff; temporary probes are evidence, not the production test contract.
 
 Evidence classes are kept separate:
 

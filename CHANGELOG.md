@@ -6,6 +6,34 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Read-only source mutation and process containment are independent: a live
+  escaped child retains exact `uncertain` ownership instead of being cleared as a
+  blocked job; a clean stopped mutation still blocks without phantom
+  reconciliation.
+- `billing: "go"` is restricted to the unchanged `opencode-go` route; non-Go
+  providers must state billing explicitly in config, preflight and migration.
+- Every route that preflight requires a grant for — including non-Go
+  `subscription`/`free`/`local` — reserves one dispatch atomically.
+- Route-grant usage lives in a separately locked run ledger keyed by reservation
+  ID, so a parent Architect save cannot erase nested Explorer consumption.
+- OpenCode routing fingerprints observe the effective selected-dialect V1/V2
+  configuration (project/ancestor/global/system, JSONC, env/file expansion,
+  endpoint/auth/model/variant mapping) and fail closed on unreadable input.
+- Claude subscription preflight resolves `CLAUDE_CONFIG_DIR`, project/local and
+  managed settings, provider-managed host control, endpoint/token/helper and
+  model/fallback overrides; explicit authorized alternate billing routes remain
+  available.
+- `authorize-route --fallback` authorizes the exact configured alternate route,
+  separate from one-dispatch fallback consent, with a documented command
+  sequence.
+- Claude foreground setup now emits separate destinations for host settings and
+  the user-scoped MCP store, including the manual path that installs the
+  per-server timeout.
+- `restore-run` fully validates a backup before atomic mutation and preserves
+  pre-restore state and backup provenance.
+
 ## [3.1.0] — 2026-11-13
 
 Closes audit findings AOR-01 through AOR-07 and adds reviewed multi-provider

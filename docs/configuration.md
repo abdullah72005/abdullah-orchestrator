@@ -33,8 +33,8 @@ chmod 600 ~/.config/abdullah-orchestrator/config.json
 | Explorer / Implementer / Reviewer model | Yes | Fully qualified `provider/model-id`; prefix and declared provider must match |
 | Explorer / Implementer / Reviewer provider | Yes | Any OpenCode provider; recorded as `worker_provider` |
 | Explorer / Implementer / Reviewer variant | Yes | Set per role; `doctor` verifies it on V1 where the catalog exposes variants |
-| Worker billing route | Yes | `go`, `subscription`, `api`, `free`, or `local`; non-Go routes require explicit per-run authorization |
-| Worker fallback | Yes (stored) | Complete exact alternate route; one dispatch needs human consent |
+| Worker billing route | Yes | `go`, `subscription`, `api`, `free`, or `local`; `go` only for `opencode-go`; other routes need explicit billing and per-run authorization |
+| Worker fallback | Yes (stored) | Complete exact alternate route; separate one-dispatch human consent and, for non-Go, its own `authorize-route --fallback` grant |
 | Limits, permissions, risk policy, verification | Yes | Security-critical values have fail-closed minimums |
 | Worker **provider** | **Yes, schema 3** | OpenCode remains the sole worker runtime; no native Codex/Claude worker backend |
 
@@ -94,6 +94,13 @@ billing  = architect.<host>.auth
 - `auth` should stay `subscription` for the supported workflow. The supervisor
   fails closed if `OPENAI_API_KEY` (Codex host) or `ANTHROPIC_API_KEY` (Claude
   host) is set while subscription billing is declared.
+- For Claude, preflight resolves the effective `CLAUDE_CONFIG_DIR` and inspects
+  user/project/local plus configured managed settings files. It rejects
+  provider-managed host control (`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`),
+  endpoint/token/helper overrides, model/fallback routing keys and unreadable
+  settings before spawn. Server/MDM-delivered settings that cannot be observed
+  are reported as unverified, not certified. A deliberately authorized API/local
+  alternate sets `auth` accordingly and uses the route-grant path instead.
 - Model IDs are passed through unchanged. Verify them against the installed CLI
   catalog rather than guessing.
 - `effort` is passed to the CLI as its reasoning-effort setting.
@@ -128,15 +135,21 @@ Validation requires:
 3. `billing` is one of `go`, `subscription`, `api`, `free`, `local`.
 4. `variant` is a string and never embedded in `model` with `#`.
 5. The three required roles exist and no unknown worker roles/keys appear.
+6. `billing: "go"` is accepted only when the worker provider is the unchanged
+   `opencode-go` route. A non-Go provider must state `api`, `subscription`,
+   `free` or `local` explicitly; missing billing is never defaulted onto an
+   arbitrary remote provider.
 
 The legacy Go configuration remains valid: omitting `provider` derives
-`opencode-go` from the model prefix, and `billing: "go"` is the Go subscription.
+`opencode-go` from the model prefix, and missing `billing` defaults to `go`
+**only** for that provider. Migration of old records infers missing fields only
+when every recorded worker route is legacy Go.
 
 ### Billing and authorization
 
 | Billing | Dispatch requirement |
 |---|---|
-| `go` | Existing Go configuration authorization; no new grant |
+| `go` | Existing Go configuration authorization; no new grant, only for `opencode-go` |
 | `subscription` / `free` / `local` | Human `authorize-route` grant with an endpoint/auth-mode attestation; `local` needs a reviewed local endpoint; `free` with a custom endpoint must explicitly attest that endpoint |
 | `api` | Human `authorize-route` grant bound to role, run and exact route |
 | unknown | Rejected |
@@ -149,10 +162,16 @@ python3 scripts/orchestrator.py authorize-route <RUN_ID> --role implementer \
   --confirm authorize-route:<RUN_ID>
 ```
 
-Each supervisor dispatch atomically consumes one grant before spawn. A crash
-after reservation is conservative and is not refunded. Grants bound call
-attempts, not tokens or provider-side retries; there is no dollar cap claim.
-Nested Explorer dispatches consume the run's Explorer grant.
+Every dispatch that preflight says needs a grant — including non-Go
+`subscription`, `free` and `local` routes — atomically reserves exactly one
+before spawn. Consumption is persisted in a run-scoped, independently locked
+grant ledger (`route-grants/ledger.json`) keyed by grant and reservation ID, so a
+parent supervisor snapshot cannot erase a nested Explorer's usage. A crash after
+reservation is conservative and is not refunded; replaying the same reservation
+ID does not consume twice. Grants bound call attempts, not tokens or
+provider-side retries; there is no dollar cap claim. Nested Explorer dispatches
+consult current durable usage before authorization and cannot exceed the run's
+grant.
 
 `doctor` reports `route_authorization_required` without treating the absence of
 a per-run grant as a configuration defect—grants are run-scoped.
@@ -207,23 +226,47 @@ A role may include a complete `fallback` route:
 ```
 
 Fallback is never automatic on rate limits, provider errors or free quota.
-A human authorizes exactly one dispatch:
+A human authorizes exactly one dispatch, and a non-Go fallback needs its own
+separate route grant. Both steps are required; neither implies the other:
 
 ```bash
+# 1. Authorize the exact configured fallback route (repeat for a non-Go route).
+python3 scripts/orchestrator.py authorize-route <RUN_ID> --role implementer \
+  --fallback --max-dispatches 1 \
+  --attest "reviewed fallback endpoint/auth mode" \
+  --confirm authorize-route:<RUN_ID>
+
+# 2. Grant one-dispatch consent to select the fallback.
 python3 scripts/orchestrator.py approve-worker-fallback <RUN_ID> --role implementer \
   --confirm approve-worker-fallback:<RUN_ID>
 ```
 
-A non-Go fallback still needs its own route grant. Sessions never continue
-across routes; the Reviewer always gets a fresh session.
+The consent is consumed only after the exact fallback passes preflight and its
+grant reservation succeeds. A failed or interrupted fallback attempt still
+needs new consent. Sessions never continue across routes; the Reviewer always
+gets a fresh session. A Go fallback does not need a route grant but still needs
+the one-dispatch consent.
 
 ### Pinned routes and provider drift
 
 Routes, variants, billing and a redacted routing fingerprint are pinned at run
-creation. Dispatch consumes those pins, including nested Explorer calls. If the
-effective OpenCode provider configuration/endpoint/auth mode changes, preflight
-rejects dispatch until the operator reviews/migrates the run. Editing the config
-after creation still makes the run `config_changed`; it never silently reroutes.
+creation. Dispatch consumes those pins, including nested Explorer calls. The
+observer reads the selected installed OpenCode dialect (V1 `provider.options` or
+V2 `providers.settings`) and the applicable merged configuration: explicit
+`OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`, the global config directory, project and
+ancestor `opencode.json(c)` files, project `.opencode/opencode.json(c)` files,
+`OPENCODE_CONFIG_CONTENT`, and `/etc/opencode`. JSONC comments/trailing commas
+and `{env:...}`/`{file:...}` expansion are handled. Unreadable influential
+configuration fails closed for every billing class, including Go.
+
+Changing the effective endpoint, credential/auth mode, selected model/variant
+mapping or a detectable auxiliary/fallback route changes the fingerprint.
+Preflight then rejects dispatch until the operator reviews/migrates the run.
+Editing the config after creation still makes the run `config_changed`; it never
+silently reroutes. Explicit `migrate-run` initializes current routing pins and
+records their source, for old schema-2 routes whose fingerprint was null.
+Arbitrary plugins/gateways that cannot be inspected remain an explicit
+limitation, not a universal proof.
 
 ## Fallback models
 
@@ -324,7 +367,7 @@ silently ignored.
 |---|---|
 | Config schema | Newer than `3`; schema 2 is normalized in memory |
 | Supervisor version | When set, anything other than `3.1.0` |
-| Worker billing | Not `go`, `subscription`, `api`, `free`, or `local` |
+| Worker billing | Not `go`, `subscription`, `api`, `free`, or `local`; `go` on a non-Go provider; missing billing on a non-Go provider |
 | Worker model | Not `provider/model-id`, or declared provider mismatch |
 | Worker variant | Embedded `#variant` or non-string |
 | Fallback | `enabled: true` (strong-host automatic fallback) |
@@ -368,7 +411,10 @@ python3 scripts/orchestrator.py migrate-run <RUN_ID> --routes routes.json
 complete historical routes. Migration never uses today's defaults, never
 reroutes an active run, and invalidates verification, review, cached decisions
 and check progress (including integration). Completed history is preserved and
-may require new checks/decisions, not retroactive recertification.
+may require new checks/decisions, not retroactive recertification. Explicit
+migration also initializes a current reviewed routing pin for each worker route
+(`routing_pin_source: "migration_observation"`) and records the previous value
+in `migration_routing_pins`.
 
 Rollback is explicit and uses the exact backup:
 
@@ -376,6 +422,13 @@ Rollback is explicit and uses the exact backup:
 python3 scripts/orchestrator.py restore-run <RUN_ID> \
   --backup <BACKUP_PATH> --acknowledge restore
 ```
+
+Before touching `state.json`, restore parses the entire backup, requires the
+exact run and project identity, rejects newer schemas, and refuses running,
+uncertain or active-work backups. It writes through the supervisor's atomic
+persistence path and records the previous state under `restores/pre-restore-*.json`
+with the backup hash and operator identity. A corrupt backup or simulated write
+failure leaves the destination bytes unchanged.
 
 ## Recipes
 

@@ -51,18 +51,31 @@ described as a limitation.
   to identical bytes before observation is not detected.
 - **Explicit host and shared billing preflight.** New runs require an explicit
   `codex` or `claude` host; resume refuses a contradictory host. One
-  deterministic preflight is shared by dispatch and `doctor`. It rejects
-  observable subscription overrides (API keys, endpoints, Bedrock/Vertex/
-  Foundry/Mantle/AWS provider flags, settings helpers, unreadable settings)
-  and unapproved non-Go worker routes before an active job or model call is
-  recorded. Rejections are durable `preflight_rejected` diagnostics with no
-  phantom job.
-- **Worker routes are pinned and granted.** Per-role OpenCode providers are
-  allowed only with explicit billing classification. API/usage routes need a
-  human-only, per-run grant; reservations are consumed atomically before spawn
-  and collapse conservatively after a crash. Effective provider configuration
-  changes are detected by a redacted fingerprint and require operator review.
+  deterministic preflight is shared by dispatch and `doctor`. It resolves the
+  effective Claude config directory/settings sources and rejects observable
+  subscription overrides (API keys, tokens, endpoints, model/fallback routing,
+  helpers, Bedrock/Vertex/Foundry/Mantle/AWS provider flags,
+  `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, unreadable settings) and unapproved
+  non-Go worker routes before an active job or model call is recorded. Rejections
+  are durable `preflight_rejected` diagnostics with no phantom job. Server/MDM
+  managed sources that cannot be observed remain explicitly unverified rather
+  than certified.
+- **Worker routes and grants are durable.** Per-role OpenCode providers are
+  allowed only with explicit billing classification; legacy `go` consent applies
+  only to the unchanged `opencode-go` route. Every route that preflight says
+  needs a grant — including non-Go subscription/free/local — reserves exactly one
+  in an independently locked run ledger, so nested Explorer usage survives parent
+  snapshots and concurrent reservations cannot exceed the bound. Effective
+  provider configuration is observed from the selected dialect and merged
+  project/global/system locations; unreadable influential input fails closed.
   There is no dollar/token cap claim and no automatic fallback.
+- **Source mutation and containment are separate gates.** A read-only stage's
+  observed source edit blocks only when the whole execution is proven stopped;
+  a live escaped child keeps exact `uncertain` ownership. A leader exit, error
+  class or valid report is not containment proof.
+- **Restore validates before mutation.** `restore-run` parses and checks the
+  whole backup (run/project identity, schema, inactive state), writes atomically
+  under the lock, and preserves the pre-restore state and backup hash for audit.
 - **No silent downgrade.** A missing model, variant, subscription, or supported
   CLI version fails visibly; the supervisor does not fall back to a free model
   or an API-billed route.

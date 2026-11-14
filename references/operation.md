@@ -2,7 +2,7 @@
 
 Copy the **entire** skill directory onto the WSL filesystem. Run `python3 scripts/install_wsl.py`, edit `~/.config/abdullah-orchestrator/config.json`, then `python3 scripts/orchestrator.py doctor --project /abs/dev/repo`. Requires Python 3.10+, git, Codex CLI, OpenCode CLI, and Docker/Compose for Docker projects; Claude Code CLI only for Claude mode. No extra Python dependencies.
 
-Model routes are configured, not hard-coded: `architect.<host>` selects the strong model/effort, and `workers.<role>.model`/`.variant` selects the paid Go worker. Worker models must be `opencode-go/...` with `billing: "go"`; other routes are rejected. Set them before starting a run, because changing the config mid-run marks the run `config_changed` and blocks stages. Full reference: [`../docs/configuration.md`](../docs/configuration.md).
+Model routes are configured, not hard-coded: `architect.<host>` selects the strong model/effort, and `workers.<role>.provider`/`.model`/`.variant`/`.billing` selects the worker route. The unchanged `opencode-go/...` route with `billing: "go"` retains the legacy Go consent; any other provider needs explicit `api`/`subscription`/`free`/`local` billing and, where preflight requires it, an exact human `authorize-route` grant. Set routes before starting a run, because changing the config mid-run marks the run `config_changed` and blocks stages. Full reference: [`../docs/configuration.md`](../docs/configuration.md).
 
 The installer links this one skill into `~/.agents/skills/abdullah-orchestrator` (Codex) and `~/.claude/skills/abdullah-orchestrator` (Claude), refuses to overwrite unrelated files, and never modifies the user's original two skills or global OpenCode settings.
 
@@ -31,11 +31,16 @@ abdullah-orchestrator -- <python> <SKILL>/scripts/orchestrator.py mcp`. It
 treats an identical registration as a no-op, refuses to overwrite a conflicting
 server, distinguishes inspection/CLI failure from "server absent", and rolls
 back only an artifact created by that invocation. It does not edit real host
-settings. Merge these snippets manually and verify with `/mcp`:
+settings. Merge these **separate** snippets manually and verify with `/mcp`:
+
+1. Foreground environment in the interactive Claude host settings
+   (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json` when that
+   variable is set): `{"env": {"CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"}}`.
+2. User-scoped MCP server entry in `~/.claude.json` (or the custom config
+   directory's `.claude.json`), **not** in `settings.json`:
 
 ```json
 {
-  "env": {"CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"},
   "mcpServers": {
     "abdullah-orchestrator": {
       "type": "stdio",
@@ -47,8 +52,13 @@ settings. Merge these snippets manually and verify with `/mcp`:
 }
 ```
 
-`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` belongs in the controlling interactive
-host (environment or host settings), not merely the MCP child environment.
+`claude mcp add` does not install the per-server timeout. Either register with
+the printed `claude mcp add-json --scope user ...` command (its JSON includes
+`timeout`) or add `"timeout": 18000000` to the existing entry and confirm it in
+`~/.claude.json`. `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` belongs in the
+controlling interactive host (environment or host settings), not merely the MCP
+child environment. Preserve unrelated settings/servers; a repeated identical
+registration/merge is a no-op.
 
 A whole foreground stage is bounded by `limits.max_stage_seconds`; individual
 checks and the strong call are clipped to the remaining budget, so a sequence of
@@ -99,6 +109,20 @@ Every worker is launched under a **guard** process that is a session and process
 - termination records descendants before killing the parent, sends SIGTERM then SIGKILL, and verifies the session is stopped;
 - if the host connection or supervisor dies, the lease pipe closes and the guard kills the worker tree;
 - an operation whose ownership cannot be proven is marked `uncertain`; no duplicate worker may be launched.
+
+Source integrity and process containment are independent gates. A read-only
+stage that edits source blocks and preserves the edit, report and diagnostics
+only when the whole execution is proven stopped. A leader exit, error class or
+valid report is not proof; if a marked child survives (for example after
+`setsid`), the exact job identity remains `uncertain` and must be reconciled
+before replay. A clean stopped mutation is `blocked` without requiring phantom
+reconciliation. No rollback/reset/clean is performed.
+
+Route-grant consumption is stored in `route-grants/ledger.json` with its own
+lock and reservation IDs, so a parent Architect save cannot erase a nested
+Explorer's usage. `restore-run` validates the complete backup (identity,
+project, schema, inactive status) before atomically writing, and preserves the
+previous state under `restores/`.
 
 A queued chat message cannot preempt an already-running foreground tool. The user must use the host's cancel/interrupt action (for example Esc in Codex); the MCP server receives the cancellation notification, stops the process session and finalizes the safe state before returning.
 
