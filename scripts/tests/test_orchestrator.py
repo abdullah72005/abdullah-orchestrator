@@ -98,6 +98,21 @@ class ControlTests(unittest.TestCase):
         guard.start()
         self.addCleanup(guard.stop)
         self.project = setup_repo(self.root)
+        # Dialect selection may introspect the installed CLI.  Provide a
+        # deterministic test-owned binary so the Popen tripwire never has to
+        # allow a real model runtime and tests remain hermetic.
+        fixture_bin = self.root / "fixture-bin"
+        fixture_bin.mkdir()
+        fixture_cli = fixture_bin / "opencode"
+        fixture_cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "print('1.18.35' if '--version' in sys.argv else '--help')\n")
+        fixture_cli.chmod(0o755)
+        path_patch = patch.dict(os.environ, {
+            "PATH": str(fixture_bin) + ":" + os.environ.get("PATH", "")})
+        path_patch.start()
+        self.addCleanup(path_patch.stop)
         self.rundir = self.root / "runs/test-run00"
         self.rundir.mkdir(parents=True)
         test_cfg = orc.read_json(orc.HERE / "config.example.json")

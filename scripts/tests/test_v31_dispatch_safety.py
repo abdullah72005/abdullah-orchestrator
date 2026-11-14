@@ -24,6 +24,21 @@ class DispatchSafetyTests(unittest.TestCase):
         baseline.ControlTests.setUp(self)
         self.addCleanup(lambda: os.environ.pop("OPENAI_API_KEY", None))
         self.addCleanup(lambda: os.environ.pop("ANTHROPIC_API_KEY", None))
+        bin_dir = self.root / "safety-bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "fake-cli.py"
+        fake.write_text("#!/usr/bin/env python3\n"
+                        "import sys\n"
+                        "print('1.18.35' if '--version' in sys.argv else "
+                        "'--agent --model --format --auto --session --variant "
+                        "--output-schema --output-last-message --json-schema')\n")
+        fake.chmod(0o755)
+        for name in ("opencode", "codex", "claude"):
+            (bin_dir / name).symlink_to(fake)
+        env_patch = patch.dict(os.environ, {
+            "PATH": str(bin_dir) + ":" + os.environ["PATH"]})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
     def outlook(self):
         return [path for path in self.root.rglob("*")
@@ -98,9 +113,12 @@ class DispatchSafetyTests(unittest.TestCase):
                 self.assertTrue(any(name in reason for reason in result["reasons"]))
 
     def test_ambient_aws_credentials_are_inert_without_a_provider_selection(self):
-        with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "ambient",
-                                     "AWS_SECRET_ACCESS_KEY": "ambient",
-                                     "ANTHROPIC_API_KEY": ""}):
+        home = self.root / "aws-inert-home"
+        home.mkdir()
+        env = {name: "" for name in orc.CLAUDE_BILLING_ENV}
+        env.update({"HOME": str(home), "AWS_ACCESS_KEY_ID": "ambient",
+                    "AWS_SECRET_ACCESS_KEY": "ambient", "ANTHROPIC_API_KEY": ""})
+        with patch.dict(os.environ, env):
             result = orc.route_preflight("architect", {
                 "provider": "claude", "model": "claude-opus-5-5",
                 "effort": "high", "billing": "subscription"}, self.cfg,
@@ -217,6 +235,127 @@ class DispatchSafetyTests(unittest.TestCase):
         self.assertNotIn("preflight_rejection", self.state)
         self.assertEqual(self.state["failed_jobs"][-1]["status"], "failed")
         self.assertIsNone(self.state["active_job"])
+
+    def claude_preflight(self, extra=None, project=None):
+        env = {name: "" for name in orc.CLAUDE_BILLING_ENV}
+        env.update({name: "" for name in orc.INERT_CLOUD_ENV})
+        env.update(extra or {})
+        with patch.dict(os.environ, env):
+            return orc.route_preflight(
+                "architect", {"provider": "claude", "model": "claude-opus-5-5",
+                              "effort": "high", "billing": "subscription"},
+                self.cfg, project or self.project, self.state)
+
+    def test_claude_alternate_config_dir_endpoint_blocks_subscription(self):
+        home = self.root / "claude-home"
+        alt = self.root / "claude-alt"
+        alt.mkdir(parents=True)
+        (alt / "settings.json").write_text(json.dumps({
+            "apiKeyHelper": "/bin/print-secret",
+            "env": {"ANTHROPIC_BASE_URL": "https://custom.invalid"}}))
+        result = self.claude_preflight({"HOME": str(home),
+                                        "CLAUDE_CONFIG_DIR": str(alt)})
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("ANTHROPIC_BASE_URL" in reason
+                            for reason in result["reasons"]))
+        self.assertTrue(any("apiKeyHelper" in reason for reason in result["reasons"]))
+        self.assertNotIn("custom.invalid", json.dumps(result))
+        self.assertNotIn("/bin/print-secret", json.dumps(result))
+
+    def test_clean_alternate_config_directory_is_inspected_not_auto_rejected(self):
+        home = self.root / "claude-clean-alt-home"
+        alt = self.root / "claude-clean-alt"
+        alt.mkdir(parents=True)
+        (alt / "settings.json").write_text(json.dumps({"theme": "dark"}))
+        result = self.claude_preflight({"HOME": str(home),
+                                        "CLAUDE_CONFIG_DIR": str(alt)})
+        self.assertTrue(result["ok"], result["reasons"])
+        self.assertEqual(result["observed"]["config_dir"], str(alt))
+
+    def test_provider_managed_host_and_fallback_settings_block_subscription(self):
+        home = self.root / "claude-managed-home"
+        (home / ".claude").mkdir(parents=True)
+        settings = home / ".claude/settings.json"
+        settings.write_text(json.dumps({"fallbackModel": ["claude-haiku-4-5"]}))
+        result = self.claude_preflight(
+            {"HOME": str(home),
+             "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1"})
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("PROVIDER_MANAGED_BY_HOST" in reason
+                            for reason in result["reasons"]))
+        self.assertTrue(any("fallbackModel" in reason for reason in result["reasons"]))
+
+    def test_managed_settings_and_model_routing_keys_block_subscription(self):
+        home = self.root / "claude-clean-home"
+        home.mkdir()
+        managed = self.root / "managed-settings.json"
+        managed.write_text(json.dumps({"apiKeyHelper": "/bin/print-secret"}))
+        with patch.object(orc, "CLAUDE_MANAGED_SETTINGS_FILES", (managed,)):
+            result = self.claude_preflight({"HOME": str(home)})
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("apiKeyHelper" in reason for reason in result["reasons"]))
+        self.assertNotIn("/bin/print-secret", json.dumps(result))
+
+    def test_malformed_effective_claude_settings_fail_closed_and_doctor_agrees(self):
+        home = self.root / "claude-broken-home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude/settings.json").write_text("{not json")
+        result = self.claude_preflight({"HOME": str(home)})
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("unreadable" in reason for reason in result["reasons"]))
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            checks = orc.doctor(self.project, "claude")
+        self.assertFalse(checks["billing_preflight"]["architect"]["ok"])
+
+    def test_post_doctor_contamination_is_rechecked_at_dispatch(self):
+        home = self.root / "claude-contaminate-home"
+        (home / ".claude").mkdir(parents=True)
+        clean = self.claude_preflight({"HOME": str(home)})
+        self.assertTrue(clean["ok"], clean["reasons"])
+        (home / ".claude/settings.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_AUTH_TOKEN": SECRET}}))
+        contaminated = self.claude_preflight({"HOME": str(home)})
+        self.assertFalse(contaminated["ok"])
+        self.assertNotIn(SECRET, json.dumps(contaminated))
+
+    def test_clean_subscription_passes_and_authorized_alternate_remains_available(self):
+        home = self.root / "claude-empty-home"
+        home.mkdir()
+        clean = self.claude_preflight({"HOME": str(home)})
+        self.assertTrue(clean["ok"], clean["reasons"])
+        alternate = {"provider": "claude", "model": "claude-opus-5-5",
+                     "effort": "high", "billing": "api"}
+        self.state["route_authorizations"] = [{
+            "id": "claude-api", "role": "architect",
+            "route_sha256": orc.route_authorization_sha(alternate),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "authorized alternate API route",
+            "actor": {"user": "operator"}}]
+        env = {name: "" for name in orc.CLAUDE_BILLING_ENV}
+        env.update({"HOME": str(home), "ANTHROPIC_BASE_URL": "https://authorized.invalid"})
+        with patch.dict(os.environ, env):
+            result = orc.route_preflight("architect", alternate, self.cfg,
+                                         self.project, self.state)
+        self.assertTrue(result["ok"], result["reasons"])
+
+    def test_claude_hazard_is_durable_and_never_spawns_or_counts_a_call(self):
+        home = self.root / "claude-block-home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude/settings.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_BASE_URL": "https://" + SECRET + ".invalid"}}))
+        env = {name: "" for name in orc.CLAUDE_BILLING_ENV}
+        env.update({"HOME": str(home)})
+        with patch.dict(os.environ, env):
+            with self.assertRaisesRegex(RuntimeError, "preflight"):
+                orc.call_model(self.rundir, self.state, self.cfg, "architect",
+                               "plan", "prompt", self.project, host="claude")
+        self.assertIsNone(self.state["active_job"])
+        self.assertEqual(orc._usage_state(self.state)["strong_calls"], 0)
+        self.assertFalse((self.rundir / "jobs").exists() and any(
+            (self.rundir / "jobs").glob("plan-*")))
+        for path in self.rundir.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(SECRET, path.read_text(errors="replace"), str(path))
 
     def test_doctor_reports_the_same_preflight_hazard_without_inference(self):
         def probe(argv, **kwargs):

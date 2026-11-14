@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import test_orchestrator as baseline
+from test_v31_route_migration import recorded_routes
 orc = baseline.orc
 
 
@@ -104,6 +105,66 @@ class WorkerRouteTests(unittest.TestCase):
         orc.save(self.rundir, self.state)
         return entry
 
+    def test_go_billing_is_only_valid_for_the_unchanged_go_provider(self):
+        cases = [
+            ({**self.api_workers()["implementer"], "provider": "opencode-zen",
+              "model": "opencode-zen/model", "billing": "go"}, "only valid"),
+            ({**self.api_workers()["implementer"], "provider": "opencode-zen",
+              "model": "opencode-zen/model", "billing": None}, "billing is required"),
+        ]
+        for spec, pattern in cases:
+            with self.subTest(pattern=pattern):
+                workers = self.api_workers()
+                workers["implementer"] = spec
+                cfg = orc.read_json(orc.HERE / "config.example.json")
+                cfg["workers"] = workers
+                orc.atomic_json(orc.CONFIG_PATH, cfg)
+                with self.assertRaisesRegex(ValueError, pattern):
+                    orc.config()
+
+    def test_legacy_missing_go_billing_still_normalizes(self):
+        cfg = orc.read_json(orc.HERE / "config.example.json")
+        cfg["schema_version"] = 2
+        for spec in cfg["workers"].values():
+            spec.pop("billing", None)
+            spec.pop("provider", None)
+        orc.atomic_json(orc.CONFIG_PATH, cfg)
+        loaded = orc.config()
+        route = orc.model_route(loaded, "codex", "implementer",
+                                project=self.project)
+        self.assertEqual(route["billing"], "go")
+        self.assertEqual(route["worker_provider"], "opencode-go")
+
+    def test_go_route_defense_in_depth_rejects_before_spawn_and_accounting(self):
+        self.write_config(self.api_workers())
+        forged = {"provider": "opencode", "worker_provider": "opencode-zen",
+                  "model": "opencode-zen/some-model", "effort": "high",
+                  "billing": "go"}
+        self.state["model_routes"] = {"implementer": forged}
+        orc.save(self.rundir, self.state)
+        os.environ["FAKE_HISTORY"] = str(self.root / "history")
+        with self.assertRaisesRegex(RuntimeError, "preflight"):
+            orc.call_model(self.rundir, self.state, self.cfg, "implementer",
+                           "implementer", "prompt", self.project)
+        self.assertIsNone(self.state["active_job"])
+        self.assertEqual(self.state["failed_jobs"], [])
+        self.assertEqual(orc._usage_state(self.state)["cheap_calls"], 0)
+        self.assertFalse((self.root / "history").exists())
+
+    def test_non_go_missing_billing_saved_route_is_refused_by_migration(self):
+        routes = recorded_routes()
+        routes["implementer"] = {"provider": "opencode",
+                                 "model": "opencode-zen/model",
+                                 "effort": "high"}
+        self.state.update({"schema_version": 2, "config_schema_version": 2,
+                           "status": "paused", "phase": "plan",
+                           "model_routes": routes})
+        orc.save(self.rundir, self.state)
+        before = (self.rundir / "state.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "billing is required"):
+            orc.migrate_run("test-run00", backup_dir=self.root / "backups")
+        self.assertEqual((self.rundir / "state.json").read_bytes(), before)
+
     def test_legacy_all_go_route_is_retained(self):
         route = orc.model_route(self.cfg, "codex", "implementer")
         self.assertEqual(route["provider"], "opencode")
@@ -139,6 +200,10 @@ class WorkerRouteTests(unittest.TestCase):
               "fallback": {"provider": "mismatch", "model": "other/model",
                            "billing": "api"}},
              "does not match"),
+            ({**self.api_workers()["implementer"], "fallback": {
+                "provider": "opencode-zen", "model": "opencode-zen/other",
+                "billing": "go"}},
+             "only valid"),
         ]
         for spec, pattern in cases:
             with self.subTest(pattern=pattern):
@@ -182,7 +247,72 @@ class WorkerRouteTests(unittest.TestCase):
         self.assertEqual((self.root / "history").read_text().splitlines(),
                          ["implementer"])
 
-    def test_endpoint_change_after_admission_is_rejected(self):
+    def test_non_go_subscription_grant_allows_exactly_one_attempt(self):
+        workers = self.api_workers()
+        workers["implementer"] = {"provider": "opencode-zen",
+                                  "model": "opencode-zen/some-model",
+                                  "variant": "high", "billing": "subscription"}
+        self.write_config(workers)
+        config_path = self.home / ".config/opencode/opencode.json"
+        orc.atomic_json(config_path, {"provider": {"opencode-zen": {
+            "options": {}, "models": {"some-model": {}}}}})
+        route = orc.model_route(self.cfg, "codex", "implementer",
+                                project=self.project)
+        self.assertEqual(route["billing"], "subscription")
+        self.state["model_routes"] = {"implementer": route}
+        self.yield_grant = self.grant(
+            "implementer", route, count=1,
+            attestation="reviewed subscription endpoint/auth mode")
+        os.environ["FAKE_HISTORY"] = str(self.root / "history")
+        report, job = orc.call_model(self.rundir, self.state, self.cfg,
+                                     "implementer", "implementer", "prompt",
+                                     self.project)
+        self.assertEqual(report["status"], "complete")
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(state["route_authorizations"][0]["used"], 1)
+        ledger = orc.load_grant_ledger(self.rundir, run_id="test-run00")
+        self.assertEqual(len(ledger["grants"][self.yield_grant["id"]]["reservations"]), 1)
+        with self.assertRaisesRegex(RuntimeError, "preflight"):
+            orc.call_model(self.rundir, state, self.cfg, "implementer",
+                           "implementer", "prompt", self.project)
+        self.assertEqual((self.root / "history").read_text().splitlines(),
+                         ["implementer"])
+        # Reload/resume cannot regain the consumed subscription attempt.
+        reloaded = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(orc.route_authorization_status(
+            reloaded, "implementer", route, run_dir=self.rundir)["authorized"], False)
+
+    def test_subscription_grant_is_consumed_even_when_the_attempt_fails(self):
+        workers = self.api_workers()
+        workers["implementer"] = {"provider": "opencode-zen",
+                                  "model": "opencode-zen/some-model",
+                                  "variant": "high", "billing": "subscription"}
+        self.write_config(workers)
+        orc.atomic_json(self.home / ".config/opencode/opencode.json",
+                        {"provider": {"opencode-zen": {
+                            "options": {}, "models": {"some-model": {}}}}})
+        route = orc.model_route(self.cfg, "codex", "implementer",
+                                project=self.project)
+        self.state["model_routes"] = {"implementer": route}
+        grant = self.grant("implementer", route, count=1,
+                           attestation="reviewed subscription endpoint/auth mode")
+        os.environ["FAKE_HISTORY"] = str(self.root / "history")
+        os.environ["FAKE_EXIT"] = "1"
+        with self.assertRaises(RuntimeError):
+            orc.call_model(self.rundir, self.state, self.cfg, "implementer",
+                           "implementer", "prompt", self.project)
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(state["route_authorizations"][0]["used"], 1)
+        os.environ.pop("FAKE_EXIT")
+        with self.assertRaisesRegex(RuntimeError, "preflight"):
+            orc.call_model(self.rundir, state, self.cfg, "implementer",
+                           "implementer", "prompt", self.project)
+        self.assertEqual((self.root / "history").read_text().splitlines(),
+                         ["implementer"])
+        self.assertEqual(grant["id"],
+                         state["route_authorizations"][0]["id"])
+
+
         self.write_config(self.api_workers())
         route = orc.model_route(self.cfg, "codex", "implementer")
         self.state["model_routes"] = {"implementer": route}

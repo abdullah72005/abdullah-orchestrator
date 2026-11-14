@@ -246,7 +246,43 @@ def _split_model_id(full, label):
     return provider, model_id, full
 
 
-def normalize_worker_spec(role, spec, *, allow_fallback=True):
+GO_WORKER_PROVIDERS = frozenset({"opencode-go"})
+
+
+def _route_worker_provider(route):
+    worker_provider = route.get("worker_provider")
+    if isinstance(worker_provider, str) and worker_provider.strip():
+        return worker_provider.strip()
+    model = route.get("model")
+    if isinstance(model, str) and "/" in model:
+        return model.split("/", 1)[0]
+    return None
+
+
+def validate_worker_billing(role, worker_provider, billing, *, inferred=False):
+    """Reject inherited Go consent on routes that are not the unchanged Go route.
+
+    ``billing: go`` is a legacy subscription attestation, not a generic default.
+    Missing billing may be inferred only for a legacy all-Go record.
+    """
+    if billing is None:
+        if inferred and worker_provider in GO_WORKER_PROVIDERS:
+            return "go"
+        raise ValueError(
+            f"{role}: billing is required for provider {worker_provider!r}; "
+            "only legacy all-Go records may omit it")
+    if billing not in EXPLICIT_BILLINGS:
+        raise ValueError(
+            f"{role}.billing must be one of {sorted(EXPLICIT_BILLINGS)}")
+    if billing == "go" and worker_provider not in GO_WORKER_PROVIDERS:
+        raise ValueError(
+            f"{role}: billing 'go' is the OpenCode Go subscription and is only valid "
+            f"for {sorted(GO_WORKER_PROVIDERS)}; provider {worker_provider!r} "
+            "needs explicit api/subscription/free/local billing")
+    return billing
+
+
+def normalize_worker_spec(role, spec, *, allow_fallback=True, legacy_go=False):
     """Validate and normalize one per-role worker route without inference."""
     if not isinstance(spec, dict):
         raise ValueError(f"workers.{role} must be an object")
@@ -263,10 +299,9 @@ def normalize_worker_spec(role, spec, *, allow_fallback=True):
         variant = ""
     if not isinstance(variant, str):
         raise ValueError(f"workers.{role}.variant must be a string")
-    billing = spec.get("billing", "go")
-    if billing not in EXPLICIT_BILLINGS:
-        raise ValueError(
-            f"workers.{role}.billing must be one of {sorted(EXPLICIT_BILLINGS)}")
+    billing = validate_worker_billing(
+        f"workers.{role}", declared, spec.get("billing"),
+        inferred=legacy_go and "billing" not in spec)
     route = {"provider": "opencode", "worker_provider": declared,
              "model": full, "effort": variant.strip(), "billing": billing}
     fallback = spec.get("fallback")
@@ -276,7 +311,8 @@ def normalize_worker_spec(role, spec, *, allow_fallback=True):
         if not isinstance(fallback, dict):
             raise ValueError(f"workers.{role}.fallback must be a complete route object")
         fallback_route = normalize_worker_spec(
-            f"{role}.fallback", {**fallback, "fallback": None}, allow_fallback=False)
+            f"{role}.fallback", {**fallback, "fallback": None},
+            allow_fallback=False, legacy_go=True)
         route["fallback_route"] = fallback_route
     unknown = set(spec) - {"provider", "model", "variant", "billing", "fallback"}
     if unknown:
@@ -329,7 +365,7 @@ def config():
     for role in ("explorer", "implementer", "reviewer"):
         if role not in workers:
             raise ValueError(f"workers.{role} is required")
-        normalize_worker_spec(role, workers[role])
+        normalize_worker_spec(role, workers[role], legacy_go=True)
     extra_workers = set(workers) - {"explorer", "implementer", "reviewer"}
     if extra_workers:
         raise ValueError(f"Unknown worker roles: {sorted(extra_workers)}")
@@ -349,6 +385,7 @@ def run_path(run_id):
 
 
 def save(path, state):
+    _sync_grant_usage(state, Path(path))
     state["updated_at"] = now()
     atomic_json(path / "state.json", state)
     if (state.get("status") in FINAL_STATES and not state.get("active_job")
@@ -366,7 +403,7 @@ def load(run_id):
 
 @contextlib.contextmanager
 def exclusive(path: Path, blocking=False):
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
     with (path / "supervisor.lock").open("a+") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
@@ -1006,14 +1043,35 @@ EXPLICIT_BILLINGS = frozenset({"subscription", "api", "free", "local", "go"})
 CLAUDE_PROVIDER_FLAGS = (
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
 )
-CLAUDE_BILLING_ENV = (
-    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
-    "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
-    "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
-) + CLAUDE_PROVIDER_FLAGS
+CLAUDE_ENDPOINT_ENV = (
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_AWS_BASE_URL", "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION",
+)
+CLAUDE_AUTH_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_AWS_API_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_PROFILE",
+    "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
+)
+CLAUDE_CONFIG_ENV = ("CLAUDE_CONFIG_DIR",)
+CLAUDE_MODEL_ENV = (
+    "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_AUTO_MODE_MODEL",
+)
+CLAUDE_CLOUD_ENV = (
+    "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+)
+CLAUDE_BILLING_ENV = (CLAUDE_ENDPOINT_ENV + CLAUDE_AUTH_ENV + CLAUDE_MODEL_ENV
+                      + CLAUDE_CLOUD_ENV + CLAUDE_PROVIDER_FLAGS
+                      + CLAUDE_CONFIG_ENV)
 CODEX_BILLING_ENV = (
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE",
     "CODEX_API_KEY", "CODEX_BASE_URL", "AZURE_OPENAI_API_KEY",
@@ -1023,17 +1081,36 @@ INERT_CLOUD_ENV = (
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
     "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION",
 )
-CLAUDE_SETTINGS_FILES = (
-    ("user", Path("~/.claude/settings.json")),
-    ("project", Path(".claude/settings.json")),
-    ("local", Path(".claude/settings.local.json")),
-    ("managed-user", Path("~/.claude/managed-settings.json")),
-    ("managed-system", Path("/etc/claude-code/managed-settings.json")),
+# Managed settings locations are inspectable on Linux.  Tests may replace this
+# tuple; macOS plist/managed-preference delivery remains explicitly unsupported.
+CLAUDE_MANAGED_SETTINGS_FILES = (
+    Path("/etc/claude-code/managed-settings.json"),
 )
-SETTINGS_HAZARD_KEYS = (
-    "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
-    "forceLoginMethod", "forceLoginOrgUUID",
+CLAUDE_SETTINGS_HAZARD_KEYS = (
+    "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh",
+    "forceLoginMethod", "forceLoginOrgUUID", "model", "fallbackModel",
+    "modelOverrides", "modelPicker", "availableModels", "advisorModel",
+    "modelSettings",
 )
+
+
+def _claude_config_dir():
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return Path.home() / ".claude"
+
+
+def _claude_settings_paths(project=None):
+    root = _claude_config_dir()
+    entries = [("user", root / "settings.json")]
+    if project is not None:
+        entries.extend([
+            ("project", Path(project) / ".claude" / "settings.json"),
+            ("local", Path(project) / ".claude" / "settings.local.json"),
+        ])
+    entries.extend(("managed", path) for path in CLAUDE_MANAGED_SETTINGS_FILES)
+    return entries
 
 
 def _present(name):
@@ -1054,14 +1131,15 @@ def _inspect_json_settings(path: Path):
     if not isinstance(data, dict):
         return None, "settings must be a JSON object"
     observed = {"hazards": [], "env_names": []}
-    for key in SETTINGS_HAZARD_KEYS:
+    for key in CLAUDE_SETTINGS_HAZARD_KEYS:
         if key in data:
             observed["hazards"].append(key)
     env = data.get("env")
     if env is not None and not isinstance(env, dict):
         return None, "settings env must be an object"
     for key in sorted((env or {}).keys()):
-        if key in CLAUDE_BILLING_ENV or key.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_")):
+        if key in CLAUDE_BILLING_ENV or key.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_",
+                                                        "CLAUDE_CODE_PROVIDER_")):
             observed["env_names"].append(key)
     return observed, None
 
@@ -1069,20 +1147,28 @@ def _inspect_json_settings(path: Path):
 def claude_billing_hazards(project=None):
     """Detect observable routing that would defeat a subscription claim."""
     reasons = []
-    observed = {"env": {}, "settings": [], "inert_cloud": []}
+    observed = {"env": {}, "settings": [], "inert_cloud": [],
+                "config_dir": str(_claude_config_dir()),
+                "managed_sources": (
+                    "local settings files only; server/MDM-delivered managed "
+                    "settings are not observable here")}
     for name in CLAUDE_BILLING_ENV:
         state = _present(name)
         if state["present"]:
             observed["env"][name] = state
-            if name in CLAUDE_PROVIDER_FLAGS:
+            if name == "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":
+                reasons.append(
+                    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST means a host application "
+                    "controls provider routing; subscription billing cannot be attested")
+            elif name in CLAUDE_PROVIDER_FLAGS:
                 reasons.append(f"{name} selects a provider-managed Claude route")
-            elif name in {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-                          "ANTHROPIC_API_KEY"}:
+            elif name in CLAUDE_ENDPOINT_ENV:
+                reasons.append(f"{name} can override the effective Claude endpoint/routing")
+            elif name in CLAUDE_AUTH_ENV:
                 reasons.append(f"{name} can override subscription authentication/billing")
-            elif name in {"ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"}:
-                reasons.append(f"{name} overrides the configured Claude model")
-            elif name in {"ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
-                          "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS"}:
+            elif name in CLAUDE_MODEL_ENV:
+                reasons.append(f"{name} overrides the configured Claude model route")
+            elif name in CLAUDE_CLOUD_ENV:
                 reasons.append(f"{name} selects a hosted/cloud Claude route")
     # Ambient AWS credentials are inert unless a provider flag/base URL selects
     # Bedrock.  Do not block unrelated credentials merely because they exist.
@@ -1095,11 +1181,7 @@ def claude_billing_hazards(project=None):
             observed["inert_cloud"].append(name)
             if aws_selected:
                 reasons.append(f"{name} is present alongside a provider-managed Claude route")
-    for scope, relative in CLAUDE_SETTINGS_FILES:
-        path = Path(project) / relative if project and scope in {"project", "local"} \
-            else relative.expanduser()
-        if scope in {"project", "local"} and project is None:
-            continue
+    for scope, path in _claude_settings_paths(project):
         observed_entry = {"scope": scope, "path": str(path), "present": path.is_file()}
         if path.is_file():
             data, error = _inspect_json_settings(path)
@@ -1109,8 +1191,12 @@ def claude_billing_hazards(project=None):
                 reasons.append(f"{scope} Claude settings {error}: {path}")
             elif data and (data["hazards"] or data["env_names"]):
                 reasons.append(
-                    f"{scope} Claude settings set billing-relevant keys: "
+                    f"{scope} Claude settings set billing/routing keys: "
                     + ", ".join(sorted(set(data["hazards"] + data["env_names"]))))
+                if "CLAUDE_CONFIG_DIR" in data["env_names"]:
+                    reasons.append(
+                        f"{scope} Claude settings change CLAUDE_CONFIG_DIR; the effective "
+                        "settings directory cannot be established from this process")
         observed["settings"].append(observed_entry)
     return reasons, observed
 
@@ -1126,45 +1212,360 @@ def codex_billing_hazards():
     return reasons, observed
 
 
-def opencode_provider_observation(route):
-    """Redacted view of the effective OpenCode provider configuration."""
-    provider = route.get("worker_provider") or str(route.get("model", "")).split("/", 1)[0]
-    candidates = []
+def _strip_jsonc(text):
+    """Remove JSONC comments and trailing commas without touching strings."""
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline
+            continue
+        if text.startswith("/*", index):
+            close = text.find("*/", index + 2)
+            index = len(text) if close < 0 else close + 2
+            continue
+        output.append(char)
+        index += 1
+    cleaned = "".join(output)
+    result = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(cleaned):
+        char = cleaned[index]
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+        if char == ",":
+            look = index + 1
+            while look < len(cleaned) and cleaned[look] in " \t\r\n":
+                look += 1
+            if look < len(cleaned) and cleaned[look] in "}]":
+                index += 1
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def _expand_opencode_value(value, base_dir):
+    """Expand documented {env:...}/{file:...} references for hashing only."""
+    if isinstance(value, dict):
+        return {key: _expand_opencode_value(item, base_dir)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_opencode_value(item, base_dir) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def env_replace(match):
+        return os.environ.get(match.group(1), "")
+
+    def file_replace(match):
+        raw = match.group(1)
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = base_dir / path
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    expanded = re.sub(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}", env_replace, value)
+    return re.sub(r"\{file:([^}]+)\}", file_replace, expanded)
+
+
+SECRET_ROUTING_KEY = re.compile(
+    r"(api[-_]?key|token|secret|password|passwd|credential|authorization|auth[-_]?header)",
+    re.I)
+
+
+def _redacted_routing_material(value, key=""):
+    """Redact secret-like values before a routing digest is computed."""
+    if isinstance(value, dict):
+        return {str(name): _redacted_routing_material(item, str(name))
+                for name, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+    if isinstance(value, list):
+        return [_redacted_routing_material(item, key) for item in value]
+    if SECRET_ROUTING_KEY.search(key or ""):
+        return {"redacted_present": value not in {None, ""}}
+    if isinstance(value, str):
+        return _without_url_credentials(value)
+    return value
+
+
+def _opencode_config_files(project=None):
+    """Applicable config files in documented precedence order."""
+    files = []
     explicit = os.environ.get("OPENCODE_CONFIG")
     if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates.extend([Path("~/.config/opencode/opencode.json").expanduser(),
-                       Path("~/.config/opencode/opencode.jsonc").expanduser()])
+        files.append(Path(explicit).expanduser())
+    config_dir = os.environ.get("OPENCODE_CONFIG_DIR")
+    if config_dir:
+        global_dir = Path(config_dir).expanduser()
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        global_dir = (Path(xdg).expanduser() / "opencode" if xdg
+                      else Path.home() / ".config" / "opencode")
+    files.extend([global_dir / "opencode.json", global_dir / "opencode.jsonc"])
+    if project is not None:
+        root = Path(project).expanduser().resolve()
+        chain = [root, *root.parents]
+        chain.reverse()
+        for directory in chain:
+            files.extend([directory / "opencode.json",
+                          directory / "opencode.jsonc"])
+        for directory in chain:
+            files.extend([directory / ".opencode" / "opencode.json",
+                          directory / ".opencode" / "opencode.jsonc"])
+    system = Path("/etc/opencode")
+    files.extend([system / "opencode.json", system / "opencode.jsonc"])
+    unique = []
+    for path in files:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def _deep_merge(target, update):
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+
+
+def _opencode_dialect_for_observation(cfg=None):
+    cfg = cfg or config()
+    policy = opencode_version_policy(cfg)
+    pin = str(policy.get("pin") or "auto").strip()
+    if pin.lower() != "auto":
+        parsed = _version_tuple(pin)
+        if parsed:
+            return "v1" if parsed[0] == 1 else "v2" if parsed[0] == 2 else None
+    try:
+        return opencode_dialect(cfg=cfg)
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _opencode_endpoint(settings):
+    for key in ("baseURL", "baseUrl", "base_url", "endpoint", "apiBase"):
+        value = settings.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def opencode_provider_observation(route, project=None, dialect=None, cfg=None):
+    """Redacted view of the effective OpenCode provider configuration.
+
+    Reads every applicable documented config location, honors JSONC and
+    ``{env:...}``/``{file:...}`` expansion, and uses the selected installed
+    dialect's provider shape.  Only redacted routing material is hashed; raw
+    secrets never leave this function.
+    """
+    provider = _route_worker_provider(route)
+    if dialect is None:
+        dialect = _opencode_dialect_for_observation(cfg)
     observed = {"provider": provider, "config": [], "providers": [],
-                "available": False, "error": None}
-    for path in candidates:
+                "available": False, "error": None, "dialect": dialect,
+                "effective_files": [], "sources": []}
+    if dialect not in {"v1", "v2"}:
+        observed["error"] = (
+            "Cannot establish the installed OpenCode dialect; effective provider "
+            "routing is unprovable (configure an exact runtime.opencode_version "
+            "or install a supported CLI)")
+        return observed
+    merged = {}
+    explicit_error = None
+    for path in _opencode_config_files(project):
         if not path.is_file():
+            if path == Path(os.environ.get("OPENCODE_CONFIG", "")).expanduser() \
+                    and os.environ.get("OPENCODE_CONFIG"):
+                explicit_error = f"OPENCODE_CONFIG file is missing: {path}"
             continue
-        observed["config"].append(str(path))
+        observed["effective_files"].append(str(path))
         try:
             text = path.read_text(encoding="utf-8")
-            # JSONC comments are not parsed here; an unreadable influential
-            # document fails closed instead of guessing at its meaning.
+            if path.suffix == ".jsonc":
+                text = _strip_jsonc(text)
             data = json.loads(text)
         except (OSError, ValueError) as exc:
-            observed["error"] = f"unreadable OpenCode config ({exc.__class__.__name__})"
-            continue
-        observed["available"] = True
-        providers = data.get("provider") if isinstance(data, dict) else None
-        if isinstance(providers, dict):
-            observed["providers"] = sorted(providers.keys())
-            entry = providers.get(provider)
-            if isinstance(entry, dict):
-                options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
-                observed["provider_configured"] = True
-                observed["endpoint_sha256"] = (
-                    hashlib.sha256(str(options.get("baseURL") or "").encode()).hexdigest()
-                    if options.get("baseURL") else None)
-                observed["auth_env_names"] = sorted(
-                    key for key in options if "key" in key.lower() or "token" in key.lower())
-                observed["model_count"] = len(entry.get("models") or {}) \
-                    if isinstance(entry.get("models"), dict) else 0
+            observed["error"] = (
+                f"unreadable influential OpenCode config {path} "
+                f"({exc.__class__.__name__}); routing cannot be established")
+            return observed
+        if not isinstance(data, dict):
+            observed["error"] = f"OpenCode config {path} is not a JSON object"
+            return observed
+        base = path.parent
+        _deep_merge(merged, _expand_opencode_value(data, base))
+        observed["config"].append(str(path))
+        observed["sources"].append(str(path))
+    inline = os.environ.get("OPENCODE_CONFIG_CONTENT")
+    if inline:
+        try:
+            data = json.loads(inline)
+        except ValueError:
+            observed["error"] = (
+                "OPENCODE_CONFIG_CONTENT is not valid JSON; effective routing "
+                "cannot be established")
+            return observed
+        if not isinstance(data, dict):
+            observed["error"] = "OPENCODE_CONFIG_CONTENT is not a JSON object"
+            return observed
+        _deep_merge(merged, _expand_opencode_value(data, Path.cwd()))
+        observed["sources"].append("OPENCODE_CONFIG_CONTENT")
+    if explicit_error:
+        observed["error"] = explicit_error
+        return observed
+    observed["available"] = bool(observed["effective_files"] or inline)
+    container_key = "provider" if dialect == "v1" else "providers"
+    providers = merged.get(container_key)
+    if isinstance(providers, dict):
+        observed["providers"] = sorted(str(name) for name in providers)
+        entry = providers.get(provider)
+        if isinstance(entry, dict):
+            observed["provider_configured"] = True
+            option_key = "options" if dialect == "v1" else "settings"
+            settings = entry.get(option_key)
+            if not isinstance(settings, dict):
+                settings = {}
+            endpoint = _opencode_endpoint(settings)
+            observed["endpoint_sha256"] = (
+                hashlib.sha256(_without_url_credentials(endpoint).encode()).hexdigest()
+                if endpoint else None)
+            env_names = entry.get("env")
+            if not isinstance(env_names, list):
+                env_names = []
+            observed["auth_env_names"] = sorted(
+                {str(name) for name in env_names}
+                | {str(key) for key in settings
+                   if SECRET_ROUTING_KEY.search(str(key))})
+            observed["auth_mode_sha256"] = content_hash({
+                "env": observed["auth_env_names"],
+                "package": entry.get("package"),
+                "canonical": entry.get("canonical"),
+                "headers": sorted(str(key) for key in (entry.get("headers") or {})
+                                  if isinstance(entry.get("headers"), dict)),
+                "api_key_configured": any(
+                    value not in {None, ""} for key, value in settings.items()
+                    if SECRET_ROUTING_KEY.search(str(key))),
+                "env_available": {
+                    str(name): bool(os.environ.get(str(name)))
+                    for name in env_names},
+            })
+            models = entry.get("models")
+            if not isinstance(models, dict):
+                models = {}
+            observed["model_count"] = len(models)
+            model_id = str(route.get("model") or "").split("/", 1)[-1]
+            selected_model = models.get(model_id)
+            observed["model_sha256"] = content_hash(
+                _redacted_routing_material(selected_model if selected_model is not None
+                                           else {}))
+            routing_material = {
+                "dialect": dialect,
+                "provider": provider,
+                "container": container_key,
+                "config_files": observed["effective_files"],
+                "provider_entry": _redacted_routing_material(entry),
+                "selected_model": _redacted_routing_material(
+                    selected_model if selected_model is not None else {}),
+                "route_variant": route.get("effort", ""),
+                "top_level": {
+                    key: _redacted_routing_material(merged.get(key))
+                    for key in ("model", "small_model", "smallModel",
+                                "fallback", "fallbacks", "default_agent")
+                    if key in merged},
+            }
+            observed["routing_material_sha256"] = content_hash(routing_material)
     return observed
+
+
+def routing_fingerprint(route, cfg=None, project=None, dialect=None,
+                        observation=None):
+    """Redacted identity of provider routing material pinned into a run.
+
+    Endpoints/auth keys are hashed; unrelated providers and raw secrets are
+    excluded.  Unreadable effective configuration is represented explicitly so
+    a change from readable to unreadable is detected.
+    """
+    observation = observation or opencode_provider_observation(
+        route, project=project, dialect=dialect, cfg=cfg)
+    material = {
+        "provider": route.get("provider"),
+        "worker_provider": route.get("worker_provider"),
+        "model": route.get("model"),
+        "effort": route.get("effort"),
+        "billing": route.get("billing"),
+    }
+    if observation.get("routing_material_sha256"):
+        material["routing_material_sha256"] = observation["routing_material_sha256"]
+        material["dialect"] = observation.get("dialect")
+    else:
+        material["configuration"] = {
+            "available": observation.get("available"),
+            "provider_configured": observation.get("provider_configured"),
+            "endpoint_sha256": observation.get("endpoint_sha256"),
+            "auth_env_names": observation.get("auth_env_names"),
+            "auth_mode_sha256": observation.get("auth_mode_sha256"),
+            "model_sha256": observation.get("model_sha256"),
+            "model_count": observation.get("model_count"),
+            "error": bool(observation.get("error")),
+            "dialect": observation.get("dialect"),
+        }
+    return content_hash(material)
+
+
+def model_route(cfg, host, role, project=None):
+    if role == "architect":
+        spec = cfg["architect"][host]
+        route = {"provider": host, "model": spec["model"],
+                 "effort": spec["effort"], "billing": spec["auth"]}
+        return route
+    if role not in {"explorer", "implementer", "reviewer"}:
+        raise ValueError(f"Unknown worker role {role!r}")
+    spec = cfg["workers"][role]
+    route = normalize_worker_spec(role, spec, legacy_go=True)
+    route["routing_fingerprint"] = routing_fingerprint(route, cfg, project=project)
+    fallback = route.get("fallback_route")
+    if isinstance(fallback, dict):
+        fallback["routing_fingerprint"] = routing_fingerprint(
+            fallback, cfg, project=project)
+    return route
 
 
 def route_authorization_sha(route):
@@ -1173,25 +1574,201 @@ def route_authorization_sha(route):
     return content_hash(material)
 
 
-def route_authorization_status(state, role, route):
+def _grants_dir(run_dir):
+    return Path(run_dir) / "route-grants"
+
+
+def _grant_ledger_path(run_dir):
+    return _grants_dir(run_dir) / "ledger.json"
+
+
+def _empty_grant_ledger(run_id=None):
+    return {"version": 1, "run_id": run_id, "grants": {}}
+
+
+def load_grant_ledger(run_dir, *, run_id=None):
+    """Load the durable reservation ledger or fail closed on corruption."""
+    path = _grant_ledger_path(run_dir)
+    if not path.is_file():
+        return _empty_grant_ledger(run_id)
+    data = _safe_read(path)
+    if not isinstance(data, dict) or not isinstance(data.get("grants"), dict):
+        raise RuntimeError(
+            "Route grant ledger is corrupt; inspect "
+            f"{path} before authorizing or dispatching more calls")
+    if run_id is not None and data.get("run_id") not in {None, run_id}:
+        raise RuntimeError("Route grant ledger belongs to a different run")
+    return data
+
+
+def _save_grant_ledger(run_dir, ledger):
+    atomic_json(_grant_ledger_path(run_dir), ledger)
+
+
+def _grant_usage(grant):
+    released = {item.get("id") for item in grant.get("releases", [])
+                if isinstance(item, dict)}
+    return sum(1 for item in grant.get("reservations", [])
+               if isinstance(item, dict) and item.get("id") not in released)
+
+
+def _ledger_grant(ledger, entry):
+    grants = ledger.setdefault("grants", {})
+    grant = grants.get(entry["id"])
+    if grant is None:
+        grant = {"id": entry["id"], "role": entry.get("role"),
+                 "route_sha256": entry.get("route_sha256"),
+                 "max_dispatches": int(entry.get("max_dispatches", 0)),
+                 "run_id": entry.get("run_id"), "registered_at": now(),
+                 "reservations": [], "releases": []}
+        # Preserve consumption recorded by a pre-ledger supervisor.  These
+        # synthetic reservations are conservative: they can never be refunded
+        # automatically, and the ledger remains authoritative thereafter.
+        for index in range(max(0, int(entry.get("used", 0)))):
+            grant["reservations"].append({
+                "id": f"legacy-{entry['id']}-{index}", "at": now(),
+                "role": entry.get("role"),
+                "route_sha256": entry.get("route_sha256"),
+                "grant_id": entry["id"],
+                "job_intent": "legacy_pre_ledger_consumption"})
+        grants[entry["id"]] = grant
+    elif (grant.get("role") != entry.get("role")
+          or grant.get("route_sha256") != entry.get("route_sha256")):
+        raise RuntimeError(
+            f"Route grant {entry['id']} disagrees with its durable ledger entry; "
+            "inspect the run before dispatching")
+    return grant
+
+
+def register_route_grant(run_dir, entry):
+    """Durably register a human grant independently of parent state snapshots."""
+    with exclusive(_grants_dir(run_dir)):
+        ledger = load_grant_ledger(run_dir, run_id=entry.get("run_id"))
+        _ledger_grant(ledger, entry)
+        _save_grant_ledger(run_dir, ledger)
+    return entry
+
+
+def _reserve_in_ledger(run_dir, entry, reservation_id, role, route_sha):
+    with exclusive(_grants_dir(run_dir)):
+        ledger = load_grant_ledger(run_dir, run_id=entry.get("run_id"))
+        grant = _ledger_grant(ledger, entry)
+        if route_sha != grant.get("route_sha256"):
+            raise RuntimeError("Route authorization grant does not match the selected route")
+        reservations = grant.setdefault("reservations", [])
+        if any(item.get("id") == reservation_id for item in reservations
+               if isinstance(item, dict)):
+            return _grant_usage(grant), grant
+        if _grant_usage(grant) >= int(grant.get("max_dispatches", 0)):
+            raise RuntimeError("Route authorization grant is missing or exhausted")
+        reservations.append({"id": reservation_id, "at": now(), "role": role,
+                             "route_sha256": route_sha, "grant_id": grant["id"],
+                             "job_intent": "reserved_before_spawn"})
+        _save_grant_ledger(run_dir, ledger)
+        return _grant_usage(grant), grant
+
+
+def _release_in_ledger(run_dir, entry, reservation_id, reason):
+    with exclusive(_grants_dir(run_dir)):
+        ledger = load_grant_ledger(run_dir, run_id=entry.get("run_id"))
+        grant = _ledger_grant(ledger, entry)
+        reservations = [item for item in grant.get("reservations", [])
+                        if isinstance(item, dict)]
+        selected = None
+        if reservation_id:
+            selected = next((item for item in reservations
+                             if item.get("id") == reservation_id), None)
+        else:
+            released = {item.get("id") for item in grant.get("releases", [])
+                        if isinstance(item, dict)}
+            selected = next((item for item in reversed(reservations)
+                             if item.get("id") not in released), None)
+        if selected is None:
+            return _grant_usage(grant), grant
+        releases = grant.setdefault("releases", [])
+        if not any(item.get("id") == selected["id"] for item in releases
+                   if isinstance(item, dict)):
+            releases.append({"id": selected["id"], "at": now(), "reason": reason,
+                             "role": selected.get("role"),
+                             "route_sha256": selected.get("route_sha256")})
+            _save_grant_ledger(run_dir, ledger)
+        return _grant_usage(grant), grant
+
+
+def _sync_grant_usage(state, run_dir=None):
+    """Mirror durable ledger usage into a state snapshot before it is saved.
+
+    The ledger, not this snapshot, is authoritative. Parent processes that
+    completed a nested Explorer must not reset consumption to an older value.
+    """
+    if not isinstance(state, dict):
+        return
+    entries = state.get("route_authorizations")
+    if not isinstance(entries, list):
+        return
+    run_id = state.get("id")
+    if run_dir is None and run_id:
+        try:
+            path = run_path(run_id)
+        except ValueError:
+            return
+        if not _grant_ledger_path(path).is_file():
+            return
+        run_dir = path
+    if not run_dir:
+        return
+    try:
+        ledger = load_grant_ledger(run_dir, run_id=run_id)
+    except RuntimeError:
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        grant = ledger.get("grants", {}).get(entry.get("id"))
+        if not isinstance(grant, dict):
+            continue
+        entry["used"] = _grant_usage(grant)
+        entry["durable_reservations"] = [
+            {"id": item.get("id"), "at": item.get("at"), "role": item.get("role"),
+             "route_sha256": item.get("route_sha256")}
+            for item in grant.get("reservations", []) if isinstance(item, dict)]
+        entry["durable_releases"] = [
+            {"id": item.get("id"), "at": item.get("at"), "reason": item.get("reason")}
+            for item in grant.get("releases", []) if isinstance(item, dict)]
+
+
+def route_authorization_status(state, role, route, *, run_dir=None):
     """Return the active human grant matching role, run and exact route."""
     sha = route_authorization_sha(route)
     if not isinstance(state, dict):
         return {"required": True, "authorized": False, "route_sha256": sha,
                 "reason": "no durable run state authorizes this route"}
+    ledger = None
+    if run_dir is not None:
+        ledger_path = _grant_ledger_path(run_dir)
+        if ledger_path.is_file():
+            ledger = load_grant_ledger(run_dir)
     for entry in reversed(state.get("route_authorizations", [])):
-        if (entry.get("role") == role and entry.get("route_sha256") == sha
-                and int(entry.get("used", 0)) < int(entry.get("max_dispatches", 0))):
+        if entry.get("role") != role or entry.get("route_sha256") != sha:
+            continue
+        used = int(entry.get("used", 0))
+        grant = (ledger or {}).get("grants", {}).get(entry.get("id"))
+        if isinstance(grant, dict):
+            used = _grant_usage(grant)
+        maximum = int(entry.get("max_dispatches", 0))
+        if isinstance(grant, dict):
+            maximum = int(grant.get("max_dispatches", maximum))
+        if used < maximum:
             return {"required": True, "authorized": True, "route_sha256": sha,
-                    "grant_id": entry.get("id"),
-                    "remaining": int(entry.get("max_dispatches", 0))
-                    - int(entry.get("used", 0)),
+                    "grant_id": entry.get("id"), "remaining": maximum - used,
+                    "used": used, "max_dispatches": maximum,
                     "attestation": entry.get("attestation")}
     return {"required": True, "authorized": False, "route_sha256": sha,
             "reason": "no matching human authorization grant with remaining dispatches"}
 
 
-def route_preflight(role, route, cfg=None, project=None, state=None):
+def route_preflight(role, route, cfg=None, project=None, state=None, *,
+                    run_dir=None):
     """Classify billing and reject unapproved routing before any dispatch.
 
     This is a deterministic application-level policy check.  It neither proves
@@ -1234,10 +1811,14 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
             result["ok"] = True
             result["warnings"].append(
                 "Configuration-only check; subscription entitlement is not proven.")
+            if provider == "claude":
+                result["warnings"].append(
+                    "Server/MDM-delivered Claude managed settings were not observed; "
+                    "treat this as unverified, not certified.")
             return result
         # Explicit API/usage billing for a strong host requires a human grant,
         # and an environment variable is never consent.
-        authorization = route_authorization_status(state, role, route)
+        authorization = route_authorization_status(state, role, route, run_dir=run_dir)
         result["authorization"] = authorization
         if not authorization["authorized"]:
             result["reasons"].append(
@@ -1248,11 +1829,24 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
     if provider != "opencode":
         result["reasons"].append(f"unsupported route provider {provider!r}")
         return result
-    observation = opencode_provider_observation(route)
+    worker_provider = _route_worker_provider(route)
+    if billing == "go" and worker_provider not in GO_WORKER_PROVIDERS:
+        result["reasons"].append(
+            "billing 'go' is only valid for the unchanged OpenCode Go provider; "
+            f"provider {worker_provider!r} requires explicit api/subscription/free/local billing")
+        return result
+    observation = opencode_provider_observation(route, project=project, cfg=cfg)
     result["observed"] = observation
+    if observation.get("error"):
+        # Unreadable or uninspectable effective routing is never a warning: it
+        # would silently grant a Go/subscription bypass.
+        result["reasons"].append(observation["error"])
+        result["classification"] = "unprovable_routing"
+        return result
     pinned = route.get("routing_fingerprint")
     if pinned:
-        current = routing_fingerprint(route)
+        current = routing_fingerprint(route, cfg, project=project,
+                                      observation=observation)
         result["current_routing_fingerprint"] = current
         if current != pinned:
             result["reasons"].append(
@@ -1261,8 +1855,6 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
             return result
     if billing == "go":
         result["classification"] = "go_subscription"
-        if observation.get("error"):
-            result["warnings"].append(observation["error"])
         if observation.get("endpoint_sha256"):
             result["reasons"].append(
                 "Go route points at a custom provider endpoint; subscription billing "
@@ -1273,11 +1865,13 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
             "OpenCode Go entitlement is attested by configuration only; no inference request was made.")
         return result
     result["classification"] = billing
-    if observation.get("error"):
-        result["reasons"].append(
-            "OpenCode provider configuration is unreadable; non-Go billing cannot be established")
     if billing in {"subscription", "free", "local"}:
-        authorization = route_authorization_status(state, role, route)
+        try:
+            authorization = route_authorization_status(
+                state, role, route, run_dir=run_dir)
+        except RuntimeError as exc:
+            result["reasons"].append(str(exc))
+            return result
         result["authorization"] = authorization
         attestation = (authorization.get("attestation") or "").strip()
         if not authorization["authorized"]:
@@ -1304,7 +1898,11 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
                 "Billing classification is attested by a human grant, not provider settlement.")
         return result
     # api or unknown remote billing
-    authorization = route_authorization_status(state, role, route)
+    try:
+        authorization = route_authorization_status(state, role, route, run_dir=run_dir)
+    except RuntimeError as exc:
+        result["reasons"].append(str(exc))
+        return result
     result["authorization"] = authorization
     if not authorization["authorized"]:
         result["reasons"].append(
@@ -1317,33 +1915,46 @@ def route_preflight(role, route, cfg=None, project=None, state=None):
     return result
 
 
-def reserve_route_grant(state, run_dir, role, route):
-    """Atomically consume one grant before spawn; never auto-refund a crash."""
+def reserve_route_grant(state, run_dir, role, route, *, reservation_id=None,
+                        job_kind=None):
+    """Atomically consume one grant before spawn; never auto-refund a crash.
+
+    Consumption is recorded in a run-scoped ledger with its own lock.  A parent
+    process holding the supervisor lock can safely learn about a nested
+    Explorer's reservation without taking that lock from its own child.
+    """
     if not isinstance(state, dict):
         return None
+    reservation_id = reservation_id or uuid.uuid4().hex[:12]
     sha = route_authorization_sha(route)
     for entry in reversed(state.get("route_authorizations", [])):
-        if (entry.get("role") == role and entry.get("route_sha256") == sha
-                and int(entry.get("used", 0)) < int(entry.get("max_dispatches", 0))):
-            entry["used"] = int(entry.get("used", 0)) + 1
-            entry.setdefault("consumptions", []).append({
-                "at": now(), "role": role, "route_sha256": sha,
-                "job_intent": "reserved_before_spawn"})
+        if entry.get("role") == role and entry.get("route_sha256") == sha:
+            used, grant = _reserve_in_ledger(run_dir, entry, reservation_id, role, sha)
+            entry["used"] = used
+            entry["last_reservation_id"] = reservation_id
+            entry["last_job_kind"] = job_kind
+            consumptions = entry.setdefault("consumptions", [])
+            if not any(item.get("id") == reservation_id for item in consumptions
+                       if isinstance(item, dict)):
+                consumptions.append({"id": reservation_id, "at": now(), "role": role,
+                                     "route_sha256": sha, "job_kind": job_kind,
+                                     "grant_id": entry.get("id"),
+                                     "job_intent": "reserved_before_spawn"})
             save(run_dir, state)
             return entry
     raise RuntimeError("Route authorization grant is missing or exhausted")
 
 
-def release_route_grant(state, run_dir, role, route, reason):
+def release_route_grant(state, run_dir, role, route, reason, *, reservation_id=None):
     """Release only a reservation whose launch was proven never attempted."""
     sha = route_authorization_sha(route)
     for entry in reversed(state.get("route_authorizations", [])):
-        if (entry.get("role") == role and entry.get("route_sha256") == sha
-                and int(entry.get("used", 0)) > 0):
-            entry["used"] = int(entry.get("used", 0)) - 1
+        if entry.get("role") == role and entry.get("route_sha256") == sha:
+            used, grant = _release_in_ledger(run_dir, entry, reservation_id, reason)
+            entry["used"] = used
             entry.setdefault("releases", []).append({
                 "at": now(), "reason": reason, "role": role,
-                "route_sha256": sha})
+                "route_sha256": sha, "reservation_id": reservation_id})
             save(run_dir, state)
             return entry
     return None
@@ -3628,49 +4239,6 @@ def schema(kind):
     return assert_report_schema_contract(kind, document)
 
 
-def routing_fingerprint(route, cfg=None):
-    """Redacted identity of provider routing material pinned into a run.
-
-    Endpoints/auth keys are hashed; unrelated providers and raw secrets are
-    excluded.  Unreadable effective configuration is represented explicitly so
-    a change from readable to unreadable is detected.
-    """
-    observation = opencode_provider_observation(route)
-    material = {
-        "provider": route.get("provider"),
-        "worker_provider": route.get("worker_provider"),
-        "model": route.get("model"),
-        "effort": route.get("effort"),
-        "billing": route.get("billing"),
-        "configuration": {
-            "available": observation.get("available"),
-            "provider_configured": observation.get("provider_configured"),
-            "endpoint_sha256": observation.get("endpoint_sha256"),
-            "auth_env_names": observation.get("auth_env_names"),
-            "model_count": observation.get("model_count"),
-            "error": bool(observation.get("error")),
-        },
-    }
-    return content_hash(material)
-
-
-def model_route(cfg, host, role):
-    if role == "architect":
-        spec = cfg["architect"][host]
-        route = {"provider": host, "model": spec["model"],
-                 "effort": spec["effort"], "billing": spec["auth"]}
-        return route
-    if role not in {"explorer", "implementer", "reviewer"}:
-        raise ValueError(f"Unknown worker role {role!r}")
-    spec = cfg["workers"][role]
-    route = normalize_worker_spec(role, spec)
-    route["routing_fingerprint"] = routing_fingerprint(route, cfg)
-    fallback = route.get("fallback_route")
-    if isinstance(fallback, dict):
-        fallback["routing_fingerprint"] = routing_fingerprint(fallback, cfg)
-    return route
-
-
 def _version_tuple(text):
     match = re.search(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?", str(text))
     if not match:
@@ -5001,7 +5569,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     host = host or (state["host"] if state is not None else "codex")
     authorization_state = grant_state or state
     pinned = ((authorization_state or {}).get("model_routes") or {}).get(role)
-    route = copy.deepcopy(route or pinned or model_route(cfg, host, role))
+    route = copy.deepcopy(route or pinned or model_route(cfg, host, role, project=project))
     fallback = authorization_state.get("fallback_authorization") if authorization_state else None
     if fallback and fallback.get("role") == role:
         selected = cfg["fallback"][host]
@@ -5016,13 +5584,13 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     worker_fallback = (authorization_state.get("worker_fallback_authorization")
                        if authorization_state else None)
     configured_fallback = route.get("fallback_route")
+    fallback_selected = False
     if (worker_fallback and worker_fallback.get("role") == role
             and isinstance(configured_fallback, dict)):
         if (worker_fallback.get("route_sha256")
                 == route_authorization_sha(configured_fallback)):
             route = copy.deepcopy(configured_fallback)
-            authorization_state["worker_fallback_authorization"] = None
-            save(grant_dir or run_dir, authorization_state)
+            fallback_selected = True
         else:
             raise RuntimeError(
                 "Worker fallback authorization does not match the configured exact route")
@@ -5030,7 +5598,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     timeout = remaining_budget(
         cfg["limits"]["max_architect_seconds" if strong else "max_worker_seconds"],
         deadline)
-    preflight = route_preflight(role, route, cfg, project, authorization_state)
+    preflight = route_preflight(role, route, cfg, project, authorization_state,
+                               run_dir=grant_dir or run_dir)
     if not preflight["ok"]:
         archive.mkdir(parents=True, exist_ok=True)
         rejection_path = archive / f"preflight-{job_id}.json"
@@ -5059,10 +5628,11 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             + f" (diagnostic: {rejection_path})")
     authorization = preflight.get("authorization") or {}
     reservation = None
-    if authorization.get("required") and route.get("billing") not in SUBSCRIPTION_BILLINGS:
+    if authorization.get("required"):
         try:
             reservation = reserve_route_grant(
-                authorization_state, grant_dir or run_dir, role, route)
+                authorization_state, grant_dir or run_dir, role, route,
+                reservation_id=job_id, job_kind=kind)
         except RuntimeError as exc:
             archive.mkdir(parents=True, exist_ok=True)
             rejection_path = archive / f"preflight-{job_id}.json"
@@ -5079,6 +5649,18 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
                               role=role, kind=kind, reasons=[str(exc)])
             raise RuntimeError(f"Dispatch blocked: {exc}") from exc
+        if reservation is not None and state is not None:
+            journal_event(grant_dir or run_dir, state, "route_grant_reserved",
+                          job_id=job_id, role=role, kind=kind,
+                          grant_id=reservation.get("id"),
+                          used=reservation.get("used"),
+                          max_dispatches=reservation.get("max_dispatches"),
+                          route_sha256=route_authorization_sha(route))
+    if fallback_selected:
+        # Consume one-dispatch consent only after the exact fallback passed
+        # preflight and its separate grant reservation succeeded.
+        authorization_state["worker_fallback_authorization"] = None
+        save(grant_dir or run_dir, authorization_state)
     if route.get("billing") == "free":
         # Only an explicitly authorized free route may leave free-model
         # discovery enabled; the default remains disabled.
@@ -5133,6 +5715,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     lease_fd = None
     launch_file = jpath / "launch.json"
     spawn_attempted = False
+    handled_failure = False
     try:
         with out_file.open("w", encoding="utf-8") as log:
             spawn_attempted = True
@@ -5214,43 +5797,76 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                           "checked_at": now()})
         atomic_json(jpath / "source-integrity.json", integrity)
         atomic_json(jpath / "report.json", report)
+        atomic_json(jpath / "completion.json", {"final_snapshot": final_snapshot,
+                                                "session_id": session_id})
+        violation = None
         if kind in READ_ONLY_STAGE_KINDS and integrity["mutated"]:
             violation = _read_only_source_violation(
                 dispatch_snapshot, final_snapshot, kind=kind, job_id=job_id)
             atomic_json(jpath / "source-mutation.json", violation.diagnostics)
-            raise violation
-        atomic_json(jpath / "completion.json", {"final_snapshot": final_snapshot, "session_id": session_id})
-        job.update({"status": "complete", "session_id": session_id,
+        job.update({"session_id": session_id,
                     "final_snapshot": final_snapshot, "seconds": result_record["seconds"],
                     "contract_version": contract_version,
                     "decision_binding": decision_binding,
                     "source_integrity": {"dispatch_sha256": source_write_sha(dispatch_snapshot),
                                          "completion_sha256": source_write_sha(final_snapshot),
-                                         "mutated": False},
+                                         "mutated": bool(integrity["mutated"])},
                     "legacy_contract": contract_version < 2})
+        containment = None
         if state is not None:
-            record_usage(state, job, "complete", result_record["seconds"])
+            record_usage(state, job, "failed" if violation else "complete",
+                         result_record["seconds"])
             parent_identity = state.get("parent_job_identity") if isinstance(state, dict) else None
+            run_identity = state.get("id") or state.get("run_id")
             inspection = inspect_execution(
-                job, run_id=state.get("id") or state.get("run_id"),
-                include_run=bool(parent_identity) or bool(state.get("run_id")
-                                                          and not state.get("id")),
+                job, run_id=run_identity, include_run=bool(run_identity),
                 exclude_identity=parent_identity)
-            containment = None
             if inspection["survivors"]:
                 containment = _terminate_pids(inspection["survivors"])
                 inspection = inspect_execution(
-                    job, run_id=state.get("id") or state.get("run_id"),
-                    include_run=bool(parent_identity), exclude_identity=parent_identity)
+                    job, run_id=run_identity, include_run=bool(run_identity),
+                    exclude_identity=parent_identity)
             if not inspection["stopped"]:
+                # A leader exit, error class, or report is not proof that the
+                # whole execution stopped. Keep exact uncertain ownership.
                 job.update({"status": "uncertain",
                             "recovery_gate": inspection["reasons"],
                             "escaped_processes": inspection["survivors"],
                             "containment": containment})
+                if violation is not None:
+                    job["source_mutation"] = violation.diagnostics
+                    job["error"] = str(violation)
+                    state["source_integrity_failure"] = {
+                        "at": now(), "job_id": job_id, "kind": kind,
+                        "mutation": violation.diagnostics}
                 state["active_job"] = job
+                state.setdefault("failed_jobs", []).append(job)
                 save(run_dir, state)
+                journal_event(run_dir, state, "job_failed", job_id=job_id, kind=kind,
+                              role=role, error=str(violation or "containment unproven"),
+                              pid=job.get("pid"), sid=job.get("sid"))
+                handled_failure = True
                 raise RuntimeError(
-                    "Worker exited but marked process(es) remain; reconcile before accepting its report")
+                    "Worker exited but marked process(es) remain; reconcile before "
+                    "accepting or replaying its execution")
+            if violation is not None:
+                job["status"] = "blocked"
+                job["source_mutation"] = violation.diagnostics
+                job["containment"] = containment
+                job["error"] = str(violation)
+                state.setdefault("failed_jobs", []).append(job)
+                state["active_job"] = None
+                state["retry_session"] = None
+                state["source_integrity_failure"] = {
+                    "at": now(), "job_id": job_id, "kind": kind,
+                    "mutation": violation.diagnostics}
+                save(run_dir, state)
+                journal_event(run_dir, state, "job_failed", job_id=job_id, kind=kind,
+                              role=role, error=str(violation), pid=job.get("pid"),
+                              sid=job.get("sid"))
+                handled_failure = True
+                raise violation
+            job["status"] = "complete"
             state.setdefault("completed_jobs", []).append(job)
             state["active_job"] = None
             state["retry_session"] = None
@@ -5262,8 +5878,12 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 evidence=report.get("evidence", [])[:20],
                 findings=report.get("findings", [])[:10],
                 verdict=report.get("verdict"), status_value=report.get("status"))
+        elif violation is not None:
+            raise violation
         return report, job
     except BaseException as exc:
+        if handled_failure:
+            raise
         job["status"] = "interrupted" if isinstance(exc, InterruptedError) else "failed"
         job["error"] = str(exc)
         failure_snapshot = None
@@ -5277,24 +5897,50 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                      "paths": [], "path_count": 0})
         mutation.update({"kind": kind, "role": role, "job_id": job_id,
                          "phase": "failure"})
+        inspection = None
+        containment = None
+        stopped = None
+        has_execution_identity = bool(
+            proc is not None or any(job_identity(job).values())
+            or _launch_identity(_job_launch_file(job)))
+        if state is not None and has_execution_identity:
+            # Wait briefly for the guard, but never infer containment from its
+            # exit, from the error class, or from the report's presence.
+            if proc is not None:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            parent_identity = state.get("parent_job_identity")
+            run_identity = state.get("id") or state.get("run_id")
+            inspection = inspect_execution(
+                job, run_id=run_identity, include_run=bool(run_identity),
+                exclude_identity=parent_identity)
+            if inspection["survivors"]:
+                containment = _terminate_pids(inspection["survivors"])
+                inspection = inspect_execution(
+                    job, run_id=run_identity, include_run=bool(run_identity),
+                    exclude_identity=parent_identity)
+            stopped = bool(inspection["stopped"])
         if kind in READ_ONLY_STAGE_KINDS and mutation.get("mutated"):
             job["source_mutation"] = mutation
+            job["source_mutation"]["containment"] = inspection
             atomic_json(jpath / "source-mutation.json", mutation)
-            stopped = False
-            if any(job_identity(job).values()):
-                inspection = inspect_execution(
-                    job, run_id=(state or {}).get("id"), include_run=bool(
-                        isinstance(state, dict) and state.get("parent_job_identity")),
-                    exclude_identity=(state or {}).get("parent_job_identity"))
-                stopped = bool(inspection["stopped"])
-                job["source_mutation"]["containment"] = inspection
-            if isinstance(exc, SourceMutationError) or stopped or (
-                    proc is not None and proc.poll() is not None):
+            if stopped is True:
                 job["status"] = "blocked"
-                if not isinstance(exc, SourceMutationError):
-                    job["source_mutation"]["error"] = str(exc)
             else:
                 job["status"] = "uncertain"
+                job["recovery_gate"] = (
+                    (inspection or {}).get("reasons")
+                    or ["execution containment was not proven stopped"])
+                job["escaped_processes"] = (inspection or {}).get("survivors", [])
+                job["containment"] = containment
+                job["source_mutation"]["error"] = str(exc)
+        elif stopped is False:
+            job["status"] = "uncertain"
+            job["recovery_gate"] = inspection["reasons"]
+            job["escaped_processes"] = inspection["survivors"]
+            job["containment"] = containment
         if state is not None:
             job["reported_usage"] = extract_reported_usage(
                 out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "",
@@ -5312,13 +5958,15 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         atomic_json(jpath / "failure.json", {"error": str(exc), "status": job["status"], "at": now()})
         if state is not None:
             state.setdefault("failed_jobs", []).append(job)
-            # Once a child has started, even an invalid report or rate limit may
-            # follow writes or other side effects. Require explicit reconciliation.
-            # A proven read-only source mutation with a stopped process is a
-            # deterministic block: preserve artifacts but do not claim a live job.
-            state["active_job"] = ({**job, "status": "uncertain"}
-                                   if proc is not None and job.get("status") != "blocked"
-                                   else None)
+            # Clear active identity only when the relevant execution is proven
+            # stopped. An exited leader with a live escaped child remains an
+            # exact uncertain ownership that must be reconciled before replay.
+            if job.get("status") == "blocked":
+                state["active_job"] = None
+            elif has_execution_identity:
+                state["active_job"] = {**job, "status": "uncertain"}
+            else:
+                state["active_job"] = None
             if job.get("source_mutation"):
                 state["source_integrity_failure"] = {
                     "at": now(), "job_id": job_id, "kind": kind,
@@ -7359,12 +8007,12 @@ def validate_cli_arguments(command, help_text):
     return True
 
 
-def probe_generated_commands(cfg, host, dialect, help_by_provider):
+def probe_generated_commands(cfg, host, dialect, help_by_provider, project=None):
     """Exercise parsers with actual generated options and --help, never a model prompt."""
     outcomes = {}
     with tempfile.TemporaryDirectory(prefix="abdullah-doctor-") as tmp:
         root = Path(tmp)
-        cases = [(role, kind, model_route(cfg, host, role), False)
+        cases = [(role, kind, model_route(cfg, host, role, project=project), False)
                  for role, kind in (("architect", "plan"), ("architect", "decision"),
                                     ("architect", "diagnose"), ("architect", "integration"),
                                     ("explorer", "explorer"), ("implementer", "implementer"),
@@ -7570,14 +8218,15 @@ def doctor(project: Path, host="codex"):
         except (OSError, subprocess.TimeoutExpired):
             checks["cli_compatible"][host] = False
     for role in ("explorer", "implementer", "reviewer"):
-        checks["route"][role] = model_route(cfg, host, role)
-    checks["route"]["architect"] = model_route(cfg, host, "architect")
+        checks["route"][role] = model_route(cfg, host, role, project=project)
+    checks["route"]["architect"] = model_route(cfg, host, "architect", project=project)
     checks["host"] = host
     checks["billing_preflight"] = {}
     for role, route in checks["route"].items():
         checks["billing_preflight"][role] = route_preflight(
             role, route, cfg, project, state=None)
-    checks["generated_commands"] = probe_generated_commands(cfg, host, dialect, help_by_provider)
+    checks["generated_commands"] = probe_generated_commands(cfg, host, dialect,
+                                                            help_by_provider, project)
     # Deterministic contract validation is authoritative; live CLI
     # introspection is best-effort and reported separately.
     checks["worker_profiles"] = {}
@@ -7777,7 +8426,7 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
                            "reported_cache_write_tokens": None, "sources": [],
                            "reported_provider_cost": None,
                            "cost_status": "unavailable"},
-                 "model_routes": {r: model_route(cfg, host, r) for r in
+                 "model_routes": {r: model_route(cfg, host, r, project=project) for r in
                                   ("architect", "explorer", "implementer", "reviewer")}}
         if handoff is not None:
             state["plan"] = plan
@@ -7853,7 +8502,7 @@ def compatibility_run(run_id):
     return result
 
 
-def _normalize_recorded_route(role, record):
+def _normalize_recorded_route(role, record, *, legacy_go=False):
     """Normalize a route recorded by an older supervisor without today's config."""
     if not isinstance(record, dict):
         raise ValueError(f"Recorded {role} route is missing")
@@ -7875,14 +8524,6 @@ def _normalize_recorded_route(role, record):
         return {"provider": provider, "model": model.strip(), "effort": effort.strip(),
                 "billing": billing}
     provider, model_id, full = _split_model_id(model, f"recorded {role}")
-    billing = record.get("billing")
-    if billing not in EXPLICIT_BILLINGS:
-        raise ValueError(f"Recorded {role} route has unsupported billing {billing!r}")
-    effort = record.get("effort", record.get("variant", ""))
-    if effort is None:
-        effort = ""
-    if not isinstance(effort, str):
-        raise ValueError(f"Recorded {role} route has invalid variant")
     if provider == "opencode":
         worker_provider = record.get("worker_provider") or \
             str(model).split("/", 1)[0]
@@ -7895,6 +8536,14 @@ def _normalize_recorded_route(role, record):
     if str(model).split("/", 1)[0] != worker_provider:
         raise ValueError(
             f"Recorded {role} route provider {worker_provider!r} contradicts model prefix")
+    billing = validate_worker_billing(
+        f"Recorded {role}", worker_provider, record.get("billing"),
+        inferred=legacy_go and "billing" not in record)
+    effort = record.get("effort", record.get("variant", ""))
+    if effort is None:
+        effort = ""
+    if not isinstance(effort, str):
+        raise ValueError(f"Recorded {role} route has invalid variant")
     route = {"provider": "opencode", "worker_provider": worker_provider,
              "model": full, "effort": effort.strip(), "billing": billing,
              "routing_fingerprint": record.get("routing_fingerprint")}
@@ -7920,17 +8569,17 @@ def _reconstruct_migrated_routes(state, route_map=None):
     missing = []
     for role in ("architect", "explorer", "implementer", "reviewer"):
         if isinstance(recorded.get(role), dict) and recorded[role].get("model"):
-            routes[role] = _normalize_recorded_route(role, recorded[role])
+            routes[role] = recorded[role]
         else:
             missing.append(role)
-    # Older runs may lack model_routes but do record each dispatch route.
+    # Older runs may lack model_routes but they do record each dispatch route.
     if missing:
         jobs = list(state.get("completed_jobs", [])) + list(state.get("failed_jobs", []))
         for role in list(missing):
             candidates = [job for job in jobs
                           if job.get("role") == role and isinstance(job.get("route"), dict)]
             if candidates:
-                routes[role] = _normalize_recorded_route(role, candidates[-1]["route"])
+                routes[role] = candidates[-1]["route"]
                 missing.remove(role)
     if missing:
         raise RuntimeError(
@@ -7938,7 +8587,17 @@ def _reconstruct_migrated_routes(state, route_map=None):
             + ", ".join(missing)
             + ". Provide an explicit --routes JSON mapping; today's defaults are "
               "never used to infer a historical route.")
-    return routes, "recorded_routes"
+    # Missing billing/provider may be inferred only when every recorded worker
+    # route is the legacy unchanged Go route.  A non-Go record must be explicit.
+    worker_records = [routes[role] for role in ("explorer", "implementer", "reviewer")]
+    all_go = all(
+        str(record.get("model") or "").split("/", 1)[0] in GO_WORKER_PROVIDERS
+        for record in worker_records)
+    normalized = {}
+    for role in ("architect", "explorer", "implementer", "reviewer"):
+        normalized[role] = _normalize_recorded_route(
+            role, routes[role], legacy_go=all_go)
+    return normalized, "recorded_routes"
 
 
 def migrate_run(run_id, backup_dir=None, route_map=None):
@@ -7958,6 +8617,27 @@ def migrate_run(run_id, backup_dir=None, route_map=None):
             return {"ok": True, "run_id": run_id, "migrated": False,
                     "compatibility": previous, "backup": None}
         routes, route_source = _reconstruct_migrated_routes(state, route_map)
+        # Initialize reviewed routing pins during this explicit migration.  The
+        # previous fingerprint is preserved for audit; dispatch never repins an
+        # existing run silently.
+        project = Path(state["project"])
+        pin_records = {}
+        for role in ("explorer", "implementer", "reviewer"):
+            route = routes[role]
+            previous_pin = route.get("routing_fingerprint")
+            route["routing_fingerprint"] = routing_fingerprint(route, project=project)
+            route["routing_pin_source"] = "migration_observation"
+            pin_records[role] = {"previous": previous_pin,
+                                 "current": route["routing_fingerprint"]}
+            fallback = route.get("fallback_route")
+            if isinstance(fallback, dict):
+                previous_fallback = fallback.get("routing_fingerprint")
+                fallback["routing_fingerprint"] = routing_fingerprint(
+                    fallback, project=project)
+                fallback["routing_pin_source"] = "migration_observation"
+                pin_records[f"{role}.fallback"] = {
+                    "previous": previous_fallback,
+                    "current": fallback["routing_fingerprint"]}
         root = (Path(backup_dir).expanduser() if backup_dir
                 else DEFAULT_STATE.parent / "backups" / "migrations")
         root.mkdir(parents=True, exist_ok=True)
@@ -7984,6 +8664,7 @@ def migrate_run(run_id, backup_dir=None, route_map=None):
                       "config_schema_version": CONFIG_SCHEMA_VERSION,
                       "config_sha256": configuration_provenance().get("sha256"),
                       "model_routes": routes,
+                      "migration_routing_pins": pin_records,
                       "migrated_at": now(),
                       "migration_from": previous,
                       "migration_route_source": route_source})
@@ -8013,6 +8694,31 @@ def migrate_run(run_id, backup_dir=None, route_map=None):
             "rollback": f"restore-run {run_id} --backup {backup} --acknowledge restore"}
 
 
+def validate_restore_backup(backup_state, run_id, current_state):
+    """Fully validate a backup before any destination mutation."""
+    if not isinstance(backup_state, dict):
+        raise ValueError("Backup must contain a JSON object")
+    if backup_state.get("id") != run_id:
+        raise ValueError(
+            f"Backup run identity {backup_state.get('id')!r} does not match {run_id!r}")
+    current_project = Path(str(current_state.get("project") or "")).expanduser().resolve()
+    backup_project = Path(str(backup_state.get("project") or "")).expanduser().resolve()
+    if not backup_state.get("project") or backup_project != current_project:
+        raise ValueError("Backup project identity does not match the current run")
+    schema = backup_state.get("schema_version")
+    if isinstance(schema, int) and schema > STATE_SCHEMA_VERSION:
+        raise ValueError("Backup state schema is newer than this supervisor")
+    status = backup_state.get("status")
+    if status in {"running", "uncertain"}:
+        raise ValueError(
+            f"A backup in {status!r} state cannot be restored; resolve execution first")
+    if not isinstance(status, str) or status not in (PAUSED_STATES | FINAL_STATES):
+        raise ValueError(f"Backup status {status!r} is not an allowed inactive state")
+    if backup_state.get("active_job") or backup_state.get("active_check"):
+        raise ValueError("Backup contains active or uncertain execution; refusing restore")
+    return True
+
+
 def restore_run(run_id, backup, acknowledge):
     """Restore a migrated run from its exact pre-migration backup."""
     _operator_action_allowed("restore-run")
@@ -8025,18 +8731,46 @@ def restore_run(run_id, backup, acknowledge):
     source = Path(backup).expanduser().resolve()
     if not source.is_file():
         raise RuntimeError(f"Backup does not exist: {source}")
+    try:
+        backup_state = read_json(source)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Backup is unreadable or invalid JSON; destination state was not changed "
+            f"({exc.__class__.__name__}: {source})") from exc
+    validate_restore_backup(backup_state, run_id, state)
     with exclusive(folder):
         folder, latest = load(run_id)
         if latest.get("active_job") or latest.get("active_check"):
             raise RuntimeError("Run acquired active work during restore; refused")
-        shutil.copy2(source, folder / "state.json")
-        restored = read_json(folder / "state.json")
+        validate_restore_backup(backup_state, run_id, latest)
+        pre_restore = copy.deepcopy(latest)
+        audit_dir = folder / "restores"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        audit_path = audit_dir / f"pre-restore-{stamp}.json"
+        atomic_json(audit_path, {"at": now(), "run_id": run_id,
+                                 "backup": str(source),
+                                 "backup_sha256": _sha256_file(source),
+                                 "acknowledge": acknowledge,
+                                 "actor": _operator_actor(),
+                                 "state": pre_restore})
+        restored = copy.deepcopy(backup_state)
         restored["restored_at"] = now()
         restored["restore_acknowledge"] = acknowledge
-        save(folder, restored)
+        restored["restore_backup"] = str(source)
+        restored["restore_audit"] = str(audit_path)
+        try:
+            save(folder, restored)
+        except BaseException:
+            # atomic_json replaces only after a complete temp write; the
+            # pre-restore state remains inspectable and is still on disk if the
+            # replace never happened.
+            raise
         journal_event(folder, restored, "state_restored", backup=str(source),
-                      acknowledge=acknowledge)
+                      acknowledge=acknowledge, pre_restore=str(audit_path))
     return {"ok": True, "run_id": run_id, "backup": str(source),
+            "pre_restore": str(audit_path),
+            "history_preserved": True,
             "compatibility": state_compatibility(restored)}
 
 
@@ -9394,11 +10128,18 @@ def approve_plan_run(run_id, confirmation=None):
 
 
 def authorize_route_run(run_id, role, max_dispatches=1, attestation=None,
-                        confirmation=None):
-    """Record a human-only, per-run route/billing authorization grant."""
+                        confirmation=None, fallback=False):
+    """Record a human-only, per-run route/billing authorization grant.
+
+    ``fallback=True`` authorizes the exact configured fallback route instead of
+    the primary route.  One-dispatch fallback consent remains a separate
+    ``approve-worker-fallback`` action; neither silently authorizes the other.
+    """
     authorization = require_human_operator("authorize-route", run_id, confirmation)
     if role not in {"architect", "explorer", "implementer", "reviewer"}:
         raise ValueError("Unknown route role")
+    if fallback and role == "architect":
+        raise ValueError("Strong-host fallback uses approve-fallback, not authorize-route")
     try:
         max_dispatches = int(max_dispatches)
     except (TypeError, ValueError):
@@ -9410,9 +10151,18 @@ def authorize_route_run(run_id, role, max_dispatches=1, attestation=None,
         folder, state = load(run_id)
         if state.get("active_job") or state.get("active_check"):
             raise RuntimeError("Reconcile active work before authorizing a route")
-        route = (state.get("model_routes") or {}).get(role)
-        if not isinstance(route, dict):
-            route = model_route(config(), state.get("host"), role)
+        primary = (state.get("model_routes") or {}).get(role)
+        if not isinstance(primary, dict):
+            primary = model_route(config(), state.get("host"), role,
+                                  project=Path(state["project"]))
+        if fallback:
+            route = primary.get("fallback_route")
+            if not isinstance(route, dict):
+                raise RuntimeError(
+                    f"No complete fallback route is configured for {role}; "
+                    "configure it before authorizing the alternate")
+        else:
+            route = primary
         billing = route.get("billing")
         attestation = (attestation or "").strip()
         if billing in {"subscription", "free", "local"} and not attestation:
@@ -9428,16 +10178,20 @@ def authorize_route_run(run_id, role, max_dispatches=1, attestation=None,
             "used": 0,
             "attestation": attestation or None,
             "run_id": run_id,
+            "selected_route": "fallback" if fallback else "primary",
+            "primary_route_sha256": route_authorization_sha(primary),
             "actor": authorization["actor"],
             "method": authorization["method"],
             "at": now(),
             "scope": "role/run/exact-route; supervisor dispatch calls only",
         }
+        register_route_grant(folder, entry)
         state.setdefault("route_authorizations", []).append(entry)
         save(folder, state)
         journal_event(folder, state, "route_authorized", grant=entry)
     return {"ok": True, "run_id": run_id, "grant": entry,
             "human_authorization": authorization,
+            "selected_route": "fallback" if fallback else "primary",
             "limitations": ("Bounds supervisor dispatch attempts selected by this "
                             "grant; it is not a token or dollar cap and cannot bound "
                             "provider-side retries or auxiliary calls.")}
@@ -9865,6 +10619,8 @@ def main(argv=None):
     ar.add_argument("--max-dispatches", type=int, default=1)
     ar.add_argument("--attest",
                     help="Reviewed endpoint/auth-mode attestation for subscription/free/local")
+    ar.add_argument("--fallback", action="store_true",
+                    help="Authorize the exact configured fallback route instead of the primary")
     ar.add_argument("--confirm")
     af = subs.add_parser("approve-worker-fallback",
                          help="Human-only one-dispatch consent for a configured worker fallback")
@@ -10002,7 +10758,7 @@ def main(argv=None):
         elif opts.command == "authorize-route":
             print(json.dumps(authorize_route_run(
                 opts.run_id, opts.role, opts.max_dispatches, opts.attest,
-                opts.confirm), ensure_ascii=False, indent=2))
+                opts.confirm, fallback=bool(opts.fallback)), ensure_ascii=False, indent=2))
         elif opts.command == "approve-fallback":
             if bool(opts.run) == bool(opts.run_id):
                 raise ValueError("Provide exactly one run ID, either positional or --run")

@@ -28,6 +28,20 @@ class RouteMigrationTests(unittest.TestCase):
     setUp = baseline.ControlTests.setUp
     tearDown = baseline.ControlTests.tearDown
 
+    def setUp(self):
+        baseline.ControlTests.setUp(self)
+        bin_dir = self.root / "migration-bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "opencode"
+        fake.write_text("#!/usr/bin/env python3\n"
+                        "import sys\n"
+                        "print('1.18.35' if '--version' in sys.argv else '--help')\n")
+        fake.chmod(0o755)
+        env_patch = patch.dict(os.environ, {
+            "PATH": str(bin_dir) + ":" + os.environ["PATH"]})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
     def legacy_state(self, **updates):
         self.state.update({
             "schema_version": 2,
@@ -82,6 +96,89 @@ class RouteMigrationTests(unittest.TestCase):
         self.assertEqual(state["status"], "paused")
         self.assertEqual(state["accepted_batches"], [{"index": 0}])
         self.assertEqual(orc.state_compatibility(state)["status"], "current")
+
+    def test_corrupt_backup_never_mutates_destination_or_requires_phantom_audit(self):
+        self.legacy_state()
+        before = (self.rundir / "state.json").read_bytes()
+        bad = self.root / "bad-backup.json"
+        bad.write_text("{invalid")
+        with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
+            orc.restore_run("test-run00", bad, "restore")
+        self.assertEqual((self.rundir / "state.json").read_bytes(), before)
+        self.assertFalse((self.rundir / "restores").exists())
+
+    def test_wrong_identity_or_active_backup_is_refused(self):
+        self.legacy_state()
+        valid = orc.read_json(self.rundir / "state.json")
+        before = (self.rundir / "state.json").read_bytes()
+        cases = [
+            ({**valid, "id": "other-run"}, "identity"),
+            ({**valid, "project": str(self.root / "other-project")}, "project"),
+            ({**valid, "status": "running"}, "running"),
+            ({**valid, "status": "uncertain"}, "uncertain"),
+            ({**valid, "status": "paused", "active_job": {"id": "live"}},
+             "active or uncertain"),
+            ({**valid, "schema_version": orc.STATE_SCHEMA_VERSION + 1}, "newer"),
+        ]
+        for index, (backup_state, pattern) in enumerate(cases):
+            with self.subTest(pattern=pattern):
+                path = self.root / f"invalid-{index}.json"
+                orc.atomic_json(path, backup_state)
+                with self.assertRaisesRegex((ValueError, RuntimeError), pattern):
+                    orc.restore_run("test-run00", path, "restore")
+                self.assertEqual((self.rundir / "state.json").read_bytes(), before)
+
+    def test_active_destination_refuses_restore_before_reading_backup(self):
+        self.legacy_state()
+        valid = self.root / "valid-backup.json"
+        orc.atomic_json(valid, orc.read_json(self.rundir / "state.json"))
+        before = (self.rundir / "state.json").read_bytes()
+        self.state["active_job"] = {"id": "live", "status": "uncertain"}
+        self.state["status"] = "uncertain"
+        orc.save(self.rundir, self.state)
+        with self.assertRaisesRegex(RuntimeError, "active or uncertain"):
+            orc.restore_run("test-run00", valid, "restore")
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(state["active_job"]["id"], "live")
+        self.assertNotEqual(before, (self.rundir / "state.json").read_bytes())
+
+    def test_write_failure_keeps_pre_restore_state_and_audit(self):
+        self.legacy_state()
+        before = (self.rundir / "state.json").read_bytes()
+        backup = self.root / "restore-backup.json"
+        orc.atomic_json(backup, orc.read_json(self.rundir / "state.json"))
+        original_atomic_json = orc.atomic_json
+
+        def failing(path, value):
+            if Path(path).name == "state.json":
+                raise OSError("simulated disk failure")
+            return original_atomic_json(path, value)
+
+        with patch.object(orc, "atomic_json", side_effect=failing):
+            with self.assertRaisesRegex(OSError, "simulated"):
+                orc.restore_run("test-run00", backup, "restore")
+        self.assertEqual((self.rundir / "state.json").read_bytes(), before)
+        audits = list((self.rundir / "restores").glob("pre-restore-*.json"))
+        self.assertEqual(len(audits), 1)
+        self.assertTrue(audits[0].is_file())
+        self.assertEqual(orc.read_json(backup)["id"], "test-run00")
+
+    def test_valid_restore_records_pre_restore_state_and_backup_provenance(self):
+        self.legacy_state()
+        migrated = orc.migrate_run("test-run00", backup_dir=self.root / "backups")
+        post_migration = (self.rundir / "state.json").read_bytes()
+        before_iteration = orc.read_json(self.rundir / "state.json")
+        result = orc.restore_run("test-run00", migrated["backup"], "restore")
+        self.assertTrue(result["ok"])
+        self.assertTrue(Path(result["pre_restore"]).is_file())
+        audit = orc.read_json(Path(result["pre_restore"]))
+        self.assertEqual(audit["backup"], migrated["backup"])
+        self.assertEqual(audit["state"]["id"], "test-run00")
+        self.assertNotEqual(post_migration, (self.rundir / "state.json").read_bytes())
+        self.assertTrue(before_iteration["migrated_at"])
+        restored = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(restored["restore_backup"], migrated["backup"])
+        self.assertEqual(restored["schema_version"], 2)
 
     def test_rollback_restores_the_pre_migration_state(self):
         self.legacy_state()

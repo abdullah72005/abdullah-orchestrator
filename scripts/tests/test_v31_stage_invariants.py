@@ -29,7 +29,8 @@ if '--version' in args:
 
 def mutate():
     app = pathlib.Path('app.py')
-    if mode in {'tracked', 'malformed', 'exit1'}:
+    if mode in {'tracked', 'malformed', 'exit1', 'escaped_valid',
+                'escaped_malformed', 'escaped_exit1'}:
         app.write_text(app.read_text() + '# mutated by read-only stage\n')
     elif mode == 'untracked':
         pathlib.Path('new_file.py').write_text('value = 9\n')
@@ -46,6 +47,12 @@ def mutate():
                             'GIT_AUTHOR_EMAIL': 'w@example.com',
                             'GIT_COMMITTER_NAME': 'Worker',
                             'GIT_COMMITTER_EMAIL': 'w@example.com'})
+    if mode.startswith('escaped'):
+        # Escape the guard's session but inherit the run/job markers.
+        child = subprocess.Popen([sys.executable, '-c',
+                                  'import time; time.sleep(120)'],
+                                 start_new_session=True)
+        pathlib.Path(os.environ['FAKE_CHILD_PID']).write_text(str(child.pid))
 
 mutate()
 if name == 'codex':
@@ -70,10 +77,10 @@ else:
     report = {'contract_version': 2, 'status': 'complete', 'summary': 'read',
               'files': ['app.py'], 'tests': [], 'evidence': ['app.py:1'],
               'unknowns': [], 'blocker': ''}
-malformed = mode == 'malformed'
+malformed = mode in {'malformed', 'escaped_malformed'}
 if name == 'codex':
     output.write_text('not a json report' if malformed else json.dumps(report))
-    if mode == 'exit1':
+    if mode in {'exit1', 'escaped_exit1'}:
         sys.exit(3)
 else:
     text = 'not a json report' if malformed else json.dumps(report)
@@ -81,7 +88,7 @@ else:
                       'part': {'text': text}}))
     print(json.dumps({'type': 'step_finish', 'sessionID': 'ses_fake',
                       'part': {'reason': 'stop'}}))
-    if mode == 'exit1':
+    if mode in {'exit1', 'escaped_exit1'}:
         sys.exit(3)
 '''
 
@@ -111,11 +118,104 @@ class StageInvariantTests(unittest.TestCase):
         self.addCleanup(env_patch.stop)
         os.environ.pop("FAKE_MUTATION", None)
         self.addCleanup(lambda: os.environ.pop("FAKE_MUTATION", None))
+        self.child_pid_file = self.root / "escaped-child.pid"
+        os.environ["FAKE_CHILD_PID"] = str(self.child_pid_file)
+        self.addCleanup(lambda: os.environ.pop("FAKE_CHILD_PID", None))
+        self.addCleanup(self._kill_escaped_child)
+
+    def _escaped_pid(self):
+        try:
+            return int(self.child_pid_file.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _kill_escaped_child(self):
+        pid = self._escaped_pid()
+        if not pid:
+            return
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+
+    def _child_alive(self):
+        pid = self._escaped_pid()
+        if not pid:
+            return False
+        stat = orc.process_stat(pid)
+        return bool(stat and stat["state"] not in {"Z", "X", "x"})
 
     def dispatch(self, kind="plan", role="architect", host="codex"):
         return orc.call_model(
             self.rundir, self.state, self.cfg, role, kind,
             "prompt", self.project, host=host)
+
+    def test_clean_stopped_mutation_blocks_without_phantom_reconciliation(self):
+        os.environ["FAKE_MUTATION"] = "tracked"
+        with self.assertRaises(orc.SourceMutationError):
+            self.dispatch("plan")
+        job = self.state["failed_jobs"][-1]
+        self.assertEqual(job["status"], "blocked")
+        self.assertIsNone(self.state["active_job"])
+        self.assertIn("# mutated by read-only stage", (self.project / "app.py").read_text())
+
+    def test_escaped_child_with_valid_report_is_cleaned_or_retained_as_uncertain(self):
+        os.environ["FAKE_MUTATION"] = "escaped_valid"
+        with self.assertRaises((orc.SourceMutationError, RuntimeError)):
+            self.dispatch("plan")
+        job = self.state["failed_jobs"][-1]
+        self.assertIn(job["status"], {"blocked", "uncertain"})
+        if job["status"] == "blocked":
+            self.assertIsNone(self.state["active_job"])
+            self.assertFalse(self._child_alive(), "blocked ownership must have no survivor")
+        else:
+            self.assertIsNotNone(self.state["active_job"],
+                                 "unproven containment must retain exact ownership")
+            self.assertEqual(self.state["active_job"]["id"], job["id"])
+        self.assertIn("# mutated by read-only stage", (self.project / "app.py").read_text())
+
+    def test_escaped_child_with_malformed_report_is_cleaned_or_retained(self):
+        os.environ["FAKE_MUTATION"] = "escaped_malformed"
+        result = orc.stage_run(self.state["id"])
+        self.assertFalse(result["ok"])
+        state = orc.read_json(self.rundir / "state.json")
+        job = state["failed_jobs"][-1]
+        self.assertIn(job["status"], {"blocked", "uncertain"})
+        if job["status"] == "blocked":
+            self.assertIsNone(state["active_job"])
+            self.assertFalse(self._child_alive())
+        else:
+            self.assertEqual(state["active_job"]["id"], job["id"])
+            self.assertEqual(state["status"], "uncertain")
+
+    def test_escaped_child_with_nonzero_exit_is_cleaned_or_retained(self):
+        os.environ["FAKE_MUTATION"] = "escaped_exit1"
+        with self.assertRaises(RuntimeError):
+            self.dispatch("plan")
+        job = self.state["failed_jobs"][-1]
+        self.assertIn(job["status"], {"blocked", "uncertain"})
+        if job["status"] == "blocked":
+            self.assertIsNone(self.state["active_job"])
+            self.assertFalse(self._child_alive())
+        else:
+            self.assertEqual(self.state["active_job"]["id"], job["id"])
+
+    def test_failed_cleanup_never_clears_uncertain_ownership(self):
+        os.environ["FAKE_MUTATION"] = "escaped_valid"
+        with patch.object(orc.os, "kill", side_effect=OSError("cleanup denied")):
+            with self.assertRaises((orc.SourceMutationError, RuntimeError)):
+                self.dispatch("plan")
+        job = self.state["failed_jobs"][-1]
+        self.assertEqual(job["status"], "uncertain")
+        self.assertIsNotNone(self.state["active_job"])
+        self.assertEqual(self.state["active_job"]["id"], job["id"])
+        self.assertTrue(self._child_alive())
+        self.assertIn("# mutated by read-only stage", (self.project / "app.py").read_text())
+
 
     def test_plan_mutation_blocks_and_preserves_source_report_and_diagnostics(self):
         os.environ["FAKE_MUTATION"] = "tracked"

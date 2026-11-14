@@ -88,6 +88,11 @@ print(json.dumps({'type': 'step_finish', 'sessionID': 'ses-' + role,
 '''
 
 
+class FakeTTY:
+    def isatty(self):
+        return True
+
+
 class CampaignIntegrationTests(unittest.TestCase):
     setUp = baseline.ControlTests.setUp
     tearDown = baseline.ControlTests.tearDown
@@ -159,6 +164,48 @@ class CampaignIntegrationTests(unittest.TestCase):
         self.assertEqual(state["model_routes"]["architect"]["provider"], "claude")
         self.assertEqual(self.history.read_text().splitlines().count("plan"), 1)
         self.assertEqual(self.history.read_text().splitlines().count("integration"), 1)
+
+    def test_mixed_provider_fake_stage_path_uses_real_authorization_helpers(self):
+        cfg = orc.read_json(orc.CONFIG_PATH)
+        cfg["workers"] = {
+            "explorer": {"provider": "opencode-go",
+                         "model": "opencode-go/deepseek-v4.1-flash",
+                         "variant": "low", "billing": "go"},
+            "implementer": {"provider": "opencode-zen",
+                            "model": "opencode-zen/worker-model",
+                            "variant": "high", "billing": "api"},
+            "reviewer": {"provider": "free-provider",
+                         "model": "free-provider/free-model",
+                         "variant": "", "billing": "free"},
+        }
+        cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = True
+        orc.atomic_json(orc.CONFIG_PATH, cfg)
+        self.cfg = orc.config()
+        run_id = self.start("codex")
+        with patch.object(orc.sys, "stdin", FakeTTY()):
+            implemented = orc.authorize_route_run(
+                run_id, "implementer", max_dispatches=1,
+                confirmation=f"authorize-route:{run_id}")
+            reviewed = orc.authorize_route_run(
+                run_id, "reviewer", max_dispatches=1,
+                attestation="reviewed free provider endpoint/auth mode",
+                confirmation=f"authorize-route:{run_id}")
+        self.assertEqual(implemented["grant"]["role"], "implementer")
+        self.assertEqual(reviewed["grant"]["attestation"],
+                         "reviewed free provider endpoint/auth mode")
+        seen = self.drive(run_id)
+        self.assertEqual(seen[-1][1], "complete")
+        history = self.history.read_text().splitlines()
+        self.assertEqual(history.count("implementer"), 1)
+        self.assertEqual(history.count("reviewer"), 1)
+        state = orc.read_json(self.runs / run_id / "state.json")
+        self.assertEqual(state["final_verdict"]["verdict"], "approved")
+        used = {item["role"]: item["used"]
+                for item in state["route_authorizations"]}
+        self.assertEqual(used, {"implementer": 1, "reviewer": 1})
+        ledger = orc.load_grant_ledger(self.runs / run_id, run_id=run_id)
+        for grant_id, grant in ledger["grants"].items():
+            self.assertEqual(len(grant["reservations"]), 1, grant_id)
 
     def test_late_drift_forces_fresh_checks_then_completes(self):
         run_id = self.start("codex")
