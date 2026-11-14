@@ -1,0 +1,6 @@
+test_session_writes_keep_the_pinned_route_valid (test_v31_aor31_r03.AccountMetadataIdentityTests.test_session_writes_keep_the_pinned_route_valid) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 6.761s
+
+OK

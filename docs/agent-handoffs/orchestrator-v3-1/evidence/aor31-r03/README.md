@@ -41,6 +41,13 @@ The skipped tests are the documented platform-specific skips; the opt-in real
 V2 suite is skipped in the full-suite counts unless `ABDULLAH_OPENCODE_V2_BIN`
 is set, and was run separately above.
 
+The production module is identical from `1456efa` through the evidence HEAD.
+After the full matrices, the round-03 session-write test gained a final
+second-dispatch assertion; the full Python 3.10 suite was rerun (830, OK), and
+that test alone passed again on Python 3.12.16 and 3.13.18
+(`r03-final-py312-single.log`, `r03-final-py313-single.log`). The full
+3.12/3.13 logs remain valid for the unchanged production code.
+
 Real V2 binary: `/home/abdullah/.opencode/bin/opencode`, `v2.2.7`,
 `sha256 589253d36810f21217edd51545cd435b328cdc3cf4f451fbe0cce6f88afcf5e1`.
 

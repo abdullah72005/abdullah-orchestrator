@@ -831,7 +831,7 @@ test_subscription_grant_is_consumed_even_when_the_attempt_fails (test_v31_worker
 test_unapproved_api_route_fails_before_spawn (test_v31_worker_routes.WorkerRouteTests) ... ok
 
 ----------------------------------------------------------------------
-Ran 830 tests in 736.058s
+Ran 830 tests in 731.032s
 
 OK (skipped=7)
 Reconciled. Check candidate source and resume when safe.
