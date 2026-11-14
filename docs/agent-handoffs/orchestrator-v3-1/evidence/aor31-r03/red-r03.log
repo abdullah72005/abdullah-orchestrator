@@ -1,0 +1,141 @@
+test_account_row_or_active_org_change_refuses_before_spawn (test_v31_aor31_r03.AccountMetadataIdentityTests) ... ok
+test_active_organization_change_alone_refuses (test_v31_aor31_r03.AccountMetadataIdentityTests) ... ok
+test_benign_empty_store_initialization_keeps_the_pin (test_v31_aor31_r03.AccountMetadataIdentityTests) ... FAIL
+test_session_writes_keep_the_pinned_route_valid (test_v31_aor31_r03.AccountMetadataIdentityTests) ... FAIL
+test_absolute_database_path_is_inspected (test_v31_aor31_r03.AccountStoreSelectionTests) ... ok
+test_active_store_refuses_before_inference_or_grant_use (test_v31_aor31_r03.AccountStoreSelectionTests) ... FAIL
+test_channel_database_name_follows_the_compiled_channel (test_v31_aor31_r03.AccountStoreSelectionTests) ... ERROR
+test_default_data_root_database_is_inspected (test_v31_aor31_r03.AccountStoreSelectionTests) ... ERROR
+test_explicit_data_root_and_channel_selector (test_v31_aor31_r03.AccountStoreSelectionTests) ... ok
+test_memory_store_has_no_persistent_account_routing (test_v31_aor31_r03.AccountStoreSelectionTests) ... ERROR
+test_relative_database_resolves_under_the_data_root (test_v31_aor31_r03.AccountStoreSelectionTests) ... FAIL
+test_relative_missing_malformed_and_directory_stores (test_v31_aor31_r03.AccountStoreSelectionTests) ... ERROR
+test_unhonored_data_dir_does_not_divert_the_scan (test_v31_aor31_r03.AccountStoreSelectionTests) ... FAIL
+test_unresolved_default_store_refuses (test_v31_aor31_r03.AccountStoreSelectionTests) ... ERROR
+test_denied_cleanup_through_dispatch_retains_uncertain_ownership (test_v31_aor31_r03.InspectionOwnershipTests) ... FAIL
+test_detached_child_after_a_polling_boundary_is_contained (test_v31_aor31_r03.InspectionOwnershipTests) ... FAIL
+test_non_run_inspection_retains_exact_metadata_when_denied (test_v31_aor31_r03.InspectionOwnershipTests) ... ERROR
+test_post_snapshot_fast_detached_child_is_contained (test_v31_aor31_r03.InspectionOwnershipTests) ... FAIL
+
+======================================================================
+ERROR: test_channel_database_name_follows_the_compiled_channel (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 164, in test_channel_database_name_follows_the_compiled_channel
+    orc._opencode_database_filename(
+AttributeError: module 'abdullah_orchestrator' has no attribute '_opencode_database_filename'
+
+======================================================================
+ERROR: test_default_data_root_database_is_inspected (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 146, in test_default_data_root_database_is_inspected
+    self.assertEqual(boundary["account_store"]["mode"], "default")
+KeyError: 'mode'
+
+======================================================================
+ERROR: test_memory_store_has_no_persistent_account_routing (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 208, in test_memory_store_has_no_persistent_account_routing
+    self.assertEqual(store["mode"], "memory")
+TypeError: 'NoneType' object is not subscriptable
+
+======================================================================
+ERROR: test_relative_missing_malformed_and_directory_stores (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 218, in test_relative_missing_malformed_and_directory_stores
+    missing["observed"]["boundary"]["account_store"]["mode"], "relative")
+TypeError: 'NoneType' object is not subscriptable
+
+======================================================================
+ERROR: test_unresolved_default_store_refuses (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 235, in test_unresolved_default_store_refuses
+    with patch.object(orc, "_opencode_database_filename",
+  File "/usr/lib/python3.10/unittest/mock.py", line 1447, in __enter__
+    original, local = self.get_original()
+  File "/usr/lib/python3.10/unittest/mock.py", line 1420, in get_original
+    raise AttributeError(
+AttributeError: <module 'abdullah_orchestrator' from '/tmp/opencode/aor31-r03-red/scripts/orchestrator.py'> does not have the attribute '_opencode_database_filename'
+
+======================================================================
+ERROR: test_non_run_inspection_retains_exact_metadata_when_denied (test_v31_aor31_r03.InspectionOwnershipTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 505, in test_non_run_inspection_retains_exact_metadata_when_denied
+    self.assertIn("ownership is unproven", observed["error"])
+  File "/usr/lib/python3.10/unittest/case.py", line 1109, in assertIn
+    if member not in container:
+TypeError: argument of type 'NoneType' is not iterable
+
+======================================================================
+FAIL: test_benign_empty_store_initialization_keeps_the_pin (test_v31_aor31_r03.AccountMetadataIdentityTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 310, in test_benign_empty_store_initialization_keeps_the_pin
+    self.assertTrue(initialized["ok"], initialized["reasons"])
+AssertionError: False is not true : ['pinned OpenCode provider routing material changed; review/migrate the run instead of silently rerouting']
+
+======================================================================
+FAIL: test_session_writes_keep_the_pinned_route_valid (test_v31_aor31_r03.AccountMetadataIdentityTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 289, in test_session_writes_keep_the_pinned_route_valid
+    self.assertTrue(second["ok"], second["reasons"])
+AssertionError: False is not true : ['pinned OpenCode provider routing material changed; review/migrate the run instead of silently rerouting']
+
+======================================================================
+FAIL: test_active_store_refuses_before_inference_or_grant_use (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 257, in test_active_store_refuses_before_inference_or_grant_use
+    with self.assertRaisesRegex(RuntimeError, "preflight|routing"):
+AssertionError: RuntimeError not raised
+
+======================================================================
+FAIL: test_relative_database_resolves_under_the_data_root (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 117, in test_relative_database_resolves_under_the_data_root
+    self.assertFalse(result["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_unhonored_data_dir_does_not_divert_the_scan (test_v31_aor31_r03.AccountStoreSelectionTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 190, in test_unhonored_data_dir_does_not_divert_the_scan
+    self.assertFalse(refused["ok"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_denied_cleanup_through_dispatch_retains_uncertain_ownership (test_v31_aor31_r03.InspectionOwnershipTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 449, in test_denied_cleanup_through_dispatch_retains_uncertain_ownership
+    with self.assertRaisesRegex(RuntimeError, "ownership is unproven"):
+AssertionError: RuntimeError not raised
+
+======================================================================
+FAIL: test_detached_child_after_a_polling_boundary_is_contained (test_v31_aor31_r03.InspectionOwnershipTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 427, in test_detached_child_after_a_polling_boundary_is_contained
+    self.assertTrue(_wait_dead(self, pid))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_post_snapshot_fast_detached_child_is_contained (test_v31_aor31_r03.InspectionOwnershipTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/opencode/aor31-r03-red/scripts/tests/test_v31_aor31_r03.py", line 400, in test_post_snapshot_fast_detached_child_is_contained
+    self.assertTrue(_wait_dead(self, pid),
+AssertionError: False is not true : post-snapshot detached child survived
+
+----------------------------------------------------------------------
+Ran 18 tests in 18.682s
+
+FAILED (failures=8, errors=6)
