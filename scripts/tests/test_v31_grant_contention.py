@@ -402,11 +402,14 @@ class CallModelGrantWaitTests(unittest.TestCase):
 
     def test_stage_deadline_while_waiting_is_not_authorization_exhaustion(self):
         holder = self.start_holder()
+        # Owned version/config inspection is whole-stage work too; leave it
+        # enough budget to complete and let the deadline expire in the wait.
+        self.cfg["limits"]["max_grant_lock_wait_seconds"] = 5.0
         try:
             with self.assertRaisesRegex(RuntimeError, "deadline|ledger"):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project,
-                               deadline=time.monotonic() + 0.1)
+                               deadline=time.monotonic() + 2.0)
         finally:
             holder.kill()
             holder.communicate(timeout=5)

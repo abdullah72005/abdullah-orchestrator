@@ -37,6 +37,16 @@ if 'debug' in args and 'config' in args:
             pathlib.Path(os.environ['FAKE_OC_CHILD_PID']).write_text(str(child.pid))
         time.sleep(30)
         sys.exit(0)
+    if mode == 'detach':
+        import subprocess
+        pathlib.Path(os.environ['FAKE_OC_PID']).write_text(str(os.getpid()))
+        child = subprocess.Popen(
+            [sys.executable, '-c', 'import time; time.sleep(60)'],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pathlib.Path(os.environ['FAKE_OC_CHILD_PID']).write_text(str(child.pid))
+        print('[]')
+        sys.exit(0)
     if 'FAKE_OC_ENTRIES' in os.environ:
         print(os.environ['FAKE_OC_ENTRIES'])
         sys.exit(0)

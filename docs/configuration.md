@@ -171,12 +171,24 @@ The supported source boundary is version-aware:
   write schema/dependency files, so it is not executed for billing inspection.
   The adapter accounts for native provider/model `api` URLs, `npm`/SDK and
   `modelID`/`id` remaps, and refuses nested provider routing shapes it does not
-  model. The SQLite account store selected by `OPENCODE_DB` (or the default data
-  directory) is inspected read-only for account-table presence and active
-  account/organization selection; credentials are never selected or logged.
-  Automatic plugin files under applicable global/project `.opencode/plugin(s)`
-  directories are discovered, hashed and refused as uninspectable code. A
-  declared plugin list alone is not a complete plugin boundary.
+  model. The SQLite account store is resolved with the supported V1
+  database-path contract: an absolute `OPENCODE_DB` is used as-is, a relative
+  one is joined under `Global.Path.data` (`XDG_DATA_HOME` verbatim, otherwise
+  `$HOME/.local/share`, plus `opencode`), `:memory:` is an ephemeral store, and
+  the default name follows the compiled channel (`opencode.db` for release
+  channels, `opencode-<channel>.db` for preview builds;
+  `OPENCODE_DISABLE_CHANNEL_DB` forces `opencode.db`). Variables upstream does
+  not honor, including `OPENCODE_DATA_DIR`, cannot divert the scan; an
+  unresolvable boundary is `unprovable_routing`. The store is opened read-only
+  and only routing-relevant account metadata (account id/email/url, active
+  account/organization, legacy control-account presence/active) is projected
+  into the route pin. Session/history rows, SQLite layout and whole-file churn
+  remain separate physical audit observations; token column values are never
+  selected or decoded, and the whole-file audit digest never enters a route pin.
+  Automatic plugin files under applicable
+  global/project `.opencode/plugin(s)` directories are discovered, hashed and
+  refused as uninspectable code. A declared plugin list alone is not a complete
+  plugin boundary.
 - **V2.2.7** uses the installed binary's ordered, non-inference
   `debug config --standalone` documents. That normalizer walks project config
   from the filesystem root (including a parent above the Git root), applies

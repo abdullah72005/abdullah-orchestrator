@@ -73,7 +73,11 @@ described as a limitation.
   source boundary or authoritative V2 normalized inspection; a V2 inspector
   failure, malformed output, plugin skip, unresolved endpoint expansion,
   account/remote/unknown material or unreadable influential input is
-  `unprovable_routing`, never an implicit Go/default approval. The prepared
+  `unprovable_routing`, never an implicit Go/default approval. Account-store
+  selection follows the supported V1 database-path contract (relative names
+  under the data root, channel-derived defaults, `:memory:`, read-only routing
+  metadata projection); an unresolved, malformed or uninspectable store refuses
+  rather than treating a missing file as proof. The prepared
   launch is generated only from the resolved executable's validated version;
   an actual-version mismatch, unsupported or failed version query, uninspected
   account store, or automatic plugin code refuses before any inference child,

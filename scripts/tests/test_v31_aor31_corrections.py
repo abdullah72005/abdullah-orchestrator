@@ -18,6 +18,23 @@ orc = baseline.orc
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def assert_no_inference_dispatch(test, spawn):
+    """The guard may run bounded metadata inspections; no model may be spawned.
+
+    Version and normalized-config inspection deliberately use the same guarded
+    launch protocol, so a raw call count is not an inference assertion.
+    """
+    def inspection(command):
+        command = [str(item) for item in command or []]
+        return ("--version" in command
+                or ("debug" in command and "config" in command))
+
+    unexpected = [call.args[0] for call in spawn.call_args_list
+                  if call.args and not inspection(call.args[0])]
+    test.assertEqual(unexpected, [],
+                     f"unexpected guarded model dispatch: {unexpected}")
+
+
 class CorrectionTests(unittest.TestCase):
     setUp = baseline.ControlTests.setUp
     tearDown = baseline.ControlTests.tearDown
@@ -447,7 +464,7 @@ class CorrectionTests(unittest.TestCase):
             with self.assertRaises(InterruptedError):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project, route=route)
-            self.assertEqual(spawn.call_count, 0)
+            assert_no_inference_dispatch(self, spawn)
         thread.join(timeout=6)
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertIsNone(self.state["active_job"])
@@ -476,7 +493,7 @@ class CorrectionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "inspection|unprovable|preflight"):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project, route=route)
-        self.assertEqual(spawn.call_count, 0)
+        assert_no_inference_dispatch(self, spawn)
         deadline = time.monotonic() + 5
         while child_pid.exists() is False and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -504,7 +521,7 @@ class CorrectionTests(unittest.TestCase):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project,
                                route=route, deadline=time.monotonic() + 0.2)
-        self.assertEqual(spawn.call_count, 0)
+        assert_no_inference_dispatch(self, spawn)
         self.assertFalse(self.history.exists())
         self.assertFalse(self.capture.exists())
 

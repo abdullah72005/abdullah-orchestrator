@@ -87,7 +87,7 @@ class VersionBoundaryTests(R02Base):
             with self.assertRaisesRegex(RuntimeError, pattern):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project, route=route)
-        self.assertEqual(spawn.call_count, 0)
+        corrections.assert_no_inference_dispatch(self, spawn)
         state = orc.read_json(self.rundir / "state.json")
         self.assert_no_inference(state)
 
@@ -445,22 +445,40 @@ class InspectorLifecycleTests(R02Base):
         self.assertTrue(_wait_dead(self, pid))
 
     def test_denied_termination_retains_ownership_and_fails_closed(self):
+        """An escaped inspector whose termination is denied is never 'done'."""
         pidfile = self.root / "denied.pid"
-        command = [sys.executable, "-c",
-                   "import pathlib,os,time\n"
-                   f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid()))\n"
-                   "time.sleep(60)\n"]
+        parent = self.spawn_parent(
+            "import pathlib,subprocess,sys\n"
+            "child=subprocess.Popen([sys.executable,'-c',"
+            "'import time;time.sleep(60)'],start_new_session=True,"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+            "stderr=subprocess.DEVNULL)\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+            "print('[]')\n")
         real_kill = os.kill
         real_killpg = os.killpg
+        pid = None
         try:
             with patch.object(orc.os, "kill", side_effect=PermissionError), \
                     patch.object(orc.os, "killpg", side_effect=PermissionError):
-                with self.assertRaises(orc.InspectionContainmentError):
+                with self.assertRaises(orc.InspectionContainmentError) as caught:
                     orc._opencode_run_bounded(
-                        command, self.root, {"PATH": os.environ["PATH"]}, 0.2)
+                        [sys.executable, str(parent), str(pidfile)],
+                        self.root, {"PATH": os.environ["PATH"]}, 2)
+            record = caught.exception.ownership
+            self.assertEqual(record["kind"], "opencode_inspection")
+            self.assertEqual(record["status"], "uncertain")
+            self.assertTrue(record["pid"])
+            self.assertTrue(record["check_token"])
+            self.assertTrue(Path(record["launch_file"]).is_file())
+            self.assertTrue(record["escaped_processes"] or record["recovery_gate"])
+            pid = int(pidfile.read_text())
+            self.assertIn(pid, [item["pid"] for item in
+                                record["escaped_processes"]])
         finally:
-            if pidfile.exists():
+            if pid is None and pidfile.exists():
                 pid = int(pidfile.read_text())
+            if pid:
                 try:
                     real_killpg(pid, signal.SIGKILL)
                 except OSError:
@@ -491,7 +509,7 @@ class InspectorLifecycleTests(R02Base):
                                        "explorer", "explorer", "prompt",
                                        self.project, route=route,
                                        deadline=time.monotonic() + 0.08)
-                    self.assertEqual(spawn.call_count, 0)
+                    corrections.assert_no_inference_dispatch(self, spawn)
                 self.assertLess(time.monotonic() - started, 2.0)
                 state = orc.read_json(self.rundir / "state.json")
                 self.assert_no_inference(state)
@@ -527,7 +545,7 @@ class InspectorLifecycleTests(R02Base):
                     orc.call_model(self.rundir, self.state, self.cfg,
                                    "explorer", "explorer", "prompt",
                                    self.project, route=route)
-                self.assertEqual(spawn.call_count, 0)
+                corrections.assert_no_inference_dispatch(self, spawn)
         finally:
             thread.join(timeout=6)
         self.assertLess(time.monotonic() - started, 5.0)

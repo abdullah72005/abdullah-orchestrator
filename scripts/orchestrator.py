@@ -1993,13 +1993,13 @@ def _opencode_fold_documents(documents, dialect):
 
 
 def _opencode_binary_version_cached(resolved, fingerprint, *, deadline=None,
-                                    cancel=None):
+                                    cancel=None, ownership=None):
     """Contained ``--version`` metadata for one executable identity.
 
-    Cold work runs through the same bounded containment as config inspection
-    and must fit the remaining whole-stage budget; cancellation and expiry
-    propagate as their own outcomes.  Callers thread one identity through a
-    dispatch rather than reusing metadata across executions.
+    Cold work runs through the same bounded, owned containment as config
+    inspection and must fit the remaining whole-stage budget; cancellation and
+    expiry propagate as their own outcomes.  Callers thread one identity
+    through a dispatch rather than reusing metadata across executions.
     """
     timeout = OPENCODE_VERSION_PROBE_TIMEOUT
     if deadline is not None:
@@ -2011,8 +2011,11 @@ def _opencode_binary_version_cached(resolved, fingerprint, *, deadline=None,
     try:
         returncode, out, err = _opencode_run_bounded(
             [str(resolved), "--version"], Path.cwd(), scrubbed_env(), timeout,
-            cancel=cancel, deadline=deadline)
+            cancel=cancel, deadline=deadline, ownership=ownership,
+            purpose="version inspection")
     except (InspectionCancelled, InspectionDeadlineExpired):
+        raise
+    except InspectionOwnershipUnproven:
         raise
     except (OSError, TimeoutError, subprocess.SubprocessError) as exc:
         return {"returncode": None, "text": "", "sha256": None,
@@ -2022,12 +2025,14 @@ def _opencode_binary_version_cached(resolved, fingerprint, *, deadline=None,
             "sha256": hashlib.sha256(text.encode()).hexdigest() if text else None}
 
 
-def _opencode_binary_version(resolved, fingerprint, *, deadline=None, cancel=None):
+def _opencode_binary_version(resolved, fingerprint, *, deadline=None, cancel=None,
+                             ownership=None):
     return _opencode_binary_version_cached(
-        resolved, tuple(fingerprint), deadline=deadline, cancel=cancel)
+        resolved, tuple(fingerprint), deadline=deadline, cancel=cancel,
+        ownership=ownership)
 
 
-def _opencode_binary_identity(*, deadline=None, cancel=None):
+def _opencode_binary_identity(*, deadline=None, cancel=None, ownership=None):
     resolved = shutil.which("opencode")
     if not resolved:
         return {"available": False, "path": None}
@@ -2042,11 +2047,12 @@ def _opencode_binary_identity(*, deadline=None, cancel=None):
             "resolved": resolved,
             "fingerprint": list(fingerprint),
             "version": _opencode_binary_version(
-                real, fingerprint, deadline=deadline, cancel=cancel)}
+                real, fingerprint, deadline=deadline, cancel=cancel,
+                ownership=ownership)}
 
 
 def _opencode_validated_dialect(cfg=None, *, deadline=None, cancel=None,
-                                identity=None):
+                                identity=None, ownership=None):
     """Validate the actual resolved executable against support/pin policy.
 
     Returns ``{"dialect", "identity", "error"}``.  A missing, failed or
@@ -2054,7 +2060,7 @@ def _opencode_validated_dialect(cfg=None, *, deadline=None, cancel=None,
     """
     cfg = cfg or config()
     identity = identity or _opencode_binary_identity(
-        deadline=deadline, cancel=cancel)
+        deadline=deadline, cancel=cancel, ownership=ownership)
     result = {"dialect": None, "identity": identity, "error": None}
     if not identity.get("available"):
         result["error"] = (
@@ -2092,6 +2098,8 @@ def _opencode_validated_dialect(cfg=None, *, deadline=None, cancel=None,
 
 OPENCODE_INSPECTION_POLL_SECONDS = 0.05
 OPENCODE_INSPECTION_TRACK_LIMIT = 512
+OPENCODE_INSPECTION_WAIT_SECONDS = 6.0
+OPENCODE_INSPECTION_OUTPUT_LIMIT = 4 * 1024 * 1024
 
 
 class InspectionCancelled(RuntimeError):
@@ -2102,7 +2110,21 @@ class InspectionDeadlineExpired(RuntimeError):
     """The whole-stage deadline expired during routing inspection."""
 
 
-class InspectionContainmentError(RuntimeError):
+class InspectionOwnershipUnproven(RuntimeError):
+    """Inspection cleanup is unproven; durable ownership must be reconciled.
+
+    ``ownership`` carries the exact durable record (PID/start/session/group,
+    launch reference, token and recorded descendants) so a caller with run
+    state can retain it rather than turning it into an ordinary route failure.
+    """
+
+    def __init__(self, message, *, ownership=None, inspection=None):
+        super().__init__(message)
+        self.ownership = ownership or {}
+        self.inspection = inspection or {}
+
+
+class InspectionContainmentError(InspectionOwnershipUnproven):
     """The inspector process tree could not be proven stopped."""
 
 
@@ -2119,111 +2141,203 @@ def _opencode_track_descendants(pid, tracked):
             tracked[child] = identity.get("pid_start")
 
 
-def _opencode_tracked_live(tracked):
-    live = []
-    for pid, start in tracked.items():
-        stat = process_stat(pid)
-        if not stat or stat["state"] in {"Z", "X", "x"}:
-            continue
-        if start is not None and stat["starttime"] != start:
-            continue
-        live.append(pid)
-    return live
+def _opencode_inspection_workdir(ownership, inspection_id):
+    run_dir = (ownership or {}).get("run_dir")
+    if run_dir:
+        workdir = Path(run_dir) / "jobs" / inspection_id
+        workdir.mkdir(parents=True, exist_ok=True)
+        return workdir
+    return Path(tempfile.mkdtemp(prefix="abdullah-inspection-"))
 
 
-def _opencode_signal_tracked(tracked, sig):
-    for pid in _opencode_tracked_live(tracked):
-        try:
-            os.kill(pid, sig)
-        except OSError:
-            pass
+def _opencode_inspection_owner(ownership, record):
+    """Persist exact inspection ownership before its child can spawn."""
+    state = (ownership or {}).get("state")
+    run_dir = (ownership or {}).get("run_dir")
+    if not isinstance(state, dict) or not run_dir:
+        return False
+    current = state.get("active_check")
+    if isinstance(current, dict) and current.get("id") != record.get("id"):
+        raise RuntimeError(
+            "Another active check owns execution; reconcile it before "
+            "OpenCode routing inspection")
+    state["active_check"] = record
+    save(Path(run_dir), state)
+    return True
 
 
-def _opencode_contain_inspector(proc, identity, tracked):
-    """Prove the whole inspection tree stopped, even after leader exit."""
-    try:
-        proc.poll()
-    except OSError:
-        pass
-    job = {"pid": identity.get("pid"), "pid_start": identity.get("pid_start"),
-           "pgid": identity.get("pgid"), "sid": identity.get("sid")}
-    result = terminate_identity(job, grace=2)
-    _opencode_signal_tracked(tracked, signal.SIGTERM)
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and _opencode_tracked_live(tracked):
-        time.sleep(0.05)
-    if _opencode_tracked_live(tracked):
-        _opencode_signal_tracked(tracked, signal.SIGKILL)
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and _opencode_tracked_live(tracked):
-            time.sleep(0.05)
-    try:
-        proc.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
-    for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
-        if stream is not None:
-            try:
-                stream.close()
-            except OSError:
-                pass
-    remaining = _opencode_tracked_live(tracked)
-    stopped = result.get("stopped") is True and not remaining
-    return stopped, result, remaining
+def _opencode_release_inspection_owner(ownership, record):
+    state = (ownership or {}).get("state")
+    run_dir = (ownership or {}).get("run_dir")
+    if not isinstance(state, dict) or not run_dir:
+        return
+    current = state.get("active_check")
+    if isinstance(current, dict) and current.get("id") == record.get("id"):
+        state["active_check"] = None
+        save(Path(run_dir), state)
 
 
-def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None):
-    """Contained, cancellable inspection; never attaches to a daemon.
+def _opencode_contain_owned_inspection(record):
+    """Reconcile an owned inspection through the shared containment gate."""
+    inspection = inspect_execution(record, run_id=None, include_run=False)
+    containment = None
+    if inspection.get("survivors"):
+        containment = _terminate_pids(inspection["survivors"])
+        inspection = inspect_execution(record, run_id=None, include_run=False)
+    return inspection, containment
 
-    Ownership covers the whole execution, including a leader that exits
-    successfully while a descendant remains alive.  Descendants are recorded
-    independently of leader liveness and every owned process must be proven
-    stopped before this helper can succeed.
+
+def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None,
+                          ownership=None, purpose="routing inspection"):
+    """Contained, cancellable inspection with durable whole-execution ownership.
+
+    The inspector is launched through the same guard, inherited markers and
+    launch-record protocol as a dispatched job.  Its exact identity is saved
+    before the child can spawn.  Success requires :func:`inspect_execution` to
+    prove that every session, group, recorded descendant and inherited marker
+    is stopped; a sampled descendant scan is only additional evidence.
+    An unproven cleanup raises :class:`InspectionContainmentError` carrying the
+    durable record, and the caller's ``active_check`` remains uncertain.
     """
-    proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, start_new_session=True)
-    identity = process_identity(proc.pid) or {
-        "pid": proc.pid, "pgid": proc.pid, "sid": proc.pid}
+    inspection_id = "inspection-" + uuid.uuid4().hex[:12]
+    token = uuid.uuid4().hex
+    child_env = dict(env)
+    child_env["ABDULLAH_CHECK_TOKEN"] = token
+    child_env["ABDULLAH_JOB_ID"] = inspection_id
+    workdir = _opencode_inspection_workdir(ownership, inspection_id)
+    out_path = workdir / "stdout.log"
+    err_path = workdir / "stderr.log"
+    launch_file = workdir / "launch.json"
+    record = {
+        "id": inspection_id, "kind": "opencode_inspection",
+        "status": "dispatched", "purpose": purpose, "path": str(workdir),
+        "log": str(out_path), "stderr_log": str(err_path),
+        "launch_file": str(launch_file), "check_token": token,
+        "command_sha256": hashlib.sha256(
+            json.dumps([str(item) for item in argv]).encode()).hexdigest(),
+        "role": (ownership or {}).get("role"),
+        "stage": (ownership or {}).get("stage"),
+        "created_at": now()}
+    owned_state = _opencode_inspection_owner(ownership, record)
+    proc = None
+    lease_fd = None
     tracked = {}
-    started = time.monotonic()
-    limit = max(0.1, float(timeout))
-    out = err = ""
+    outcome = None
     try:
-        while True:
-            if cancel is not None and cancel():
-                raise InspectionCancelled(
-                    "Run pause/cancel requested during OpenCode routing inspection")
-            if deadline is not None and time.monotonic() >= deadline:
-                raise InspectionDeadlineExpired(
-                    "Whole-stage deadline expired during OpenCode routing inspection")
-            elapsed = time.monotonic() - started
-            if elapsed >= limit:
-                raise TimeoutError(
-                    f"OpenCode config inspection exceeded {limit:.1f}s")
-            _opencode_track_descendants(proc.pid, tracked)
-            wait = min(OPENCODE_INSPECTION_POLL_SECONDS,
-                       max(0.01, limit - elapsed))
-            if deadline is not None:
-                wait = min(wait, max(0.01, deadline - time.monotonic()))
+        try:
+            with out_path.open("wb") as out_log, err_path.open("wb") as err_log:
+                proc, lease_fd = _spawn_guarded(
+                    [str(item) for item in argv], cwd, child_env, out_log,
+                    launch_file=launch_file, error_stream=err_log)
+                launch = _wait_launch(launch_file)
+                identity = ((launch or {}).get("guard")
+                            if isinstance(launch, dict) else None) \
+                    or process_identity(proc.pid) or {}
+                record.update({
+                    "pid": proc.pid, "pid_start": identity.get("pid_start"),
+                    "pgid": identity.get("pgid"), "sid": identity.get("sid"),
+                    "process": identity, "launch": launch,
+                    "status": "running"})
+                _opencode_inspection_owner(ownership, record)
+                started = time.monotonic()
+                limit = max(0.1, float(timeout))
+                while True:
+                    if proc.poll() is not None:
+                        break
+                    if cancel is not None and cancel():
+                        outcome = InspectionCancelled(
+                            "Run pause/cancel requested during OpenCode routing "
+                            "inspection")
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        outcome = InspectionDeadlineExpired(
+                            "Whole-stage deadline expired during OpenCode routing "
+                            "inspection")
+                        break
+                    elapsed = time.monotonic() - started
+                    if elapsed >= limit:
+                        outcome = TimeoutError(
+                            f"OpenCode config inspection exceeded {limit:.1f}s")
+                        break
+                    try:
+                        _opencode_track_descendants(proc.pid, tracked)
+                    except InspectionContainmentError as exc:
+                        outcome = exc
+                        break
+                    record["descendant_pids"] = sorted(
+                        set(record.get("descendant_pids") or []) | set(tracked))
+                    wait = min(OPENCODE_INSPECTION_POLL_SECONDS,
+                               max(0.01, limit - elapsed))
+                    if deadline is not None:
+                        wait = min(wait, max(0.01, deadline - time.monotonic()))
+                    time.sleep(wait)
+                record["descendant_pids"] = sorted(
+                    set(record.get("descendant_pids") or []) | set(tracked))
+        finally:
+            if lease_fd is not None:
+                try:
+                    os.close(lease_fd)
+                except OSError:
+                    pass
+                lease_fd = None
+        if proc is not None:
             try:
-                out, err = proc.communicate(timeout=wait)
-                break
+                proc.wait(timeout=OPENCODE_INSPECTION_WAIT_SECONDS)
             except subprocess.TimeoutExpired:
-                continue
-    finally:
-        contained, details, remaining = _opencode_contain_inspector(
-            proc, identity, tracked)
-        if not contained:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        inspection, containment = _opencode_contain_owned_inspection(record)
+        stopped = bool(inspection.get("stopped"))
+        record.update({
+            "status": "stopped" if stopped else "uncertain",
+            "escaped_processes": inspection.get("survivors") or [],
+            "containment": containment,
+            "recovery_gate": inspection.get("reasons") or []})
+        atomic_json(workdir / "inspection.json", record)
+        if not stopped:
+            if owned_state:
+                _opencode_inspection_owner(ownership, record)
             raise InspectionContainmentError(
                 "OpenCode inspector process tree "
-                f"{identity.get('pid')} could not be proven stopped"
-                + (f"; remaining {remaining}" if remaining else "")
-                + (f"; {details.get('reason')}" if details.get("reason") else ""))
-    if proc.returncode is None:
-        raise InspectionContainmentError(
-            f"OpenCode inspector process {proc.pid} did not exit after containment")
-    return proc.returncode, out, err
+                f"{record.get('pid')} could not be proven stopped"
+                + (f"; remaining {record['escaped_processes']}"
+                   if record["escaped_processes"] else "")
+                + (f"; {'; '.join(record['recovery_gate'])}"
+                   if record["recovery_gate"] else ""),
+                ownership=record, inspection=inspection)
+        if owned_state:
+            _opencode_release_inspection_owner(ownership, record)
+        if outcome is not None:
+            raise outcome
+        output = b""
+        error = b""
+        try:
+            with out_path.open("rb") as stream:
+                output = stream.read(OPENCODE_INSPECTION_OUTPUT_LIMIT)
+        except OSError:
+            pass
+        try:
+            with err_path.open("rb") as stream:
+                error = stream.read(OPENCODE_INSPECTION_OUTPUT_LIMIT)
+        except OSError:
+            pass
+        return (proc.returncode if proc is not None else None,
+                output.decode("utf-8", "replace"),
+                error.decode("utf-8", "replace"))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if proc is None:
+            record.update({"status": "not_started",
+                           "error": exc.__class__.__name__})
+            atomic_json(workdir / "inspection.json", record)
+            if owned_state:
+                _opencode_release_inspection_owner(ownership, record)
+        raise
 
 
 def _opencode_routing_view(info):
@@ -2236,10 +2350,10 @@ def _opencode_routing_view(info):
 def _opencode_inspected_documents(project, role, dialect, child_env, inline_bytes,
                                   source_records, *, deadline=None,
                                   cancel=None, adapter_config=None,
-                                  identity=None):
+                                  identity=None, ownership=None):
     """Normalized, non-inference V2 config documents from the installed CLI."""
     identity = identity or _opencode_binary_identity(
-        deadline=deadline, cancel=cancel)
+        deadline=deadline, cancel=cancel, ownership=ownership)
     result = {"ok": False, "reason": None, "documents": [], "identity": identity,
               "entry_paths": [], "cancelled": False, "expired": False}
     if dialect != "v2":
@@ -2272,7 +2386,8 @@ def _opencode_inspected_documents(project, role, dialect, child_env, inline_byte
         returncode, out, err = _opencode_run_bounded(
             ["opencode", "debug", "config", "--standalone"],
             Path(project).expanduser().resolve(), env, timeout,
-            cancel=cancel, deadline=deadline)
+            cancel=cancel, deadline=deadline, ownership=ownership,
+            purpose="config inspection")
     except InspectionCancelled as exc:
         result.update({"reason": "inspection_cancelled", "cancelled": True,
                        "detail": str(exc)})
@@ -2281,9 +2396,9 @@ def _opencode_inspected_documents(project, role, dialect, child_env, inline_byte
         result.update({"reason": "inspection_deadline_expired", "expired": True,
                        "detail": str(exc)})
         return result
-    except InspectionContainmentError as exc:
+    except InspectionOwnershipUnproven as exc:
         result.update({"reason": "inspection_containment_unproven",
-                       "detail": str(exc)})
+                       "detail": str(exc), "containment": exc.ownership})
         return result
     except (OSError, TimeoutError) as exc:
         result["reason"] = f"inspector_failed: {exc.__class__.__name__}"
@@ -2333,14 +2448,108 @@ def _opencode_inspected_documents(project, role, dialect, child_env, inline_byte
     return result
 
 
-def _opencode_data_dir(child_env):
-    configured = child_env.get("OPENCODE_DATA_DIR")
-    if configured:
-        return Path(configured).expanduser()
+def _opencode_data_dir(child_env, cwd=None):
+    """V1 ``Global.Path.data`` from the pinned upstream ``global.ts``.
+
+    ``xdg-basedir`` uses ``XDG_DATA_HOME`` verbatim and otherwise
+    ``HOME/.local/share``; ``opencode`` is appended by the CLI.  V1 does not
+    honor ``OPENCODE_DATA_DIR`` for this root, so it must not divert the scan.
+    A relative root is resolved by Node against the child's project cwd.
+    """
     xdg = child_env.get("XDG_DATA_HOME")
     if xdg:
-        return Path(xdg).expanduser() / "opencode"
-    return Path(child_env.get("HOME") or Path.home()) / ".local/share/opencode"
+        root = Path(xdg)
+        if not root.is_absolute():
+            if cwd is None:
+                return None
+            root = Path(cwd) / root
+        return root / "opencode"
+    home = child_env.get("HOME") or str(Path.home())
+    if not home:
+        return None
+    root = Path(home)
+    if not root.is_absolute():
+        if cwd is None:
+            return None
+        root = Path(cwd) / root
+    return root / ".local" / "share" / "opencode"
+
+
+OPENCODE_RELEASE_CHANNELS = frozenset({"latest", "beta", "prod"})
+
+
+def _opencode_installation_channel(version_text):
+    """Compiled channel for a supported build, from its embedded version.
+
+    ``packages/script`` embeds ``0.0.0-<channel>-<timestamp>`` in preview builds
+    and a release semver otherwise; release channels all select ``opencode.db``.
+    ``None`` means the release channel family.
+    """
+    text = str(version_text or "").strip()
+    if text.startswith("0.0.0-"):
+        channel = text[len("0.0.0-"):]
+        channel = re.sub(r"-\d{12}$", "", channel)
+        if channel:
+            return channel
+    if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+].*)?", text):
+        return None
+    return ""
+
+
+def _opencode_database_filename(child_env, executable=None, version=None):
+    """Channel-selected default database name, or ``(None, reason)``."""
+    disable = str(child_env.get("OPENCODE_DISABLE_CHANNEL_DB") or "").strip().lower()
+    if disable in {"1", "true"}:
+        return "opencode.db", None
+    version = (version if version is not None
+               else ((executable or {}).get("version") or {}).get("text"))
+    channel = _opencode_installation_channel(version)
+    if channel == "":
+        return None, ("the installed OpenCode channel cannot be established from "
+                      f"its version text {str(version or '')[:80]!r}")
+    if channel is None or channel in OPENCODE_RELEASE_CHANNELS:
+        return "opencode.db", None
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "-", channel)
+    return f"opencode-{safe}.db", None
+
+
+def _opencode_database_selection(child_env, project_path, executable=None,
+                                 version=None):
+    """Resolve the exact V1 SQLite store the child will use.
+
+    Implements ``packages/core/src/database/database.ts``: an absolute
+    ``OPENCODE_DB`` is used directly, a relative one is joined under the data
+    root, ``:memory:`` is an ephemeral store, and the default name depends on
+    the compiled installation channel.  An unresolvable boundary is returned
+    as ``resolved=False`` instead of guessing a file.
+    """
+    configured = child_env.get("OPENCODE_DB")
+    if configured == ":memory:":
+        return {"resolved": True, "mode": "memory", "path": None}
+    if configured:
+        try:
+            candidate = Path(configured)
+        except (TypeError, ValueError):
+            return {"resolved": False, "mode": "unresolved", "path": None,
+                    "reason": f"OPENCODE_DB {configured!r} is not a path"}
+        if candidate.is_absolute():
+            return {"resolved": True, "mode": "absolute", "path": candidate}
+        data_dir = _opencode_data_dir(child_env, project_path)
+        if data_dir is None:
+            return {"resolved": False, "mode": "unresolved", "path": None,
+                    "reason": "OpenCode V1 data root cannot be resolved"}
+        return {"resolved": True, "mode": "relative",
+                "path": data_dir / candidate}
+    data_dir = _opencode_data_dir(child_env, project_path)
+    if data_dir is None:
+        return {"resolved": False, "mode": "unresolved", "path": None,
+                "reason": "OpenCode V1 data root cannot be resolved"}
+    filename, reason = _opencode_database_filename(
+        child_env, executable, version=version)
+    if filename is None:
+        return {"resolved": False, "mode": "unresolved", "path": None,
+                "reason": reason}
+    return {"resolved": True, "mode": "default", "path": data_dir / filename}
 
 
 def _opencode_plugin_dirs(project_path, dialect):
@@ -2434,43 +2643,126 @@ def _opencode_plugin_sources(project_path, dialect):
     return records, error
 
 
-def _opencode_account_store(child_env, project_path):
-    """Read-only metadata identity for the CLI's SQLite account store.
+def _opencode_account_projection(connection, tables):
+    """Routing-relevant account metadata; never token values or history rows."""
+    projection = {}
+    accounts = 0
+    if "account" in tables:
+        count = int(connection.execute(
+            "SELECT COUNT(*) FROM account").fetchone()[0])
+        if count:
+            rows = connection.execute(
+                "SELECT id, email, url FROM account ORDER BY id").fetchall()
+            projection["account"] = [[_account_text(value) for value in row]
+                                     for row in rows]
+            accounts += len(rows)
+    if "account_state" in tables:
+        rows = connection.execute(
+            "SELECT active_account_id, active_org_id FROM account_state "
+            "ORDER BY active_account_id, active_org_id").fetchall()
+        rows = [[_account_text(row[0]), _account_text(row[1])]
+                for row in rows
+                if row[0] not in (None, "") or row[1] not in (None, "")]
+        if rows:
+            projection["account_state"] = rows
+    if "control_account" in tables:
+        # Legacy Go store: presence and the active flag affect routing.
+        count = int(connection.execute(
+            "SELECT COUNT(*) FROM control_account").fetchone()[0])
+        if count:
+            rows = connection.execute(
+                "SELECT email, url, active FROM control_account "
+                "ORDER BY email, url").fetchall()
+            projection["control_account"] = [
+                [_account_text(row[0]), _account_text(row[1]),
+                 1 if row[2] else 0] for row in rows]
+            accounts += len(rows)
+    return projection, accounts
 
-    Only table presence/counts and active selection are inspected.  Credential
-    and token columns are never selected, printed or hashed.
+
+def _account_text(value):
+    return None if value is None else str(value)
+
+
+def _opencode_route_boundary(boundary):
+    """Routing-only boundary view; physical DB audit bytes never enter a pin."""
+    result = copy.deepcopy(boundary or {})
+    store = result.get("account_store")
+    if isinstance(store, dict):
+        result["account_store"] = {
+            key: store.get(key) for key in
+            ("kind", "path", "mode", "routing_sha256", "accounts", "active")}
+    return _redacted_routing_material(result)
+
+
+def _account_route_record(record):
+    return {key: record.get(key) for key in
+            ("kind", "path", "mode", "routing_sha256", "accounts", "active")}
+
+
+def _opencode_account_store(child_env, project_path, executable=None, version=None):
+    """Read-only identity of the exact SQLite store the V1 child will use.
+
+    Only routing-relevant account metadata is projected into the route pin.
+    Session/history tables, SQLite layout and whole-file churn are physical
+    observations kept separate from that projection.  Token and credential
+    column values are never selected, decoded, printed or persisted; the
+    separate whole-file audit digest never enters a route pin.
     """
-    configured = str(child_env.get("OPENCODE_DB") or "").strip()
-    if configured:
-        path = Path(configured).expanduser()
-        if not path.is_absolute():
-            path = project_path / path
-    else:
-        path = _opencode_data_dir(child_env) / "opencode.db"
-    path = path.resolve()
-    if not path.exists():
-        return None, []
-    record = {"kind": "account_store", "path": str(path), "present": True,
-              "sha256": None, "tables": [], "accounts": 0, "active": False}
+    selection = _opencode_database_selection(
+        child_env, project_path, executable=executable, version=version)
+    mode = selection.get("mode")
+    path = selection.get("path")
+    if not selection.get("resolved"):
+        record = {"kind": "account_store", "path": None, "mode": mode,
+                  "resolved": False, "present": False, "accounts": 0,
+                  "active": False, "routing_sha256": None}
+        return record, _account_route_record(record), [
+            selection.get("reason") or
+            "OpenCode account store cannot be resolved"]
+    if mode == "memory":
+        identity = {"mode": "memory", "path": None, "projection": {}}
+        record = {"kind": "account_store", "path": None, "mode": "memory",
+                  "resolved": True, "present": False, "accounts": 0,
+                  "active": False, "routing_sha256": content_hash(identity)}
+        return record, _account_route_record(record), []
     try:
+        path = Path(path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        record = {"kind": "account_store", "path": str(path), "mode": mode,
+                  "resolved": False, "present": False, "accounts": 0,
+                  "active": False, "routing_sha256": None}
+        return record, _account_route_record(record), [
+            f"unreadable OpenCode account store {path}"]
+    record = {"kind": "account_store", "path": str(path), "mode": mode,
+              "resolved": True, "present": False, "accounts": 0,
+              "active": False, "routing_sha256": None, "sha256": None,
+              "tables": [], "size": None}
+    if not path.exists():
+        identity = {"mode": mode, "path": str(path), "projection": {}}
+        record["routing_sha256"] = content_hash(identity)
+        return record, _account_route_record(record), []
+    record["present"] = True
+    try:
+        record["size"] = path.stat().st_size
         record["sha256"] = _sha256_file(path)
     except OSError:
-        return record, [f"unreadable OpenCode account store {path}"]
+        return record, _account_route_record(record), [
+            f"unreadable OpenCode account store {path}"]
     if not path.is_file():
-        return record, [f"unreadable OpenCode account store {path} (not a file)"]
+        return record, _account_route_record(record), [
+            f"unreadable OpenCode account store {path} (not a file)"]
     try:
         uri = path.as_uri() + "?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=0.25)
     except (sqlite3.Error, ValueError):
-        return record, [f"unreadable OpenCode account store {path}"]
+        return record, _account_route_record(record), [
+            f"unreadable OpenCode account store {path}"]
     try:
-        tables = sorted(row[0] for row in connection.execute(
+        tables = sorted(str(row[0]) for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"))
-        record["tables"] = [str(name) for name in tables]
-        accounts = 0
-        if "account" in tables:
-            accounts = int(connection.execute(
-                "SELECT COUNT(*) FROM account").fetchone()[0])
+        record["tables"] = tables
+        projection, accounts = _opencode_account_projection(connection, tables)
         record["accounts"] = accounts
         active = False
         if "account_state" in tables:
@@ -2480,11 +2772,17 @@ def _opencode_account_store(child_env, project_path):
             active = any(
                 (account not in (None, "") or organization not in (None, ""))
                 for account, organization in rows)
+        if projection.get("control_account"):
+            active = active or any(row[2] for row in projection["control_account"])
         record["active"] = active
     except sqlite3.Error:
-        return record, [f"unreadable OpenCode account store {path}"]
+        return record, _account_route_record(record), [
+            f"unreadable OpenCode account store {path}"]
     finally:
         connection.close()
+    identity = {"mode": mode, "path": str(path), "projection": projection}
+    record["routing_sha256"] = content_hash(identity)
+    route_record = _account_route_record(record)
     hazards = []
     if record["accounts"]:
         hazards.append(
@@ -2494,15 +2792,20 @@ def _opencode_account_store(child_env, project_path):
         hazards.append(
             "OpenCode account store selects an active account/organization "
             f"whose routing cannot be inspected ({path})")
-    return record, hazards
+    return record, route_record, hazards
 
 
-def _opencode_external_routing_hazards(child_env):
+def _opencode_external_routing_hazards(child_env, project_path=None):
     """Uninspectable account/remote/managed sources that can change routing."""
     hazards = []
-    data_dir = _opencode_data_dir(child_env)
-    auth = data_dir / "auth.json"
-    if auth.is_file():
+    data_dir = _opencode_data_dir(
+        child_env, project_path if project_path is not None else Path.cwd())
+    if data_dir is None:
+        hazards.append("OpenCode V1 data root cannot be resolved")
+        auth = None
+    else:
+        auth = data_dir / "auth.json"
+    if auth is not None and auth.is_file():
         try:
             content = read_json(auth)
         except (OSError, ValueError):
@@ -2535,7 +2838,8 @@ def _opencode_external_routing_hazards(child_env):
 
 
 def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
-                               deadline=None, cancel=None, identity=None):
+                               deadline=None, cancel=None, identity=None,
+                               ownership=None, version=None):
     """One shared effective-routing context for preflight and real dispatch.
 
     V1 and an authoritative V2 normalized inspection are the only routing
@@ -2561,7 +2865,8 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
                 "error": "Whole-stage deadline expired before routing inspection"}
     try:
         executable = (identity if identity is not None else
-                      _opencode_binary_identity(deadline=deadline, cancel=cancel))
+                      _opencode_binary_identity(deadline=deadline, cancel=cancel,
+                                                ownership=ownership))
     except InspectionCancelled as exc:
         return {**base, "cancelled": True, "error": str(exc)}
     except InspectionDeadlineExpired as exc:
@@ -2638,7 +2943,7 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
         inspection = _opencode_inspected_documents(
             project_path, role, dialect, child_env, inline_bytes, records,
             deadline=deadline, cancel=cancel, adapter_config=adapter_config,
-            identity=executable)
+            identity=executable, ownership=ownership)
         if inspection.get("cancelled") or inspection.get("expired"):
             return {**base, "records": records, "documents": documents,
                     "sources": sources, "inline": meta,
@@ -2655,6 +2960,12 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
             if reason == "plugin_config_present":
                 error = ("OpenCode configuration declares plugins; normalized "
                          "routing cannot be inspected safely and is unprovable")
+            elif reason == "inspection_containment_unproven":
+                boundary["inspection_containment"] = (
+                    inspection.get("containment") or {})
+                error = ("OpenCode routing inspection ownership is unproven; "
+                         "the exact inspection process identity must be "
+                         "reconciled before any further dispatch")
             else:
                 error = ("normalized OpenCode routing inspection is unavailable ("
                          + reason + "); effective routing is unprovable")
@@ -2678,11 +2989,11 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
         merged = inspected_config
         boundary["adapter_complete"] = True
     else:
-        hazards = _opencode_external_routing_hazards(child_env)
-        account_record, account_hazards = _opencode_account_store(
-            child_env, project_path)
-        if account_record is not None:
-            records.append(account_record)
+        hazards = _opencode_external_routing_hazards(child_env, project_path)
+        account_record, account_route, account_hazards = _opencode_account_store(
+            child_env, project_path, executable=executable, version=version)
+        if account_route is not None:
+            records.append(account_route)
         hazards = sorted(set(hazards) | set(account_hazards))
         boundary["external_hazards"] = hazards
         boundary["account_store"] = account_record
@@ -2708,11 +3019,12 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
 
 
 def _opencode_launch_context(role, dialect, project, *, allow_free=False,
-                             deadline=None, cancel=None, identity=None):
+                             deadline=None, cancel=None, identity=None,
+                             ownership=None, version=None):
     """Immutable launch environment prepared before authorization."""
     context = _opencode_prepared_context(
         role, dialect, project, deadline=deadline, cancel=cancel,
-        identity=identity)
+        identity=identity, ownership=ownership, version=version)
     if context.get("cancelled") or context.get("expired"):
         return {"context": context, "env": None}
     env = dict(context.get("child_env") or scrubbed_env())
@@ -2913,7 +3225,7 @@ def _opencode_go_qualification(dialect, provider, entry, model_id, model_entry,
 
 def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
                                   role=None, deadline=None, prepared=None,
-                                  cancel=None):
+                                  cancel=None, ownership=None, version=None):
     """Redacted view of the effective OpenCode provider configuration.
 
     Uses version-aware source discovery plus the installed V2 normalizer's
@@ -2937,7 +3249,7 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
     if dialect is None:
         try:
             validated = _opencode_validated_dialect(
-                cfg, deadline=deadline, cancel=cancel)
+                cfg, deadline=deadline, cancel=cancel, ownership=ownership)
         except InspectionCancelled as exc:
             observed["cancel_requested"] = True
             observed["error"] = str(exc)
@@ -2960,9 +3272,14 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
     context = (prepared_context if isinstance(prepared_context, dict)
                else _opencode_prepared_context(
                    role, dialect, project, deadline=deadline, cancel=cancel,
-                   identity=observed.get("executable")))
+                   identity=observed.get("executable"), ownership=ownership,
+                   version=version))
     observed["effective_files"] = [str(path) for path in context.get("files") or []]
     observed["boundary"] = context.get("boundary")
+    if isinstance(context.get("boundary"), dict) and \
+            context["boundary"].get("inspection_containment"):
+        observed["inspection_containment"] = (
+            context["boundary"]["inspection_containment"])
     observed["cancel_requested"] = bool(context.get("cancelled"))
     observed["deadline_expired"] = bool(context.get("expired"))
     observed["config"] = list(observed["effective_files"])
@@ -3039,7 +3356,7 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
         "inspection": observed["inspection"],
         "inspection_reason": observed["inspection_reason"],
         "inspection_entries": (inspection or {}).get("entry_identity"),
-        "boundary": observed.get("boundary"),
+        "boundary": _opencode_route_boundary(observed.get("boundary")),
         "executable": {
             "path": (observed["executable"] or {}).get("path"),
             "fingerprint": (observed["executable"] or {}).get("fingerprint"),
@@ -3134,18 +3451,28 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
 
 
 def routing_fingerprint(route, cfg=None, project=None, dialect=None,
-                        observation=None, role=None, deadline=None):
+                        observation=None, role=None, deadline=None,
+                        ownership=None, version=None):
     """Redacted identity of provider routing material pinned into a run.
 
     Endpoints/auth keys are hashed; unrelated providers and raw secrets are
     excluded.  Unreadable effective configuration is represented explicitly so
     a change from readable to unreadable is detected.  Authentication mode is
     bound in every branch, because an env name and an available credential are
-    different effective routes.
+    different effective routes.  An inspection whose cleanup is unproven can
+    never create or refresh a pin.
     """
     observation = observation or opencode_provider_observation(
         route, project=project, dialect=dialect, cfg=cfg, role=role,
-        deadline=deadline)
+        deadline=deadline, ownership=ownership, version=version)
+    if observation.get("inspection_containment"):
+        record = observation.get("inspection_containment") or {}
+        raise InspectionOwnershipUnproven(
+            "OpenCode routing inspection ownership is unproven (pid "
+            f"{record.get('pid')}, sid {record.get('sid')}, launch "
+            f"{record.get('launch_file')}); reconcile the exact inspection "
+            "process identity before pinning a route",
+            ownership=record)
     material = {
         "provider": route.get("provider"),
         "worker_provider": route.get("worker_provider"),
@@ -3170,7 +3497,7 @@ def routing_fingerprint(route, cfg=None, project=None, dialect=None,
             "dialect": observation.get("dialect"),
             "source_identity": _redacted_routing_material(
                 observation.get("source_identity") or []),
-            "boundary": observation.get("boundary"),
+            "boundary": _opencode_route_boundary(observation.get("boundary")),
             "executable": {
                 "path": (observation.get("executable") or {}).get("path"),
                 "fingerprint": (observation.get("executable") or {}).get("fingerprint"),
@@ -3183,7 +3510,7 @@ def routing_fingerprint(route, cfg=None, project=None, dialect=None,
     return content_hash(material)
 
 
-def model_route(cfg, host, role, project=None, *, dialect=None):
+def model_route(cfg, host, role, project=None, *, dialect=None, version=None):
     if role == "architect":
         spec = cfg["architect"][host]
         route = {"provider": host, "model": spec["model"],
@@ -3194,11 +3521,13 @@ def model_route(cfg, host, role, project=None, *, dialect=None):
     spec = cfg["workers"][role]
     route = normalize_worker_spec(role, spec, legacy_go=True)
     route["routing_fingerprint"] = routing_fingerprint(
-        route, cfg, project=project, role=role, dialect=dialect)
+        route, cfg, project=project, role=role, dialect=dialect,
+        version=version)
     fallback = route.get("fallback_route")
     if isinstance(fallback, dict):
         fallback["routing_fingerprint"] = routing_fingerprint(
-            fallback, cfg, project=project, role=role, dialect=dialect)
+            fallback, cfg, project=project, role=role, dialect=dialect,
+            version=version)
     return route
 
 
@@ -3531,7 +3860,7 @@ def route_authorization_status(state, role, route, *, run_dir=None):
 
 def route_preflight(role, route, cfg=None, project=None, state=None, *,
                     run_dir=None, deadline=None, prepared=None, cancel=None,
-                    dialect=None):
+                    dialect=None, ownership=None, version=None):
     """Classify billing and reject unapproved routing before any dispatch.
 
     This is a deterministic application-level policy check.  It neither proves
@@ -3600,9 +3929,19 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
         return result
     observation = opencode_provider_observation(
         route, project=project, cfg=cfg, role=role, deadline=deadline,
-        prepared=prepared, cancel=cancel, dialect=dialect)
+        prepared=prepared, cancel=cancel, dialect=dialect, ownership=ownership,
+        version=version)
     result["observed"] = observation
     result["route_material_sha256"] = observation.get("routing_material_sha256")
+    if observation.get("inspection_containment"):
+        # Cleaning up an owned preflight/inspection is not a route property.
+        # Refuse as uncertain ownership so the caller keeps the exact owner.
+        result["reasons"].append(
+            "OpenCode routing inspection ownership is unproven; reconcile the "
+            "exact inspection process identity before any dispatch")
+        result["classification"] = "inspection_containment_unproven"
+        result["inspection_containment"] = observation["inspection_containment"]
+        return result
     if observation.get("error"):
         # Unreadable or uninspectable effective routing is never a warning: it
         # would silently grant a Go/subscription bypass.
@@ -4424,7 +4763,8 @@ def _guard_entry(argv):
     return rc if isinstance(rc, int) else 1
 
 
-def _spawn_guarded(command, cwd, env, log_stream, launch_file=None):
+def _spawn_guarded(command, cwd, env, log_stream, launch_file=None,
+                   error_stream=None):
     read_fd, write_fd = os.pipe()
     guard = [sys.executable, str(Path(__file__).resolve()), "_guard",
              "--lease-fd", str(read_fd)]
@@ -4434,8 +4774,8 @@ def _spawn_guarded(command, cwd, env, log_stream, launch_file=None):
     try:
         proc = subprocess.Popen(
             guard, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log_stream,
-            stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(read_fd,),
-            text=True)
+            stderr=subprocess.STDOUT if error_stream is None else error_stream,
+            start_new_session=True, pass_fds=(read_fd,), text=True)
     except BaseException:
         os.close(write_fd)
         raise
@@ -7578,18 +7918,24 @@ def _run_cancel_requested(run_dir):
 
 
 def _route_identity_recheck(route, preflight, cfg, project, role, deadline=None,
-                            cancel=None):
+                            cancel=None, ownership=None):
     """Re-observe effective routing immediately before spawn.
 
     Returns a human-readable drift reason, or None.  Material changes never
-    silently re-pin or select another route.
+    silently re-pin or select another route.  Unproven inspection cleanup is
+    raised as ownership uncertainty, never downgraded to route drift.
     """
     if route.get("provider") != "opencode":
         return None
     observed = preflight.get("observed") or {}
     current = opencode_provider_observation(
         route, project=project, cfg=cfg, role=role, deadline=deadline,
-        cancel=cancel)
+        cancel=cancel, ownership=ownership)
+    if current.get("inspection_containment"):
+        raise InspectionOwnershipUnproven(
+            "OpenCode routing inspection ownership is unproven; reconcile the "
+            "exact inspection process identity before launch",
+            ownership=current["inspection_containment"])
     if current.get("cancel_requested"):
         raise InterruptedError("Run pause/cancel requested during final route recheck")
     if current.get("deadline_expired"):
@@ -7614,6 +7960,10 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                deadline=None, decision_binding=None, route=None, grant_state=None,
                grant_dir=None):
     """Persist intent -> spawn -> observe; never replay a completed command."""
+    if isinstance(state, dict) and state.get("active_check"):
+        raise RuntimeError(
+            "Cannot dispatch while an active verification/inspection is not "
+            "proven stopped; reconcile the exact ownership first")
     job_id = uuid.uuid4().hex[:12]
     archive = archive or (run_dir / "jobs")
     host = host or (state["host"] if state is not None else "codex")
@@ -7646,18 +7996,32 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 "Worker fallback authorization does not match the configured exact route")
     strong = route["provider"] in {"codex", "claude"}
     authoritative_dir = grant_dir or run_dir
+    ownership = ({"run_dir": run_dir, "state": state, "role": role,
+                  "stage": kind} if isinstance(state, dict) else None)
     launch = None
     if not strong:
         cancel_run = (lambda: _run_cancel_requested(authoritative_dir))
         try:
             validated = _opencode_validated_dialect(
-                cfg, deadline=deadline, cancel=cancel_run)
+                cfg, deadline=deadline, cancel=cancel_run,
+                ownership=ownership)
         except InspectionCancelled as exc:
             raise InterruptedError(
                 "Run pause/cancel requested during OpenCode version inspection") from exc
         except InspectionDeadlineExpired as exc:
             raise TimeoutError(
                 "Whole-stage deadline expired during OpenCode version inspection") from exc
+        except InspectionOwnershipUnproven as exc:
+            if state is not None:
+                state["status"] = "uncertain"
+                state["pause_reason"] = (
+                    "OpenCode inspection cleanup is unproven; reconcile the "
+                    "exact inspection process identity before any dispatch")
+                save(run_dir, state)
+                journal_event(run_dir, state, "inspection_containment_unproven",
+                              kind=kind, role=role,
+                              inspection=(exc.ownership or {}).get("id"))
+            raise RuntimeError(str(exc)) from exc
         dialect = validated.get("dialect")
         if dialect in {"v1", "v2"}:
             launch = _opencode_launch_context(
@@ -7665,7 +8029,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 allow_free=route.get("billing") == "free",
                 deadline=deadline,
                 cancel=cancel_run,
-                identity=validated.get("identity"))
+                identity=validated.get("identity"),
+                ownership=ownership)
             if launch["context"].get("cancelled"):
                 raise InterruptedError(
                     "Run pause/cancel requested during routing inspection")
@@ -7675,19 +8040,39 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     preflight = route_preflight(
         role, route, cfg, project, authorization_state,
         run_dir=authoritative_dir, deadline=deadline, prepared=launch,
-        cancel=(lambda: _run_cancel_requested(authoritative_dir)))
+        cancel=(lambda: _run_cancel_requested(authoritative_dir)),
+        ownership=ownership)
     if not preflight["ok"]:
         archive.mkdir(parents=True, exist_ok=True)
         rejection_path = archive / f"preflight-{job_id}.json"
+        containment = preflight.get("inspection_containment")
         rejection = {**preflight, "kind": kind, "job_id": job_id,
                      "phase": (state or {}).get("phase"),
-                     "decision": "preflight_rejected",
+                     "decision": ("inspection_containment_unproven"
+                                  if containment else "preflight_rejected"),
                      "active_job_created": False,
                      "model_calls_counted": False}
         atomic_json(rejection_path, rejection)
         if state is not None:
             state["preflight_rejection"] = {
                 **rejection, "path": str(rejection_path)}
+            if containment:
+                # The route itself was not rejected: the owned inspection could
+                # not be proven stopped.  Keep its exact identity and block
+                # admission until reconciliation, instead of discarding it.
+                state["status"] = "uncertain"
+                state["pause_reason"] = (
+                    "OpenCode inspection cleanup is unproven; reconcile the "
+                    "exact inspection process identity before any dispatch")
+                save(run_dir, state)
+                journal_event(run_dir, state, "inspection_containment_unproven",
+                              kind=kind, role=role, path=str(rejection_path),
+                              inspection=(containment or {}).get("id"),
+                              pid=(containment or {}).get("pid"))
+                raise RuntimeError(
+                    "OpenCode routing inspection ownership is unproven; "
+                    "reconcile the exact inspection process identity "
+                    f"(diagnostic: {rejection_path})")
             state["status"] = "blocked"
             state["pause_reason"] = (
                 "Dispatch blocked by billing/route preflight: "
@@ -7786,7 +8171,43 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     try:
         drift = _route_identity_recheck(
             route, preflight, cfg, project, role, deadline=deadline,
-            cancel=(lambda: _run_cancel_requested(authoritative_dir)))
+            cancel=(lambda: _run_cancel_requested(authoritative_dir)),
+            ownership=ownership)
+    except InspectionOwnershipUnproven as exc:
+        # The model launch was never attempted; release any reservation created
+        # for this exact attempt, but retain the uncertain inspection owner.
+        if reservation is not None:
+            try:
+                release_route_grant(
+                    authorization_state, authoritative_dir, role, route,
+                    "inspection ownership unproven before launch",
+                    reservation_id=job_id, cfg=cfg, deadline=deadline)
+            except GrantLedgerTimeout:
+                pass
+        rejection_path = jpath / "preflight-rejected.json"
+        rejection = {**preflight, "kind": kind, "job_id": job_id,
+                     "decision": "inspection_containment_unproven",
+                     "reason_code": "inspection_containment_unproven",
+                     "reasons": [str(exc)],
+                     "inspection_containment": exc.ownership,
+                     "active_job_created": False,
+                     "model_calls_counted": False}
+        atomic_json(rejection_path, rejection)
+        if state is not None:
+            state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
+            state["status"] = "uncertain"
+            state["pause_reason"] = (
+                "OpenCode inspection cleanup is unproven; reconcile the exact "
+                "inspection process identity before any dispatch")
+            save(run_dir, state)
+            journal_event(run_dir, state, "inspection_containment_unproven",
+                          kind=kind, role=role, path=str(rejection_path),
+                          inspection=(exc.ownership or {}).get("id"),
+                          pid=(exc.ownership or {}).get("pid"))
+        raise RuntimeError(
+            "OpenCode routing inspection ownership is unproven; reconcile the "
+            f"exact inspection process identity (diagnostic: {rejection_path})"
+        ) from exc
     except (InterruptedError, TimeoutError) as exc:
         if reservation is not None:
             try:
@@ -10369,16 +10790,20 @@ def doctor(project: Path, host="codex"):
                     response.returncode == 0 and all(item in help_text for item in keys))
         except (OSError, subprocess.TimeoutExpired):
             checks["cli_compatible"][host] = False
+    installed_version = checks["versions"].get("opencode")
     for role in ("explorer", "implementer", "reviewer"):
-        checks["route"][role] = model_route(cfg, host, role, project=project,
-                                            dialect=dialect)
-    checks["route"]["architect"] = model_route(cfg, host, "architect", project=project,
-                                               dialect=dialect)
+        checks["route"][role] = model_route(
+            cfg, host, role, project=project, dialect=dialect,
+            version=installed_version)
+    checks["route"]["architect"] = model_route(
+        cfg, host, "architect", project=project, dialect=dialect,
+        version=installed_version)
     checks["host"] = host
     checks["billing_preflight"] = {}
     for role, route in checks["route"].items():
         checks["billing_preflight"][role] = route_preflight(
-            role, route, cfg, project, state=None, dialect=dialect)
+            role, route, cfg, project, state=None, dialect=dialect,
+            version=installed_version)
     checks["generated_commands"] = probe_generated_commands(cfg, host, dialect,
                                                             help_by_provider, project)
     # Deterministic contract validation is authoritative; live CLI
