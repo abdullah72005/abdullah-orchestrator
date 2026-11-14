@@ -95,12 +95,16 @@ billing  = architect.<host>.auth
   fails closed if `OPENAI_API_KEY` (Codex host) or `ANTHROPIC_API_KEY` (Claude
   host) is set while subscription billing is declared.
 - For Claude, preflight resolves the effective `CLAUDE_CONFIG_DIR` and inspects
-  user/project/local plus configured managed settings files. It rejects
-  provider-managed host control (`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`),
-  endpoint/token/helper overrides, model/fallback routing keys and unreadable
-  settings before spawn. Server/MDM-delivered settings that cannot be observed
-  are reported as unverified, not certified. A deliberately authorized API/local
-  alternate sets `auth` accordingly and uses the route-grant path instead.
+  user/project/local settings plus every configured managed settings file and
+  its sibling `managed-settings.d/*.json` policy fragments (base file first,
+  then non-hidden JSON alphabetically, including when the base file is absent).
+  It rejects provider-managed host control
+  (`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`), endpoint/token/helper overrides,
+  model/fallback routing keys, malformed/non-object fragments and unreadable
+  files or directories before spawn. Server/MDM-delivered settings that cannot
+  be observed are reported as unverified, not certified. A deliberately
+  authorized API/local alternate sets `auth` accordingly and uses the
+  route-grant path instead.
 - Model IDs are passed through unchanged. Verify them against the installed CLI
   catalog rather than guessing.
 - `effort` is passed to the CLI as its reasoning-effort setting.
@@ -145,11 +149,45 @@ The legacy Go configuration remains valid: omitting `provider` derives
 **only** for that provider. Migration of old records infers missing fields only
 when every recorded worker route is legacy Go.
 
+### Effective child routing
+
+Preflight, the pinned routing fingerprint, Doctor and the spawned child share
+one composition boundary for `OPENCODE_CONFIG_CONTENT`. Documented global,
+project and `.opencode` config files are read in precedence order, and supported
+top-level routing fields from any ambient inline config (`provider`/`providers`,
+`model`, `small_model`, provider enable/disable lists) are carried into the
+generated worker block. Generated agent profiles, ordered permissions and
+`subagent_depth: 0` are applied last and are never inherited from ambient inline
+agents or permission blocks; replaced control keys are reported as preflight
+warnings. A project/global config that defines the generated
+`abdullah-<role>` agent name is refused before spawn, because its extra keys
+could shadow the generated controls. `{env:...}` and `{file:...}` references are
+expanded against the child environment and project cwd, so a credential that the
+wrapper strips is not observed as available. Malformed or unreadable
+influential config still fails closed.
+
+Authentication mode (declared env names plus their availability in the child
+environment, configured key/header presence and model/variant auth settings) is
+part of every routing fingerprint branch. Adding or removing a provider
+credential therefore changes the pin and blocks dispatch until the run is
+deliberately reviewed/migrated. Declared auth configuration is not proof of
+authenticated entitlement.
+
+For `billing: "go"`, preflight resolves the selected provider, model and variant
+endpoint in documented precedence order (provider, then model, then selected
+variant) and inspects package/canonical and model/provider remaps. Any custom
+endpoint or remap outside the unchanged Go default is classified
+`unqualified_go_route` and refused before spawn; the same route can still be
+dispatched with explicit `api`/`subscription` billing and an `authorize-route`
+grant. The unchanged default (no inspectable override) remains a legacy Go
+subscription without a new grant. This is a configuration check, not proof of
+Go settlement or entitlement.
+
 ### Billing and authorization
 
 | Billing | Dispatch requirement |
 |---|---|
-| `go` | Existing Go configuration authorization; no new grant, only for `opencode-go` |
+| `go` | Existing Go configuration authorization; no new grant, only for the unchanged `opencode-go` route with no inspectable endpoint/package/model remap |
 | `subscription` / `free` / `local` | Human `authorize-route` grant with an endpoint/auth-mode attestation; `local` needs a reviewed local endpoint; `free` with a custom endpoint must explicitly attest that endpoint |
 | `api` | Human `authorize-route` grant bound to role, run and exact route |
 | unknown | Rejected |
@@ -259,9 +297,13 @@ ancestor `opencode.json(c)` files, project `.opencode/opencode.json(c)` files,
 and `{env:...}`/`{file:...}` expansion are handled. Unreadable influential
 configuration fails closed for every billing class, including Go.
 
-Changing the effective endpoint, credential/auth mode, selected model/variant
-mapping or a detectable auxiliary/fallback route changes the fingerprint.
-Preflight then rejects dispatch until the operator reviews/migrates the run.
+Changing the effective endpoint (provider, selected model or selected variant),
+credential/auth mode, selected model/variant mapping or a detectable
+auxiliary/fallback route changes the fingerprint. Auth-mode presence is bound in
+every branch, and the observer expands references in the same child environment
+the spawn receives, so an added/stripped credential is detected rather than
+assumed. Preflight then rejects dispatch until the operator reviews/migrates the
+run.
 Editing the config after creation still makes the run `config_changed`; it never
 silently reroutes. Explicit `migrate-run` initializes current routing pins and
 records their source, for old schema-2 routes whose fingerprint was null.

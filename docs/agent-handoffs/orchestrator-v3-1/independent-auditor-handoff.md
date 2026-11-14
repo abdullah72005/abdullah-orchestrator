@@ -7,9 +7,10 @@ was performed by the Implementer.
 - Worktree: `/home/abdullah/.local/src/abdullah-orchestrator-v3-1`
 - Branch: `design/orchestrator-v3-1`
 - Review baseline: `1b8e10e5c1b2c08a236b68450cb5b2a1a610416d`
-- Candidate source/evidence HEAD: branch tip on `design/orchestrator-v3-1`; the
-  Round 1 correction implementation commits are `740db1c` and `190d7fb`, followed
-  by this documentation commit. Use the branch tip for review.
+- Candidate source/evidence HEAD: branch tip on `design/orchestrator-v3-1`. Round 2
+  correction implementation commit is `2d324b0`, followed by this documentation
+  commit. Round 1 correction commits were `740db1c` and `190d7fb`. Use the branch
+  tip for review.
 - Candidate commits: `e223ca1` (acceptance integrity), `076caeb` (host/preflight),
   `e6cab3c` (Claude setup/stage deadline), `a3f6202` (worker routes/migration),
   `9eb49ef` (integration evidence/docs), plus the Round 1 correction commits
@@ -43,7 +44,7 @@ ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
 | AOR-02 | Preserved source and blocked unauthorized stage mutation | `source_write_projection`, `source_mutation`, `_read_only_source_violation`, `call_model` dispatch/completion checks, `validate_preserved_stage_source`, `cached_job_report`, `cached_recovered_job_report`, `recover_finished_dispatch` | `test_v31_stage_invariants.py` (real Git + fake CLIs; plan/diagnose/decision/integration/explorer/reviewer; tracked/staged/untracked/HEAD; pre-existing dirty; malformed/nonzero; recovered mismatch; guarded `stage_run`) |
 | AOR-03 | Idempotent user-scoped Claude MCP registration and rollback tests | `install_wsl.register_claude`, `inspect_claude_registration`, `_registration_matches`, manual snippets | `test_v31_claude_setup.py` (fresh/repeat/conflict/scope/malformed/missing CLI/add failure/unverified rollback/unrelated server preservation/host snippet) |
 | AOR-04 | Explicit host, durable identity and route reporting | `create_run` host validation, `start_run`, `resume_run`, MCP start/resume schemas, `route_report`, `status_run`, `stage_payload` | `test_v31_dispatch_safety.py` (missing/invalid host, no state write, MCP required host, contradictory resume, distinct host/route, legacy host persistence) |
-| AOR-05 | Shared Claude provider/billing hazard preflight and Doctor checks | `claude_billing_hazards`, `codex_billing_hazards`, `opencode_provider_observation`, `route_preflight`, `doctor` | `test_v31_dispatch_safety.py`, `test_checkpoint_c_security.py` (API keys, provider flags incl AWS/Mantle, endpoints, settings helper/malformed settings, inert AWS creds, runtime env change after Doctor, secret-free diagnostics, Doctor parity) |
+| AOR-05 | Shared Claude provider/billing hazard preflight and Doctor checks | `claude_billing_hazards`, `codex_billing_hazards`, `_managed_settings_entries`, `opencode_provider_observation`, `route_preflight`, `doctor` | `test_v31_dispatch_safety.py`, `test_checkpoint_c_security.py`, `test_v31_routing_observation.py` (API keys, provider flags incl AWS/Mantle, endpoints, settings helper/malformed settings, managed drop-ins, effective child routing, inert AWS creds, runtime env change after Doctor, secret-free diagnostics, Doctor parity) |
 | AOR-06 | Foreground host setup, stage deadline, cancellation and recovery | `manual_claude_snippets`, `FOREGROUND_ENV`, `RECOMMENDED_SERVER_TIMEOUT_MS`, `stage_deadline`, `remaining_budget`, clipped `call_model`/`run_checks` | `test_v31_claude_setup.py`, `test_v31_stage_deadline.py`, existing `test_interactive_recovery.py`, `test_checkpoint_a_containment.py` (whole-stage clipping, decision timeout, no next stage, cancellation) |
 | AOR-07 | Durable preflight rejection with no phantom active dispatch | `call_model` rejection path writes `preflight-*.json`, `preflight_rejection`, no `active_job`, no usage accounting | `test_v31_dispatch_safety.py` (rejection before spawn, repeated rejection, no reconciliation work, spawn failure distinct) |
 | Multi-provider | Per-role routes, consent, migration, Doctor | Schema-3 config/state, `normalize_worker_spec`, `model_route`, `routing_fingerprint`, `route_authorization_status`, `reserve_route_grant`, `approve_worker_fallback_run`, `migrate_run`, `restore_run`, generalized inventory, Doctor fields | `test_v31_worker_routes.py`, `test_v31_route_migration.py`, existing V1/V2/report/usage suites |
@@ -63,6 +64,25 @@ ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
 | F8 Claude destination split | `manual_claude_snippets` returns separate settings and user MCP-store destinations/content, `add-json` timeout command, merge/verify steps; no real file mutation. | `test_v31_claude_setup.py::test_manual_snippets_use_separate...`, `test_disposable_settings_and_user_mcp_stores...`, `test_repeated_registration...`; baseline `claude-setup` probe |
 | F9 restore validation | `validate_restore_backup` checks full JSON identity/project/schema/inactive state before mutation; atomic write under lock; pre-restore audit. | `test_v31_route_migration.py::test_corrupt_backup...`, `test_wrong_identity...`, `test_write_failure...`, `test_valid_restore...`; baseline `restore` probe |
 
+## Round 2 correction matrix (Architect fix-b01-r02)
+
+Remaining F5/F6 boundaries only; accepted Round 1 corrections were preserved and
+re-exercised by the same suites.
+
+| Finding | Correction | Permanent evidence |
+|---|---|---|
+| F5a child-configuration mismatch | `opencode_child_inline` / `_opencode_child_config` compose the effective `OPENCODE_CONFIG_CONTENT` from documented files plus supported ambient routing fields, then apply generated agent/permission/subagent controls last. Preflight, fingerprint, Doctor and `opencode_env` share this boundary; references expand in the child environment and project cwd. A file-defined `abdullah-<role>` agent is refused before spawn. | `test_v31_routing_observation.py::test_fake_child_receives_the_approved_provider_for_both_dialects` (fake CLI captures argv + env for V1/V2; pin reproducible from captured bytes), `::test_inline_expansion_uses_the_child_environment_and_project_cwd`, `::test_ambient_inline_controls_cannot_weaken_generated_profile`, `::test_file_defined_worker_agent_conflict_fails_closed_before_spawn` |
+| F5b auth mode omitted from pin | `auth_mode_sha256` (declared env names, child-env availability, configured key/header presence, model/variant auth settings) is bound in every `routing_fingerprint` branch. | `::test_auth_environment_availability_is_part_of_the_pin_for_both_dialects` (absent→present→absent, V1/V2, pinned drift blocks; red baseline showed equal pins) |
+| F5c Go model/variant override | `_opencode_effective_endpoint` resolves provider→selected model→selected variant endpoints; `_opencode_go_qualification` rejects endpoint, package/canonical and model/provider remaps with classification `unqualified_go_route`. Unchanged Go remains `go_subscription` without a new grant; the same route with explicit `api` billing plus grant is accepted as accurately classified. | `::test_go_route_model_and_variant_endpoint_overrides_are_not_subscription` (V1/V2, model/variant/remap), `::test_unchanged_go_route_remains_a_subscription_without_a_grant`; red baseline approved all overrides |
+| F6 managed drop-ins | `_managed_settings_entries` enumerates each configured managed base file then non-hidden sibling `managed-settings.d/*.json` alphabetically, including when the base is absent. Every fragment gets the existing redacted hazard/parse validation; unreadable files/directories and listed-but-vanished files fail closed; hidden/non-JSON entries are ignored. Doctor and dispatch share the classification. | `test_v31_dispatch_safety.py::test_managed_dropin_is_inspected_when_base_file_is_absent` (incl. no spawn/active job, secret-free diagnostics), `::test_managed_dropins_are_ordered_and_hidden_or_non_json_ignored`, `::test_malformed_and_non_object_managed_dropins_fail_closed`, `::test_unreadable_managed_dropin_fails_closed`, `::test_unreadable_managed_directory_fails_closed`, `::test_clean_dropin_and_authorized_alternate_classification`; red baseline returned `ok` with no hazards |
+
+Captured child-configuration evidence (temporary probe, not a production test):
+`/tmp/opencode/ao-r02-child-config-capture.log` shows a V1 local dispatch whose
+captured `OPENCODE_CONFIG_CONTENT` retains the approved provider/endpoint and
+generated `abdullah-explorer` profile with `subagent_depth: 0`, and whose
+recomputed pin equals the pinned preflight digest. Red regressions are preserved
+in `/tmp/opencode/ao-red-r02/`.
+
 Also replaced the old “checks fit” deadline test with a genuine single-batch
 accept stage where a final check (0.8 s) and fake decision (1.5 s) each fit a 2 s
 stage but together time out without completion, and added a mixed
@@ -73,14 +93,14 @@ API/free/Go fake stage path driven through the real human authorization helpers
 
 | Route form | Config | Dispatch policy | Evidence status |
 |---|---|---|---|
-| OpenCode Go (default) | `provider: opencode-go`, `billing: go` | Existing Go authorization; no new grant; only this provider may inherit Go | Offline fake-CLI; historical v3.0.0 live pilot used Go |
+| OpenCode Go (default) | `provider: opencode-go`, `billing: go` | Existing Go authorization; no new grant; only this provider may inherit Go, and only without an inspectable endpoint/package/model remap | Offline fake-CLI; historical v3.0.0 live pilot used Go |
 | OpenCode paid API | fully qualified `provider/model`, `billing: api` | Human `authorize-route` grant; durable ledger reservation before spawn | Offline fake-CLI only; not live-verified |
 | Non-Go subscription | explicit route, attestation | Human grant with endpoint/auth attestation; reservation actually consumed | Offline fake-CLI policy/dispatch tests |
 | Free route | explicit route, attestation | Human grant; free-model guard removed only for the authorized route; custom endpoint must be attested | Offline policy tests only |
 | Local route | explicit route + reviewed endpoint | Human grant; endpoint required in effective config | Offline policy tests only; a provider named “ollama” is not automatically local |
 | Per-role fallback | complete `fallback` object | `authorize-route --fallback` for the exact alternate grant plus separate one-dispatch `approve-worker-fallback` consent | Offline fake-CLI tests incl missing/changed/exhausted alternate |
 | Schema-2 recorded routes | `migrate-run` | Reconstructed only from recorded routes/jobs or explicit mapping; explicit migration initializes routing pins | Offline migration tests incl rollback |
-| Effective routing | V1/V2 config locations | Merged project/ancestor/global/system, JSONC, env/file expansion; unreadable fails closed | Offline temporary configs; arbitrary plugins/gateways unverified |
+| Effective routing | V1/V2 config locations | One composition boundary for files + preserved ambient inline routing + generated controls; JSONC, child-env/file expansion; unreadable fails closed; auth mode and model/variant endpoints pinned | Offline temporary configs plus captured fake-child `OPENCODE_CONFIG_CONTENT`; arbitrary plugins/gateways unverified |
 | Authenticated Claude/Codex E2E | real host | Not executed | **Unverified** |
 
 `subscription` entitlement, provider settlement, auxiliary provider calls and
@@ -89,22 +109,30 @@ attempts, not tokens or dollars. There is no hard spend-cap claim.
 
 ## Verification snapshot
 
-Round 1 correction evidence (offline; no paid model, install or live Doctor):
+Round 2 correction evidence (offline; no paid model, install or live Doctor):
 
 - Interpreter: Python 3.10.12
 - `python3 -m compileall -q scripts`: exit 0
+- Routing regressions:
+  `python3 -m unittest discover -s scripts/tests -p 'test_v31_routing_observation.py' -v`
+  — **13 tests**, exit 0.
+- Claude dispatch regressions:
+  `python3 -m unittest discover -s scripts/tests -p 'test_v31_dispatch_safety.py' -v`
+  — **27 tests**, exit 0.
 - Focused v3.1: `python3 -m unittest discover -s scripts/tests -p 'test_v31_*.py' -v`
-  — **116 tests**, exit 0, 139.8 s.
-- `test_checkpoint_a_containment.py` 25, `test_checkpoint_c_security.py` 24,
-  `test_interactive_recovery.py` 49, `test_usage_rate_limit_regressions.py` 20 —
-  all exit 0.
+  — **129 tests**, exit 0, 141.6 s.
+- `test_p1_03_permission_overlap.py` 23 and `test_checkpoint_a_containment.py` 25 —
+  both exit 0. Round 1 targeted F1–F4/F7–F9 suites remain inside the v3.1 and
+  full runs.
 - Full offline suite:
-  `python3 -m unittest discover -s scripts/tests -v` — **695 tests**,
-  4 skipped, exit 0, 354.5 s.
+  `python3 -m unittest discover -s scripts/tests -v` — **708 tests**,
+  4 skipped, exit 0, 366.0 s.
 - The 4 skips are the optional installed-CLI V2 introspection suite; they are
   reported separately and are not counted as passed.
-- Baseline red probes are preserved under `/tmp/opencode/ao-red-evidence/`
-  (temporary evidence, not a production test contract).
+- Baseline red probes from Round 1 are preserved under
+  `/tmp/opencode/ao-red-evidence/`; Round 2 red runs are under
+  `/tmp/opencode/ao-red-r02/`. Temporary evidence is not a production test
+  contract.
 - No paid requests, authenticated E2E, real installer execution or Doctor
   against live config were performed.
 
@@ -137,8 +165,10 @@ document as Architect approval.
 3. Same-user hostile races and write-and-restore between snapshots are not
    preventable; this is observed boundary state, not an OS sandbox.
 4. `doctor` never executes inference and cannot prove entitlement; local Claude
-   settings files are inspected, but server/MDM-delivered managed settings and
-   macOS managed preferences remain explicitly unobserved/unverified.
+   user/project/local settings and `managed-settings.d/*.json` fragments are
+   inspected, but server/MDM-delivered managed settings, macOS managed
+   preferences and executable policy helpers remain explicitly
+   unobserved/unverified.
 5. Exactly-once side effects, price/quota accuracy and arbitrary
    plugin/gateway/auxiliary route behavior remain outside the supervisor's
    guarantees; the routing fingerprint covers inspectable configuration only.
