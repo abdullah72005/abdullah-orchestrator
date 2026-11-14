@@ -10,9 +10,10 @@ reproduce or challenge the claims.
 python3 -m unittest discover -s scripts/tests
 ```
 
-- **656 tests**, 4 opt-in skips, roughly 6 minutes on a laptop (Python 3.10.12;
-  CI also targets 3.12/3.13). Counts are from the v3.1 candidate run recorded
-  below; `pytest` may show a different skip distribution.
+- **830 tests**, 7 opt-in skips, roughly 12 minutes on a laptop (Python 3.10.12;
+  CI also targets 3.12/3.13). The 7 skips are the real-OpenCode introspection
+  module, which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set. `pytest` may
+  show a different skip distribution.
 - No model calls. A guard replaces `codex`, `claude`, and `opencode` with fakes
   and raises if a test tries to launch a real model CLI.
 - Tests are hermetic: exported `ABDULLAH_CONFIG`, `ABDULLAH_STATE_DIR`, and
@@ -73,6 +74,42 @@ The final candidate run and exact counts are recorded in the delivery report and
 temporary Git checkouts, real `run_checks` records and real process containment.
 They do **not** prove authenticated model behavior.
 
+### AOR31 remediation (final candidate `0ea5381`)
+
+An independent Architect review of the v3.1 candidate raised four findings. All
+four are closed in the current candidate; the exact fix commits, closure matrix,
+and limitations are in the
+[AOR31 final Architect review](agent-handoffs/orchestrator-v3-1/aor31-final-architect-review.md).
+
+| Finding | Defect | Correction | Regression module |
+|---|---|---|---|
+| **AOR31-01** | OpenCode configuration precedence could authorize a route that differed from the one actually launched, and legacy Go consent could survive an endpoint override | Dialect comes from the resolved executable's validated actual version; ordered V1 sources and a fresh authoritative V2 normalized document are bound into pins and grants; launch bytes are immutable and re-observed before spawn; unknown, stale, or uninspectable routing refuses | `test_v31_route_sources.py`, `test_v31_routing_observation.py`, `test_v31_aor31_corrections.py`, `test_v31_aor31_r02.py`, `test_v31_aor31_r03.py` |
+| **AOR31-02** | Ignored runtime inputs could be mutated by read-only stages without detection because they were outside the write projection | Relevant ignored executable/config inputs and nested symlink target content enter the projection; incomplete manifests block; success, failure, acceptance and recovery paths preserve changed bytes and block without rollback | `test_v31_runtime_write_integrity.py` |
+| **AOR31-03** | Concurrent grant-ledger operations could contend or race, allowing capacity to be exceeded | Independent ledger operations wait within configured/cancel/deadline bounds; atomic accounting and reservation replay stay intact; lock timeout is distinct from exhausted capacity; the supervisor ownership lock stays nonblocking | `test_v31_grant_contention.py`, `test_v31_grant_ledger.py` |
+| **AOR31-04** | The deadline regression asserted incidental timeout wording instead of safety behavior | Tests assert failed verification, unchanged phase, no acceptance and no later Reviewer/worker; production wording is retained | `test_v31_stage_deadline.py` |
+
+Architect-executed verification at the accepted HEAD (Python 3.10.12):
+
+| Execution | Result |
+|---|---|
+| Eight focused remediation modules | 135 tests, OK, 0 skips, 194.3 s |
+| Integration, provenance, migration, schema and decision-contract modules | 89 tests, OK, 0 skips, 128.2 s |
+| Real OpenCode V2.2.7 introspection in a disposable credential-free HOME | 7 tests, OK, 0 skips, 18.5 s (no inference) |
+| Full offline suite, Python 3.10 / 3.12 / 3.13 | 830 tests, OK, 731.0 / 833.8 / 834.0 s; 7 skips on the host, 9 in the containers |
+
+The 3.12/3.13 matrices ran before a final eight-line test assertion; production
+source is identical across that range, and the changed test was rerun singly on
+both interpreters. Those runs are inspected evidence, not an Architect
+full-matrix rerun. Reproduce any group with:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts/tests python3 -m unittest \
+  test_v31_aor31_r03 test_v31_aor31_corrections test_v31_aor31_r02 \
+  test_v31_route_sources test_v31_routing_observation \
+  test_v31_runtime_write_integrity test_v31_grant_contention \
+  test_v31_stage_deadline -v
+```
+
 ### Correction round r01
 
 The Architect's nine-blocking-finding correction round was reproduced on the
@@ -89,7 +126,7 @@ Evidence classes are kept separate:
 
 | Class | What it establishes | v3.1 status |
 |---|---|---|
-| Source inspection | Code paths and guards exist as described | Performed by Implementer; independent Architect review pending |
+| Source inspection | Code paths and guards exist as described | Performed by the Implementer; independently reviewed by the Architect at `0ea5381` |
 | Offline fake-CLI tests | Deterministic supervisor behavior and failure paths | Executed; see counts above |
 | Installed-CLI introspection | Generated argv/help and V2 agent/permission shapes | Optional suite; skipped when the binary is absent |
 | Historical pilot claims | A real v3.0.0 run completed | Historical, not v3.1 recertification |
@@ -193,6 +230,17 @@ Highlights of what changed as a result:
 
 Be explicit with reviewers and users:
 
+- **The independent remediation-closure audit has not happened.** The Architect
+  verdict at `0ea5381` is APPROVED WITH KNOWN LIMITATIONS; it is not a
+  substitute for the independent audit described in the
+  [closure-audit handoff](agent-handoffs/orchestrator-v3-1/aor31-closure-auditor-handoff.md).
+- **The literal independent-auditor scripts were never supplied.** Saved
+  Architect reconstructions and regression equivalents were rerun; no claim is
+  made that the unavailable scripts ran.
+- **OpenCode V1 has no runtime verification.** V1 behavior is source-backed and
+  tested with fixtures and fakes against the pinned upstream contracts; no V1
+  binary was available, so no V1 compatibility claim is made. V2.2.7 was tested
+  for normalization and permissions, not for provider inference.
 - **Authenticated model execution is not covered by the default suite.** The
   historical pilot proves one real v3.0.0 path; it is not a compatibility matrix
   and does not recertify v3.1.
@@ -213,6 +261,8 @@ Be explicit with reviewers and users:
   run. Same-user write-and-restore between snapshots is not detectable.
 - **Docker verification** was unit-tested with synthetic Compose evidence; the
   pilot project did not use containers.
+- **Linux-only managed configuration.** Managed OpenCode/Claude files are
+  covered on Linux; macOS and Windows managed delivery is not certified.
 - **`doctor`** does not authenticate, prove entitlement, or run a model.
 
 ## 6. Reproducing the checks

@@ -11,17 +11,25 @@
 [![Standard library only](https://img.shields.io/badge/runtime-stdlib%20only-success.svg)](#requirements)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+> **Project status: v3.1 Architect-approved engineering candidate.**
+> The four AOR31 remediation findings are closed and independently
+> Architect-approved at `0ea5381`. An independent remediation-closure audit and
+> real end-to-end testing are still pending. No stable `v3.1.0` release is
+> tagged. See [validation](docs/validation.md) and the
+> [closure-audit handoff](docs/agent-handoffs/orchestrator-v3-1/aor31-closure-auditor-handoff.md).
+
 Abdullah Orchestrator turns one interactive Codex or Claude conversation into a
 disciplined engineering workflow. A cheap visible coordinator drives a bundled
 Python **supervisor**; a strong **Architect** plans and accepts; OpenCode
 **Explorer**, **Implementer**, and independent **Reviewer** workers do the
 bounded work. OpenCode Go is the default, and each worker can use a separately
-configured provider and model with explicit billing authorization. The supervisor — not the language model — owns state, process
-lifecycle, verification, and recovery.
+configured provider and model with explicit billing authorization. The
+supervisor — not the language model — owns state, process lifecycle,
+verification, and recovery.
 
 Every model identifier is configurable in one JSON file: Architect models per
-host, and worker providers, models, variants, and billing classifications per role. See
-[Model configuration](#configure-models).
+host, and worker providers, models, variants, and billing classifications per
+role. See [Model configuration](#configure-models).
 
 It was built for long-running work on a real repository where a dropped chat,
 a wrong checkout, or an unverified "it works" is expensive.
@@ -97,7 +105,9 @@ inside one call and never claims completion without supervisor evidence.
 - Linux or WSL, **Python 3.10+** (standard library only — no pip install)
 - `git`
 - Codex CLI (Codex host) or Claude Code CLI (Claude host)
-- OpenCode CLI with a paid **OpenCode Go** account
+- OpenCode CLI on a tested line (`>=1.18 <2.0` or `>=2.2 <3.0`) with a paid
+  **OpenCode Go** account by default, or another provider with explicit billing
+  authorization
 - Docker/Compose only for projects whose verification uses containers
 
 ## Quick start
@@ -148,8 +158,35 @@ hours deliberately exceeds the default whole-stage (`max_stage_seconds`) and
 per-child caps so the host cannot race the supervisor at the boundary. Do not
 apply it globally.
 
-Open one Codex chat, invoke `$abdullah-orchestrator`, give it an absolute
-project path and a precise goal. Full walkthrough:
+### Claude Code
+
+The same supervisor serves a Claude conversation. Register it once at user
+scope:
+
+```bash
+python3 scripts/install_wsl.py --register-claude
+# or manually:
+claude mcp add --scope user --transport stdio abdullah-orchestrator -- \
+  python3 "$PWD/scripts/orchestrator.py" mcp
+```
+
+Two Claude-specific details matter:
+
+- Keep `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` in the user settings
+  (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) so a
+  foreground stage cannot be auto-backgrounded.
+- `claude mcp add` does not install a per-server timeout. Re-register with the
+  printed `claude mcp add-json` command or add `"timeout": 18000000` to the
+  `abdullah-orchestrator` entry in the user MCP store (`~/.claude.json`, or
+  `$CLAUDE_CONFIG_DIR/.claude.json`). Do not put `mcpServers` in
+  `settings.json`.
+
+Verify with `claude mcp get abdullah-orchestrator` and `/mcp` inside Claude
+Code. Claude host mode is covered by fake-CLI tests; authenticated long stages,
+Esc/cancel and reconnect behavior are not yet certified.
+
+Open one Codex or Claude chat, invoke `$abdullah-orchestrator`, give it an
+absolute project path and a precise goal. Full walkthrough:
 [`docs/architecture.md`](docs/architecture.md).
 
 ## Configure models
@@ -202,6 +239,27 @@ billing. Architect models and all worker model IDs/variants are editable. Set
 them before starting a run: changing the config mid-run marks the run
 `config_changed` and blocks further stages. New runs must name their host
 explicitly (`host: codex|claude`).
+
+**OpenCode Go stays the default.** Existing Go configs and schema-2 runs keep
+working: legacy Go configuration is normalized in memory without rewriting the
+file, and `billing: "go"` is accepted only for the unchanged `opencode-go`
+route. Schema-2 paused runs need an explicit, backup-first `migrate-run`;
+historical completed history stays readable but is not retroactively
+recertified.
+
+**Grants are durable and human-issued.** Every route that preflight requires a
+grant for — including non-Go `subscription`, `free`, and `local` — reserves
+exactly one dispatch in a separately locked run ledger keyed by reservation ID.
+Concurrent Explorer/Implementer dispatch therefore cannot overspend
+`--max-dispatches`, and a parent Architect save cannot erase nested consumption.
+Grants bind role, run, exact route, and source/executable material: a moved
+checkout, binary upgrade, or route change requires explicit re-authorization.
+
+**Fallback is never automatic.** A configured `fallback` route is selected only
+after a genuine rate limit or model error, and only with human one-dispatch
+consent (`approve-worker-fallback`); a non-Go fallback also needs its own
+`authorize-route --fallback` grant. Strong-host automatic fallback
+(`fallback.enabled`) remains prohibited for worker routes.
 
 Complete reference, limits, fallback, and recipes:
 [`docs/configuration.md`](docs/configuration.md).
@@ -285,18 +343,28 @@ Full threat model: [`docs/security-model.md`](docs/security-model.md).
 
 ## Validation
 
-- **579 deterministic tests** in the default suite (4 opt-in skips) covering
-  state transitions, containment, provenance, command policy, recovery,
-  report ingestion, permissions, and structured output. No model calls; model
-  CLIs are replaced with fakes and a guard blocks real `codex`, `claude`, or
-  `opencode` processes.
-- **A real end-to-end pilot** on 2026-11-13 completed a goal through Architect
-  plan → Implementer → supervisor verification (22 tests) → independent review
-  → Architect acceptance, using Codex `gpt-6.1-sol` and OpenCode Go
-  `deepseek-v4.1-flash` on OpenCode `v2.2.7`. The pilot surfaced three genuine
-  defects (invalid strict JSON schema, missing `contract_version`, and report
-  ingestion recovery); all were fixed with regression tests and are documented
-  in [`docs/validation.md`](docs/validation.md).
+**Current status:** v3.1 Architect-approved engineering candidate. The four
+AOR31 remediation findings are closed within the supported offline boundary and
+independently Architect-approved at
+`0ea5381aa6e1a26e9ee0e1935c494b33800c62ae`. An **independent closure audit and
+real end-to-end testing are still pending**; no stable `v3.1.0` release exists.
+
+- **830 deterministic tests** in the default suite (7 opt-in skips) covering
+  state transitions, containment, provenance, command policy, recovery, report
+  ingestion, permissions, routing, billing grants, and structured output. No
+  model calls; model CLIs are replaced with fakes and a guard blocks real
+  `codex`, `claude`, or `opencode` processes.
+- **Architect-executed remediation evidence:** 135 focused remediation tests,
+  89 integration/provenance/migration tests, and 7 real OpenCode V2.2.7
+  configuration tests, all green with no skips.
+- **A historical real end-to-end pilot** on 2026-11-13 completed a goal through
+  Architect plan → Implementer → supervisor verification (22 tests) →
+  independent review → Architect acceptance, using Codex `gpt-6.1-sol` and
+  OpenCode Go `deepseek-v4.1-flash` on OpenCode `v2.2.7`. It is v3.0.0 evidence
+  and does not recertify v3.1. The pilot surfaced three genuine defects
+  (invalid strict JSON schema, missing `contract_version`, and report ingestion
+  recovery); all were fixed with regression tests and are documented in
+  [`docs/validation.md`](docs/validation.md).
 
 Reproduce the deterministic suite:
 
@@ -319,9 +387,9 @@ ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
 ├── agents/openai.yaml        # Agent interface metadata
 ├── scripts/
 │   ├── orchestrator.py       # Supervisor CLI + stdio MCP server
-│   ├── install_wsl.py        # Installer and Codex MCP registration
+│   ├── install_wsl.py        # Installer, Codex/Claude MCP registration
 │   ├── config.example.json   # Editable model, limit, permission defaults
-│   └── tests/                # 579-test deterministic suite and fixtures
+│   └── tests/                # 830-test deterministic suite and fixtures
 ├── references/               # Operation, roles, contracts, approved handoff
 ├── docs/
 │   ├── architecture.md       # Components, state model, stage lifecycle
@@ -329,7 +397,8 @@ ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
 │   ├── security-model.md     # Trust boundaries and limitations
 │   ├── validation.md         # Test evidence and the real end-to-end pilot
 │   ├── maintenance.md        # Distribution, backup, rollback, upgrade
-│   └── audit/                # Independent-audit findings and before/after probes
+│   ├── audit/                # Independent-audit findings and before/after probes
+│   └── agent-handoffs/       # AOR31 remediation review and closure-audit packet
 ├── assets/icon.svg
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
@@ -356,6 +425,7 @@ module map are documented in [`docs/architecture.md`](docs/architecture.md).
 | [`docs/validation.md`](docs/validation.md) | Test evidence and the real end-to-end pilot |
 | [`docs/maintenance.md`](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 |
 | [`docs/audit/`](docs/audit/) | Audit findings, corrections, and before/after probes |
+| [`docs/agent-handoffs/orchestrator-v3-1/`](docs/agent-handoffs/orchestrator-v3-1/) | AOR31 remediation packet: briefs, reviews, final acceptance, closure-audit handoff, saved evidence |
 
 ## Limitations
 

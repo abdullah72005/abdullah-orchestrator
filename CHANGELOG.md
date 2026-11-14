@@ -6,35 +6,49 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Remediation of the four AOR31 findings from the independent Architect audit.
+**Status: Architect-approved engineering candidate** at `0ea5381`; an independent
+remediation-closure audit and real end-to-end testing are still pending. No
+stable release is tagged. Review packet:
+[`docs/agent-handoffs/orchestrator-v3-1/`](docs/agent-handoffs/orchestrator-v3-1/).
+
 ### Fixed
 
-- Read-only source mutation and process containment are independent: a live
-  escaped child retains exact `uncertain` ownership instead of being cleared as a
-  blocked job; a clean stopped mutation still blocks without phantom
-  reconciliation.
-- `billing: "go"` is restricted to the unchanged `opencode-go` route; non-Go
-  providers must state billing explicitly in config, preflight and migration.
-- Every route that preflight requires a grant for — including non-Go
-  `subscription`/`free`/`local` — reserves one dispatch atomically.
-- Route-grant usage lives in a separately locked run ledger keyed by reservation
-  ID, so a parent Architect save cannot erase nested Explorer consumption.
-- OpenCode routing fingerprints observe the effective selected-dialect V1/V2
-  configuration (project/ancestor/global/system, JSONC, env/file expansion,
-  endpoint/auth/model/variant mapping) and fail closed on unreadable input.
-- Claude subscription preflight resolves `CLAUDE_CONFIG_DIR`, project/local and
-  managed settings, provider-managed host control, endpoint/token/helper and
-  model/fallback overrides; explicit authorized alternate billing routes remain
-  available.
+- **AOR31-02** — Read-only source mutation and process containment are
+  independent: a live escaped child retains exact `uncertain` ownership instead
+  of being cleared as a blocked job, while a clean stopped mutation still blocks
+  without phantom reconciliation. Ignored executable/config inputs and nested
+  symlink target content now enter the write projection.
+- **AOR31-01** — `billing: "go"` is restricted to the unchanged `opencode-go`
+  route; non-Go providers must state billing explicitly in config, preflight and
+  migration. A legacy Go consent can no longer authorize an endpoint override.
+- **AOR31-03** — Every route that preflight requires a grant for — including
+  non-Go `subscription`/`free`/`local` — reserves one dispatch atomically.
+- **AOR31-03** — Route-grant usage lives in a separately locked run ledger keyed
+  by reservation ID, so a parent Architect save cannot erase nested Explorer
+  consumption and concurrent ledgers wait within configured/cancel/deadline
+  bounds.
+- **AOR31-01** — OpenCode routing fingerprints observe the effective
+  selected-dialect V1/V2 configuration (project/ancestor/global/system, JSONC,
+  env/file expansion, endpoint/auth/model/variant mapping) and fail closed on
+  unreadable input.
+- **AOR31-01** — Claude subscription preflight resolves `CLAUDE_CONFIG_DIR`,
+  project/local and managed settings, provider-managed host control,
+  endpoint/token/helper and model/fallback overrides; explicit authorized
+  alternate billing routes remain available.
+- **AOR31-04** — The deadline regression asserts failed verification, unchanged
+  phase, no acceptance and no later worker instead of incidental timeout
+  wording; production wording is retained.
 - `authorize-route --fallback` authorizes the exact configured alternate route,
   separate from one-dispatch fallback consent, with a documented command
   sequence.
-- Claude foreground setup now emits separate destinations for host settings and
-  the user-scoped MCP store, including the manual path that installs the
-  per-server timeout.
+- Claude foreground setup emits separate destinations for host settings and the
+  user-scoped MCP store, including the manual path that installs the per-server
+  timeout.
 - `restore-run` fully validates a backup before atomic mutation and preserves
   pre-restore state and backup provenance.
 
-## [3.1.0] — 2026-11-13
+## [3.1.0] — unreleased candidate (2026-11-13)
 
 Closes audit findings AOR-01 through AOR-07 and adds reviewed multi-provider
 OpenCode worker routes. Supervisors report `SUPERVISOR_VERSION 3.1.0`, state and
@@ -157,6 +171,6 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.1.0...HEAD
-[3.1.0]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...v3.1.0
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...HEAD
+[3.1.0]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...main
 [3.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v3.0.0

@@ -1,7 +1,7 @@
 # Final audit evidence (before/after)
 
 Generated: 2026-11-12. Test counts in this document are historical; see
-[`../validation.md`](../validation.md) for the current suite (579 tests) and the
+[`../validation.md`](../validation.md) for the current suite (830 tests) and the
 end-to-end pilot.
 
 Baseline: `b71f84e` (tag `final-audit-baseline`).

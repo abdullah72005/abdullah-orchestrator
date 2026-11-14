@@ -101,6 +101,13 @@ Mechanical risk may skip `review`; high risk requires a separate review and at
 least two distinct verification checks. An accepted batch becomes an immutable
 snapshot in `accepted_batches`; later work preserves it as history.
 
+A whole-stage deadline (`limits.max_stage_seconds`) covers the entire stage, not
+only the model call: pending CLI inspection, sequential checks, and the strong
+call are clipped to the remaining budget. An expired budget blocks at the
+current phase with no acceptance, no completed job, and no later Reviewer or
+worker start. Deadline regressions assert that safety behavior rather than the
+exact timeout wording.
+
 ## Dispatch and report pipeline
 
 1. **Source snapshot.** Capture resolved project path, git HEAD, dirty files and
@@ -154,6 +161,14 @@ after each command the supervisor records:
 - per-command log path, SHA-256, byte count, return code, and bounded output
   tail;
 - containment result and escaped-process scan.
+
+The runtime-input manifest covers ignored inputs that can still change
+execution: `.env*`, Compose/Docker files, lockfiles, version files, relevant
+ignored executable/config files, and symlinked targets (content-hashed through
+their resolved in-tree path). An incomplete, unreadable, truncated, or
+out-of-tree required input blocks verification instead of producing green
+evidence. Read-only stages compare these same bytes, so an ignored-file edit is
+a blocked mutation rather than an invisible side effect.
 
 Acceptance re-loads this evidence and compares every binding. A changed
 environment, toolchain, config, ignored executable, or source invalidates the
@@ -243,6 +258,18 @@ per-run `authorize-route` grant (attestation for non-API classifications), and
 the grant is consumed atomically before spawn. Routes, variants, billing and a
 redacted provider/config fingerprint are pinned per run. Route-scoped fallback
 is opt-in, one dispatch, and never inherits a session from another route.
+
+Route authorization is bound to material, not labels. The dialect comes from the
+resolved executable's validated actual version; the ordered V1 configuration
+sources, or the authoritative V2 normalized document, are hashed into the pin
+together with executable and selected account-store identity; and the generated
+launch bytes are re-observed immediately before spawn. A missing or stale pin, an
+unresolvable account store, an inspection failure, or an automatic plugin that
+could change routing refuses dispatch. Legacy Go consent cannot authorize an
+endpoint override. Grant reservations serialize through a separately locked
+ledger keyed by reservation ID, so concurrent Explorer/Implementer dispatch
+cannot exceed `max_dispatches`, and a lock timeout is reported distinctly from
+exhausted capacity. The supervisor ownership lock remains nonblocking.
 
 `doctor` checks configured models (and, on V1, variants) against the installed
 inventory, reports redacted provider availability/auth observability, and never
