@@ -1,0 +1,10 @@
+test_captured_variant_config_normalizes_to_the_recorded_document (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_doctor_introspection_matches_binary (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_generated_profiles_are_accepted_with_effective_denials (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_run_help_supports_generated_flags (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_version_is_tested_v2_line (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 12.928s
+
+OK

@@ -1,0 +1,24 @@
+test_ambient_inline_controls_cannot_weaken_generated_profile (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_auth_environment_availability_is_part_of_the_pin_for_both_dialects (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_authorized_custom_v2_variant_dispatches_without_go_bypass (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_benign_v2_variant_settings_keep_default_go_subscription (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_captured_v2_variant_fixture_resolves_the_selected_endpoint (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_fake_child_receives_the_approved_provider_for_both_dialects (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_file_defined_worker_agent_conflict_fails_closed_before_spawn (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_go_route_model_and_variant_endpoint_overrides_are_not_subscription (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_inline_expansion_uses_the_child_environment_and_project_cwd (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_invalid_v2_variant_shapes_fail_closed_before_spawn (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_selected_v2_variant_auth_and_remap_are_observed (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_unchanged_go_route_remains_a_subscription_without_a_grant (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_v2_variant_selection_is_by_id_not_position (test_v31_routing_observation.EffectiveChildRoutingTests) ... ok
+test_doctor_and_dispatch_agree_and_refuse_before_spawn (test_v31_routing_observation.RoutingObservationTests) ... ok
+test_env_expansion_and_config_directory_drift_change_the_pin (test_v31_routing_observation.RoutingObservationTests) ... ok
+test_migrated_pin_then_drift_is_refused (test_v31_routing_observation.RoutingObservationTests) ... ok
+test_unreadable_effective_config_blocks_even_go (test_v31_routing_observation.RoutingObservationTests) ... ok
+test_v1_project_endpoint_change_changes_pin_and_blocks_dispatch (test_v31_routing_observation.RoutingObservationTests) ... ok
+test_v2_providers_settings_model_mapping_and_auth_mode_drift (test_v31_routing_observation.RoutingObservationTests) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 8.258s
+
+OK

@@ -13,13 +13,14 @@
 
 Abdullah Orchestrator turns one interactive Codex or Claude conversation into a
 disciplined engineering workflow. A cheap visible coordinator drives a bundled
-Python **supervisor**; a strong **Architect** plans and accepts; paid OpenCode Go
+Python **supervisor**; a strong **Architect** plans and accepts; OpenCode
 **Explorer**, **Implementer**, and independent **Reviewer** workers do the
-bounded work. The supervisor — not the language model — owns state, process
+bounded work. OpenCode Go is the default, and each worker can use a separately
+configured provider and model with explicit billing authorization. The supervisor — not the language model — owns state, process
 lifecycle, verification, and recovery.
 
 Every model identifier is configurable in one JSON file: Architect models per
-host, and worker models/variants within the paid OpenCode Go catalog. See
+host, and worker providers, models, variants, and billing classifications per role. See
 [Model configuration](#configure-models).
 
 It was built for long-running work on a real repository where a dropped chat,
@@ -38,7 +39,7 @@ a wrong checkout, or an unverified "it works" is expensive.
                               ▼                ▼                   ▼                   ▼
                        ┌────────────┐   ┌────────────┐      ┌────────────┐      ┌────────────┐
                        │ Architect  │   │ Explorer   │      │ Implementer│      │ Reviewer   │
-                       │ strong     │   │ Go, low    │      │ Go, high   │      │ Go, high   │
+                       │ strong     │   │ OpenCode   │      │ OpenCode   │      │ OpenCode   │
                        │ plan/accept│   │ read-only  │      │ one writer │      │ read-only  │
                        └────────────┘   └────────────┘      └────────────┘      └────────────┘
 ```
@@ -160,9 +161,9 @@ Everything lives in `~/.config/abdullah-orchestrator/config.json` (or
 |---|---|---|
 | Architect (Codex host) | `architect.codex.model` / `.effort` | Passed through; confirm it is in the Codex catalog |
 | Architect (Claude host) | `architect.claude.model` / `.effort` | Passed through; confirm it is in the Claude catalog |
-| Explorer | `workers.explorer.model` / `.variant` | `opencode-go/...`, billing `go` |
-| Implementer | `workers.implementer.model` / `.variant` | `opencode-go/...`, billing `go` |
-| Reviewer | `workers.reviewer.model` / `.variant` | `opencode-go/...`, billing `go` |
+| Explorer | `workers.explorer` | OpenCode provider/model, variant, and explicit billing |
+| Implementer | `workers.implementer` | OpenCode provider/model, variant, and explicit billing |
+| Reviewer | `workers.reviewer` | OpenCode provider/model, variant, and explicit billing |
 
 Example — pin the Implementer to a different Go model while keeping the cheaper
 Explorer:
