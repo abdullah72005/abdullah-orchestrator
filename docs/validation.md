@@ -32,11 +32,12 @@ Coverage areas:
 | Host and dispatch preflight (AOR-04/05/07) | `test_v31_dispatch_safety.py`: missing host, contradictory resume, provider flags, settings helper/malformed settings, inert AWS creds, durable rejection without a job, spawn-failure distinction, Doctor parity; alternate `CLAUDE_CONFIG_DIR`, provider-managed host, managed settings, fallback/model routing keys, post-Doctor contamination, authorized alternate billing |
 | Claude setup and stage deadline (AOR-03/06) | `test_v31_claude_setup.py`, `test_v31_stage_deadline.py`: idempotent/conflicting registration, rollback, separate settings/MCP-store destinations and timeout path, whole-stage clipping, genuine accept-stage checks+decision timeout |
 | Worker providers and migration | `test_v31_worker_routes.py`, `test_v31_route_migration.py`: mixed routes, non-Go `go`/missing-billing rejection before spawn, bounded non-Go subscription grants, fallback, session boundaries, effective V1/V2 project routing drift, JSONC/env expansion, unreadable config fail-closed, migration pins, restore validation/write-failure, rollback, newer schemas |
-| Durable grants across processes | `test_v31_grant_ledger.py`: real separate-process parent→`explore` path, stale parent save, concurrent reservation bound, replay idempotence, public `authorize-route --fallback` sequence |
+| Durable grants across processes | `test_v31_grant_ledger.py`: real separate-process parent→`explore` path, stale parent save, concurrent reservation bound, replay idempotence, public `authorize-route --fallback` sequence; `test_v31_grant_contention.py`: bounded/cancellable separate-process lock, capacity, crash/replay, deadline, nonblocking supervisor ownership |
+| AOR31 correction round 01 | `test_v31_aor31_corrections.py`: V1 home/legacy source order, V2 disjoint legacy/native providers and inspector-failure refusal, inspector freshness/parent-above-root drift, prepared-launch inline immutability, unpinned/stale grants, nested symlink content/cycles/budgets, inspector cancel/deadline/descendant cleanup |
 | Full campaign paths | `test_v31_campaign_integration.py`: fake Codex and Claude multi-batch runs, mixed API/free/Go routes through real human authorization helpers, late drift with fresh checks |
 | Command policy | shell wrappers, interpreter strings, indirect Docker, scoped exceptions, bypass acknowledgements |
 | Report contracts | strict schemas, contract v2, invalid JSONL, recovery without a model call |
-| OpenCode dialects | V1/V2 profile generation, effective-permission validation, glob-overlap rejection |
+| OpenCode dialects | V1/V2 profile generation, effective-permission validation, glob-overlap rejection; version-aware source discovery and authoritative V2 normalization |
 | Usage accounting | nested OpenCode usage, derived/partial totals, bounded 429 detection |
 | MCP surface | nine tools, no approval/grant tools, cancellation, recovery guidance |
 | Security regressions | credential env scrubbing, API-billing fail-closed, sensitive CLI gating |
@@ -50,7 +51,10 @@ ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
 
 It checks generated V2 configuration against the real binary's
 `opencode debug agents` output, including that appended `allow` rules cannot
-reopen mandatory denies.
+reopen mandatory denies. It also checks credential-free `debug config`
+normalization for a parent config above the Git root and disjoint legacy/native
+provider retention. A failed or unavailable V2 normalizer is intentionally not a
+substitute source of authorization.
 
 ## 2. v3.1 candidate evidence
 

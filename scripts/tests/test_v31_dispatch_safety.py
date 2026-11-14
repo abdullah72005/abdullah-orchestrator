@@ -167,6 +167,8 @@ class DispatchSafetyTests(unittest.TestCase):
         route = {"provider": "opencode", "worker_provider": "opencode-zen",
                  "model": "opencode-zen/some-model", "effort": "high",
                  "billing": "api"}
+        route["routing_fingerprint"] = orc.routing_fingerprint(
+            route, self.cfg, project=self.project, role="implementer")
         self.state["model_routes"] = {"implementer": route}
         orc.save(self.rundir, self.state)
         self.cfg["workers"]["implementer"] = {
@@ -186,11 +188,8 @@ class DispatchSafetyTests(unittest.TestCase):
             "max_dispatches": 2, "used": 0, "attestation": "reviewed api endpoint",
             "actor": {"user": "tester"}, "at": orc.now()}
         self.state["route_authorizations"] = [grant]
-        home = self.root / "api-empty-home"
-        home.mkdir(exist_ok=True)
-        with patch.dict(os.environ, {"HOME": str(home)}):
-            result = orc.route_preflight("implementer", route, self.cfg,
-                                         self.project, self.state)
+        result = orc.route_preflight("implementer", route, self.cfg,
+                                     self.project, self.state)
         self.assertTrue(result["ok"], result["reasons"])
         self.assertTrue(result["authorization"]["authorized"])
         reserved = orc.reserve_route_grant(self.state, self.rundir, "implementer", route)
@@ -208,6 +207,8 @@ class DispatchSafetyTests(unittest.TestCase):
                 route = {"provider": "opencode", "worker_provider": "local",
                          "model": "local/model", "effort": "",
                          "billing": billing}
+                route["routing_fingerprint"] = orc.routing_fingerprint(
+                    route, self.cfg, project=self.project, role="explorer")
                 result = orc.route_preflight("explorer", route, self.cfg,
                                              self.project, self.state)
                 self.assertFalse(result["ok"])

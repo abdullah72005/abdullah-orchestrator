@@ -281,7 +281,7 @@ class ControlTests(unittest.TestCase):
     def test_zero_credit_fallback_and_go_only(self):
         self.assertFalse(self.cfg["fallback"]["enabled"])
         for role in ("explorer", "implementer", "reviewer"):
-            self.assertTrue(orc.model_route(self.cfg, "codex", role)["model"].startswith("opencode-go/"))
+            self.assertTrue(orc.model_route(self.cfg, "codex", role, project=self.project)["model"].startswith("opencode-go/"))
         broken = json.loads(json.dumps(self.cfg))
         broken["workers"]["implementer"]["model"] = "opencode/deepseek-v4.1-flash"
         with patch.object(orc, "read_json", return_value=broken):

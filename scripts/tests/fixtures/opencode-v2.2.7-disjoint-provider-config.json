@@ -1,0 +1,37 @@
+{
+  "provenance": {
+    "opencode_version": "v2.2.7",
+    "command": [
+      "opencode",
+      "debug",
+      "config",
+      "--standalone"
+    ],
+    "captured": "2026-11-14",
+    "environment": "disposable HOME/XDG; no credentials, no inference"
+  },
+  "input": {
+    "provider": {
+      "opencode-go": {
+        "options": {
+          "baseURL": "https://legacy.invalid/v1"
+        }
+      }
+    },
+    "providers": {
+      "other-provider": {}
+    }
+  },
+  "normalized_documents": [
+    {
+      "providers": {
+        "opencode-go": {
+          "settings": {
+            "baseURL": "https://legacy.invalid/v1"
+          }
+        },
+        "other-provider": {}
+      }
+    }
+  ]
+}

@@ -71,6 +71,7 @@ worker to an API-billed or remote route.
     "max_check_seconds": 14400,
     "max_stage_seconds": 17000,
     "max_explorer_calls_per_run": 8,
+    "max_grant_lock_wait_seconds": 5.0,
     "max_context_chars": 200000
   }
 }
@@ -151,20 +152,46 @@ when every recorded worker route is legacy Go.
 
 ### Effective child routing
 
-Preflight, the pinned routing fingerprint, Doctor and the spawned child share
-one composition boundary for `OPENCODE_CONFIG_CONTENT`. Documented global,
-project and `.opencode` config files are read in precedence order, and supported
-top-level routing fields from any ambient inline config (`provider`/`providers`,
-`model`, `small_model`, provider enable/disable lists) are carried into the
-generated worker block. Generated agent profiles, ordered permissions and
-`subagent_depth: 0` are applied last and are never inherited from ambient inline
-agents or permission blocks; replaced control keys are reported as preflight
-warnings. A project/global config that defines the generated
-`abdullah-<role>` agent name is refused before spawn, because its extra keys
-could shadow the generated controls. `{env:...}` and `{file:...}` references are
-expanded against the child environment and project cwd, so a credential that the
-wrapper strips is not observed as available. Malformed or unreadable
-influential config still fails closed.
+Preflight and the spawned child share one immutable prepared launch context:
+the resolved executable/version identity, project cwd, scrubbed child
+environment, generated `OPENCODE_CONFIG_CONTENT`, and the effective routing
+observation. `cli_command` does not regenerate inline bytes from ambient
+variables after approval; a final source re-observation after dispatch
+snapshots blocks and refunds an attempt whose material changed.
+
+The supported source boundary is version-aware:
+
+- **V1.18.35** uses the bounded source adapter, matching the pinned upstream
+  loader: global `config.json` then `opencode.json` then `opencode.jsonc`;
+  explicit `OPENCODE_CONFIG`; project `opencode.json(c)` from the Git worktree
+  root downward; project `.opencode` directories nearest-first (outermost wins);
+  `$HOME/.opencode`; late `OPENCODE_CONFIG_DIR`; inline content; Linux managed
+  files. V1 `debug` initialization can write schema/dependency files, so it is
+  not executed for billing inspection.
+- **V2.2.7** uses the installed binary's ordered, non-inference
+  `debug config --standalone` documents. That normalizer walks project config
+  from the filesystem root (including a parent above the Git root), applies
+  ordered provider settings/model/variant overlays, and retains disjoint legacy
+  and native provider ids. A failed, malformed, timed-out or plugin-skipped
+  inspection is `unprovable_routing`; it is never a source-adapter authorization
+  fallback. Account/remote/integration or managed routing that cannot be
+  observed is likewise unprovable rather than an implicit default route. On
+  macOS, managed preferences are included only through the supported normalizer.
+- The source adapter's ordered presence/absence, raw file digests, expansion
+  dependencies, inline routing bytes, normalized routing, inspector entry
+  identities and executable identity are all bound into the routing material.
+  Inspection results are never reused from a cache across observations.
+- Supported top-level routing fields from ambient inline config
+  (`provider`/`providers`, `model`, `small_model`, enable/disable lists) are
+  carried into the generated worker block. Generated agent profiles, ordered
+  permissions and `subagent_depth: 0` are applied last and are never inherited
+  from ambient inline agents or permission blocks; replaced control keys are
+  reported as preflight warnings. A project/global config that defines the
+  generated `abdullah-<role>` agent name is refused before spawn.
+  `{env:...}` and `{file:...}` references are expanded against the child
+  environment and project cwd; an unresolved endpoint/remap expansion is
+  unprovable, while a stripped credential is not observed as available.
+  Malformed or unreadable influential config fails closed.
 
 Authentication mode (declared env names plus their availability in the child
 environment, configured key/header presence and model/variant auth settings) is
@@ -180,8 +207,10 @@ endpoint or remap outside the unchanged Go default is classified
 `unqualified_go_route` and refused before spawn; the same route can still be
 dispatched with explicit `api`/`subscription` billing and an `authorize-route`
 grant. The unchanged default (no inspectable override) remains a legacy Go
-subscription without a new grant. This is a configuration check, not proof of
-Go settlement or entitlement.
+subscription without a new grant only when the applicable source boundary is
+fully observed. A V2 inspector failure or a V1 plugin/external-routing hazard is
+`unprovable_routing`; it never becomes a Go approval. This is a configuration
+check, not proof of Go settlement or entitlement.
 
 Variant configuration is dialect-specific. V1 keeps a dictionary keyed by
 variant id; supported V2 uses an array of objects such as
@@ -202,6 +231,13 @@ repoint of the route.
 | `api` | Human `authorize-route` grant bound to role, run and exact route |
 | unknown | Rejected |
 
+Every new OpenCode grant must bind a resolved material pin. An unpinned or stale
+schema-3 route is refused with guidance to create a new run or explicitly run
+`migrate-run`; the supervisor never auto-repins or grandfathers a label-only
+grant. A strong-host (`codex`/`claude`) route keeps its separate label identity
+contract. The same binding is required at grant consumption, including worker
+fallback.
+
 A grant is created outside the model context:
 
 ```bash
@@ -212,7 +248,10 @@ python3 scripts/orchestrator.py authorize-route <RUN_ID> --role implementer \
 
 Every dispatch that preflight says needs a grant — including non-Go
 `subscription`, `free` and `local` routes — atomically reserves exactly one
-before spawn. Consumption is persisted in a run-scoped, independently locked
+before spawn. Ledger waits are bounded by `limits.max_grant_lock_wait_seconds`
+(default 5 seconds) and the remaining stage deadline, poll at most every 50 ms,
+and distinguish lock contention, stage expiry and cancellation from missing or
+exhausted authorization. Consumption is persisted in a run-scoped, independently locked
 grant ledger (`route-grants/ledger.json`) keyed by grant and reservation ID, so a
 parent supervisor snapshot cannot erase a nested Explorer's usage. A crash after
 reservation is conservative and is not refunded; replaying the same reservation

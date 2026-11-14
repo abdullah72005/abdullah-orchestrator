@@ -1382,6 +1382,9 @@ def _redacted_routing_material(value, key=""):
 
 
 OPENCODE_INSPECTION_TIMEOUT = 20.0
+# Retained only so older diagnostics can clear a named object.  Inspection
+# results are never reused across observations: cached output cannot prove that
+# an uninspected parent/remote source did not change.
 OPENCODE_INSPECTION_CACHE = {}
 OPENCODE_INSPECTION_CACHE_LIMIT = 16
 OPENCODE_MANAGED_CONFIG_FILES = (
@@ -1403,18 +1406,18 @@ def _opencode_env_flag(name):
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _opencode_project_chain(project):
-    """Directories from the filesystem root to the project, root first.
+def _opencode_project_chain(project, dialect):
+    """Directories from the outermost V2 root or V1 worktree to the project.
 
-    Upstream V2 loads project config from the cwd upward; a nested cwd sees
-    both the repository root and its own config.  The walk is bounded by the
-    filesystem root and performs no subprocess work.
+    V1 ``ConfigPaths.files`` stops at the Git worktree; V2 ``FSUtil.up`` walks
+    to the filesystem root, so a parent config above the Git root remains
+    influential.  Order is outermost first (later entries win).
     """
     root = Path(project).expanduser().resolve()
     chain = [root]
     current = root
     while current != current.parent:
-        if (current / ".git").exists():
+        if dialect == "v1" and (current / ".git").exists():
             break
         current = current.parent
         chain.append(current)
@@ -1453,10 +1456,11 @@ def _opencode_config_sources(project, dialect):
         if explicit_path is not None:
             add("explicit", explicit_path, required=True)
         if not project_disabled:
-            for directory in _opencode_project_chain(project_path):
+            chain = _opencode_project_chain(project_path, "v2")
+            for directory in chain:
                 add("project", directory / "opencode.json")
                 add("project", directory / "opencode.jsonc")
-            for directory in _opencode_project_chain(project_path):
+            for directory in chain:
                 add("project_directory", directory / ".opencode" / "opencode.json")
                 add("project_directory", directory / ".opencode" / "opencode.jsonc")
         add("inline", None)
@@ -1464,25 +1468,29 @@ def _opencode_config_sources(project, dialect):
             add("managed", path)
         return sources
 
-    # V1: ordinary global directory, including the legacy config.json name.
+    # V1: legacy global files merge first, then opencode.json/jsonc.
     global_dir = _opencode_xdg_global_dir()
+    add("global", global_dir / "config.json")
     add("global", global_dir / "opencode.json")
     add("global", global_dir / "opencode.jsonc")
-    add("global", global_dir / "config.json")
     if explicit_path is not None:
         add("explicit", explicit_path, required=True)
     if not project_disabled:
-        for directory in _opencode_project_chain(project_path):
+        chain = _opencode_project_chain(project_path, "v1")
+        for directory in chain:
             add("project", directory / "opencode.json")
             add("project", directory / "opencode.jsonc")
-        for directory in _opencode_project_chain(project_path):
+        # V1 loads nearest .opencode directory first, so the outermost wins.
+        for directory in reversed(chain):
             add("project_directory", directory / ".opencode" / "opencode.json")
             add("project_directory", directory / ".opencode" / "opencode.jsonc")
+    # V1 also loads the user's home .opencode directory, then OPENCODE_CONFIG_DIR.
+    add("home_directory", Path.home() / ".opencode" / "opencode.json")
+    add("home_directory", Path.home() / ".opencode" / "opencode.jsonc")
     if custom_path is not None:
         # V1 appends the custom directory instead of replacing the global root.
         add("config_directory", custom_path / "opencode.json")
         add("config_directory", custom_path / "opencode.jsonc")
-        add("config_directory", custom_path / "config.json")
     add("inline", None)
     for path in OPENCODE_MANAGED_CONFIG_FILES:
         add("managed", path)
@@ -1707,8 +1715,10 @@ def _opencode_read_config_source(source, child_env):
     return record, expanded
 
 
-def _opencode_inline_source(role, dialect, child_env, project=None):
-    inline, meta = opencode_child_inline(role, dialect)
+def _opencode_inline_source(role, dialect, child_env, project=None, *,
+                            inline=None, meta=None):
+    if inline is None or meta is None:
+        inline, meta = opencode_child_inline(role, dialect)
     routing = {key: copy.deepcopy(inline[key])
                for key in OPENCODE_ROUTING_KEYS[dialect] if key in inline}
     generated = json.dumps(routing, sort_keys=True)
@@ -1729,12 +1739,96 @@ def _opencode_inline_source(role, dialect, child_env, project=None):
     return record, expanded, meta
 
 
-def _opencode_normalize_v2_document(document):
-    """Fold supported V1 ``provider``/``options`` material into V2 ``providers``.
+def _opencode_legacy_provider_id(name):
+    """V2 provider-id renames used by the supported normalizer."""
+    if name == "azure-cognitive-services":
+        return "azure"
+    if name == "google-vertex-anthropic":
+        return "google-vertex"
+    return name
 
-    The installed V2 normalizer prefers a native ``providers`` container when
-    one is present; legacy material is converted only when it is the sole
-    provider container.  Legacy ``options`` becomes V2 ``settings``.
+
+def _opencode_legacy_package(npm):
+    if not isinstance(npm, str) or not npm.strip():
+        return None
+    npm = npm.strip()
+    if npm.startswith("@opencode/ai/"):
+        return npm
+    return "aisdk:" + npm
+
+
+def _opencode_legacy_options(options, provider_entry):
+    """Split V1 options into V2 settings/headers/body and apply ``api``."""
+    if not isinstance(options, dict):
+        return {}, None, None
+    value = copy.deepcopy(options)
+    headers = value.pop("headers", None)
+    body = value.pop("body", None)
+    settings = dict(value)
+    api = provider_entry.get("api")
+    if isinstance(api, str) and api.strip():
+        settings.setdefault("baseURL", api)
+    return settings, (headers if isinstance(headers, dict) else None), (
+        body if isinstance(body, dict) else None)
+
+
+def _opencode_normalize_v2_legacy_model(model):
+    if not isinstance(model, dict):
+        return copy.deepcopy(model)
+    item = copy.deepcopy(model)
+    options = item.pop("options", None)
+    if isinstance(options, dict):
+        existing = item.get("settings")
+        if not isinstance(existing, dict):
+            existing = {}
+        item["settings"] = {**options, **existing}
+    provider = item.get("provider")
+    if isinstance(provider, dict):
+        api = provider.get("api")
+        if isinstance(api, str) and api.strip():
+            settings = item.get("settings")
+            if not isinstance(settings, dict):
+                settings = {}
+            settings.setdefault("baseURL", api)
+            item["settings"] = settings
+        npm = provider.get("npm")
+        package = _opencode_legacy_package(npm)
+        if package and not item.get("package"):
+            item["package"] = package
+    if "modelID" not in item and isinstance(item.get("id"), str):
+        item["modelID"] = item["id"]
+    if item.get("status") == "deprecated" and "disabled" not in item:
+        item["disabled"] = True
+    variants = item.get("variants")
+    if isinstance(variants, dict):
+        item["variants"] = [
+            {"id": str(identifier), **(
+                {"settings": copy.deepcopy(value)}
+                if isinstance(value, dict) else {})}
+            for identifier, value in variants.items()]
+    elif isinstance(variants, list):
+        normalized = []
+        for entry in variants:
+            if not isinstance(entry, dict):
+                normalized.append(copy.deepcopy(entry))
+                continue
+            entry = copy.deepcopy(entry)
+            options = entry.pop("options", None)
+            if isinstance(options, dict):
+                existing = entry.get("settings")
+                if not isinstance(existing, dict):
+                    existing = {}
+                entry["settings"] = {**options, **existing}
+            normalized.append(entry)
+        item["variants"] = normalized
+    return item
+
+
+def _opencode_normalize_v2_document(document):
+    """Migrate V1 provider material exactly as the supported V2 normalizer does.
+
+    Legacy and native provider maps merge by id: disjoint legacy ids survive,
+    while a native entry with the same id overrides the converted legacy entry.
     """
     if not isinstance(document, dict):
         raise ValueError("OpenCode config document is not a JSON object")
@@ -1751,21 +1845,38 @@ def _opencode_normalize_v2_document(document):
             raise ValueError(f"legacy OpenCode provider {name!r} must be an object")
         item = copy.deepcopy(entry)
         options = item.pop("options", None)
-        if options is not None:
-            if not isinstance(options, dict):
-                raise ValueError(
-                    f"legacy OpenCode provider {name!r} options must be an object")
+        settings, headers, body = _opencode_legacy_options(options, item)
+        item.pop("api", None)
+        if settings or options is not None:
             existing = item.get("settings")
             if not isinstance(existing, dict):
                 existing = {}
-            item["settings"] = {**copy.deepcopy(options), **existing}
-        converted[str(name)] = item
+            item["settings"] = {**settings, **existing}
+        if headers is not None and not isinstance(item.get("headers"), dict):
+            item["headers"] = headers
+        if body is not None and not isinstance(item.get("body"), dict):
+            item["body"] = body
+        package = _opencode_legacy_package(item.pop("npm", None))
+        if package and not item.get("package"):
+            item["package"] = package
+        models = item.get("models")
+        if isinstance(models, dict):
+            item["models"] = {
+                model_name: _opencode_normalize_v2_legacy_model(model)
+                for model_name, model in models.items()}
+        destination = _opencode_legacy_provider_id(str(name))
+        converted[destination] = item
     if native is None:
         result["providers"] = converted
         return result
     if not isinstance(native, dict):
         raise ValueError("OpenCode `providers` must be an object")
-    # Native providers win wholesale, matching the supported normalizer.
+    merged = dict(converted)
+    for name, entry in native.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"OpenCode provider {name!r} must be an object")
+        merged[str(name)] = copy.deepcopy(entry)
+    result["providers"] = merged
     return result
 
 
@@ -1885,46 +1996,88 @@ def _opencode_binary_identity():
             "version": _opencode_binary_version(real, fingerprint)}
 
 
-def _opencode_run_bounded(argv, cwd, env, timeout):
+OPENCODE_INSPECTION_POLL_SECONDS = 0.05
+
+
+class InspectionCancelled(RuntimeError):
+    """The owning run paused/cancelled while routing inspection was running."""
+
+
+class InspectionDeadlineExpired(RuntimeError):
+    """The whole-stage deadline expired during routing inspection."""
+
+
+class InspectionContainmentError(RuntimeError):
+    """The inspector process tree could not be proven stopped."""
+
+
+def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None):
     """Contained, cancellable inspector execution; never attaches to a daemon."""
     proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True)
+    started = time.monotonic()
+    limit = max(0.1, float(timeout))
+    out = err = ""
     try:
-        out, err = proc.communicate(timeout=max(0.1, timeout))
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        raise TimeoutError(
-            f"OpenCode config inspection exceeded {timeout:.1f}s") from None
+        while True:
+            if cancel is not None and cancel():
+                raise InspectionCancelled(
+                    "Run pause/cancel requested during OpenCode routing inspection")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise InspectionDeadlineExpired(
+                    "Whole-stage deadline expired during OpenCode routing inspection")
+            elapsed = time.monotonic() - started
+            if elapsed >= limit:
+                raise TimeoutError(
+                    f"OpenCode config inspection exceeded {limit:.1f}s")
+            wait = min(OPENCODE_INSPECTION_POLL_SECONDS,
+                       max(0.01, limit - elapsed))
+            if deadline is not None:
+                wait = min(wait, max(0.01, deadline - time.monotonic()))
+            try:
+                out, err = proc.communicate(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
     finally:
         if proc.poll() is None:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGTERM)
             except OSError:
                 pass
+            try:
+                proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    raise InspectionContainmentError(
+                        f"OpenCode inspector process {proc.pid} could not be proven stopped")
+    if proc.returncode is None:
+        raise InspectionContainmentError(
+            f"OpenCode inspector process {proc.pid} did not exit after containment")
     return proc.returncode, out, err
 
 
 def _opencode_routing_view(info):
-    keys = set(OPENCODE_ROUTING_KEYS["v2"]) | set(OPENCODE_CONTROL_KEYS["v2"])
+    """Routing-only view; generated role controls are not routing material."""
+    keys = set(OPENCODE_ROUTING_KEYS["v2"])
     keys |= {"provider", "providers", "plugin", "plugins", "$schema"}
     return {key: copy.deepcopy(info[key]) for key in info if key in keys}
 
 
-def _opencode_inspected_documents(project, role, dialect, child_env, inline,
+def _opencode_inspected_documents(project, role, dialect, child_env, inline_bytes,
                                   source_records, *, deadline=None,
-                                  adapter_config=None):
+                                  cancel=None, adapter_config=None):
     """Normalized, non-inference V2 config documents from the installed CLI."""
     identity = _opencode_binary_identity()
     result = {"ok": False, "reason": None, "documents": [], "identity": identity,
-              "entry_paths": []}
+              "entry_paths": [], "cancelled": False, "expired": False}
     if dialect != "v2":
         result["reason"] = "dialect_not_inspectable"
         return result
@@ -1948,30 +2101,26 @@ def _opencode_inspected_documents(project, role, dialect, child_env, inline,
             return result
         timeout = min(timeout, remaining)
     env = dict(child_env)
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(inline)
+    env["OPENCODE_CONFIG_CONTENT"] = inline_bytes
     env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
     env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"
-    key = content_hash({
-        "identity": identity.get("fingerprint"),
-        "version": version.get("sha256"),
-        "project": str(Path(project).expanduser().resolve()),
-        "role": role,
-        "inline": hashlib.sha256(env["OPENCODE_CONFIG_CONTENT"].encode()).hexdigest(),
-        "sources": [{name: record.get(name) for name in
-                     ("kind", "path", "present", "sha256", "routing_sha256")}
-                    for record in source_records],
-        "env": {name: (hashlib.sha256(env[name].encode()).hexdigest()
-                       if name in env else None)
-                for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR",
-                             "XDG_CONFIG_HOME", "HOME")},
-    })
-    cached = OPENCODE_INSPECTION_CACHE.get(key)
-    if cached is not None:
-        return copy.deepcopy(cached)
     try:
         returncode, out, err = _opencode_run_bounded(
             ["opencode", "debug", "config", "--standalone"],
-            Path(project).expanduser().resolve(), env, timeout)
+            Path(project).expanduser().resolve(), env, timeout,
+            cancel=cancel, deadline=deadline)
+    except InspectionCancelled as exc:
+        result.update({"reason": "inspection_cancelled", "cancelled": True,
+                       "detail": str(exc)})
+        return result
+    except InspectionDeadlineExpired as exc:
+        result.update({"reason": "inspection_deadline_expired", "expired": True,
+                       "detail": str(exc)})
+        return result
+    except InspectionContainmentError as exc:
+        result.update({"reason": "inspection_containment_unproven",
+                       "detail": str(exc)})
+        return result
     except (OSError, TimeoutError) as exc:
         result["reason"] = f"inspector_failed: {exc.__class__.__name__}"
         return result
@@ -2017,18 +2166,83 @@ def _opencode_inspected_documents(project, role, dialect, child_env, inline,
             return result
     result.update({"ok": True, "reason": None, "documents": documents,
                    "entry_paths": paths, "entry_identity": entry_identity})
-    if len(OPENCODE_INSPECTION_CACHE) >= OPENCODE_INSPECTION_CACHE_LIMIT:
-        OPENCODE_INSPECTION_CACHE.clear()
-    OPENCODE_INSPECTION_CACHE[key] = copy.deepcopy(result)
     return result
 
 
+def _opencode_data_dir(child_env):
+    configured = child_env.get("OPENCODE_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    xdg = child_env.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "opencode"
+    return Path(child_env.get("HOME") or Path.home()) / ".local/share/opencode"
+
+
+def _opencode_external_routing_hazards(child_env):
+    """Uninspectable account/remote/managed sources that can change routing."""
+    hazards = []
+    data_dir = _opencode_data_dir(child_env)
+    auth = data_dir / "auth.json"
+    if auth.is_file():
+        try:
+            content = read_json(auth)
+        except (OSError, ValueError):
+            hazards.append("unreadable OpenCode auth store")
+        else:
+            if isinstance(content, dict):
+                for name, value in content.items():
+                    if isinstance(value, dict) and value.get("type") == "wellknown":
+                        hazards.append(f"remote well-known auth entry {name!r}")
+    content = child_env.get("OPENCODE_AUTH_CONTENT")
+    if content:
+        try:
+            parsed = json.loads(content)
+        except ValueError:
+            hazards.append("unparseable OPENCODE_AUTH_CONTENT")
+        else:
+            if isinstance(parsed, dict):
+                for name, value in parsed.items():
+                    if isinstance(value, dict) and value.get("type") == "wellknown":
+                        hazards.append(f"remote well-known auth entry {name!r}")
+    if sys.platform == "darwin":
+        for path in (
+                Path("/Library/Managed Preferences") / os.environ.get("USER", "user")
+                / "ai.opencode.managed.plist",
+                Path("/Library/Managed Preferences/ai.opencode.managed.plist")):
+            if path.is_file():
+                hazards.append(f"macOS managed preferences {path}")
+                break
+    return sorted(set(hazards))
+
+
 def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
-                               deadline=None):
-    """One shared effective-routing context for preflight and real dispatch."""
+                               deadline=None, cancel=None):
+    """One shared effective-routing context for preflight and real dispatch.
+
+    V1 and an authoritative V2 normalized inspection are the only routing
+    authorities.  A V2 inspector failure, malformed output or plugin skip is
+    unprovable, never a silent adapter authorization fallback.
+    """
     child_env = scrubbed_env() if child_env is None else child_env
     project_path = (Path(project).expanduser().resolve()
                     if project is not None else Path.cwd().resolve())
+    base = {"error": None, "records": [], "documents": [], "sources": [],
+            "inline": {}, "config": {}, "files": [], "inspection": None,
+            "executable": None, "child_env": child_env, "project": project_path,
+            "dialect": dialect, "full_inline": {}, "inline_bytes": None,
+            "cancelled": False, "expired": False, "boundary": {
+                "adapter_complete": False, "external_hazards": []}}
+    if dialect not in {"v1", "v2"}:
+        return {**base, "error": "Unsupported OpenCode dialect"}
+    if cancel is not None and cancel():
+        return {**base, "cancelled": True,
+                "error": "Run pause/cancel requested before routing inspection"}
+    if deadline is not None and deadline - time.monotonic() <= 0.05:
+        return {**base, "expired": True,
+                "error": "Whole-stage deadline expired before routing inspection"}
+    full_inline, inline_meta = opencode_child_inline(role, dialect)
+    inline_bytes = json.dumps(full_inline)
     sources = _opencode_config_sources(project_path, dialect)
     records = []
     documents = []
@@ -2038,7 +2252,8 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
     for source in sources:
         if source.get("kind") == "inline":
             record, inline, meta = _opencode_inline_source(
-                role, dialect, child_env, project=project_path)
+                role, dialect, child_env, project=project_path,
+                inline=full_inline, meta=inline_meta)
             if isinstance(inline, dict) and not record.get("error"):
                 documents.append((record, inline))
         else:
@@ -2048,59 +2263,119 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
                 file_documents.append(data)
         records.append(record)
         if record.get("error"):
-            return {"error": record["error"], "records": records,
+            return {**base, "error": record["error"], "records": records,
                     "documents": documents, "sources": sources,
-                    "inline": meta, "config": {}, "files": [],
-                    "inspection": None, "executable": None,
-                    "child_env": child_env, "project": project_path}
-    # Source-backed fold is both the V1 authority and the proven bounded
-    # adapter/fallback for V2 (and the comparison basis when inspection works).
+                    "inline": meta, "full_inline": full_inline,
+                    "inline_bytes": inline_bytes}
     try:
         adapter_config = _opencode_fold_documents(
             [data for _, data in documents], dialect)
     except ValueError as exc:
-        return {"error": f"OpenCode config cannot be normalized: {exc}",
+        return {**base, "error": f"OpenCode config cannot be normalized: {exc}",
                 "records": records, "documents": documents, "sources": sources,
-                "inline": meta, "config": {}, "files": [],
-                "inspection": None, "executable": None,
-                "child_env": child_env, "project": project_path}
-    inspection = None
-    merged = adapter_config
-    if dialect == "v2":
-        inspection = _opencode_inspected_documents(
-            project_path, role, dialect, child_env, inline, records,
-            deadline=deadline, adapter_config=adapter_config)
-        if inspection.get("ok"):
-            try:
-                inspected_config = _opencode_fold_documents(
-                    inspection["documents"], dialect)
-            except ValueError as exc:
-                inspection = {**inspection, "ok": False,
-                              "reason": f"inspector_shape_error: {exc}"}
-            else:
-                if _opencode_material_mismatch(adapter_config, inspected_config):
-                    inspection = {**inspection, "disagreement": True,
-                                  "reason": "normalized_source_disagreement"}
-                merged = inspected_config
-    conflict = None
+                "inline": meta, "full_inline": full_inline,
+                "inline_bytes": inline_bytes}
     try:
         file_config = _opencode_fold_documents(file_documents, dialect)
     except ValueError:
         file_config = {}
     conflict = _opencode_control_conflict(file_config, role)
     if conflict:
-        return {"error": conflict, "records": records, "documents": documents,
-                "sources": sources, "inline": meta, "config": {},
-                "files": [], "inspection": inspection,
-                "executable": _opencode_binary_identity(),
-                "child_env": child_env, "project": project_path}
+        return {**base, "error": conflict, "records": records,
+                "documents": documents, "sources": sources, "inline": meta,
+                "full_inline": full_inline, "inline_bytes": inline_bytes,
+                "executable": _opencode_binary_identity()}
+    plugins = adapter_config.get("plugins") or adapter_config.get("plugin")
+    inspection = None
+    boundary = {"adapter_complete": False, "external_hazards": [],
+                "plugin_config_present": bool(plugins)}
+    if dialect == "v2":
+        inspection = _opencode_inspected_documents(
+            project_path, role, dialect, child_env, inline_bytes, records,
+            deadline=deadline, cancel=cancel, adapter_config=adapter_config)
+        if inspection.get("cancelled") or inspection.get("expired"):
+            return {**base, "records": records, "documents": documents,
+                    "sources": sources, "inline": meta,
+                    "full_inline": full_inline, "inline_bytes": inline_bytes,
+                    "inspection": inspection,
+                    "executable": _opencode_binary_identity(),
+                    "cancelled": bool(inspection.get("cancelled")),
+                    "expired": bool(inspection.get("expired")),
+                    "error": ("Routing inspection cancelled" if
+                              inspection.get("cancelled") else
+                              "Whole-stage deadline expired during routing inspection")}
+        if not inspection.get("ok"):
+            reason = str(inspection.get("reason") or "unknown")
+            if reason == "plugin_config_present":
+                error = ("OpenCode configuration declares plugins; normalized "
+                         "routing cannot be inspected safely and is unprovable")
+            else:
+                error = ("normalized OpenCode routing inspection is unavailable ("
+                         + reason + "); effective routing is unprovable")
+            return {**base, "records": records, "documents": documents,
+                    "sources": sources, "inline": meta,
+                    "full_inline": full_inline, "inline_bytes": inline_bytes,
+                    "inspection": inspection,
+                    "executable": _opencode_binary_identity(),
+                    "boundary": boundary, "error": error}
+        try:
+            inspected_config = _opencode_fold_documents(
+                inspection["documents"], dialect)
+        except ValueError as exc:
+            return {**base, "error": f"OpenCode inspection shape error: {exc}",
+                    "records": records, "documents": documents,
+                    "sources": sources, "inline": meta,
+                    "full_inline": full_inline, "inline_bytes": inline_bytes,
+                    "inspection": inspection}
+        if _opencode_material_mismatch(adapter_config, inspected_config):
+            inspection = {**inspection, "disagreement": True,
+                          "reason": "normalized_source_disagreement"}
+        merged = inspected_config
+        boundary["adapter_complete"] = True
+    else:
+        hazards = _opencode_external_routing_hazards(child_env)
+        boundary["external_hazards"] = hazards
+        if plugins:
+            return {**base, "records": records, "documents": documents,
+                    "sources": sources, "inline": meta,
+                    "full_inline": full_inline, "inline_bytes": inline_bytes,
+                    "boundary": boundary,
+                    "error": ("OpenCode configuration declares plugins; effective "
+                              "routing is unprovable without safe inspection")}
+        if hazards:
+            return {**base, "records": records, "documents": documents,
+                    "sources": sources, "inline": meta,
+                    "full_inline": full_inline, "inline_bytes": inline_bytes,
+                    "boundary": boundary,
+                    "error": ("uninspectable external OpenCode routing sources: "
+                              + "; ".join(hazards))}
+        boundary["adapter_complete"] = True
+        merged = adapter_config
     files = [Path(record["path"]) for record in records
              if record.get("present") and record.get("path")]
     return {"error": None, "records": records, "documents": documents,
             "sources": sources, "inline": meta, "config": merged,
-            "files": files, "inspection": inspection,
+            "files": files, "inspection": inspection, "boundary": boundary,
             "executable": _opencode_binary_identity(),
-            "child_env": child_env, "project": project_path}
+            "child_env": child_env, "project": project_path, "dialect": dialect,
+            "full_inline": full_inline, "inline_bytes": inline_bytes,
+            "cancelled": False, "expired": False}
+
+
+def _opencode_launch_context(role, dialect, project, *, allow_free=False,
+                             deadline=None, cancel=None):
+    """Immutable launch environment prepared before authorization."""
+    context = _opencode_prepared_context(
+        role, dialect, project, deadline=deadline, cancel=cancel)
+    if context.get("cancelled") or context.get("expired"):
+        return {"context": context, "env": None}
+    env = dict(context.get("child_env") or scrubbed_env())
+    for key in ("LEAN_CTX_READ_ONLY_ROOTS", "__LEAN_CTX_NO_DAEMON"):
+        env.pop(key, None)
+    if not allow_free:
+        env["OPENCODE_DISABLE_FREE_MODELS"] = "1"
+    env["OPENCODE_CONFIG_CONTENT"] = context["inline_bytes"]
+    return {"context": context, "env": env}
 
 
 def _opencode_material_mismatch(adapter_config, inspected_config):
@@ -2238,7 +2513,8 @@ def _opencode_go_qualification(provider, entry, model_id, model_entry,
 
 
 def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
-                                  role=None, deadline=None):
+                                  role=None, deadline=None, prepared=None,
+                                  cancel=None):
     """Redacted view of the effective OpenCode provider configuration.
 
     Uses version-aware source discovery plus the installed V2 normalizer's
@@ -2263,8 +2539,14 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
             "routing is unprovable (configure an exact runtime.opencode_version "
             "or install a supported CLI)")
         return observed
-    context = _opencode_prepared_context(role, dialect, project, deadline=deadline)
+    context = ((prepared or {}).get("context")
+               if isinstance(prepared, dict) and prepared.get("context")
+               else _opencode_prepared_context(
+                   role, dialect, project, deadline=deadline, cancel=cancel))
     observed["effective_files"] = [str(path) for path in context.get("files") or []]
+    observed["boundary"] = context.get("boundary")
+    observed["cancel_requested"] = bool(context.get("cancelled"))
+    observed["deadline_expired"] = bool(context.get("expired"))
     observed["config"] = list(observed["effective_files"])
     inspection = context.get("inspection") or {}
     observed["inspection"] = "normalized" if inspection.get("ok") else "source_adapter"
@@ -2303,6 +2585,11 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
     variant = str(route.get("effort") or "")
     container_key = "provider" if dialect == "v1" else "providers"
     providers = merged.get(container_key)
+    entry = None
+    settings = {}
+    model_entry = variant_entry = None
+    endpoint = endpoint_source = None
+    layer_error = None
     if isinstance(providers, dict):
         observed["providers"] = sorted(str(name) for name in providers)
         entry = providers.get(provider)
@@ -2311,114 +2598,120 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
                 f"OpenCode provider {provider!r} has an unsupported non-object "
                 "entry; effective routing cannot be established")
             return observed
-        if isinstance(entry, dict):
-            observed["provider_configured"] = True
-            settings = _opencode_layer_settings(entry, dialect)
-            layers, model_entry, variant_entry, layer_error = (
-                _opencode_route_layers(dialect, entry, model_id, variant))
-            if layer_error:
-                observed["error"] = layer_error
-                return observed
-            endpoint, endpoint_source = _opencode_effective_endpoint(
-                dialect, layers)
-            if endpoint and any(marker in str(endpoint)
-                                for marker in OPENCODE_REDACTION_MARKERS):
-                observed["error"] = (
-                    "OpenCode inspection masked the selected provider endpoint; "
-                    "a masked endpoint is not evidence of the default endpoint "
-                    "and this route cannot be authorized")
-                return observed
-            observed["endpoint_source"] = endpoint_source
-            observed["endpoint_sha256"] = (
-                hashlib.sha256(_without_url_credentials(endpoint).encode()).hexdigest()
-                if endpoint else None)
-            env_names = entry.get("env")
-            if not isinstance(env_names, list):
-                env_names = []
-            observed["auth_env_names"] = sorted(
-                {str(name) for name in env_names}
-                | {str(key) for key in settings
-                   if SECRET_ROUTING_KEY.search(str(key))})
-            layer_auth = {}
-            for layer_name, layer_entry in (("model", model_entry),
-                                            ("variant", variant_entry)):
-                layer_settings = _opencode_layer_settings(layer_entry, dialect)
-                keys = sorted(str(key) for key in layer_settings
-                              if SECRET_ROUTING_KEY.search(str(key)))
-                layer_auth[layer_name] = {
-                    "keys": keys,
-                    "present": any(layer_settings[key] is not None
-                                   and layer_settings[key] != ""
-                                   for key in keys)}
-            observed["auth_mode_sha256"] = content_hash({
-                "env": observed["auth_env_names"],
-                "package": entry.get("package"),
-                "canonical": entry.get("canonical"),
-                "headers": sorted(str(key) for key in (entry.get("headers") or {})
-                                  if isinstance(entry.get("headers"), dict)),
-                "api_key_configured": any(
-                    value is not None and value != ""
-                    for key, value in settings.items()
-                    if SECRET_ROUTING_KEY.search(str(key))),
-                "env_available": {
-                    str(name): bool(context["child_env"].get(str(name)))
-                    for name in env_names},
-                "layers": layer_auth,
-            })
-            models = entry.get("models")
-            if not isinstance(models, dict):
-                models = {}
-            observed["model_count"] = len(models)
-            observed["model_sha256"] = content_hash(
-                _redacted_routing_material(model_entry if model_entry is not None
-                                           else {}))
-            observed["go_route"] = _opencode_go_qualification(
-                provider, entry, model_id, model_entry, variant_entry,
-                endpoint, endpoint_source)
-            routing_material = {
-                "dialect": dialect,
-                "provider": provider,
-                "container": container_key,
-                "config_files": observed["effective_files"],
-                "source_identity": _redacted_routing_material(
-                    observed["source_identity"]),
-                "inline": {
-                    "present": any(
-                        record.get("kind") == "inline" and record.get("present")
-                        for record in observed["source_identity"]),
-                    "sha256": next((record.get("sha256") for record in
-                                    observed["source_identity"]
-                                    if record.get("kind") == "inline"), None),
-                    "routing_sha256": next(
-                        (record.get("routing_sha256") for record in
-                         observed["source_identity"]
-                         if record.get("kind") == "inline"), None),
-                },
-                "inspection": observed["inspection"],
-                "inspection_reason": observed["inspection_reason"],
-                "inspection_entries": (inspection or {}).get("entry_identity"),
-                "executable": {
-                    "path": (observed["executable"] or {}).get("path"),
-                    "fingerprint": (observed["executable"] or {}).get("fingerprint"),
-                    "version_sha256": ((observed["executable"] or {}).get("version")
-                                       or {}).get("sha256"),
-                },
-                "normalized_routing": _redacted_routing_material(
-                    _opencode_routing_view(merged)),
-                "provider_entry": _redacted_routing_material(entry),
-                "selected_model": _redacted_routing_material(
-                    model_entry if model_entry is not None else {}),
-                "selected_variant": _redacted_routing_material(
-                    variant_entry if variant_entry is not None else {}),
-                "route_variant": variant,
-                "endpoint_source": endpoint_source,
-                "top_level": {
-                    key: _redacted_routing_material(merged.get(key))
-                    for key in ("model", "small_model", "smallModel",
-                                "fallback", "fallbacks", "default_agent")
-                    if key in merged},
-            }
-            observed["routing_material_sha256"] = content_hash(routing_material)
+    routing_material = {
+        "dialect": dialect,
+        "provider": provider,
+        "container": container_key,
+        "provider_configured": False,
+        "config_files": observed["effective_files"],
+        "source_identity": _redacted_routing_material(
+            observed["source_identity"]),
+        "inline": {
+            "present": any(
+                record.get("kind") == "inline" and record.get("present")
+                for record in observed["source_identity"]),
+            "sha256": next((record.get("sha256") for record in
+                            observed["source_identity"]
+                            if record.get("kind") == "inline"), None),
+            "routing_sha256": next(
+                (record.get("routing_sha256") for record in
+                 observed["source_identity"]
+                 if record.get("kind") == "inline"), None),
+        },
+        "inspection": observed["inspection"],
+        "inspection_reason": observed["inspection_reason"],
+        "inspection_entries": (inspection or {}).get("entry_identity"),
+        "boundary": observed.get("boundary"),
+        "executable": {
+            "path": (observed["executable"] or {}).get("path"),
+            "fingerprint": (observed["executable"] or {}).get("fingerprint"),
+            "version_sha256": ((observed["executable"] or {}).get("version")
+                               or {}).get("sha256"),
+        },
+        "normalized_routing": _redacted_routing_material(
+            _opencode_routing_view(merged)),
+        "providers": observed["providers"],
+        "route_variant": variant,
+        "top_level": {
+            key: _redacted_routing_material(merged.get(key))
+            for key in ("model", "small_model", "smallModel",
+                        "fallback", "fallbacks", "default_agent")
+            if key in merged},
+    }
+    if isinstance(entry, dict):
+        observed["provider_configured"] = True
+        routing_material["provider_configured"] = True
+        settings = _opencode_layer_settings(entry, dialect)
+        layers, model_entry, variant_entry, layer_error = (
+            _opencode_route_layers(dialect, entry, model_id, variant))
+        if layer_error:
+            observed["error"] = layer_error
+            return observed
+        endpoint, endpoint_source = _opencode_effective_endpoint(
+            dialect, layers)
+        if endpoint and any(marker in str(endpoint)
+                            for marker in OPENCODE_REDACTION_MARKERS):
+            observed["error"] = (
+                "OpenCode inspection masked the selected provider endpoint; "
+                "a masked endpoint is not evidence of the default endpoint "
+                "and this route cannot be authorized")
+            return observed
+        observed["endpoint_source"] = endpoint_source
+        observed["endpoint_sha256"] = (
+            hashlib.sha256(_without_url_credentials(endpoint).encode()).hexdigest()
+            if endpoint else None)
+        env_names = entry.get("env")
+        if not isinstance(env_names, list):
+            env_names = []
+        observed["auth_env_names"] = sorted(
+            {str(name) for name in env_names}
+            | {str(key) for key in settings
+               if SECRET_ROUTING_KEY.search(str(key))})
+        layer_auth = {}
+        for layer_name, layer_entry in (("model", model_entry),
+                                        ("variant", variant_entry)):
+            layer_settings = _opencode_layer_settings(layer_entry, dialect)
+            keys = sorted(str(key) for key in layer_settings
+                          if SECRET_ROUTING_KEY.search(str(key)))
+            layer_auth[layer_name] = {
+                "keys": keys,
+                "present": any(layer_settings[key] is not None
+                               and layer_settings[key] != ""
+                               for key in keys)}
+        observed["auth_mode_sha256"] = content_hash({
+            "env": observed["auth_env_names"],
+            "package": entry.get("package"),
+            "canonical": entry.get("canonical"),
+            "headers": sorted(str(key) for key in (entry.get("headers") or {})
+                              if isinstance(entry.get("headers"), dict)),
+            "api_key_configured": any(
+                value is not None and value != ""
+                for key, value in settings.items()
+                if SECRET_ROUTING_KEY.search(str(key))),
+            "env_available": {
+                str(name): bool(context["child_env"].get(str(name)))
+                for name in env_names},
+            "layers": layer_auth,
+        })
+        models = entry.get("models")
+        if not isinstance(models, dict):
+            models = {}
+        observed["model_count"] = len(models)
+        observed["model_sha256"] = content_hash(
+            _redacted_routing_material(model_entry if model_entry is not None
+                                       else {}))
+        observed["go_route"] = _opencode_go_qualification(
+            provider, entry, model_id, model_entry, variant_entry,
+            endpoint, endpoint_source)
+        routing_material.update({
+            "endpoint_source": endpoint_source,
+            "provider_entry": _redacted_routing_material(entry),
+            "selected_model": _redacted_routing_material(
+                model_entry if model_entry is not None else {}),
+            "selected_variant": _redacted_routing_material(
+                variant_entry if variant_entry is not None else {}),
+        })
+    observed["routing_material_sha256"] = content_hash(routing_material)
     return observed
 
 
@@ -2453,8 +2746,19 @@ def routing_fingerprint(route, cfg=None, project=None, dialect=None,
             "auth_env_names": observation.get("auth_env_names"),
             "model_sha256": observation.get("model_sha256"),
             "model_count": observation.get("model_count"),
-            "error": bool(observation.get("error")),
+            "error": observation.get("error"),
+            "inspection": observation.get("inspection"),
+            "inspection_reason": observation.get("inspection_reason"),
             "dialect": observation.get("dialect"),
+            "source_identity": _redacted_routing_material(
+                observation.get("source_identity") or []),
+            "boundary": observation.get("boundary"),
+            "executable": {
+                "path": (observation.get("executable") or {}).get("path"),
+                "fingerprint": (observation.get("executable") or {}).get("fingerprint"),
+                "version_sha256": ((observation.get("executable") or {}).get("version")
+                                   or {}).get("sha256"),
+            },
         }
     if observation.get("auth_mode_sha256"):
         material["auth_mode_sha256"] = observation["auth_mode_sha256"]
@@ -2478,6 +2782,27 @@ def model_route(cfg, host, role, project=None):
         fallback["routing_fingerprint"] = routing_fingerprint(
             fallback, cfg, project=project, role=role)
     return route
+
+
+OPENCODE_ROUTE_UNBOUND_GUIDANCE = (
+    "OpenCode route has no resolved material binding; create a new run, or "
+    "explicitly migrate an existing schema-3 run (`migrate-run`) and review the "
+    "resolved route before authorizing it")
+
+
+def route_material_binding_error(route, cfg, project, role, *, deadline=None):
+    """Require a current resolved material pin for an OpenCode grant route."""
+    if not isinstance(route, dict) or route.get("provider") != "opencode":
+        return None
+    pinned = route.get("routing_fingerprint")
+    if not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{64}", pinned):
+        return OPENCODE_ROUTE_UNBOUND_GUIDANCE
+    current = routing_fingerprint(
+        route, cfg, project=project, role=role, deadline=deadline)
+    if current != pinned:
+        return ("OpenCode route material is stale; review/migrate the run and "
+                "authorize the current resolved route instead of silently rerouting")
+    return None
 
 
 def route_authorization_sha(route):
@@ -2753,6 +3078,12 @@ def _sync_grant_usage(state, run_dir=None):
 def route_authorization_status(state, role, route, *, run_dir=None):
     """Return the active human grant matching role, run and exact route."""
     sha = route_authorization_sha(route)
+    if route.get("provider") == "opencode":
+        pinned = route.get("routing_fingerprint")
+        if not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{64}", pinned):
+            return {"required": True, "authorized": False,
+                    "route_sha256": sha,
+                    "reason": OPENCODE_ROUTE_UNBOUND_GUIDANCE}
     if not isinstance(state, dict):
         return {"required": True, "authorized": False, "route_sha256": sha,
                 "reason": "no durable run state authorizes this route"}
@@ -2781,7 +3112,7 @@ def route_authorization_status(state, role, route, *, run_dir=None):
 
 
 def route_preflight(role, route, cfg=None, project=None, state=None, *,
-                    run_dir=None, deadline=None):
+                    run_dir=None, deadline=None, prepared=None, cancel=None):
     """Classify billing and reject unapproved routing before any dispatch.
 
     This is a deterministic application-level policy check.  It neither proves
@@ -2848,8 +3179,9 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
             "billing 'go' is only valid for the unchanged OpenCode Go provider; "
             f"provider {worker_provider!r} requires explicit api/subscription/free/local billing")
         return result
-    observation = opencode_provider_observation(route, project=project, cfg=cfg,
-                                                role=role, deadline=deadline)
+    observation = opencode_provider_observation(
+        route, project=project, cfg=cfg, role=role, deadline=deadline,
+        prepared=prepared, cancel=cancel)
     result["observed"] = observation
     result["route_material_sha256"] = observation.get("routing_material_sha256")
     if observation.get("error"):
@@ -2860,10 +3192,9 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
         return result
     if observation.get("inspection") == "source_adapter":
         result["warnings"].append(
-            "effective OpenCode routing was derived from ordered local sources "
-            "because normalized CLI inspection was unavailable ("
-            + str(observation.get("inspection_reason") or "unknown")
-            + "); account/remote/integration sources were not observed")
+            "effective OpenCode routing was derived from the version-aware V1 "
+            "source boundary; V1 normalized CLI inspection is intentionally not "
+            "executed because its initialization can write schema/dependency files")
     elif observation.get("inspection_disagreement"):
         result["warnings"].append(
             "normalized CLI routing differs from the local source adapter; the "
@@ -2874,6 +3205,15 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
             "generated worker controls: "
             + ", ".join(observation["inline_neutralized"]))
     pinned = route.get("routing_fingerprint")
+    requires_grant = billing in {"api", "subscription", "free", "local"}
+    if not pinned and requires_grant:
+        result["classification"] = "unbound_route"
+        result["reasons"].append(
+            "OpenCode route has no resolved material binding; missing or stale "
+            "pins cannot authorize dispatch. Create a new run, or run "
+            "`migrate-run` for an existing schema-3 run, then review and authorize "
+            "the exact resolved route")
+        return result
     if pinned:
         current = routing_fingerprint(route, cfg, project=project,
                                       observation=observation, role=role)
@@ -2883,6 +3223,11 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
                 "pinned OpenCode provider routing material changed; review/migrate the run "
                 "instead of silently rerouting")
             return result
+    elif observation.get("routing_material_sha256"):
+        # Legacy Go routes may omit a pin, but the observed material is still
+        # reported so operators can migrate them deliberately.
+        result["current_routing_fingerprint"] = routing_fingerprint(
+            route, cfg, project=project, observation=observation, role=role)
     if billing == "go":
         qualification = observation.get("go_route") or {
             "qualified": True, "reasons": []}
@@ -2966,6 +3311,10 @@ def reserve_route_grant(state, run_dir, role, route, *, reservation_id=None,
     """
     if not isinstance(state, dict):
         return None
+    if route.get("provider") == "opencode":
+        pinned = route.get("routing_fingerprint")
+        if not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{64}", pinned):
+            raise RuntimeError(OPENCODE_ROUTE_UNBOUND_GUIDANCE)
     reservation_id = reservation_id or uuid.uuid4().hex[:12]
     sha = route_authorization_sha(route)
     for entry in reversed(state.get("route_authorizations", [])):
@@ -3689,14 +4038,25 @@ def _sha256_file(path: Path):
     return h.hexdigest()
 
 
-def _bounded_tree_digest(root: Path, budget_bytes):
-    """Cycle-safe bounded content digest for a linked directory target."""
-    if budget_bytes <= 0:
-        return None, 0, False
+def _bounded_tree_digest(root: Path, budget_bytes, budget_files, project_root):
+    """Cycle-safe bounded content digest for a linked directory target.
+
+    Nested symlinks are followed and their target content hashed; dangling,
+    outside-project, unreadable or budget-exhausted entries make the traversal
+    incomplete so the caller can fail closed instead of certifying the link.
+    """
+    if budget_bytes <= 0 or budget_files <= 0:
+        return None, 0, 0, False
     digest = hashlib.sha256()
-    used = 0
+    used_bytes = 0
+    used_files = 0
     complete = True
-    stack = [(root, "")]
+    try:
+        root_real = Path(root).resolve()
+    except (OSError, RuntimeError):
+        return None, 0, 0, False
+    visited = {root_real}
+    stack = [(Path(root), "")]
     while stack:
         directory, prefix = stack.pop()
         try:
@@ -3705,26 +4065,63 @@ def _bounded_tree_digest(root: Path, budget_bytes):
             complete = False
             continue
         for entry in entries:
-            if entry.name in RUNTIME_SKIP_PARTS:
-                continue
             relative = f"{prefix}{entry.name}"
             try:
                 if entry.is_symlink():
                     link = "link:" + os.readlink(entry)
                     digest.update(relative.encode() + b"\0" + link.encode() + b"\0")
+                    try:
+                        target = entry.resolve()
+                    except (OSError, RuntimeError):
+                        complete = False
+                        continue
+                    if not target.exists():
+                        complete = False
+                        continue
+                    if not target.is_relative_to(project_root):
+                        complete = False
+                        continue
+                    if target.is_dir():
+                        if target in visited:
+                            digest.update(b"cycle\0")
+                            complete = False
+                            continue
+                        visited.add(target)
+                        stack.append((target, relative + "/"))
+                        continue
+                    if not target.is_file():
+                        complete = False
+                        continue
+                    if used_files >= budget_files:
+                        return None, used_bytes, used_files, False
+                    size = target.stat().st_size
+                    if used_bytes + size > budget_bytes:
+                        return None, used_bytes, used_files, False
+                    digest.update(relative.encode() + b"\0")
+                    digest.update(bytes.fromhex(_sha256_file(target)))
+                    used_bytes += size
+                    used_files += 1
                     continue
                 if entry.is_dir():
+                    if entry in visited:
+                        digest.update(relative.encode() + b"\0cycle\0")
+                        complete = False
+                        continue
+                    visited.add(entry)
                     stack.append((entry, relative + "/"))
                     continue
+                if used_files >= budget_files:
+                    return None, used_bytes, used_files, False
                 size = entry.stat().st_size
-                if used + size > budget_bytes:
-                    return None, used, False
+                if used_bytes + size > budget_bytes:
+                    return None, used_bytes, used_files, False
                 digest.update(relative.encode() + b"\0")
                 digest.update(bytes.fromhex(_sha256_file(entry)))
-                used += size
+                used_bytes += size
+                used_files += 1
             except OSError:
                 complete = False
-    return digest.hexdigest(), used, complete
+    return digest.hexdigest(), used_bytes, used_files, complete
 
 
 def runtime_input_manifest(project: Path, cfg=None):
@@ -3852,8 +4249,10 @@ def runtime_input_manifest(project: Path, cfg=None):
                                            "target_outside_project": True}
                         complete = False
                         continue
-                    digest, used, tree_complete = _bounded_tree_digest(
-                        target, max_bytes - total_bytes)
+                    digest, used, linked_files, tree_complete = (
+                        _bounded_tree_digest(
+                            target, max_bytes - total_bytes,
+                            max_files - len(files), project_resolved))
                     total_bytes += used
                     if not tree_complete or digest is None:
                         complete = False
@@ -3861,7 +4260,8 @@ def runtime_input_manifest(project: Path, cfg=None):
                                            "unprovable": True}
                     else:
                         files[relative] = {"link": link, "directory": True,
-                                           "sha256": digest}
+                                           "sha256": digest,
+                                           "file_count": linked_files}
                     continue
                 if not target.is_file():
                     files[relative] = {"link": link, "unreadable": True}
@@ -5865,9 +6265,11 @@ def opencode_env(role, dialect, allow_free=False):
     return env
 
 
-def cli_command(host, role, route, prompt, path: Path, resume_session=None, evidence_root=None):
+def cli_command(host, role, route, prompt, path: Path, resume_session=None,
+                evidence_root=None, prepared=None):
     if route["provider"] == "opencode":
-        dialect = opencode_dialect()
+        prepared_context = (prepared or {}).get("context") or {}
+        dialect = prepared_context.get("dialect") or opencode_dialect()
         selector = route["model"]
         if dialect == "v2" and route["effort"]:
             selector += f"#{route['effort']}"
@@ -5882,8 +6284,12 @@ def cli_command(host, role, route, prompt, path: Path, resume_session=None, evid
             cmd.extend(["--variant", route["effort"]])
         if resume_session:
             cmd.extend(["--session", resume_session])
-        return (cmd + [prompt], opencode_env(
-            role, dialect, allow_free=bool(route.get("free_authorized"))), "jsonl")
+        if isinstance(prepared, dict) and isinstance(prepared.get("env"), dict):
+            env = dict(prepared["env"])
+        else:
+            env = opencode_env(
+                role, dialect, allow_free=bool(route.get("free_authorized")))
+        return (cmd + [prompt], env, "jsonl")
     schema_kind = path.name.split("-")[0]
     if schema_kind in {"decision", "diagnose", "integration"}:
         schema_kind = "decision"
@@ -6741,7 +7147,8 @@ def _run_cancel_requested(run_dir):
         return False
 
 
-def _route_identity_recheck(route, preflight, cfg, project, role, deadline=None):
+def _route_identity_recheck(route, preflight, cfg, project, role, deadline=None,
+                            cancel=None):
     """Re-observe effective routing immediately before spawn.
 
     Returns a human-readable drift reason, or None.  Material changes never
@@ -6751,7 +7158,12 @@ def _route_identity_recheck(route, preflight, cfg, project, role, deadline=None)
         return None
     observed = preflight.get("observed") or {}
     current = opencode_provider_observation(
-        route, project=project, cfg=cfg, role=role, deadline=deadline)
+        route, project=project, cfg=cfg, role=role, deadline=deadline,
+        cancel=cancel)
+    if current.get("cancel_requested"):
+        raise InterruptedError("Run pause/cancel requested during final route recheck")
+    if current.get("deadline_expired"):
+        raise TimeoutError("Whole-stage deadline expired during final route recheck")
     if current.get("error"):
         return current["error"]
     if observed.get("routing_material_sha256") != current.get("routing_material_sha256"):
@@ -6803,8 +7215,26 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             raise RuntimeError(
                 "Worker fallback authorization does not match the configured exact route")
     strong = route["provider"] in {"codex", "claude"}
-    preflight = route_preflight(role, route, cfg, project, authorization_state,
-                               run_dir=grant_dir or run_dir, deadline=deadline)
+    authoritative_dir = grant_dir or run_dir
+    launch = None
+    if not strong:
+        dialect = _opencode_dialect_for_observation(cfg)
+        if dialect in {"v1", "v2"}:
+            launch = _opencode_launch_context(
+                role, dialect, project,
+                allow_free=route.get("billing") == "free",
+                deadline=deadline,
+                cancel=(lambda: _run_cancel_requested(authoritative_dir)))
+            if launch["context"].get("cancelled"):
+                raise InterruptedError(
+                    "Run pause/cancel requested during routing inspection")
+            if launch["context"].get("expired"):
+                raise TimeoutError(
+                    "Whole-stage deadline expired during routing inspection")
+    preflight = route_preflight(
+        role, route, cfg, project, authorization_state,
+        run_dir=authoritative_dir, deadline=deadline, prepared=launch,
+        cancel=(lambda: _run_cancel_requested(authoritative_dir)))
     if not preflight["ok"]:
         archive.mkdir(parents=True, exist_ok=True)
         rejection_path = archive / f"preflight-{job_id}.json"
@@ -6888,52 +7318,6 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         # Only an explicitly authorized free route may leave free-model
         # discovery enabled; the default remains disabled.
         route["free_authorized"] = True
-    drift = _route_identity_recheck(route, preflight, cfg, project, role,
-                                    deadline=deadline)
-    if drift:
-        if reservation is not None:
-            # Launch was proven never attempted: release only this reservation.
-            try:
-                release_route_grant(
-                    authorization_state, grant_dir or run_dir, role, route,
-                    "route identity drift before launch", reservation_id=job_id,
-                    cfg=cfg, deadline=deadline)
-            except GrantLedgerTimeout:
-                # Bounded wait expired; conservative consumption remains.
-                pass
-        archive.mkdir(parents=True, exist_ok=True)
-        rejection_path = archive / f"preflight-{job_id}.json"
-        rejection = {**preflight, "kind": kind, "job_id": job_id,
-                     "decision": "preflight_rejected",
-                     "reason_code": "route_identity_drift",
-                     "reasons": [drift], "active_job_created": False,
-                     "model_calls_counted": False}
-        atomic_json(rejection_path, rejection)
-        if state is not None:
-            state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
-            state["status"] = "blocked"
-            state["pause_reason"] = "Dispatch blocked: " + drift
-            save(run_dir, state)
-            journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
-                          role=role, kind=kind, reason_code="route_identity_drift",
-                          reasons=[drift])
-        raise RuntimeError(f"Dispatch blocked: {drift} (diagnostic: {rejection_path})")
-    # Inspection/wait elapsed time belongs to the same whole-stage budget.
-    try:
-        timeout = remaining_budget(
-            cfg["limits"]["max_architect_seconds" if strong else "max_worker_seconds"],
-            deadline)
-    except TimeoutError:
-        if reservation is not None:
-            # No child was launched, so this reservation is safely released.
-            try:
-                release_route_grant(
-                    authorization_state, grant_dir or run_dir, role, route,
-                    "whole-stage deadline expired before launch",
-                    reservation_id=job_id, cfg=cfg, deadline=deadline)
-            except GrantLedgerTimeout:
-                pass
-        raise
     jpath = archive / f"{kind}-{job_id}"
     jpath.mkdir(parents=True, exist_ok=False)
     dispatch_snapshot = source_snapshot(project)
@@ -6957,9 +7341,63 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             else:
                 continuation = prior["session_id"]
     prompt = prompt.replace("__ABDULLAH_PARENT_JOB__", job_id)
+    # Final launch boundary: re-observe sources after snapshots/preparation.
+    try:
+        drift = _route_identity_recheck(
+            route, preflight, cfg, project, role, deadline=deadline,
+            cancel=(lambda: _run_cancel_requested(authoritative_dir)))
+    except (InterruptedError, TimeoutError) as exc:
+        if reservation is not None:
+            try:
+                release_route_grant(
+                    authorization_state, authoritative_dir, role, route,
+                    str(exc), reservation_id=job_id, cfg=cfg, deadline=deadline)
+            except GrantLedgerTimeout:
+                pass
+        raise
+    if drift:
+        if reservation is not None:
+            try:
+                release_route_grant(
+                    authorization_state, authoritative_dir, role, route,
+                    "route identity drift before launch", reservation_id=job_id,
+                    cfg=cfg, deadline=deadline)
+            except GrantLedgerTimeout:
+                pass
+        rejection_path = jpath / "preflight-rejected.json"
+        rejection = {**preflight, "kind": kind, "job_id": job_id,
+                     "decision": "preflight_rejected",
+                     "reason_code": "route_identity_drift",
+                     "reasons": [drift], "active_job_created": False,
+                     "model_calls_counted": False}
+        atomic_json(rejection_path, rejection)
+        if state is not None:
+            state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
+            state["status"] = "blocked"
+            state["pause_reason"] = "Dispatch blocked: " + drift
+            save(run_dir, state)
+            journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
+                          role=role, kind=kind, reason_code="route_identity_drift",
+                          reasons=[drift])
+        raise RuntimeError(f"Dispatch blocked: {drift} (diagnostic: {rejection_path})")
+    try:
+        timeout = remaining_budget(
+            cfg["limits"]["max_architect_seconds" if strong else "max_worker_seconds"],
+            deadline)
+    except TimeoutError:
+        if reservation is not None:
+            try:
+                release_route_grant(
+                    authorization_state, authoritative_dir, role, route,
+                    "whole-stage deadline expired before launch",
+                    reservation_id=job_id, cfg=cfg, deadline=deadline)
+            except GrantLedgerTimeout:
+                pass
+        raise
     cmd, env, output_format = cli_command(
         route["provider"] if strong else host, role, route, prompt, jpath, continuation,
-        evidence_root=run_dir if role == "architect" else None)
+        evidence_root=run_dir if role == "architect" else None,
+        prepared=launch)
     if state is not None:
         env = dict(env)
         env["ABDULLAH_RUN_ID"] = str(state.get("id") or state.get("run_id") or "")
@@ -11443,6 +11881,10 @@ def authorize_route_run(run_id, role, max_dispatches=1, attestation=None,
                     "configure it before authorizing the alternate")
         else:
             route = primary
+        binding_error = route_material_binding_error(
+            route, config(), Path(state["project"]), role)
+        if binding_error:
+            raise RuntimeError(binding_error)
         billing = route.get("billing")
         attestation = (attestation or "").strip()
         if billing in {"subscription", "free", "local"} and not attestation:
@@ -11491,6 +11933,10 @@ def approve_worker_fallback_run(run_id, role, confirmation=None):
         fallback = route.get("fallback_route")
         if not isinstance(fallback, dict):
             raise RuntimeError(f"No complete fallback route is configured for {role}")
+        binding_error = route_material_binding_error(
+            fallback, config(), Path(state["project"]), role)
+        if binding_error:
+            raise RuntimeError(binding_error)
         state["worker_fallback_authorization"] = {
             "role": role, "route_sha256": route_authorization_sha(fallback),
             "approved_at": now(), "limit": "one dispatch",

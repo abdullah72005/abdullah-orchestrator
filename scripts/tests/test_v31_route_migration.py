@@ -256,7 +256,7 @@ class RouteMigrationTests(unittest.TestCase):
         before = Path(orc.CONFIG_PATH).read_bytes()
         loaded = orc.config()
         self.assertEqual(loaded["schema_version"], 2)
-        route = orc.model_route(loaded, "codex", "implementer")
+        route = orc.model_route(loaded, "codex", "implementer", project=self.project)
         self.assertEqual(route["worker_provider"], "opencode-go")
         self.assertEqual(route["billing"], "go")
         self.assertEqual(Path(orc.CONFIG_PATH).read_bytes(), before)

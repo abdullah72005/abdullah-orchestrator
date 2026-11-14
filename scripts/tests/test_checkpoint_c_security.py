@@ -294,7 +294,7 @@ class CheckpointCSecurity(unittest.TestCase):
 
     def test_model_routes_remain_go_only(self):
         for role in ("explorer", "implementer", "reviewer"):
-            self.assertTrue(orc.model_route(self.cfg, "codex", role)["model"]
+            self.assertTrue(orc.model_route(self.cfg, "codex", role, project=self.project)["model"]
                             .startswith("opencode-go/"))
         broken = self._cfg(); broken["fallback"]["enabled"] = True
         with patch.object(orc, "read_json", return_value=broken):

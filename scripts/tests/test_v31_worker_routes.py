@@ -166,7 +166,7 @@ class WorkerRouteTests(unittest.TestCase):
         self.assertEqual((self.rundir / "state.json").read_bytes(), before)
 
     def test_legacy_all_go_route_is_retained(self):
-        route = orc.model_route(self.cfg, "codex", "implementer")
+        route = orc.model_route(self.cfg, "codex", "implementer", project=self.project)
         self.assertEqual(route["provider"], "opencode")
         self.assertEqual(route["worker_provider"], "opencode-go")
         self.assertEqual(route["model"], "opencode-go/deepseek-v4.1-flash")
@@ -184,7 +184,7 @@ class WorkerRouteTests(unittest.TestCase):
                                "billing": "free"}
         self.write_config(workers)
         for role in ("explorer", "implementer", "reviewer"):
-            route = orc.model_route(self.cfg, "codex", role)
+            route = orc.model_route(self.cfg, "codex", role, project=self.project)
             self.assertEqual(route["provider"], "opencode")
             self.assertTrue(route["worker_provider"])
 
@@ -218,7 +218,7 @@ class WorkerRouteTests(unittest.TestCase):
 
     def test_unapproved_api_route_fails_before_spawn(self):
         self.write_config(self.api_workers())
-        route = orc.model_route(self.cfg, "codex", "implementer")
+        route = orc.model_route(self.cfg, "codex", "implementer", project=self.project)
         self.state["model_routes"] = {"implementer": route}
         orc.save(self.rundir, self.state)
         os.environ["FAKE_HISTORY"] = str(self.root / "history")
@@ -230,7 +230,7 @@ class WorkerRouteTests(unittest.TestCase):
 
     def test_approved_bounded_api_dispatch_exhausts_its_grant(self):
         self.write_config(self.api_workers())
-        route = orc.model_route(self.cfg, "codex", "implementer")
+        route = orc.model_route(self.cfg, "codex", "implementer", project=self.project)
         self.state["model_routes"] = {"implementer": route}
         grant = self.grant("implementer", route, count=1)
         os.environ["FAKE_HISTORY"] = str(self.root / "history")
@@ -314,7 +314,7 @@ class WorkerRouteTests(unittest.TestCase):
 
 
         self.write_config(self.api_workers())
-        route = orc.model_route(self.cfg, "codex", "implementer")
+        route = orc.model_route(self.cfg, "codex", "implementer", project=self.project)
         self.state["model_routes"] = {"implementer": route}
         self.grant("implementer", route)
         with patch.object(orc, "opencode_provider_observation", return_value={
@@ -343,7 +343,7 @@ class WorkerRouteTests(unittest.TestCase):
             "provider": "opencode-go",
             "model": "opencode-go/other-model", "variant": "low", "billing": "go"}
         self.write_config(workers)
-        primary = orc.model_route(self.cfg, "codex", "explorer")
+        primary = orc.model_route(self.cfg, "codex", "explorer", project=self.project)
         fallback = primary["fallback_route"]
         self.state["model_routes"] = {"explorer": primary}
         self.state["retry_session"] = {
@@ -377,7 +377,7 @@ class WorkerRouteTests(unittest.TestCase):
         self.assertEqual(job["route"]["model"], primary["model"])
 
     def test_reviewer_session_is_always_fresh(self):
-        route = orc.model_route(self.cfg, "codex", "reviewer")
+        route = orc.model_route(self.cfg, "codex", "reviewer", project=self.project)
         self.state["model_routes"] = {"reviewer": route}
         self.state["retry_session"] = {
             "role": "reviewer", "session_id": "ses-old", "reconciled": True,
@@ -397,23 +397,26 @@ class WorkerRouteTests(unittest.TestCase):
     def test_free_label_with_custom_endpoint_needs_explicit_attestation(self):
         route = {"provider": "opencode", "worker_provider": "free",
                  "model": "free/model", "effort": "", "billing": "free"}
+        fake_observation = {
+            "available": True, "provider_configured": True,
+            "endpoint_sha256": "abc", "auth_env_names": [], "model_count": 1,
+            "error": None}
+        route["routing_fingerprint"] = orc.routing_fingerprint(
+            route, self.cfg, project=self.project, role="explorer",
+            observation=fake_observation)
         self.state["route_authorizations"] = [{
             "id": "g", "role": "explorer",
             "route_sha256": orc.route_authorization_sha(route),
             "max_dispatches": 1, "used": 0, "attestation": "reviewed free route"}]
-        with patch.object(orc, "opencode_provider_observation", return_value={
-                "available": True, "provider_configured": True,
-                "endpoint_sha256": "abc", "auth_env_names": [], "model_count": 1,
-                "error": None}):
+        with patch.object(orc, "opencode_provider_observation",
+                          return_value=fake_observation):
             result = orc.route_preflight("explorer", route, self.cfg,
                                          self.project, self.state)
         self.assertFalse(result["ok"])
         self.assertIn("custom endpoint", " ".join(result["reasons"]))
         self.state["route_authorizations"][0]["attestation"] = "reviewed free endpoint only"
-        with patch.object(orc, "opencode_provider_observation", return_value={
-                "available": True, "provider_configured": True,
-                "endpoint_sha256": "abc", "auth_env_names": [], "model_count": 1,
-                "error": None}):
+        with patch.object(orc, "opencode_provider_observation",
+                          return_value=fake_observation):
             result = orc.route_preflight("explorer", route, self.cfg,
                                          self.project, self.state)
         self.assertTrue(result["ok"], result["reasons"])
@@ -425,7 +428,7 @@ class WorkerRouteTests(unittest.TestCase):
                                "model": "opencode-zen/explorer-model",
                                "variant": "low", "billing": "api"}
         self.write_config(workers)
-        route = orc.model_route(self.cfg, "codex", "explorer")
+        route = orc.model_route(self.cfg, "codex", "explorer", project=self.project)
         self.assertEqual(route["billing"], "api")
         self.state.update(explorer_policy="on_demand", status="running", phase="plan",
                           model_routes={"explorer": route},
@@ -445,7 +448,7 @@ class WorkerRouteTests(unittest.TestCase):
                          ["explorer"])
 
     def test_provider_failure_is_distinct_from_preflight(self):
-        route = orc.model_route(self.cfg, "codex", "explorer")
+        route = orc.model_route(self.cfg, "codex", "explorer", project=self.project)
         self.state["model_routes"] = {"explorer": route}
         os.environ["FAKE_HISTORY"] = str(self.root / "history")
         os.environ["FAKE_EXIT"] = "1"

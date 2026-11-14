@@ -63,16 +63,26 @@ described as a limitation.
 - **Worker routes and grants are durable.** Per-role OpenCode providers are
   allowed only with explicit billing classification; legacy `go` consent applies
   only to the unchanged `opencode-go` route. Every route that preflight says
-  needs a grant — including non-Go subscription/free/local — reserves exactly one
-  in an independently locked run ledger, so nested Explorer usage survives parent
-  snapshots and concurrent reservations cannot exceed the bound. Effective
-  provider configuration is observed from the selected dialect and merged
-  project/global/system locations; unreadable influential input fails closed.
-  There is no dollar/token cap claim and no automatic fallback.
+  needs a grant — including non-Go subscription/free/local — must carry a
+  resolved material pin; an unpinned or stale schema-3 route is refused with
+  new-run/explicit-migration guidance and is never auto-repinned. Consumption
+  reserves exactly one attempt in an independently locked run ledger, so nested
+  Explorer usage survives parent snapshots and concurrent reservations cannot
+  exceed the bound. Ledger waiting is bounded by configuration and the stage
+  deadline. Effective provider configuration is observed through the pinned V1
+  source boundary or authoritative V2 normalized inspection; a V2 inspector
+  failure, malformed output, plugin skip, unresolved endpoint expansion,
+  account/remote/unknown material or unreadable influential input is
+  `unprovable_routing`, never an implicit Go/default approval. There is no
+  dollar/token cap claim and no automatic fallback.
 - **Source mutation and containment are separate gates.** A read-only stage's
   observed source edit blocks only when the whole execution is proven stopped;
   a live escaped child keeps exact `uncertain` ownership. A leader exit, error
-  class or valid report is not containment proof.
+  class or valid report is not containment proof. Write detection includes
+  ignored executable/config content and nested symlink target content (chains,
+  cycles and directory links); outside, dangling, unreadable or budget-exhausted
+  projections are unprovable and block rather than certifying a clean tree.
+  Boundary snapshots still cannot detect a write restored to identical bytes.
 - **Restore validates before mutation.** `restore-run` parses and checks the
   whole backup (run/project identity, schema, inactive state), writes atomically
   under the lock, and preserves the pre-restore state and backup hash for audit.

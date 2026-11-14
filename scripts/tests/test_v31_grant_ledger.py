@@ -121,10 +121,30 @@ class GrantLedgerTests(unittest.TestCase):
         self.assertIn("preflight", again.stderr)
         self.assertEqual(self.history.read_text().splitlines(), ["explorer"])
 
+    def test_unbound_legacy_route_cannot_authorize_or_reserve(self):
+        route = {"provider": "opencode", "worker_provider": "opencode-zen",
+                 "model": "opencode-zen/explorer-model", "effort": "low",
+                 "billing": "api"}
+        self.state["route_authorizations"] = [{
+            "id": "legacy-grant", "role": "explorer",
+            "route_sha256": orc.route_authorization_sha(route),
+            "max_dispatches": 2, "used": 0, "attestation": "reviewed"}]
+        orc.save(self.rundir, self.state)
+        status = orc.route_authorization_status(
+            self.state, "explorer", route, run_dir=self.rundir)
+        self.assertFalse(status["authorized"])
+        self.assertIn("material binding", status["reason"])
+        with self.assertRaisesRegex(RuntimeError, "material binding"):
+            orc.reserve_route_grant(
+                self.state, self.rundir, "explorer", route,
+                reservation_id="unbound-intent")
+
     def test_legacy_state_consumption_is_not_reset_by_first_ledger_write(self):
         route = {"provider": "opencode", "worker_provider": "opencode-zen",
                  "model": "opencode-zen/explorer-model", "effort": "low",
                  "billing": "api"}
+        route["routing_fingerprint"] = orc.routing_fingerprint(
+            route, self.cfg, project=self.project, role="explorer")
         entry = {"id": "legacy-grant", "role": "explorer",
                  "route_sha256": orc.route_authorization_sha(route),
                  "max_dispatches": 2, "used": 1, "attestation": "reviewed",

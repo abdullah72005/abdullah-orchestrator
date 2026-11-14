@@ -79,6 +79,72 @@ class OpenCodeV2Binary(unittest.TestCase):
         self.assertEqual(len(documents), 1)
         self.assertEqual(documents[0]["info"], fixture["normalized_document"])
 
+    def test_parent_config_above_git_root_is_freshly_observed(self):
+        root = Path(self.tmp.name)
+        home = root / "parent-home"
+        home.mkdir()
+        project = root / "nested" / "repo"
+        project.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        parent = root / "opencode.json"
+        parent.write_text(json.dumps({"providers": {"opencode-go": {
+            "settings": {"baseURL": "https://parent-first.invalid/v1"},
+            "models": {"go-model": {}}}}}))
+        env = {
+            "PATH": str(Path(self.bin).parent) + os.pathsep + os.environ["PATH"],
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "XDG_STATE_HOME": str(home / "state"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_FREE_MODELS": "1",
+        }
+        route = {"provider": "opencode", "worker_provider": "opencode-go",
+                 "model": "opencode-go/go-model", "effort": "low",
+                 "billing": "api"}
+        with patch.dict(os.environ, env, clear=True):
+            first = orc.opencode_provider_observation(
+                route, project=project, cfg=self.cfg, role="explorer")
+            parent.write_text(json.dumps({"providers": {"opencode-go": {
+                "settings": {"baseURL": "https://parent-second.invalid/v1"},
+                "models": {"go-model": {}}}}}))
+            second = orc.opencode_provider_observation(
+                route, project=project, cfg=self.cfg, role="explorer")
+        self.assertIn(str(parent), first["effective_files"])
+        self.assertNotEqual(first["endpoint_sha256"], second["endpoint_sha256"])
+
+    def test_disjoint_legacy_native_providers_match_real_normalizer(self):
+        root = Path(self.tmp.name)
+        home = root / "mixed-home"
+        home.mkdir()
+        project = root / "mixed-repo"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        mixed = {"provider": {"opencode-go": {
+            "options": {"baseURL": "https://legacy-retained.invalid/v1"}}},
+            "providers": {"other-provider": {}}}
+        (project / "opencode.json").write_text(json.dumps(mixed))
+        env = {
+            "PATH": str(Path(self.bin).parent) + os.pathsep + os.environ["PATH"],
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "XDG_STATE_HOME": str(home / "state"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            observed = orc.opencode_provider_observation(
+                {"provider": "opencode", "worker_provider": "opencode-go",
+                 "model": "opencode-go/go-model", "effort": "low",
+                 "billing": "go"},
+                project=project, cfg=self.cfg, role="explorer")
+        self.assertIn("opencode-go", observed["providers"])
+        self.assertIn("other-provider", observed["providers"])
+
     def test_run_help_supports_generated_flags(self):
         result = self._run(["run", "--help"])
         text = (result.stdout or "") + (result.stderr or "")

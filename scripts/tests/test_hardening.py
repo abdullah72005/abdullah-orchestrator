@@ -22,17 +22,20 @@ class HardeningTests(unittest.TestCase):
                     orc.modify('test-run00', 'resume')
         detach.assert_not_called()
 
-    def test_interrupted_worker_remains_uncertain(self):
+    def test_pause_before_launch_prevents_spawn(self):
         fake = self.root / 'opencode'
         fake.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo 1.18.35; exit; fi\nsleep 30\n')
         fake.chmod(0o755)
+        history = self.root / 'pause-history'
         orc.atomic_json(self.rundir / 'control.json', {'action':'pause'})
-        with patch.dict(os.environ, {'PATH':str(self.root) + ':' + os.environ['PATH']}):
+        with patch.dict(os.environ, {'PATH':str(self.root) + ':' + os.environ['PATH'],
+                                     'FAKE_PAUSE_HISTORY': str(history)}):
             with self.assertRaises(InterruptedError):
                 orc.call_model(self.rundir, self.state, self.cfg, 'implementer', 'implementer', 'task', self.project)
         restored = orc.read_json(self.rundir / 'state.json')
-        self.assertEqual(restored['active_job']['status'], 'uncertain')
-        self.assertEqual(len(restored['failed_jobs']), 1)
+        self.assertIsNone(restored.get('active_job'))
+        self.assertFalse(restored.get('failed_jobs'))
+        self.assertFalse(history.exists())
 
     def test_fallback_worker_response_uses_worker_contract(self):
         fake = self.root / 'codex'

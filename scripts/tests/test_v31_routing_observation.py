@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import test_orchestrator as baseline
+from test_v31_route_sources import FAKE_OPENCODE as V2_NORMALIZER
 orc = baseline.orc
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -103,7 +104,15 @@ class RoutingObservationTests(unittest.TestCase):
         baseline.ControlTests.setUp(self)
         self.home = self.root / "routing-home"
         self.home.mkdir()
+        self.v2_bin = self.root / "routing-v2-bin"
+        self.v2_bin.mkdir()
+        fake = self.v2_bin / "fake.py"
+        fake.write_text(V2_NORMALIZER)
+        fake.chmod(0o755)
+        (self.v2_bin / "opencode").symlink_to(fake)
         self.env_patch = patch.dict(os.environ, {
+            "PATH": str(self.v2_bin) + ":" + os.environ["PATH"],
+            "FAKE_OC_VERSION": "2.2.7",
             "HOME": str(self.home), "OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": "",
             "XDG_CONFIG_HOME": "", "OPENCODE_CONFIG": "",
             "OPENCODE_CONFIG_DIR": "", "OPENCODE_CONFIG_CONTENT": "",
@@ -117,6 +126,7 @@ class RoutingObservationTests(unittest.TestCase):
     def configure(self, version="1.18.35"):
         cfg = orc.read_json(orc.HERE / "config.example.json")
         cfg.setdefault("runtime", {})["opencode_version"] = version
+        os.environ["FAKE_OC_VERSION"] = version
         cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = True
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         self.cfg = orc.config()
@@ -587,6 +597,9 @@ class EffectiveChildRoutingTests(unittest.TestCase):
                                      "model|variant|remap|endpoint|package|canonical")
                     # An accurately classified explicit grant may still dispatch.
                     grant_route = dict(route, billing="api")
+                    grant_route["routing_fingerprint"] = orc.routing_fingerprint(
+                        grant_route, self.cfg, project=self.project,
+                        role="explorer")
                     self.state["route_authorizations"] = [{
                         "id": "grant-go-override", "role": "explorer",
                         "route_sha256": orc.route_authorization_sha(grant_route),

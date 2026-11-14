@@ -30,11 +30,24 @@ if 'debug' in args and 'config' in args:
         sys.exit(2)
     if mode == 'sleep':
         pathlib.Path(os.environ['FAKE_OC_PID']).write_text(str(os.getpid()))
+        if os.environ.get('FAKE_OC_CHILD_PID'):
+            import subprocess
+            child = subprocess.Popen(
+                [sys.executable, '-c', 'import time; time.sleep(30)'])
+            pathlib.Path(os.environ['FAKE_OC_CHILD_PID']).write_text(str(child.pid))
         time.sleep(30)
         sys.exit(0)
     if 'FAKE_OC_ENTRIES' in os.environ:
         print(os.environ['FAKE_OC_ENTRIES'])
         sys.exit(0)
+    def load(path):
+        text = path.read_text()
+        if path.suffix == '.jsonc':
+            import re
+            text = re.sub(r'(?m)^\s*//.*$', '', text)
+            text = re.sub(r',\s*([}\]])', r'\1', text)
+        return json.loads(text)
+
     documents = []
     custom = os.environ.get('OPENCODE_CONFIG_DIR')
     home = pathlib.Path(os.environ.get('HOME', ''))
@@ -43,30 +56,30 @@ if 'debug' in args and 'config' in args:
         path = global_dir / name
         if path.is_file():
             documents.append({'type': 'document', 'path': str(path),
-                              'info': json.loads(path.read_text())})
+                              'info': load(path)})
     explicit = os.environ.get('OPENCODE_CONFIG')
     if explicit and pathlib.Path(explicit).is_file():
         documents.append({'type': 'document', 'path': explicit,
-                          'info': json.loads(pathlib.Path(explicit).read_text())})
+                          'info': load(pathlib.Path(explicit))})
     cwd = pathlib.Path.cwd()
     chain = [cwd]
     while chain[-1] != chain[-1].parent:
-        if (chain[-1] / '.git').exists():
-            break
         chain.append(chain[-1].parent)
     disabled = (os.environ.get('OPENCODE_DISABLE_PROJECT_CONFIG', '') or
                 os.environ.get('OPENCODE_CONFIG_PROJECT_DISABLE', '')).lower() in ('1', 'true')
     if not disabled:
         for directory in reversed(chain):
-            path = directory / 'opencode.json'
-            if path.is_file():
-                documents.append({'type': 'document', 'path': str(path),
-                                  'info': json.loads(path.read_text())})
+            for name in ('opencode.json', 'opencode.jsonc'):
+                path = directory / name
+                if path.is_file():
+                    documents.append({'type': 'document', 'path': str(path),
+                                      'info': load(path)})
         for directory in reversed(chain):
-            path = directory / '.opencode' / 'opencode.json'
-            if path.is_file():
-                documents.append({'type': 'document', 'path': str(path),
-                                  'info': json.loads(path.read_text())})
+            for name in ('opencode.json', 'opencode.jsonc'):
+                path = directory / '.opencode' / name
+                if path.is_file():
+                    documents.append({'type': 'document', 'path': str(path),
+                                      'info': load(path)})
     documents.append({'type': 'document',
                       'info': json.loads(os.environ.get('OPENCODE_CONFIG_CONTENT') or '{}')})
     print(json.dumps(documents))
@@ -81,10 +94,13 @@ history = pathlib.Path(os.environ.get('FAKE_OC_HISTORY', '/dev/null'))
 if os.environ.get('FAKE_OC_HISTORY'):
     with history.open('a') as stream:
         stream.write('run\n')
+if os.environ.get('FAKE_OC_CAPTURE'):
+    pathlib.Path(os.environ['FAKE_OC_CAPTURE']).write_text(
+        os.environ.get('OPENCODE_CONFIG_CONTENT', ''))
 role = args[args.index('--agent') + 1].replace('abdullah-', '')
 report = {'contract_version': 2, 'status': 'complete', 'summary': role,
-          'files': [], 'tests': [], 'evidence': [], 'unknowns': [],
-          'blocker': ''}
+          'files': ['app.py'], 'tests': [], 'evidence': ['app.py:1'],
+          'unknowns': [], 'blocker': ''}
 if role in {'architect'}:
     report = {'contract_version': 2, 'status': 'complete', 'summary': 'plan',
               'invariants': ['Keep behavior'], 'blocker': '',
@@ -253,19 +269,22 @@ class RouteSourceTests(unittest.TestCase):
         self.assertEqual(result["classification"], "unprovable_routing")
         self.assertIn("masked", " ".join(result["reasons"]))
 
-    def test_missing_or_failed_inspector_uses_the_bounded_source_adapter(self):
+    def test_failed_inspector_is_unprovable_not_a_source_adapter_fallback(self):
         self.configure("2.2.7")
         self.write_json(self.project / "opencode.json",
                         self.provider("https://source.invalid/v1"))
         os.environ["FAKE_OC_MODE"] = "fail"
         observed = orc.opencode_provider_observation(
             self.route(), project=self.project, cfg=self.cfg, role="explorer")
-        self.assertIsNone(observed["error"])
+        self.assertIn("inspection is unavailable", observed["error"])
         self.assertEqual(observed["inspection"], "source_adapter")
         self.assertEqual(observed["inspection_reason"], "inspector_exit_2")
-        self.assertEqual(
-            observed["endpoint_sha256"],
-            orc.hashlib.sha256(b"https://source.invalid/v1").hexdigest())
+        self.assertNotIn("endpoint_sha256", observed)
+        result = orc.route_preflight("explorer", self.route(), self.cfg,
+                                     self.project, self.state,
+                                     run_dir=self.rundir)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["classification"], "unprovable_routing")
 
     def test_inspector_is_bounded_and_fully_cleaned_up(self):
         self.configure("2.2.7")
@@ -283,33 +302,40 @@ class RouteSourceTests(unittest.TestCase):
         self.assertLess(elapsed, 5.0)
         self.assertEqual(observed["inspection"], "source_adapter")
         self.assertIn("inspector_failed", observed["inspection_reason"])
+        self.assertIn("inspection is unavailable", observed["error"])
         pid = int(pid_file.read_text())
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and orc.process_stat(pid):
             time.sleep(0.05)
         self.assertIsNone(orc.process_stat(pid))
 
-    def test_route_material_drift_after_preflight_spawns_no_child(self):
+    def test_material_source_edit_during_preparation_blocks_and_refunds(self):
         self.configure("1.18.35")
         self.write_json(self.project / "opencode.json",
                         self.provider("https://first.invalid/v1", legacy=True))
         route = self.route(billing="api")
+        route["routing_fingerprint"] = orc.routing_fingerprint(
+            route, self.cfg, project=self.project, role="explorer")
         self.state["model_routes"] = {"explorer": route}
-        self.state["route_authorizations"] = [{
-            "id": "grant-drift", "role": "explorer",
-            "route_sha256": orc.route_authorization_sha(route),
-            "max_dispatches": 1, "used": 0,
-            "attestation": "reviewed endpoint"}]
+        grant = {"id": "grant-drift", "role": "explorer",
+                 "route_sha256": orc.route_authorization_sha(route),
+                 "max_dispatches": 1, "used": 0,
+                 "attestation": "reviewed endpoint"}
+        self.state["route_authorizations"] = [grant]
         orc.save(self.rundir, self.state)
-        first = orc.opencode_provider_observation(
-            route, project=self.project, cfg=self.cfg, role="explorer")
-        second = dict(first, routing_material_sha256="different-material")
-        with patch.object(orc, "opencode_provider_observation",
-                          side_effect=[first, second]):
-            with self.assertRaisesRegex(RuntimeError, "preflight"):
+        orc.register_route_grant(self.rundir, grant)
+        original = orc.source_snapshot
+        def snapshot(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.write_json(self.project / "opencode.json",
+                            self.provider("https://changed.invalid/v1", legacy=True))
+            return result
+        with patch.object(orc, "source_snapshot", side_effect=snapshot):
+            with self.assertRaisesRegex(RuntimeError, "drift|preflight|blocked"):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project)
-        self.assertIsNone(self.state["active_job"])
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertIsNone(state["active_job"])
         self.assertFalse(self.history.exists())
         ledger = orc.load_grant_ledger(self.rundir)
         self.assertEqual(orc._grant_usage(ledger["grants"]["grant-drift"]), 0)
@@ -409,7 +435,7 @@ class RouteSourceTests(unittest.TestCase):
         self.assertEqual(result["classification"], "unprovable_routing")
         self.assertIn("unresolved", " ".join(result["reasons"]))
 
-    def test_malformed_normalized_entry_falls_back_to_the_source_adapter(self):
+    def test_malformed_normalized_entry_is_unprovable(self):
         self.configure("2.2.7")
         self.write_json(self.project / "opencode.json",
                         self.provider("https://source.invalid/v1"))
@@ -417,13 +443,10 @@ class RouteSourceTests(unittest.TestCase):
             {"type": "document", "info": None}])
         observed = orc.opencode_provider_observation(
             self.route(), project=self.project, cfg=self.cfg, role="explorer")
-        self.assertIsNone(observed["error"])
+        self.assertIn("inspection is unavailable", observed["error"])
         self.assertEqual(observed["inspection"], "source_adapter")
         self.assertEqual(observed["inspection_reason"],
                          "inspector_document_without_object_info")
-        self.assertEqual(
-            observed["endpoint_sha256"],
-            orc.hashlib.sha256(b"https://source.invalid/v1").hexdigest())
 
     def test_v1_legacy_config_json_global_file_is_observed(self):
         self.configure("1.18.35")
