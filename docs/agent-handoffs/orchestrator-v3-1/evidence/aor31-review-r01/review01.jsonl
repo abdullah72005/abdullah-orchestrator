@@ -1,0 +1,5 @@
+{"probe": "v1-home-opencode-omitted", "ok": true, "classification": "go_subscription", "files": []}
+{"probe": "v1-legacy-global-order-reversed", "ok": true, "classification": "go_subscription", "endpoint": null}
+{"probe": "v2-fallback-drops-disjoint-legacy-provider", "ok": true, "classification": "go_subscription", "mode": "source_adapter", "providers": ["other-provider"], "warnings": ["effective OpenCode routing was derived from ordered local sources because normalized CLI inspection was unavailable (inspector_exit_2); account/remote/integration sources were not observed", "OpenCode Go entitlement is attested by configuration only; no inference request was made."]}
+{"probe": "child-inline-changes-after-recheck", "outcome": "ReportIngestionError: report_schema_invalid: Completed explorer requires evidence", "captured_providers": {"opencode-go": {"models": {}, "settings": {"baseURL": "https://after-preflight.invalid/v1"}}}, "grant_count": 0, "history": "run\n"}
+{"probe": "nested-runtime-symlink-target", "outcome": "accepted", "before_complete": true, "after_complete": true, "projection_equal": true, "completed": 1}

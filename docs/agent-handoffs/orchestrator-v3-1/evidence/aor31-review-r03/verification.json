@@ -1,0 +1,32 @@
+{
+  "reviewed_head": "2c316d41c9fb281131a6d5196eb2adf20c2c7a2d",
+  "correction_base": "161683d6f51249a99e5964dee9b8c927600fb3e4",
+  "original_base": "b9139946db5684e3e48724b9e1060af355362e82",
+  "architect_executed": {
+    "python": "3.10.12",
+    "focused": {
+      "tests": 117,
+      "skipped": 0,
+      "seconds": 78.067,
+      "exit": 0
+    },
+    "real_v2": {
+      "version": "v2.2.7",
+      "tests": 7,
+      "skipped": 0,
+      "seconds": 16.148,
+      "exit": 0
+    }
+  },
+  "implementer_full_py310_log": {
+    "tests": 812,
+    "skipped": 7,
+    "seconds": 457.193,
+    "hashes_verified": true,
+    "independently_rerun": false
+  },
+  "existing_docker_images_observed_not_run": {
+    "python:3.13-alpine": "sha256:9ef1a599f863231c3d91e941389bfdc4a2d6070557243d54df1a4e57015b960e",
+    "orchestrator-integration-3ornvc:latest": "sha256:10a195991b6a3de3dfe49845526ddfed28078bd22808ab38da2d880295ece579"
+  }
+}

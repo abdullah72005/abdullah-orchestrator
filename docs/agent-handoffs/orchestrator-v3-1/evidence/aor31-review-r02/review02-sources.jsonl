@@ -1,0 +1,3 @@
+{"probe": "v1-relative-explicit-config-resolved-in-wrong-cwd", "ok": true, "classification": "go_subscription", "endpoint": null, "effective_files": ["relative.json"]}
+{"probe": "v1-active-account-store-unobserved", "ok": true, "classification": "go_subscription", "boundary": {"adapter_complete": true, "external_hazards": [], "plugin_config_present": false}, "account_store_in_sources": false}
+{"probe": "v1-discovered-plugin-unobserved", "ok": true, "classification": "go_subscription", "boundary": {"adapter_complete": true, "external_hazards": [], "plugin_config_present": false}}

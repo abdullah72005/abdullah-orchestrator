@@ -1,0 +1,2 @@
+{"probe": "public-grant-on-unpinned-route", "grant_recorded": true, "route_has_pin": false, "changed_endpoint_ok": true, "authorized": true, "endpoint_observed": "8b2baea05b99260bcd5488c8a204cdc01877f1f7fa72f3c3cbf9221c0ec55db9"}
+{"probe": "cancel-during-inspection", "outcome": "InterruptedError: Run cancel requested", "elapsed": 2.026733125996543, "inference_spawn_calls_after_cancel": 1, "control": "cancel"}
