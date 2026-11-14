@@ -13,6 +13,9 @@ from unittest.mock import patch
 import test_orchestrator as baseline
 orc = baseline.orc
 
+FIXTURES = Path(__file__).parent / "fixtures"
+V2_VARIANT_FIXTURE = FIXTURES / "opencode-v2.2.7-variant-config.json"
+
 FAKE_CLI = r'''#!/usr/bin/env python3
 import json, pathlib, sys
 
@@ -449,6 +452,57 @@ class EffectiveChildRoutingTests(unittest.TestCase):
         self.assertIsNone(self.state["active_job"])
         self.assertFalse(self.capture.exists())
 
+    def test_authorized_custom_v2_variant_dispatches_without_go_bypass(self):
+        cfg = orc.read_json(orc.HERE / "config.example.json")
+        cfg["runtime"]["opencode_version"] = "2.2.7"
+        cfg["workers"]["explorer"] = {
+            "provider": "local", "model": "local/probe-model",
+            "variant": "low", "billing": "api"}
+        orc.atomic_json(orc.CONFIG_PATH, cfg)
+        self.cfg = orc.config()
+        self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
+        os.environ["FAKE_OPENCODE_VERSION"] = "2.2.7"
+        self.addCleanup(lambda: os.environ.pop("FAKE_OPENCODE_VERSION", None))
+        data = {"providers": {"local": {
+            "settings": {"baseURL": "http://127.0.0.1:11434/v1"},
+            "models": {"probe-model": {"variants": [
+                {"id": "low", "settings": {
+                    "baseURL": "http://127.0.0.1:9999/v1"}},
+                {"id": "high", "settings": {
+                    "baseURL": "http://127.0.0.1:9998/v1"}},
+            ]}}}}}
+        (self.project / "opencode.json").write_text(json.dumps(data))
+        route = orc.model_route(self.cfg, "codex", "explorer",
+                                project=self.project)
+        self.assertEqual(route["billing"], "api")
+        self.state["model_routes"] = {"explorer": route}
+        self.state["route_authorizations"] = [{
+            "id": "grant-custom-variant", "role": "explorer",
+            "route_sha256": orc.route_authorization_sha(route),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "reviewed custom variant endpoint",
+            "actor": {"user": "tester"}, "at": orc.now()}]
+        orc.save(self.rundir, self.state)
+        preflight = orc.route_preflight(
+            "explorer", route, self.cfg, self.project, self.state,
+            run_dir=self.rundir)
+        self.assertTrue(preflight["ok"], preflight["reasons"])
+        self.assertEqual(preflight["classification"], "api")
+        self.assertEqual(preflight["observed"]["endpoint_source"], "variant")
+        report, job = orc.call_model(
+            self.rundir, self.state, self.cfg, "explorer", "explorer",
+            "prompt", self.project)
+        self.assertTrue(self.capture.is_file(), report)
+        captured = json.loads(self.capture.read_text())
+        content = json.loads(captured["config"])
+        self.assertEqual(content["agents"]["abdullah-explorer"],
+                         orc.opencode_profile("explorer", "v2"))
+        selector = captured["argv"][captured["argv"].index("--model") + 1]
+        self.assertEqual(selector, "local/probe-model#low")
+        self.assertIn("--standalone", captured["argv"])
+        self.assertNotIn("--variant", captured["argv"])
+        self.assertEqual(job["preflight"]["classification"], "api")
+
     def test_auth_environment_availability_is_part_of_the_pin_for_both_dialects(self):
         for dialect in ("v1", "v2"):
             with self.subTest(dialect=dialect):
@@ -493,8 +547,15 @@ class EffectiveChildRoutingTests(unittest.TestCase):
                         model[options_key] = {
                             "baseURL": "https://proxy.invalid/v1"}
                     elif layer == "variant":
-                        model["variants"] = {"low": {options_key: {
-                            "baseURL": "https://variant.invalid/v1"}}}
+                        if dialect == "v1":
+                            model["variants"] = {"low": {options_key: {
+                                "baseURL": "https://variant.invalid/v1"}}}
+                        else:
+                            # Supported V2 variants are an array keyed by id.
+                            model["variants"] = [{
+                                "id": "low",
+                                options_key: {
+                                    "baseURL": "https://variant.invalid/v1"}}]
                     else:
                         model["modelID"] = "remapped-upstream"
                     data = {container: {"opencode-go": {
@@ -523,6 +584,188 @@ class EffectiveChildRoutingTests(unittest.TestCase):
                         self.state, run_dir=self.rundir)
                     self.assertTrue(authorized["ok"], authorized["reasons"])
                     self.assertEqual(authorized["classification"], "api")
+
+    def test_captured_v2_variant_fixture_resolves_the_selected_endpoint(self):
+        fixture = json.loads(V2_VARIANT_FIXTURE.read_text())
+        self.assertEqual(fixture["provenance"]["opencode_version"],
+                         "v2.2.7")
+        self.configure_local("v2")
+        (self.project / "opencode.json").write_text(
+            json.dumps(fixture["normalized_document"]))
+        for effort, endpoint in (
+                ("low", "https://variant-low.invalid/v1"),
+                ("high", "https://variant-high.invalid/v1")):
+            with self.subTest(effort=effort):
+                route = {"provider": "opencode", "worker_provider": "opencode-go",
+                         "model": "opencode-go/go-model", "effort": effort,
+                         "billing": "go"}
+                observed = orc.opencode_provider_observation(
+                    route, project=self.project, cfg=self.cfg)
+                self.assertIsNone(observed["error"])
+                self.assertEqual(observed["endpoint_source"], "variant")
+                self.assertEqual(
+                    observed["endpoint_sha256"],
+                    orc.hashlib.sha256(endpoint.encode()).hexdigest())
+                self.assertFalse(observed["go_route"]["qualified"])
+                result = orc.route_preflight(
+                    "explorer", route, self.cfg, self.project, self.state,
+                    run_dir=self.rundir)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["classification"],
+                                 "unqualified_go_route")
+                self.assertIn("variant", " ".join(result["reasons"]))
+        selected = {"provider": "opencode", "worker_provider": "opencode-go",
+                    "model": "opencode-go/go-model", "effort": "low",
+                    "billing": "go"}
+        self.state["model_routes"] = {"explorer": selected}
+        orc.save(self.rundir, self.state)
+        with self.assertRaisesRegex(RuntimeError, "preflight"):
+            orc.call_model(self.rundir, self.state, self.cfg, "explorer",
+                           "explorer", "prompt", self.project)
+        self.assertIsNone(self.state["active_job"])
+        self.assertFalse(self.capture.exists())
+
+    def test_v2_variant_selection_is_by_id_not_position(self):
+        self.configure_local("v2")
+        data = {"providers": {"opencode-go": {
+            "settings": {"baseURL": "https://provider.invalid/v1"},
+            "models": {"go-model": {
+                "settings": {"baseURL": "https://model.invalid/v1"},
+                "variants": [
+                    {"id": "high", "settings": {
+                        "baseURL": "https://variant-high.invalid/v1"}},
+                    {"id": "low", "settings": {
+                        "baseURL": "https://variant-low.invalid/v1"}},
+                ]}}}}}
+        (self.project / "opencode.json").write_text(json.dumps(data))
+        route = {"provider": "opencode", "worker_provider": "opencode-go",
+                 "model": "opencode-go/go-model", "effort": "low",
+                 "billing": "go"}
+        observed = orc.opencode_provider_observation(
+            route, project=self.project, cfg=self.cfg)
+        self.assertEqual(observed["endpoint_source"], "variant")
+        self.assertEqual(
+            observed["endpoint_sha256"],
+            orc.hashlib.sha256(
+                b"https://variant-low.invalid/v1").hexdigest())
+        # The unselected variant must not supply the selected endpoint.
+        self.assertNotEqual(
+            observed["endpoint_sha256"],
+            orc.hashlib.sha256(
+                b"https://variant-high.invalid/v1").hexdigest())
+
+    def test_selected_v2_variant_auth_and_remap_are_observed(self):
+        self.configure_local("v2")
+        data = {"providers": {"opencode-go": {
+            "settings": {},
+            "models": {"go-model": {"variants": [
+                {"id": "low", "settings": {
+                    "apiKey": "{env:REVIEW_ROUTE_KEY}"}},
+                {"id": "high", "settings": {"reasoningEffort": "high"}},
+            ]}}}}}
+        path = self.project / "opencode.json"
+        path.write_text(json.dumps(data))
+        route = {"provider": "opencode", "worker_provider": "opencode-go",
+                 "model": "opencode-go/go-model", "effort": "low",
+                 "billing": "go"}
+        absent = orc.routing_fingerprint(route, self.cfg, project=self.project)
+        os.environ["REVIEW_ROUTE_KEY"] = "dummy-not-a-real-key"
+        self.addCleanup(lambda: os.environ.pop("REVIEW_ROUTE_KEY", None))
+        present = orc.routing_fingerprint(route, self.cfg, project=self.project)
+        self.assertNotEqual(absent, present)
+        observed = orc.opencode_provider_observation(
+            route, project=self.project, cfg=self.cfg)
+        self.assertNotIn("dummy-not-a-real-key", json.dumps(observed))
+        self.assertTrue(observed["auth_mode_sha256"])
+        # A remap on the selected variant must not inherit Go consent.
+        data["providers"]["opencode-go"]["models"]["go-model"]["variants"][0][
+            "modelID"] = "remapped-variant-upstream"
+        path.write_text(json.dumps(data))
+        observed = orc.opencode_provider_observation(
+            route, project=self.project, cfg=self.cfg)
+        self.assertFalse(observed["go_route"]["qualified"])
+        self.assertTrue(any("variant" in reason
+                            for reason in observed["go_route"]["reasons"]))
+        result = orc.route_preflight(
+            "explorer", route, self.cfg, self.project, self.state,
+            run_dir=self.rundir)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["classification"], "unqualified_go_route")
+
+    def test_invalid_v2_variant_shapes_fail_closed_before_spawn(self):
+        self.configure_local("v2")
+        shapes = {
+            "dict": {"low": {"settings": {
+                "baseURL": "https://variant.invalid/v1"}}},
+            "null": None,
+            "scalar": "low",
+            "non_object_entry": ["low"],
+            "missing_id": [{"settings": {
+                "baseURL": "https://variant.invalid/v1"}}],
+            "blank_id": [{"id": " ", "settings": {}}],
+            "duplicate_id": [
+                {"id": "low", "settings": {
+                    "baseURL": "https://variant-a.invalid/v1"}},
+                {"id": "low", "settings": {
+                    "baseURL": "https://variant-b.invalid/v1"}}],
+        }
+        for name, variants in shapes.items():
+            with self.subTest(shape=name):
+                data = {"providers": {"opencode-go": {
+                    "settings": {}, "models": {"go-model": {
+                        "variants": variants}}}}}
+                (self.project / "opencode.json").write_text(json.dumps(data))
+                route = {"provider": "opencode",
+                         "worker_provider": "opencode-go",
+                         "model": "opencode-go/go-model", "effort": "low",
+                         "billing": "go"}
+                result = orc.route_preflight(
+                    "explorer", route, self.cfg, self.project, self.state,
+                    run_dir=self.rundir)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["classification"],
+                                 "unprovable_routing")
+                self.assertIn("variant", " ".join(result["reasons"]))
+                self.assertNotEqual(result["classification"],
+                                    "go_subscription")
+        # An explicit API grant cannot turn an uninspectable variant shape into
+        # an approved route.
+        api_route = dict(route, billing="api")
+        self.state["route_authorizations"] = [{
+            "id": "grant-invalid-shape", "role": "explorer",
+            "route_sha256": orc.route_authorization_sha(api_route),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "reviewed custom endpoint"}]
+        granted = orc.route_preflight(
+            "explorer", api_route, self.cfg, self.project, self.state,
+            run_dir=self.rundir)
+        self.assertFalse(granted["ok"])
+        self.assertEqual(granted["classification"], "unprovable_routing")
+        self.state["model_routes"] = {"explorer": api_route}
+        orc.save(self.rundir, self.state)
+        with self.assertRaisesRegex(RuntimeError, "preflight"):
+            orc.call_model(self.rundir, self.state, self.cfg, "explorer",
+                           "explorer", "prompt", self.project)
+        self.assertIsNone(self.state["active_job"])
+
+    def test_benign_v2_variant_settings_keep_default_go_subscription(self):
+        self.configure_local("v2")
+        data = {"providers": {"opencode-go": {
+            "settings": {}, "models": {"go-model": {"variants": [
+                {"id": "low", "settings": {"reasoningEffort": "low"}},
+                {"id": "high", "settings": {"reasoningEffort": "high"}},
+            ]}}}}}
+        (self.project / "opencode.json").write_text(json.dumps(data))
+        route = {"provider": "opencode", "worker_provider": "opencode-go",
+                 "model": "opencode-go/go-model", "effort": "low",
+                 "billing": "go"}
+        result = orc.route_preflight(
+            "explorer", route, self.cfg, self.project, self.state,
+            run_dir=self.rundir)
+        self.assertTrue(result["ok"], result["reasons"])
+        self.assertEqual(result["classification"], "go_subscription")
+        self.assertIsNone(result["observed"]["endpoint_source"])
+        self.assertTrue(result["observed"]["go_route"]["qualified"])
 
     def test_unchanged_go_route_remains_a_subscription_without_a_grant(self):
         for dialect in ("v1", "v2"):

@@ -1,0 +1,79 @@
+{
+  "provenance": {
+    "opencode_version": "v2.2.7",
+    "command": [
+      "/tmp/ocv2/opencode",
+      "debug",
+      "config",
+      "--standalone"
+    ],
+    "captured": "2026-11-14",
+    "environment": "disposable HOME/XDG + OPENCODE_CONFIG_CONTENT; no credentials, no project, no inference"
+  },
+  "input": {
+    "$schema": "https://opencode.ai/config.json",
+    "providers": {
+      "opencode-go": {
+        "settings": {
+          "baseURL": "https://provider.invalid/v1"
+        },
+        "models": {
+          "go-model": {
+            "settings": {
+              "baseURL": "https://model.invalid/v1"
+            },
+            "variants": [
+              {
+                "id": "low",
+                "settings": {
+                  "baseURL": "https://variant-low.invalid/v1",
+                  "reasoningEffort": "low"
+                }
+              },
+              {
+                "id": "high",
+                "settings": {
+                  "baseURL": "https://variant-high.invalid/v1",
+                  "reasoningEffort": "high"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "normalized_document": {
+    "$schema": "https://opencode.ai/config.json",
+    "providers": {
+      "opencode-go": {
+        "settings": {
+          "baseURL": "https://provider.invalid/v1"
+        },
+        "models": {
+          "go-model": {
+            "settings": {
+              "baseURL": "https://model.invalid/v1"
+            },
+            "variants": [
+              {
+                "id": "low",
+                "settings": {
+                  "baseURL": "https://variant-low.invalid/v1",
+                  "reasoningEffort": "low"
+                }
+              },
+              {
+                "id": "high",
+                "settings": {
+                  "baseURL": "https://variant-high.invalid/v1",
+                  "reasoningEffort": "high"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

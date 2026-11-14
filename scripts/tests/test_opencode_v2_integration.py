@@ -16,6 +16,8 @@ import test_orchestrator as baseline
 
 orc = baseline.orc
 V2_BIN = os.environ.get("ABDULLAH_OPENCODE_V2_BIN")
+VARIANT_FIXTURE = (Path(__file__).parent / "fixtures"
+                   / "opencode-v2.2.7-variant-config.json")
 
 
 @unittest.skipUnless(V2_BIN and Path(V2_BIN).is_file(),
@@ -45,6 +47,37 @@ class OpenCodeV2Binary(unittest.TestCase):
         result = self._run(["--version"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(orc.opencode_dialect(result.stdout.strip(), cfg=self.cfg), "v2")
+
+    def test_captured_variant_config_normalizes_to_the_recorded_document(self):
+        fixture = json.loads(VARIANT_FIXTURE.read_text())
+        version = self._run(["--version"])
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertEqual(
+            version.stdout.strip().replace("opencode ", ""),
+            fixture["provenance"]["opencode_version"])
+        with tempfile.TemporaryDirectory(prefix="ao-v2-variant-") as home:
+            # Credential-free disposable environment: the binary must not read
+            # real user settings while normalizing this captured config.
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": home,
+                "XDG_CONFIG_HOME": os.path.join(home, "config"),
+                "XDG_DATA_HOME": os.path.join(home, "data"),
+                "XDG_CACHE_HOME": os.path.join(home, "cache"),
+                "OPENCODE_DISABLE_AUTOUPDATE": "true",
+                "OPENCODE_DISABLE_FREE_MODELS": "1",
+                "OPENCODE_CONFIG_CONTENT": json.dumps(fixture["input"]),
+            }
+            result = subprocess.run(
+                [self.bin, "debug", "config", "--standalone"], cwd=home,
+                env=env, capture_output=True, text=True, timeout=60,
+                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entries = json.loads(result.stdout)
+        documents = [item for item in entries
+                     if item.get("type") == "document"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0]["info"], fixture["normalized_document"])
 
     def test_run_help_supports_generated_flags(self):
         result = self._run(["run", "--help"])

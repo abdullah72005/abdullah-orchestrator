@@ -1567,6 +1567,57 @@ def _opencode_layer_settings(layer, dialect):
     return value if isinstance(value, dict) else {}
 
 
+def _opencode_variant_error(dialect, model_id, detail):
+    label = "V1" if dialect == "v1" else "V2"
+    return (f"OpenCode {label} variants for model {model_id!r} {detail}; "
+            "selected-variant routing cannot be established")
+
+
+def _opencode_selected_variant(dialect, model_id, model_entry, variant):
+    """Resolve the selected variant using that dialect's supported shape.
+
+    V1 variants are a dictionary keyed by variant id.  Supported V2 variants
+    are an array of objects carrying a unique, non-empty ``id``.  A present but
+    malformed influential shape returns an error instead of silently treating
+    the Go default as unchanged.
+    """
+    if not isinstance(model_entry, dict) or not variant:
+        return None, None
+    if "variants" not in model_entry:
+        return None, None
+    variants = model_entry["variants"]
+    if dialect == "v1":
+        if not isinstance(variants, dict):
+            return None, _opencode_variant_error(
+                dialect, model_id, "must be an object keyed by variant id")
+        entry = variants.get(variant)
+        if entry is None:
+            return None, None
+        if not isinstance(entry, (dict, str)):
+            return None, _opencode_variant_error(
+                dialect, model_id, f"entry {variant!r} must be an object")
+        return entry, None
+    if not isinstance(variants, list):
+        return None, _opencode_variant_error(
+            dialect, model_id,
+            "must be an array of objects with a unique string id")
+    by_id = {}
+    for item in variants:
+        if not isinstance(item, dict):
+            return None, _opencode_variant_error(
+                dialect, model_id, "contains a non-object entry")
+        identifier = item.get("id")
+        if not isinstance(identifier, str) or not identifier.strip():
+            return None, _opencode_variant_error(
+                dialect, model_id,
+                "contains an entry without a non-empty string id")
+        if identifier in by_id:
+            return None, _opencode_variant_error(
+                dialect, model_id, f"repeats variant id {identifier!r}")
+        by_id[identifier] = item
+    return by_id.get(variant), None
+
+
 def _opencode_route_layers(dialect, entry, model_id, variant):
     """Provider, then selected model, then selected variant material."""
     layers = [("provider", entry)]
@@ -1575,19 +1626,15 @@ def _opencode_route_layers(dialect, entry, model_id, variant):
                    if isinstance(models, dict) and model_id else None)
     if isinstance(model_entry, (dict, str)):
         layers.append(("model", model_entry))
-    variant_entry = None
-    if isinstance(model_entry, dict) and variant:
-        variants = model_entry.get("variants")
-        if isinstance(variants, dict):
-            variant_entry = variants.get(variant)
+    variant_entry, error = _opencode_selected_variant(
+        dialect, model_id, model_entry, variant)
     if isinstance(variant_entry, (dict, str)):
         layers.append(("variant", variant_entry))
-    return layers, model_entry, variant_entry
+    return layers, model_entry, variant_entry, error
 
 
-def _opencode_effective_endpoint(dialect, entry, model_id, variant):
+def _opencode_effective_endpoint(dialect, layers):
     """Most specific configured endpoint, matching documented precedence."""
-    layers, _, _ = _opencode_route_layers(dialect, entry, model_id, variant)
     for source, layer in reversed(layers):
         endpoint = _opencode_endpoint(_opencode_layer_settings(layer, dialect))
         if endpoint:
@@ -1674,10 +1721,13 @@ def opencode_provider_observation(route, project=None, dialect=None, cfg=None,
         if isinstance(entry, dict):
             observed["provider_configured"] = True
             settings = _opencode_layer_settings(entry, dialect)
-            _, model_entry, variant_entry = _opencode_route_layers(
-                dialect, entry, model_id, variant)
+            layers, model_entry, variant_entry, layer_error = (
+                _opencode_route_layers(dialect, entry, model_id, variant))
+            if layer_error:
+                observed["error"] = layer_error
+                return observed
             endpoint, endpoint_source = _opencode_effective_endpoint(
-                dialect, entry, model_id, variant)
+                dialect, layers)
             observed["endpoint_source"] = endpoint_source
             observed["endpoint_sha256"] = (
                 hashlib.sha256(_without_url_credentials(endpoint).encode()).hexdigest()
