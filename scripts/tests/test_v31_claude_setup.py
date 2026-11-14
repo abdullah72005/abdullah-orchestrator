@@ -165,32 +165,70 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertIn("abdullah-orchestrator", stored["removed"])
         self.assertIn("unrelated-server", stored["servers"])
 
-    def test_manual_snippets_target_the_interactive_host_and_recommend_five_hours(self):
-        snippets = install_wsl.manual_claude_snippets("/usr/bin/python3", self.skill)
-        self.assertEqual(snippets["settings"]["env"]["CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"], "0")
-        server = snippets["mcp_server"]["abdullah-orchestrator"]
+    def test_manual_snippets_use_separate_real_destinations_and_timeout_path(self):
+        alt = self.root / "claude-config"
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(alt)}):
+            snippets = install_wsl.manual_claude_snippets("/usr/bin/python3",
+                                                          self.skill)
+        self.assertEqual(snippets["settings"]["destination"],
+                         str(alt / "settings.json"))
+        self.assertEqual(snippets["mcp_server"]["destination"],
+                         str(alt / ".claude.json"))
+        self.assertEqual(
+            snippets["settings"]["content"]["env"]
+            ["CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"], "0")
+        server = snippets["mcp_server"]["content"]["abdullah-orchestrator"]
         self.assertEqual(server["timeout"], 18_000_000)
         self.assertEqual(server["command"], "/usr/bin/python3")
         self.assertEqual(server["args"],
                          [str(self.skill / "scripts/orchestrator.py"), "mcp"])
-        self.assertIn("--scope user", snippets["manual_command"])
+        self.assertIn("mcp add-json", snippets["timeout_command"])
+        self.assertIn("--scope", snippets["timeout_command"])
+        self.assertTrue(any("do not put mcpServers in settings.json" in step
+                            for step in snippets["merge_steps"]))
         self.assertIn("/mcp", " ".join(snippets["verify"]))
 
-    def test_host_settings_fixture_is_mergeable_without_writing_real_settings(self):
-        home = self.root / "home"
-        (home / ".claude").mkdir(parents=True)
-        settings = home / ".claude/settings.json"
+    def test_disposable_settings_and_user_mcp_stores_are_kept_separate(self):
+        root = self.root / "disposable-claude"
+        settings = root / "settings.json"
+        mcp_store = root / ".claude.json"
+        root.mkdir(parents=True)
         settings.write_text(json.dumps({"theme": "dark"}))
-        snippets = install_wsl.manual_claude_snippets("/usr/bin/python3", self.skill)
-        merged = json.loads(settings.read_text())
-        merged.setdefault("env", {}).update(snippets["settings"]["env"])
-        merged.setdefault("mcpServers", {}).update(snippets["mcp_server"])
-        self.assertEqual(merged["theme"], "dark")
-        self.assertEqual(merged["env"]["CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"], "0")
-        self.assertEqual(merged["mcpServers"]["abdullah-orchestrator"]["timeout"],
-                         18_000_000)
-        # The helper still returns data; it never writes the developer's file.
-        self.assertEqual(json.loads(settings.read_text()), {"theme": "dark"})
+        mcp_store.write_text(json.dumps({"mcpServers": {
+            "unrelated-server": {"type": "stdio", "command": "/usr/bin/other",
+                                 "args": ["serve"]}}}))
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(root)}):
+            snippets = install_wsl.manual_claude_snippets("/usr/bin/python3",
+                                                          self.skill)
+            host = json.loads(settings.read_text())
+            host.setdefault("env", {}).update(
+                snippets["settings"]["content"]["env"])
+            store = json.loads(mcp_store.read_text())
+            store.setdefault("mcpServers", {}).update(
+                snippets["mcp_server"]["content"])
+        self.assertEqual(host["theme"], "dark")
+        self.assertEqual(host["env"]["CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS"], "0")
+        self.assertNotIn("mcpServers", host)
+        self.assertIn("unrelated-server", store["mcpServers"])
+        self.assertEqual(
+            store["mcpServers"]["abdullah-orchestrator"]["timeout"], 18_000_000)
+        # The helper never writes the developer's files.
+        self.assertIn("unrelated-server", mcp_store.read_text())
+        self.assertNotIn("abdullah-orchestrator", settings.read_text())
+
+    def test_repeated_registration_and_manual_merge_are_idempotent(self):
+        self.register()
+        before = self.state.read_bytes()
+        result = self.register()
+        self.assertFalse(result["changed"])
+        self.assertEqual(self.state.read_bytes(), before)
+        snippets = install_wsl.manual_claude_snippets("/usr/bin/python3",
+                                                      self.skill)
+        store = {"mcpServers": {}}
+        store["mcpServers"].update(snippets["mcp_server"]["content"])
+        first = json.dumps(store, sort_keys=True)
+        store["mcpServers"].update(snippets["mcp_server"]["content"])
+        self.assertEqual(json.dumps(store, sort_keys=True), first)
 
 
 if __name__ == "__main__":

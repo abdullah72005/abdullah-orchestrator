@@ -25,20 +25,60 @@ def manual_claude_command(python=None, skill=None):
             str((skill / "scripts/orchestrator.py").resolve()), "mcp"]
 
 
+def claude_config_paths():
+    """Effective user settings and user-scoped MCP store for the Claude CLI."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured and configured.strip():
+        root = Path(configured).expanduser()
+        return {"settings": root / "settings.json",
+                "mcp_store": root / ".claude.json",
+                "root": root}
+    home = Path.home()
+    return {"settings": home / ".claude" / "settings.json",
+            "mcp_store": home / ".claude.json",
+            "root": home / ".claude"}
+
+
 def manual_claude_snippets(python=None, skill=None):
-    """Mergeable host configuration; the installer never writes real settings."""
+    """Separate host-settings and user MCP-store snippets; never write them."""
     command = manual_claude_command(python, skill)
+    server = {
+        "type": "stdio",
+        "command": command[9],
+        "args": [command[10], command[11]],
+        "timeout": RECOMMENDED_SERVER_TIMEOUT_MS,
+    }
+    add_json = ["claude", "mcp", "add-json", "--scope", "user",
+                MCP_SERVER_NAME, json.dumps(server, separators=(",", ":"))]
+    paths = claude_config_paths()
     return {
         "shell": "export CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0",
-        "settings": {"env": dict(FOREGROUND_ENV)},
-        "mcp_server": {MCP_SERVER_NAME: {
-            "type": "stdio",
-            "command": command[9],
-            "args": [command[10], command[11]],
-            "timeout": RECOMMENDED_SERVER_TIMEOUT_MS}},
+        "settings": {
+            "destination": str(paths["settings"]),
+            "content": {"env": dict(FOREGROUND_ENV)},
+        },
+        "mcp_server": {
+            "destination": str(paths["mcp_store"]),
+            "content": {MCP_SERVER_NAME: server},
+        },
         "manual_command": " ".join(shlex.quote(item) for item in command),
+        "timeout_command": " ".join(shlex.quote(item) for item in add_json),
+        "merge_steps": [
+            f"Merge the foreground env keys into {paths['settings']} (user scope) "
+            "or export them in the interactive host environment before launch.",
+            f"Merge the server entry into the user-scoped MCP store {paths['mcp_store']}; "
+            "do not put mcpServers in settings.json.",
+            "`claude mcp add` does not install the per-server timeout. Either register "
+            "with the printed `claude mcp add-json` command or add "
+            f"\"timeout\": {RECOMMENDED_SERVER_TIMEOUT_MS} to the existing entry in "
+            f"{paths['mcp_store']}.",
+            "Preserve unrelated settings and MCP servers; re-running the installer "
+            "must be a no-op for an identical registration.",
+        ],
         "verify": ["Run /mcp inside Claude Code and confirm the server is connected.",
                    "Run `claude mcp get abdullah-orchestrator` to inspect scope/command.",
+                   f"Confirm the user MCP entry in {paths['mcp_store']} has "
+                   f"timeout {RECOMMENDED_SERVER_TIMEOUT_MS}.",
                    "A foreground tool call should not auto-background; Ctrl-C/Esc should "
                    "cancel it and the supervisor should preserve recoverable state."],
         "manual_limit": ("Fake CLI tests and documented snippets do not prove the real "
@@ -248,9 +288,16 @@ def install(argv=None):
               " Claude MCP server:", MCP_SERVER_NAME)
         print("Manual command:", result["snippets"]["manual_command"])
         print("Interactive host environment:", result["snippets"]["shell"])
-        print("Mergeable host snippet:", json.dumps(
-            {"env": result["snippets"]["settings"]["env"],
-             "mcpServers": result["snippets"]["mcp_server"]}, indent=2))
+        print("Foreground host settings snippet (destination "
+              + result["snippets"]["settings"]["destination"] + "):")
+        print(json.dumps(result["snippets"]["settings"]["content"], indent=2))
+        print("User MCP server snippet (destination "
+              + result["snippets"]["mcp_server"]["destination"] + "):")
+        print(json.dumps(result["snippets"]["mcp_server"]["content"], indent=2))
+        print("Manual step that installs the timeout:")
+        print("  " + result["snippets"]["timeout_command"])
+        for item in result["snippets"]["merge_steps"]:
+            print("Merge:", item)
         for item in result["snippets"]["verify"]:
             print("Verify:", item)
     print("MCP registration command:")
