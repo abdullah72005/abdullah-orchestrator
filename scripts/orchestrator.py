@@ -92,6 +92,10 @@ CONFIG_SCHEMA_VERSION = 3
 READ_ONLY_STAGE_KINDS = frozenset({"plan", "diagnose", "decision", "integration",
                                   "explorer", "reviewer"})
 DECISION_BINDING_VERSION = 1
+# Review and acceptance authority is bound to a durable epoch.  Verification
+# recovery increments it so pre-invalidation reports cannot be reused after
+# fresh checks of identical source.  Implementation eligibility is unaffected.
+AUTHORITY_EPOCH_KINDS = frozenset({"reviewer", "decision"})
 SENSITIVE_OPERATOR_COMMANDS = {"adopt", "retire", "checkout-recover",
                                "acknowledge-legacy-evidence", "migrate-run", "cancel",
                                "restore-run"}
@@ -5495,6 +5499,73 @@ def provenance_drift(recorded, current):
     return diffs
 
 
+# Environment and toolchain provenance never contains raw environment values.
+# A bounded, leaf-level diff is therefore safe to persist as recovery audit data.
+PROVENANCE_LEAF_LIMIT = 60
+REVIEW_RECOVERABLE_DIMENSIONS = frozenset(
+    {"environment", "toolchain", "check_executable"})
+
+
+def _bounded_leaf_diff(recorded, current, *, limit=PROVENANCE_LEAF_LIMIT):
+    """Return safe field-level before/after identities for already-hashed data."""
+    differences = []
+
+    def walk(old, new, path):
+        if len(differences) >= limit:
+            return
+        if isinstance(old, dict) and isinstance(new, dict):
+            for key in sorted(set(old) | set(new), key=str):
+                walk(old.get(key), new.get(key), path + [str(key)])
+            return
+        if old != new:
+            differences.append({"field": ".".join(path),
+                                "recorded": old, "current": new})
+
+    walk(recorded, current, [])
+    return differences
+
+
+def _provenance_recovery_fields(recorded, current, dimensions):
+    """Map drift dimensions to safe leaf identities; never raw env values."""
+    projected = {}
+    for dimension in sorted(set(dimensions)):
+        if dimension == "runtime_inputs_complete":
+            projected[dimension] = _bounded_leaf_diff(
+                (recorded.get("runtime_inputs") or {}).get("complete"),
+                (current.get("runtime_inputs") or {}).get("complete"))
+        elif dimension in {"environment", "toolchain", "configuration",
+                           "runtime_inputs"}:
+            projected[dimension] = _bounded_leaf_diff(
+                recorded.get(dimension), current.get(dimension))
+        else:
+            projected[dimension] = []
+    return projected
+
+
+class VerificationEvidenceRejected(ValueError):
+    """Classified, structured refusal of a verification evidence record.
+
+    The subclass keeps the historical ``ValueError`` contract for existing
+    callers while carrying stable reason codes, provenance dimensions and
+    content-free field identities.  English exception text is never parsed.
+    """
+
+    def __init__(self, message, *, code, dimensions=(), fields=None,
+                 recoverable=False, details=None):
+        super().__init__(message)
+        self.code = code
+        self.dimensions = list(dimensions)
+        self.fields = fields or {}
+        self.recoverable = bool(recoverable)
+        self.details = details or {}
+
+    def as_dict(self):
+        return {"message": str(self), "code": self.code,
+                "dimensions": list(self.dimensions),
+                "recoverable": self.recoverable,
+                "fields": self.fields, "details": self.details}
+
+
 class SourceMutationError(RuntimeError):
     """A read-only stage changed candidate source; artifacts are preserved."""
 
@@ -8273,6 +8344,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
            "path": str(jpath), "created_at": now(), "pid": None,
            "preflight": preflight,
            "amendment_epoch": (state.get("amendment_epoch", 0) if state is not None else 0),
+           "authority_epoch": (state.get("authority_epoch", 0) if state is not None else 0),
            "launch_file": str(jpath / "launch.json"),
            "continued_session": continuation}
     if state is not None:
@@ -9304,6 +9376,11 @@ def cached_job_report(run_dir, state, kind):
         return None
     if last.get("amendment_epoch", 0) != state.get("amendment_epoch", 0):
         return None
+    if (kind in AUTHORITY_EPOCH_KINDS
+            and last.get("authority_epoch", 0) != state.get("authority_epoch", 0)):
+        # A report produced before verification authority was invalidated can
+        # never be reused, even when source is byte-identical after fresh checks.
+        return None
     job_path = Path(last.get("path", ""))
     if kind in READ_ONLY_STAGE_KINDS:
         integrity = validate_preserved_stage_source(last, job_path, kind)
@@ -9615,7 +9692,8 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
                    for item in latest.get("failed_jobs", [])):
             raise RuntimeError("Failed job disappeared during report recovery")
         latest.setdefault("report_recoveries", []).append({
-            **record, "recovery_path": str(recovery_path)})
+            **record, "recovery_path": str(recovery_path),
+            "authority_epoch": latest.get("authority_epoch", 0)})
         save(folder, latest)
         journal_event(folder, latest, "report_recovered", job_id=job_id,
                       kind=kind, role=job.get("role"), session_id=session_id,
@@ -9630,7 +9708,10 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
 def cached_recovered_job_report(run_dir, state, kind):
     """A validated recovery record may feed the next stage without a model call."""
     records = [record for record in state.get("report_recoveries", [])
-               if record.get("kind") == kind]
+               if record.get("kind") == kind
+               and (kind not in AUTHORITY_EPOCH_KINDS
+                    or record.get("authority_epoch", 0)
+                    == state.get("authority_epoch", 0))]
     if not records:
         return None
     record = records[-1]
@@ -9704,8 +9785,15 @@ def _bounded_log_text(path, *, success, limit=EVIDENCE_LOG_LIMIT,
     """Return a bounded log view and its provenance; missing logs fail closed."""
     log = Path(path)
     if not log.is_file():
-        raise ValueError(f"Verification log is missing: {log}")
-    raw = log.read_bytes()
+        raise VerificationEvidenceRejected(
+            f"Verification log is missing: {log}", code="log_missing",
+            details={"log": str(log)})
+    try:
+        raw = log.read_bytes()
+    except OSError as exc:
+        raise VerificationEvidenceRejected(
+            f"Verification log is unreadable: {log}: {exc}", code="log_unreadable",
+            details={"log": str(log)}) from exc
     digest = hashlib.sha256(raw).hexdigest()
     text = raw.decode("utf-8", errors="replace")
     truncated = False
@@ -9729,58 +9817,110 @@ def _bounded_log_text(path, *, success, limit=EVIDENCE_LOG_LIMIT,
 def load_verification_evidence(reference, current, *, plan_version=None):
     """Load and validate the source/provenance binding of a verification record.
 
-    Returns the parsed record plus integrity metadata. Raises when the record
-    is missing, stale, from another plan revision, or when the toolchain /
+    Returns the parsed record plus integrity metadata. Raises a classified
+    :class:`VerificationEvidenceRejected` (a ``ValueError``) when the record is
+    missing, stale, from another plan revision, or when the toolchain /
     environment / configuration drifted since the checks ran.
     """
+    details = {}
+
+    def reject(message, code, *, dimensions=(), fields=None, recoverable=None):
+        if recoverable is None:
+            recoverable = (bool(dimensions)
+                           and set(dimensions) <= REVIEW_RECOVERABLE_DIMENSIONS)
+        raise VerificationEvidenceRejected(
+            message, code=code, dimensions=dimensions, fields=fields or {},
+            recoverable=recoverable, details=dict(details))
+
     if not isinstance(reference, dict) or not reference.get("path"):
-        raise ValueError("Verification evidence reference is missing")
-    path = Path(reference["path"])
+        reject("Verification evidence reference is missing", "reference_missing")
+    try:
+        path = Path(reference["path"])
+    except (TypeError, ValueError):
+        reject("Verification evidence reference is invalid", "reference_missing")
     if not path.is_file():
-        raise ValueError(f"Verification record is missing: {path}")
-    record_bytes = path.read_bytes()
+        reject(f"Verification record is missing: {path}", "record_missing")
+    try:
+        record_bytes = path.read_bytes()
+    except OSError as exc:
+        reject(f"Verification record is unreadable: {path}: {exc}",
+               "record_unreadable")
     record_sha = hashlib.sha256(record_bytes).hexdigest()
-    evidence = read_json(path)
+    details["record_sha256"] = record_sha
+    try:
+        evidence = read_json(path)
+    except (OSError, ValueError) as exc:
+        reject(f"Verification record is unreadable: {path}: {exc}",
+               "record_unreadable")
+    if not isinstance(evidence, dict):
+        reject(f"Verification record is unreadable: {path}: not a JSON object",
+               "record_unreadable")
+    try:
+        evidence_version = int(evidence.get("evidence_version", 1) or 1)
+    except (TypeError, ValueError):
+        reject(f"Verification record has an invalid evidence version: {path}",
+               "record_unreadable")
+    details.update({
+        "evidence_version": evidence_version,
+        "candidate_hash": evidence.get("candidate_hash"),
+        "passed": evidence.get("passed"),
+        "source_unchanged": evidence.get("source_unchanged"),
+        "batch": evidence.get("batch"), "final": evidence.get("final"),
+        "commands": [{"argv": item.get("argv"),
+                      "returncode": item.get("returncode")}
+                     for item in evidence.get("commands", [])
+                     if isinstance(item, dict)],
+    })
     fingerprint = signature(current)
     if reference.get("passed") is not True or reference.get("candidate_hash") != fingerprint:
-        raise ValueError("Verification reference is stale or not passed")
+        reject("Verification reference is stale or not passed", "reference_stale")
     if not (evidence.get("passed") is True and evidence.get("source_unchanged") is True):
-        raise ValueError("Verification record is not a passed, source-unchanged run")
+        reject("Verification record is not a passed, source-unchanged run",
+               "evidence_not_passed")
     if plan_version is not None and evidence.get("plan_version") not in (None, plan_version):
-        raise ValueError(
+        reject(
             "Verification evidence belongs to a different plan revision; "
-            "re-run verification for the current plan")
+            "re-run verification for the current plan", "plan_changed")
     if evidence.get("candidate_hash") != fingerprint or evidence.get("after_hash") != fingerprint:
-        raise ValueError("Verification fingerprints do not match the current candidate")
+        reject("Verification fingerprints do not match the current candidate",
+               "source_changed")
     if (signature(evidence.get("candidate")) != signature(current)
             or signature(evidence.get("after")) != signature(current)):
-        raise ValueError("Verification source snapshot does not match the current candidate")
-    evidence_version = int(evidence.get("evidence_version", 1) or 1)
+        reject("Verification source snapshot does not match the current candidate",
+               "source_changed")
     provenance = evidence.get("provenance") or {}
     provenance_complete = bool(provenance.get("source", {}).get("provenance_complete"))
     if evidence_version >= VERIFICATION_EVIDENCE_VERSION:
         if provenance.get("version") != SOURCE_PROVENANCE_VERSION:
-            raise ValueError("Versioned verification evidence has missing or incompatible provenance")
+            reject("Versioned verification evidence has missing or incompatible provenance",
+                   "provenance_incompatible")
         if signature(provenance.get("source")) != signature(current):
-            raise ValueError("Verification provenance source does not match the current candidate")
+            reject("Verification provenance source does not match the current candidate",
+                   "source_changed")
         if not provenance_complete:
-            raise ValueError("Versioned verification evidence has an incomplete runtime-input manifest")
+            reject("Versioned verification evidence has an incomplete runtime-input manifest",
+                   "provenance_incomplete")
         drift = provenance_drift(provenance, current)
         if drift:
-            raise ValueError(
+            reject(
                 "Verification provenance drifted since the check: "
                 + ", ".join(drift)
-                + ". Re-run verification instead of reusing stale evidence.")
+                + ". Re-run verification instead of reusing stale evidence.",
+                "provenance_drift", dimensions=drift,
+                fields=_provenance_recovery_fields(provenance, current, drift))
         recorded_tools = provenance.get("check_toolchain")
         if recorded_tools is not None:
             current_tools = check_toolchain_identity(
                 evidence.get("commands") and [item.get("argv") or []
                                               for item in evidence.get("commands")])
             if recorded_tools != current_tools:
-                raise ValueError(
+                reject(
                     "Verification toolchain drifted since the check: a verification "
                     "executable was replaced. Re-run verification instead of reusing "
-                    "stale evidence.")
+                    "stale evidence.",
+                    "check_executable_drift", dimensions=["check_executable"],
+                    fields={"check_executable": _bounded_leaf_diff(
+                        recorded_tools, current_tools)})
     return {"evidence": evidence, "record_sha256": record_sha,
             "fingerprint": fingerprint, "evidence_version": evidence_version,
             "provenance": provenance, "provenance_complete": provenance_complete}
@@ -9807,7 +9947,10 @@ def verification_evidence_package(reference, current, *, run_id=None,
     commands = []
     for command in evidence.get("commands", []):
         if not isinstance(command, dict) or not command.get("log"):
-            raise ValueError("Verification command has no log reference")
+            raise VerificationEvidenceRejected(
+                "Verification command has no log reference",
+                code="evidence_incomplete",
+                details={"verification_sha256": record_sha})
         success = command.get("returncode") == 0
         log = _bounded_log_text(command["log"], success=success,
                                 limit=log_limit, failure_limit=failure_log_limit)
@@ -9950,6 +10093,288 @@ def certified_exploration(run_dir, state, plan):
 def reviewer_verification_package(reference, current, run_id=None, plan_version=None):
     return verification_evidence_package(reference, current, run_id=run_id,
                                          plan_version=plan_version)
+
+
+def _review_plan_guard(state):
+    """Return the current batch only when the approved plan is byte-bound."""
+    plan = state.get("plan")
+    if not isinstance(plan, dict):
+        raise VerificationEvidenceRejected(
+            "Review requires the approved plan", code="plan_missing",
+            details={"batch_index": state.get("batch_index", 0)})
+    version = state.get("plan_version")
+    if not version or content_hash(plan) != version:
+        raise VerificationEvidenceRejected(
+            "Plan content no longer matches its approved version; a new plan "
+            "approval is required", code="plan_changed",
+            details={"plan_version": version,
+                     "batch_index": state.get("batch_index", 0)})
+    batches = plan.get("batches")
+    index = state.get("batch_index", 0)
+    if (not isinstance(batches, list) or not isinstance(index, int)
+            or index < 0 or index >= len(batches)):
+        raise VerificationEvidenceRejected(
+            "Review batch position is outside the approved plan",
+            code="batch_invalid",
+            details={"batch_index": index,
+                     "batch_count": len(batches) if isinstance(batches, list) else None})
+    return batches[index]
+
+
+def _last_job_id(state, kind):
+    for job in reversed(state.get("completed_jobs", [])):
+        if job.get("kind") == kind:
+            return job.get("id")
+    return None
+
+
+def _review_recovery_precondition(state, cfg, project, current, rejection):
+    """Return (code, message, advice) when rewind is not permitted."""
+    job = state.get("active_job") or {}
+    if state.get("active_check") or job or state.get("status") == "uncertain":
+        return ("active_execution",
+                "Review verification recovery is blocked by an active or uncertain "
+                "job/check; containment and reconciliation remain authoritative",
+                "Inspect and reconcile the exact active/uncertain execution first. "
+                "Recovery never clears an owner or uncertain verification.")
+    if not rejection.recoverable:
+        return (rejection.code,
+                str(rejection),
+                "Inspect the classified change. Restore the approved source, plan, "
+                "configuration or runtime input, or obtain an explicit new plan/"
+                "correction. This stale record will not be reused.")
+    try:
+        batch = _review_plan_guard(state)
+    except VerificationEvidenceRejected as exc:
+        return (exc.code, str(exc),
+                "Restore the approved plan/version or obtain an explicit new plan "
+                "approval, then resume. This stale record will not be reused.")
+    reference = state.get("verification") or {}
+    details = rejection.details or {}
+    try:
+        reference_version = int(reference.get("evidence_version", 1) or 1)
+        evidence_version = int(details.get("evidence_version", 1) or 1)
+    except (TypeError, ValueError):
+        reference_version = evidence_version = 0
+    if (reference_version < VERIFICATION_EVIDENCE_VERSION
+            or evidence_version < VERIFICATION_EVIDENCE_VERSION):
+        return ("legacy_evidence",
+                "Legacy verification evidence cannot authorize review",
+                "Re-run the approved checks to obtain modern attested evidence.")
+    planned_batch = details.get("batch")
+    if planned_batch is not None and planned_batch != batch.get("title"):
+        return ("batch_mismatch",
+                "Verification evidence belongs to a different batch",
+                "Restore the approved evidence/batch position or obtain a new plan "
+                "approval, then resume.")
+    approved = [list(check) for check in batch.get("checks", [])
+                if isinstance(check, list) and check]
+    recorded = [item.get("argv") for item in details.get("commands", [])
+                if isinstance(item, dict)]
+    if not approved or recorded != approved:
+        return ("checks_changed",
+                "Verification evidence commands do not match the approved checks",
+                "Restore the approved checks or approve a revised plan, then resume. "
+                "No checks were executed.")
+    try:
+        policy = risk_policy(batch.get("risk"), cfg)
+    except ValueError as exc:
+        return ("policy_invalid", "Risk policy is invalid: " + str(exc),
+                "Correct risk_policy configuration or approve a revised plan, then resume.")
+    distinct = {tuple(check) for check in approved}
+    if len(distinct) < policy["minimum_checks"]:
+        return ("policy_minimum_checks",
+                f"Risk class {policy['risk']} now requires at least "
+                f"{policy['minimum_checks']} distinct checks",
+                "Approve a revised plan/check set or correct risk policy, then resume. "
+                "No checks were executed.")
+    runtime = current.get("runtime_inputs") or {}
+    if not runtime.get("complete") or runtime.get("truncated"):
+        return ("runtime_inputs_incomplete",
+                "The current runtime-input manifest is incomplete",
+                "Narrow verification.runtime_inputs or attest the required inputs, "
+                "then resume. No checks were executed.")
+    for argv in approved:
+        if not argv or not all(isinstance(item, str) for item in argv):
+            return ("checks_changed",
+                    "Approved verification checks are not argv arrays",
+                    "Approve a corrected plan check set, then resume. No checks were executed.")
+        if shutil.which(argv[0]) is None:
+            return ("check_executable_unavailable",
+                    f"Verification command executable is no longer resolvable: {argv[0]}",
+                    f"Restore {argv[0]!r} or approve a revised plan check, then resume. "
+                    "No checks were executed.")
+        try:
+            decision = verification_command_policy(argv, cfg, project=project)
+        except ValueError as exc:
+            return ("command_policy_invalid",
+                    "Verification command policy is invalid: " + str(exc),
+                    "Correct verification.command_policy or approve a revised plan "
+                    "check, then resume. No checks were executed.")
+        if not decision.get("allowed"):
+            reasons = ", ".join(decision.get("rejected_reasons") or ["policy"])
+            return ("command_disallowed",
+                    f"Verification command is rejected by current command policy "
+                    f"({reasons}): {json.dumps(argv, ensure_ascii=False)}",
+                    "Add an operator-authorized verification.command_policy exception "
+                    "or approve a revised plan check, then resume. "
+                    "No checks were executed.")
+    return None
+
+
+def _block_review_verification(state, run_dir, rejection, *, code=None,
+                               message=None, advice=None):
+    record = {
+        "version": 1, "at": now(),
+        "run_id": state.get("id"), "batch_index": state.get("batch_index", 0),
+        "plan_version": state.get("plan_version"),
+        "code": code or rejection.code,
+        "message": message or str(rejection),
+        "dimensions": list(rejection.dimensions),
+        "fields": rejection.fields, "details": rejection.details,
+        "recoverable": bool(rejection.recoverable),
+        "cause": rejection.as_dict(), "advice": advice,
+        "next_action": "orchestrator_resume",
+    }
+    state["verification_rejection"] = record
+    pause_reason = record["message"]
+    if advice:
+        pause_reason = pause_reason.rstrip(". ") + ". Next: " + advice
+    pause_with(run_dir, state, pause_reason, "blocked")
+    try:
+        journal_event(run_dir, state, "verification_review_blocked",
+                      code=record["code"], dimensions=record["dimensions"],
+                      batch_index=record["batch_index"],
+                      next_action="orchestrator_resume", advice=advice)
+    except OSError:
+        # pause_with already persisted the classified rejection; a failed
+        # secondary journal append cannot change the authoritative state.
+        pass
+
+
+def _rewind_review_to_verify(run_dir, state, rejection, reference):
+    """Atomically invalidate review authority and rewind to verification."""
+    details = rejection.details or {}
+    evidence_path = str(Path(reference.get("path")).resolve()) \
+        if reference.get("path") else None
+    recovery_id = content_hash({
+        "run_id": state.get("id"), "batch_index": state.get("batch_index", 0),
+        "plan_version": state.get("plan_version"),
+        "evidence_path": evidence_path,
+        "evidence_sha256": details.get("record_sha256"),
+        "code": rejection.code, "dimensions": rejection.dimensions,
+    })[:16]
+    existing = next((item for item in state.get("review_recoveries", [])
+                     if item.get("id") == recovery_id), None)
+    if (existing and state.get("phase") == "verify"
+            and state.get("verification") is None):
+        # A repeated delivery of the same invalidation is a no-op: authority is
+        # already gone and the audit record is already durable.
+        return existing
+    epoch = (existing.get("authority_epoch") if existing
+             else state.get("authority_epoch", 0) + 1)
+    record = existing or {
+        "version": 1, "id": recovery_id, "at": now(),
+        "action": "invalidate_review_verification",
+        "run_id": state.get("id"),
+        "batch_index": state.get("batch_index", 0),
+        "plan_version": state.get("plan_version"),
+        "plan_sha256": content_hash(state.get("plan") or {}),
+        "reason": str(rejection), "code": rejection.code,
+        "dimensions": list(rejection.dimensions),
+        "differences": rejection.fields,
+        "evidence": {
+            "path": evidence_path,
+            "sha256": details.get("record_sha256"),
+            "candidate_hash": reference.get("candidate_hash"),
+            "passed": reference.get("passed"),
+            "evidence_version": reference.get("evidence_version"),
+        },
+        "before": {
+            "phase": state.get("phase"), "status": state.get("status"),
+            "verification": {key: (state.get("verification") or {}).get(key)
+                             for key in ("path", "passed", "candidate_hash",
+                                         "evidence_version")},
+            "review_present": bool(state.get("review")),
+            "architect_authority": bool(state.get("architect_verdict")
+                                        or state.get("final_verdict")),
+            "reviewer_job_id": _last_job_id(state, "reviewer"),
+            "decision_job_id": _last_job_id(state, "decision"),
+        },
+        "after": {"phase": "verify", "status": "running",
+                  "next_action": "orchestrator_stage"},
+        "authority_epoch": epoch,
+        "preserved": ["verification record and logs", "implementation report",
+                      "job/report history", "prior accepted batches",
+                      "plan", "route grants and usage"],
+        "note": ("Old verification and downstream authority were invalidated "
+                 "without deleting historical artifacts; fresh checks are required."),
+    }
+    recoveries = list(state.get("review_recoveries", []))
+    if not existing:
+        recoveries.append(record)
+    candidate = copy.deepcopy(state)
+    candidate["review_recoveries"] = recoveries
+    candidate["review_recovery"] = record
+    candidate["authority_epoch"] = epoch
+    candidate["verification"] = None
+    candidate["check_progress"] = None
+    candidate.pop("single_batch_verification", None)
+    candidate["review"] = None
+    candidate["architect_verdict"] = None
+    candidate["final_verdict"] = None
+    candidate["final_evidence"] = None
+    candidate.pop("pending_decision_binding", None)
+    candidate.pop("decision_binding", None)
+    candidate.pop("final_decision_binding", None)
+    candidate.pop("verification_interrupted", None)
+    candidate["retry_session"] = None
+    candidate.pop("fallback_authorization", None)
+    candidate["verification_rejection"] = None
+    candidate["phase"] = "verify"
+    candidate["status"] = "running"
+    candidate["pause_reason"] = None
+    save(run_dir, candidate)
+    state.clear()
+    state.update(candidate)
+    try:
+        journal_event(
+            run_dir, state, "review_verification_recovered",
+            recovery_id=recovery_id, code=rejection.code,
+            dimensions=list(rejection.dimensions),
+            batch_index=record["batch_index"],
+            plan_version=record["plan_version"],
+            verification_path=evidence_path,
+            verification_sha256=details.get("record_sha256"),
+            previous_phase="review", authority_epoch=epoch,
+            next_action="orchestrator_stage")
+    except OSError:
+        # State is authoritative: the same audit record is already durable in
+        # the atomic state commit, so an interrupted journal append cannot
+        # resurrect stale authority.
+        pass
+    return record
+
+
+def review_verification_admission(run_dir, state, cfg, project, current):
+    """Return (batch, package) or handle a classified review rejection."""
+    try:
+        batch = _review_plan_guard(state)
+        package = reviewer_verification_package(
+            state.get("verification"), current, run_id=state.get("id"),
+            plan_version=state.get("plan_version"))
+        return batch, package
+    except VerificationEvidenceRejected as exc:
+        precondition = _review_recovery_precondition(
+            state, cfg, project, current, exc)
+        if precondition is None:
+            _rewind_review_to_verify(
+                run_dir, state, exc, state.get("verification") or {})
+        else:
+            code, message, advice = precondition
+            _block_review_verification(
+                state, run_dir, exc, code=code, message=message, advice=advice)
+        return None, None
 
 
 def advance(run_dir, state, cfg, deadline=None):
@@ -10139,9 +10564,15 @@ def advance(run_dir, state, cfg, deadline=None):
             save(run_dir, state)
         return
     if stage == "review":
-        batch = state["plan"]["batches"][state["batch_index"]]
+        current = source_snapshot(project)
+        batch, package = review_verification_admission(
+            run_dir, state, cfg, project, current)
+        if package is None:
+            # Classified rejection: either a durable rewind to verify or a
+            # precise block.  No cached/new model runs in this call.
+            return
         context = {"project": str(project), "batch": batch, "plan_version": state["plan_version"],
-                   "source": source_snapshot(project), "verification": reviewer_verification_package(state["verification"], source_snapshot(project), run_id=state["id"], plan_version=state.get("plan_version")),
+                   "source": current, "verification": package,
                    "invariants": state["plan"].get("invariants", []), "approved_handoff": state.get("approved_handoff"),
                    "instruction": (
                        "Review candidate INDEPENDENTLY: read requirements, changed source and tests first; "
@@ -11821,7 +12252,13 @@ def stage_task(state, stage):
         return (f"Implement batch {state.get('batch_index', 0) + 1}: "
                 f"{batch.get('title', '')} — {batch.get('goal', '')}") if batch else f"Implement: {goal}"
     if stage == "verify":
-        return f"Run supervisor verification: {json.dumps((batch or {}).get('checks', []))}"
+        task = f"Run supervisor verification: {json.dumps((batch or {}).get('checks', []))}"
+        recovery = state.get("review_recovery") or {}
+        if (state.get("verification") is None and recovery
+                and recovery.get("batch_index") == state.get("batch_index", 0)):
+            task = ("Re-run supervisor verification after stale review evidence was "
+                    "invalidated: " + task)
+        return task
     if stage == "review":
         return f"Independently review batch: {(batch or {}).get('title', 'candidate')}"
     if stage == "accept":
@@ -11996,7 +12433,10 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
             "report": compact_report(stage_report(state, stage)),
             "error": error, "pause_reason": state.get("pause_reason"),
             "progress_line": progress, "next_action": next_action_for(state),
-            "next": next_stage_preview(state), "run_dir": str(folder)}
+            "next": next_stage_preview(state),
+            "recovery": (state.get("review_recovery")
+                         if state.get("verification") is None else None),
+            "run_dir": str(folder)}
 
 
 def _checkout_conflict_payload(folder, state, exc):
@@ -12176,6 +12616,8 @@ def status_run(run_id):
                        if job else None),
         "active_check": state.get("active_check"),
         "verification": state.get("verification"),
+        "verification_recovery": state.get("review_recovery"),
+        "verification_rejection": state.get("verification_rejection"),
         "last_implementation": compact_report(state.get("implementation")),
         "last_review": compact_report(state.get("review")),
         "architect_verdict": compact_report(state.get("architect_verdict")),

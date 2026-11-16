@@ -10,7 +10,7 @@ reproduce or challenge the claims.
 python3 -m unittest discover -s scripts/tests
 ```
 
-- **830 tests**, 7 opt-in skips, roughly 12 minutes on a laptop (Python 3.10.12;
+- **853 tests**, 7 opt-in skips, roughly 13 minutes on a laptop (Python 3.10.12;
   CI also targets 3.12/3.13). The 7 skips are the real-OpenCode introspection
   module, which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set. `pytest` may
   show a different skip distribution.
@@ -29,6 +29,7 @@ Coverage areas:
 | Checkout ownership | leases, conflicts, retirement, orphan recovery, adoption, WSL inode fallback |
 | Verification provenance | source/env/config/toolchain drift, runtime-input manifests, Docker source proof, legacy evidence |
 | Acceptance integrity (AOR-01) | `test_v31_acceptance_integrity.py`: late check-executable/source/env/config/runtime/plan drift, evidence-byte replacement, new-record/new-decision, bound crash recovery |
+| Stale-review recovery | `test_v31_review_recovery.py`: incident-shaped PATH drift rewind, environment/check-executable/toolchain classification, unavailable/disallowed checks without execution, nonrecoverable source/plan/config/runtime/incomplete/missing/corrupt/failed/unknown rejection, active/uncertain ownership, atomic crash seams and idempotent journal audit, completed/recovered Reviewer and decision cache disarming, multi-batch history, separate-process stage/resume contention |
 | Read-only stage invariants (AOR-02) | `test_v31_stage_invariants.py`: real Git/fake CLIs, tracked/staged/untracked/HEAD mutation, malformed/nonzero failure paths, recovered-report mismatch |
 | Host and dispatch preflight (AOR-04/05/07) | `test_v31_dispatch_safety.py`: missing host, contradictory resume, provider flags, settings helper/malformed settings, inert AWS creds, durable rejection without a job, spawn-failure distinction, Doctor parity; alternate `CLAUDE_CONFIG_DIR`, provider-managed host, managed settings, fallback/model routing keys, post-Doctor contamination, authorized alternate billing |
 | Claude setup and stage deadline (AOR-03/06) | `test_v31_claude_setup.py`, `test_v31_stage_deadline.py`: idempotent/conflicting registration, rollback, separate settings/MCP-store destinations and timeout path, whole-stage clipping, genuine accept-stage checks+decision timeout |
@@ -109,6 +110,27 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts/tests python3 -m unittest \
   test_v31_runtime_write_integrity test_v31_grant_contention \
   test_v31_stage_deadline -v
 ```
+
+### Stale-review verification recovery (2026-11-16)
+
+Implementer verification at the batch HEAD (Python 3.10.12), no model calls:
+
+| Execution | Result |
+|---|---|
+| New recovery module `test_v31_review_recovery.py` | 23 tests, OK, 0 skips, 52.9 s |
+| Requested regression set (provenance, acceptance, stage invariants, interactive recovery, campaign integration, route migration, containment, billing/quota) | 202 tests, OK, 0 skips, 294.6 s |
+| Full offline suite | 853 tests, OK, 780.2 s, 7 opt-in skips |
+| Original saved reproduction at BASE `5d0b8be` | Exit 0: two blocked/review attempts, 0 model dispatches, old evidence bytes preserved |
+| Same reproduction against the fixed tree | Exit 1 because verification is now `None` and the run has rewound to `verify`; green recovery is covered by the new module |
+
+The new module covers incident-shaped PATH drift, environment/check-executable/
+toolchain classification, unavailable/disallowed commands without execution,
+nonrecoverable source/plan/config/runtime/incomplete/missing/corrupt/failed/
+unknown evidence, active/uncertain ownership, crash seams before/after the
+atomic save and during journal append, idempotent audit, completed/recovered
+Reviewer and decision cache disarming, multi-batch history, and separate-process
+stage/resume serialization. Architect review and rerunning the saved failure are
+still required before acceptance.
 
 ### Correction round r01
 

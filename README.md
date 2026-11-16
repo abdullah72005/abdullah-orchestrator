@@ -349,7 +349,7 @@ independently Architect-approved at
 `0ea5381aa6e1a26e9ee0e1935c494b33800c62ae`. An **independent closure audit and
 real end-to-end testing are still pending**; no stable `v3.1.0` release exists.
 
-- **830 deterministic tests** in the default suite (7 opt-in skips) covering
+- **853 deterministic tests** in the default suite (7 opt-in skips) covering
   state transitions, containment, provenance, command policy, recovery, report
   ingestion, permissions, routing, billing grants, and structured output. No
   model calls; model CLIs are replaced with fakes and a guard blocks real
