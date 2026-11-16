@@ -9505,6 +9505,61 @@ def _journal_failure(folder, job_id):
     return matches[-1] if matches else None
 
 
+def _authority_epoch_value(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _job_authority_epoch(state, job):
+    """Original producing epoch from the failed job/dispatch, never apply time.
+
+    A legacy job with no recorded epoch is compatible only while the run still
+    has its unchanged initial authority. After an invalidation, missing identity
+    cannot prove current authority and is refused.
+    """
+    job_epoch = _authority_epoch_value(job.get("authority_epoch"))
+    job_path = Path(job.get("path", ""))
+    dispatch = _safe_read(job_path / "dispatch.json") if job.get("path") else None
+    dispatch_epoch = (_authority_epoch_value(dispatch.get("authority_epoch"))
+                      if isinstance(dispatch, dict) else None)
+    if job_epoch is None and dispatch_epoch is None:
+        current = _authority_epoch_value(state.get("authority_epoch", 0))
+        return 0 if current == 0 else None
+    if job_epoch is not None and dispatch_epoch is not None and job_epoch != dispatch_epoch:
+        return None
+    return job_epoch if job_epoch is not None else dispatch_epoch
+
+
+def _recovery_authority_current(state, record, job):
+    """Whether a recovered report still belongs to current authority."""
+    if record.get("kind") not in AUTHORITY_EPOCH_KINDS:
+        return True
+    expected_phase = {"reviewer": "review", "decision": "accept"}.get(
+        record.get("kind"))
+    if expected_phase and state.get("phase") != expected_phase:
+        return False
+    if record.get("batch_index") != state.get("batch_index", 0):
+        return False
+    if job.get("kind") != record.get("kind"):
+        return False
+    producing = record.get("producing_job") or {}
+    if producing.get("id") is not None and producing.get("id") != job.get("id"):
+        return False
+    if producing.get("path") is not None and producing.get("path") != job.get("path"):
+        return False
+    current_epoch = _authority_epoch_value(state.get("authority_epoch", 0))
+    job_epoch = _job_authority_epoch(state, job)
+    if current_epoch is None or job_epoch is None:
+        return False
+    if job_epoch != current_epoch:
+        return False
+    if _authority_epoch_value(record.get("authority_epoch")) != current_epoch:
+        return False
+    if (producing.get("epoch") is not None
+            and _authority_epoch_value(producing["epoch"]) != current_epoch):
+        return False
+    return True
+
+
 def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
                    acknowledge=None, data_root=None):
     """Re-extract a preserved worker report without any model call.
@@ -9526,6 +9581,11 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
     jpath = Path(job.get("path", ""))
     if jpath.name != f"{kind}-{job_id}" or jpath.parent != Path(folder) / "jobs":
         raise RuntimeError("Failed job path does not match its recorded identity")
+    producing_epoch = _job_authority_epoch(state, job)
+    if producing_epoch is None:
+        raise RuntimeError(
+            "The failed job has no provable original authority epoch; a fresh "
+            "independent report is required")
     if state.get("status") not in PAUSED_STATES:
         raise RuntimeError("Report recovery requires a paused, non-running run")
     if state.get("active_job"):
@@ -9638,6 +9698,9 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
         "snapshot_tree_files": tree_detail.get("files"),
         "source_signature": signature(before), "git_head": before.get("git_head"),
         "changed": before.get("changed"), "batch_index": state.get("batch_index"),
+        "authority_epoch": producing_epoch,
+        "authority_current": state.get("authority_epoch", 0),
+        "authority_eligible": producing_epoch == state.get("authority_epoch", 0),
         "applied": False,
     }
     if not apply:
@@ -9646,6 +9709,11 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
     if (acknowledge or "").strip() != expected_ack:
         raise RuntimeError(
             f"Applying recovery requires --acknowledge {expected_ack}")
+    if producing_epoch != state.get("authority_epoch", 0):
+        raise RuntimeError(
+            f"Recovered report belongs to invalidated authority epoch "
+            f"{producing_epoch}; current run epoch is "
+            f"{state.get('authority_epoch', 0)}. A fresh independent report is required")
     _operator_action_allowed("recover-report")
     report_path = jpath / "recovered-report.json"
     text_path = jpath / "recovered-report-text.json"
@@ -9676,6 +9744,11 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
                    "changed": before.get("changed"),
                    "runtime_inputs": before.get("runtime_inputs")},
         "batch_index": state.get("batch_index"),
+        "authority_epoch": producing_epoch,
+        "producing_job": {
+            "id": job.get("id"), "kind": kind, "role": job.get("role"),
+            "path": str(jpath), "batch_index": state.get("batch_index"),
+            "phase": expected_phase, "epoch": producing_epoch},
         "repair": repair,
         "note": ("Report was re-extracted from the preserved failed job. The "
                  "failed job remains failed; this record does not claim that "
@@ -9684,22 +9757,47 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
     atomic_json(recovery_path, record)
     with exclusive(folder):
         folder, latest = load(run_id)
+        latest_job = next((item for item in latest.get("failed_jobs", [])
+                           if item.get("id") == job_id), None)
+        if latest_job is None:
+            raise RuntimeError("Failed job disappeared during report recovery")
+        if (latest_job.get("kind") != kind
+                or latest_job.get("role") != job.get("role")
+                or latest_job.get("path") != job.get("path")):
+            raise RuntimeError("Failed job identity changed during report recovery")
         if (latest.get("status") not in PAUSED_STATES or latest.get("active_job")
+                or latest.get("phase") != expected_phase
                 or latest.get("batch_index") != record.get("batch_index")):
             raise RuntimeError(
                 "Run state changed during report recovery; retry explicitly")
-        if not any(item.get("id") == job_id
-                   for item in latest.get("failed_jobs", [])):
-            raise RuntimeError("Failed job disappeared during report recovery")
+        same_kind_latest = [item for item in latest.get("failed_jobs", [])
+                            if item.get("kind") == kind]
+        if not same_kind_latest or same_kind_latest[-1].get("id") != job_id:
+            raise RuntimeError("A newer failed job of the same kind exists")
+        for completed in latest.get("completed_jobs", []):
+            if (completed.get("role") == job.get("role")
+                    and completed.get("created_at", "") > job.get("created_at", "")):
+                raise RuntimeError("Newer completed work exists for this role")
+        latest_epoch = latest.get("authority_epoch", 0)
+        latest_producing = _job_authority_epoch(latest, latest_job)
+        if (latest_producing is None or latest_producing != latest_epoch
+                or latest_producing != producing_epoch):
+            raise RuntimeError(
+                f"Recovered report authority changed during application "
+                f"(job epoch {latest_producing!r}, run epoch {latest_epoch!r}). "
+                "A fresh independent report is required")
+        record["authority_epoch"] = latest_producing
+        record["producing_job"]["epoch"] = latest_producing
         latest.setdefault("report_recoveries", []).append({
             **record, "recovery_path": str(recovery_path),
-            "authority_epoch": latest.get("authority_epoch", 0)})
+            "authority_epoch": latest_producing})
         save(folder, latest)
         journal_event(folder, latest, "report_recovered", job_id=job_id,
                       kind=kind, role=job.get("role"), session_id=session_id,
                       repaired=bool(repair.get("ops")), snapshot_tree=tree_hash,
                       report_sha256=result["report_sha256"],
-                      events_sha256=events_sha)
+                      events_sha256=events_sha,
+                      authority_epoch=latest_producing)
     result.update({"applied": True, "recovery_path": str(recovery_path),
                    "report_path": str(report_path), "text_path": str(text_path)})
     return result
@@ -9737,6 +9835,10 @@ def cached_recovered_job_report(run_dir, state, kind):
                 if item.get("id") == record.get("job_id")), None)
     if job is None:
         raise RuntimeError("Recovered job no longer exists in the failed-job history")
+    if not _recovery_authority_current(state, record, job):
+        # Old extraction remains inspectable, but it can never acquire current
+        # review/decision authority after invalidation.
+        return None
     if kind in READ_ONLY_STAGE_KINDS:
         job_path = Path(job.get("path", ""))
         dispatch = _safe_read(job_path / "dispatch.json")
@@ -10090,6 +10192,61 @@ def certified_exploration(run_dir, state, plan):
         return None
 
 
+def verification_evidence_integrity(reference):
+    """Validate required record/package/log artifacts without checks or models.
+
+    Provenance drift is only eligible for automatic recovery when the rest of
+    the required evidence is intact. This is a structural/readability gate; it
+    never compares source or manufactures missing artifacts.
+    """
+    if not isinstance(reference, dict) or not reference.get("path"):
+        return VerificationEvidenceRejected(
+            "Verification evidence reference is missing", code="reference_missing")
+    try:
+        path = Path(reference["path"])
+    except (TypeError, ValueError):
+        return VerificationEvidenceRejected(
+            "Verification evidence reference is invalid", code="reference_missing")
+    if not path.is_file():
+        return VerificationEvidenceRejected(
+            f"Verification record is missing: {path}", code="record_missing",
+            details={"record": str(path)})
+    try:
+        evidence = read_json(path)
+    except (OSError, ValueError) as exc:
+        return VerificationEvidenceRejected(
+            f"Verification record is unreadable: {path}: {exc}",
+            code="record_unreadable", details={"record": str(path)})
+    if not isinstance(evidence, dict):
+        return VerificationEvidenceRejected(
+            f"Verification record is unreadable: {path}: not a JSON object",
+            code="record_unreadable", details={"record": str(path)})
+    commands = evidence.get("commands")
+    if not isinstance(commands, list) or not commands:
+        return VerificationEvidenceRejected(
+            "Verification evidence has no required command records",
+            code="evidence_incomplete", details={"record": str(path)})
+    for command in commands:
+        if not isinstance(command, dict) or not command.get("log"):
+            return VerificationEvidenceRejected(
+                "Verification command has no log reference",
+                code="evidence_incomplete", details={"record": str(path)})
+        log = Path(command["log"])
+        if not log.is_file():
+            return VerificationEvidenceRejected(
+                f"Verification log is missing: {log}", code="log_missing",
+                details={"record": str(path), "log": str(log)})
+        try:
+            with log.open("rb") as stream:
+                stream.read(1)
+        except OSError as exc:
+            return VerificationEvidenceRejected(
+                f"Verification log is unreadable: {log}: {exc}",
+                code="log_unreadable",
+                details={"record": str(path), "log": str(log)})
+    return None
+
+
 def reviewer_verification_package(reference, current, run_id=None, plan_version=None):
     return verification_evidence_package(reference, current, run_id=run_id,
                                          plan_version=plan_version)
@@ -10223,7 +10380,7 @@ def _review_recovery_precondition(state, cfg, project, current, rejection):
 
 
 def _block_review_verification(state, run_dir, rejection, *, code=None,
-                               message=None, advice=None):
+                               message=None, advice=None, masked_cause=None):
     record = {
         "version": 1, "at": now(),
         "run_id": state.get("id"), "batch_index": state.get("batch_index", 0),
@@ -10234,6 +10391,8 @@ def _block_review_verification(state, run_dir, rejection, *, code=None,
         "fields": rejection.fields, "details": rejection.details,
         "recoverable": bool(rejection.recoverable),
         "cause": rejection.as_dict(), "advice": advice,
+        "masked_cause": masked_cause.as_dict() if masked_cause else None,
+        "masked_code": masked_cause.code if masked_cause else None,
         "next_action": "orchestrator_resume",
     }
     state["verification_rejection"] = record
@@ -10245,7 +10404,8 @@ def _block_review_verification(state, run_dir, rejection, *, code=None,
         journal_event(run_dir, state, "verification_review_blocked",
                       code=record["code"], dimensions=record["dimensions"],
                       batch_index=record["batch_index"],
-                      next_action="orchestrator_resume", advice=advice)
+                      next_action="orchestrator_resume", advice=advice,
+                      masked_code=record["masked_code"])
     except OSError:
         # pause_with already persisted the classified rejection; a failed
         # secondary journal append cannot change the authoritative state.
@@ -10365,6 +10525,16 @@ def review_verification_admission(run_dir, state, cfg, project, current):
             plan_version=state.get("plan_version"))
         return batch, package
     except VerificationEvidenceRejected as exc:
+        integrity = (verification_evidence_integrity(state.get("verification"))
+                     if exc.recoverable else None)
+        if integrity is not None:
+            _block_review_verification(
+                state, run_dir, integrity, masked_cause=exc,
+                advice=("Restore or re-run the required verification record/log. "
+                        "Automatic provenance recovery is refused while required "
+                        "evidence artifacts are missing, unreadable or malformed. "
+                        "No checks were executed."))
+            return None, None
         precondition = _review_recovery_precondition(
             state, cfg, project, current, exc)
         if precondition is None:

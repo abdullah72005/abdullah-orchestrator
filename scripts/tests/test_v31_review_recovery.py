@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import test_orchestrator as baseline
 import test_v31_acceptance_integrity as acceptance
+import test_report_ingestion as ingestion
 orc = baseline.orc
 
 make_plan = acceptance.make_plan
@@ -131,6 +132,72 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.state["implementation_job"] = "implementer-old"
         orc.save(self.rundir, self.state)
         return plan, evidence
+
+    def add_failed_reviewer(self, *, job_id="oldreview01", authority_epoch=0,
+                            include_epoch=True):
+        """Public-recovery fixture: preserved Reviewer stream at an old epoch."""
+        self.data_root = self.root / "opencode-data"
+        self.tree = ingestion.RecoveryRegressions._commit_candidate(self)
+        self.prepare_blocked_review()
+        self.job_id = job_id
+        self.job_dir = self.rundir / "jobs" / f"reviewer-{job_id}"
+        self.job_dir.mkdir(parents=True)
+        ingestion.RecoveryRegressions._write_job(
+            self, json.dumps(ingestion.REVIEWER), "stop")
+        job = self.state["failed_jobs"][0]
+        job.update({"kind": "reviewer", "role": "reviewer"})
+        if include_epoch:
+            job["authority_epoch"] = authority_epoch
+        dispatch = {"kind": "reviewer", "role": "reviewer",
+                    "source": orc.source_snapshot(self.project)}
+        if include_epoch:
+            dispatch["authority_epoch"] = authority_epoch
+        orc.atomic_json(self.job_dir / "dispatch.json", dispatch)
+        self.state.update({
+            "project_lease": {"status": "active", "run_id": self.state["id"],
+                              "project": str(self.project)},
+            "config_sha256": orc.configuration_provenance().get("sha256"),
+            "status": "running"})
+        orc.save(self.rundir, self.state)
+        return job
+
+    def apply_reviewer_recovery(self, job_id=None):
+        return orc.recover_report(
+            self.state["id"], job_id or self.job_id, apply=True,
+            acknowledge=f"recover-report:{self.state['id']}:"
+                        f"{job_id or self.job_id}",
+            data_root=self.data_root)
+
+    def pause_state(self):
+        state = self.state_file()
+        state["status"] = "paused"
+        state["pause_reason"] = "operator recovery test"
+        orc.save(self.rundir, state)
+
+    def assert_artifact_block(self, code, drift_context):
+        """Combined drift + required-artifact failure must stay blocked."""
+        before = self.state_file()
+        epoch_before = before.get("authority_epoch", 0)
+        evidence_path = Path(before["verification"]["path"])
+        evidence_bytes = evidence_path.read_bytes()
+        with drift_context, \
+                patch.object(orc, "call_model",
+                             side_effect=AssertionError("unexpected model")) as model, \
+                patch.object(orc, "run_checks",
+                             side_effect=AssertionError("unexpected check")) as checks:
+            self.stage("review")
+        final = self.state_file()
+        self.assertEqual(model.call_count, 0)
+        self.assertEqual(checks.call_count, 0)
+        self.assertEqual(final["phase"], "review")
+        self.assertEqual(final["status"], "blocked")
+        self.assertEqual(final.get("authority_epoch", 0), epoch_before)
+        self.assertFalse(final.get("review_recoveries"))
+        self.assertEqual(final["verification_rejection"]["code"], code)
+        self.assertFalse(final["verification_rejection"]["recoverable"])
+        self.assertIn("Next:", final["pause_reason"])
+        self.assertEqual(evidence_path.read_bytes(), evidence_bytes)
+        return final
 
     # -- incident shape and full fresh pipeline ---------------------------
     def test_saved_incident_shape_rewinds_once_and_fresh_pipeline_completes(self):
@@ -493,6 +560,230 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(state["verification_rejection"]["dimensions"],
                          ["mystery"])
         self.assertFalse(state["verification_rejection"]["recoverable"])
+
+    # -- late recovery authority (F1) ------------------------------------
+    def test_late_old_reviewer_recovery_is_refused_and_fresh_review_required(self):
+        self.add_failed_reviewer(authority_epoch=0)
+        with self.drifting_path():
+            self.stage("review")
+        with self.drifting_path():
+            self.stage("verify")
+        self.assertEqual(self.state_file()["authority_epoch"], 1)
+        self.pause_state()
+        preview = orc.recover_report(
+            self.state["id"], self.job_id, apply=False,
+            data_root=self.data_root)
+        self.assertTrue(preview["ok"])
+        self.assertFalse(preview["applied"])
+        self.assertEqual(preview["authority_epoch"], 0)
+        self.assertEqual(preview["authority_current"], 1)
+        self.assertFalse(preview["authority_eligible"])
+        with self.assertRaisesRegex(RuntimeError, "invalidated|authority|fresh"):
+            self.apply_reviewer_recovery()
+        after = self.state_file()
+        self.assertEqual(after["failed_jobs"][0]["status"], "failed")
+        self.assertFalse(after.get("report_recoveries"))
+        self.assertEqual(after["phase"], "review")
+        self.assertEqual(after["authority_epoch"], 1)
+
+        self.resume()
+        fake_job = {"id": "reviewer-new", "kind": "reviewer",
+                    "path": str(self.rundir / "jobs")}
+        with self.drifting_path(), \
+                patch.object(orc, "call_model",
+                             return_value=(dict(REVIEWER_REPORT), fake_job)) as model:
+            self.stage("review")
+        self.assertEqual(model.call_count, 1)
+        self.assertEqual(self.state_file()["phase"], "accept")
+        with self.drifting_path(), \
+                patch.object(orc, "strong_call",
+                             return_value=self.verdict()) as strong:
+            self.stage("accept")
+        strong.assert_called_once()
+        self.assertEqual(self.state_file()["status"], "complete")
+
+    def test_reapplied_old_reviewer_recovery_is_refused(self):
+        self.add_failed_reviewer(authority_epoch=0)
+        self.pause_state()
+        first = self.apply_reviewer_recovery()
+        self.assertTrue(first["applied"])
+        self.assertEqual(self.state_file()["report_recoveries"][0]
+                         ["authority_epoch"], 0)
+        self.resume()
+        with self.drifting_path():
+            self.stage("review")
+        with self.drifting_path():
+            self.stage("verify")
+        self.assertEqual(self.state_file()["authority_epoch"], 1)
+        self.pause_state()
+        with self.assertRaisesRegex(RuntimeError, "invalidated|authority|fresh"):
+            self.apply_reviewer_recovery()
+        after = self.state_file()
+        self.assertEqual(len(after["report_recoveries"]), 1)
+        self.assertEqual(after["report_recoveries"][0]["authority_epoch"], 0)
+        self.assertEqual(after["authority_epoch"], 1)
+        self.assertEqual(after["phase"], "review")
+
+    def test_stale_recovered_record_with_current_stamp_is_not_consumed(self):
+        self.add_failed_reviewer(authority_epoch=0)
+        with self.drifting_path():
+            self.stage("review")
+        with self.drifting_path():
+            self.stage("verify")
+        state = self.state_file()
+        self.add_recovered_reviewer_cache(state)
+        # Emulate a record persisted by the previous bug: stamped with the
+        # latest epoch while the producing job/dispatch still belongs to epoch 0.
+        state["report_recoveries"][-1]["authority_epoch"] = 1
+        orc.save(self.rundir, state)
+        fake_job = {"id": "reviewer-new", "kind": "reviewer",
+                    "path": str(self.rundir / "jobs")}
+        with self.drifting_path(), \
+                patch.object(orc, "call_model",
+                             return_value=(dict(REVIEWER_REPORT), fake_job)) as model:
+            self.stage("review")
+        self.assertEqual(model.call_count, 1)
+        self.assertEqual(self.state_file()["review"]["summary"],
+                         "fresh independent review")
+        self.assertEqual(self.state_file()["phase"], "accept")
+
+    def test_current_epoch_reviewer_recovery_still_consumes(self):
+        self.add_failed_reviewer(authority_epoch=0)
+        self.pause_state()
+        self.assertTrue(self.apply_reviewer_recovery()["applied"])
+        self.resume()
+        with patch.object(orc, "call_model",
+                          side_effect=AssertionError("unexpected model")) as model:
+            self.stage("review")
+        self.assertEqual(model.call_count, 0)
+        self.assertEqual(self.state_file()["phase"], "accept")
+        with patch.object(orc, "strong_call",
+                          return_value=self.verdict()) as strong:
+            self.stage("accept")
+        strong.assert_called_once()
+        self.assertEqual(self.state_file()["status"], "complete")
+
+    def test_legacy_missing_epoch_recovery_works_at_initial_authority(self):
+        self.add_failed_reviewer(include_epoch=False)
+        self.pause_state()
+        self.assertTrue(self.apply_reviewer_recovery()["applied"])
+        state = self.state_file()
+        self.assertEqual(state["report_recoveries"][0]["authority_epoch"], 0)
+        self.resume()
+        with patch.object(orc, "call_model",
+                          side_effect=AssertionError("unexpected model")):
+            self.stage("review")
+        self.assertEqual(self.state_file()["phase"], "accept")
+
+    def test_legacy_missing_epoch_recovery_is_refused_after_invalidation(self):
+        self.add_failed_reviewer(include_epoch=False)
+        with self.drifting_path():
+            self.stage("review")
+        with self.drifting_path():
+            self.stage("verify")
+        self.pause_state()
+        with self.assertRaisesRegex(RuntimeError, "invalidated|authority|fresh"):
+            self.apply_reviewer_recovery()
+        after = self.state_file()
+        self.assertFalse(after.get("report_recoveries"))
+        self.assertEqual(after["phase"], "review")
+        self.assertEqual(after["authority_epoch"], 1)
+
+    def test_epoch_race_during_apply_cannot_promote_old_report(self):
+        self.add_failed_reviewer(authority_epoch=0)
+        self.pause_state()
+        real_exclusive = orc.exclusive
+        run_id = self.state["id"]
+
+        def racing_exclusive(path, blocking=False):
+            context = real_exclusive(path, blocking=blocking)
+
+            class Racing:
+                def __enter__(self):
+                    entered = context.__enter__()
+                    folder, latest = orc.load(run_id)
+                    latest["authority_epoch"] = 1
+                    orc.save(folder, latest)
+                    return entered
+
+                def __exit__(self, *exc):
+                    return context.__exit__(*exc)
+
+            return Racing()
+
+        with patch.object(orc, "exclusive", side_effect=racing_exclusive):
+            with self.assertRaisesRegex(RuntimeError, "invalidated|authority|fresh"):
+                self.apply_reviewer_recovery()
+        after = self.state_file()
+        self.assertFalse(after.get("report_recoveries"))
+        self.assertEqual(after["authority_epoch"], 1)
+        self.assertEqual(after["phase"], "review")
+
+    # -- required evidence integrity before drift recovery (F2) ----------
+    def _remove_command_log(self, *, remove_reference=False, delete=True):
+        state = self.state_file()
+        record_path = Path(state["verification"]["path"])
+        record = orc.read_json(record_path)
+        log = Path(record["commands"][0]["log"])
+        if remove_reference:
+            record["commands"][0].pop("log")
+            record_path.write_text(json.dumps(record))
+        elif delete:
+            log.unlink()
+        return record_path, log
+
+    def test_missing_log_plus_path_drift_blocks_without_recovery(self):
+        self.prepare(make_plan(1), phase="review", review=False)
+        self._remove_command_log()
+        final = self.assert_artifact_block("log_missing", self.drifting_path())
+        self.assertIn("required", final["pause_reason"].lower())
+
+    def test_missing_log_plus_environment_drift_blocks_without_recovery(self):
+        self.prepare(make_plan(1), phase="review", review=False)
+        self._remove_command_log()
+        self.assert_artifact_block(
+            "log_missing",
+            patch.dict(os.environ, {"PYTHONPATH": "/v31/combined-drift"}))
+
+    def test_missing_log_plus_toolchain_drift_blocks_without_recovery(self):
+        self.prepare(make_plan(1), phase="review", review=False)
+        self._remove_command_log()
+        original = orc.toolchain_identity()
+        changed = copy.deepcopy(original)
+        changed["node"] = {"available": True, "sha256": "e" * 64}
+        self.assert_artifact_block(
+            "log_missing", patch.object(orc, "toolchain_identity",
+                                        return_value=changed))
+
+    def test_missing_log_plus_check_executable_drift_blocks_without_recovery(self):
+        check = self.install_check("v31combinedcheck")
+        self.prepare(make_plan(1, [[str(check)]]), phase="review", review=False)
+        self._remove_command_log()
+        check.write_text(check.read_text() + "# replaced with missing log\n")
+        self.assert_artifact_block("log_missing", patch.dict(os.environ, {}))
+
+    def test_missing_log_reference_plus_path_drift_blocks_without_recovery(self):
+        self.prepare(make_plan(1), phase="review", review=False)
+        self._remove_command_log(remove_reference=True)
+        final = self.assert_artifact_block("evidence_incomplete",
+                                           self.drifting_path())
+        self.assertIn("log", final["pause_reason"].lower())
+
+    def test_unreadable_log_plus_path_drift_blocks_where_permissions_apply(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read mode-000 logs")
+        self.prepare(make_plan(1), phase="review", review=False)
+        _, log = self._remove_command_log(delete=False)
+        log.chmod(0o000)
+        self.addCleanup(log.chmod, 0o644)
+        try:
+            with log.open("rb"):
+                pass
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("filesystem does not enforce mode-000 read denial")
+        self.assert_artifact_block("log_unreadable", self.drifting_path())
 
     # -- ownership and containment ---------------------------------------
     def test_active_or_uncertain_execution_blocks_recovery(self):

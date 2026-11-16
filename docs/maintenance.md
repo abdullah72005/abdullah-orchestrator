@@ -88,15 +88,18 @@ use isolated disposable repositories and synthetic runs.
 Stale verification rejected during `review` is the one bounded automatic
 transition: resume + stage reevaluates the old reference, and only
 environment/toolchain/check-executable drift on current, modern, passed evidence
-rewinds atomically to `verify`. The old evidence and logs remain inspectable;
-implementation, plan, batch position, accepted history, grants and usage are
-preserved. Source/plan/config/runtime/integrity failures and missing/corrupt/
-failed evidence stay blocked with a classified cause and repair path. Active or
-uncertain execution must be reconciled first. Do not manually edit `phase`,
-`verification` or `review` to work around a rejection, and do not weaken the
-provenance loader. The preserved E2E incident run still needs a separate
-authorization, backup and disposable-copy validation before operational
-recovery.
+with intact required record/log artifacts rewinds atomically to `verify`. The
+old evidence and logs remain inspectable; implementation, plan, batch position,
+accepted history, grants and usage are preserved. Source/plan/config/runtime/
+integrity failures and missing/corrupt/failed evidence stay blocked with a
+classified cause and repair path. Report recovery is likewise bound to the
+original failed job/dispatch epoch: after invalidation, a late or re-applied old
+Reviewer report is refused even with the exact operator acknowledgment, while
+same-epoch recovery remains valid. Active or uncertain execution must be
+reconciled first. Do not manually edit `phase`, `verification` or `review` to
+work around a rejection, and do not weaken the provenance loader. The preserved
+E2E incident run still needs a separate authorization, backup and
+disposable-copy validation before operational recovery.
 
 ## Rollback
 

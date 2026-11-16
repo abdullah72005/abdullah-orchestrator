@@ -17,10 +17,15 @@ stable release is tagged. Review packet:
 - **Stale-review recovery** — Review admission classifies verification
   rejections at their origin and, for environment/toolchain/check-executable
   drift on current modern evidence, performs one atomic rewind to `verify`.
+  Required record/log integrity is checked first, so missing/unreadable/
+  malformed artifacts block instead of being laundered into recovery.
   Implementation, source, plan, batch position, accepted history, grants and
   usage are preserved; source/plan/config/runtime/integrity/missing-evidence
   failures stay blocked with actionable diagnostics. Pre-invalidation Reviewer
-  and decision caches are disarmed by a durable authority epoch.
+  and decision caches are disarmed by a durable authority epoch. Report recovery
+  is bound to the original failed job/dispatch epoch and cannot promote an old
+  Reviewer after invalidation on apply or consumption; valid same-epoch recovery
+  remains available.
 - **AOR31-02** — Read-only source mutation and process containment are
   independent: a live escaped child retains exact `uncertain` ownership instead
   of being cleared as a blocked job, while a clean stopped mutation still blocks
