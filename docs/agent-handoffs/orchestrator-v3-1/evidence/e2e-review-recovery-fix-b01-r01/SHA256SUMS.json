@@ -1,0 +1,14 @@
+{
+  "code_revision": "66033a82ce75e08242988b01254c2621e4cb28f4",
+  "files": {
+    "README.md": "66c6795eacb86361b38c712bdc54c1d2e92ddf8114a38907195e939431c66bc3",
+    "full-suite-b01-r01.log": "111cf73fca2f285301d7bcf0ff52c93c1a329af885d672a203767d26bbe0358a",
+    "requested-regressions-b01-r01.log": "dc18b9e1c59690a5e9bf3bc7be9032ebe6d45ba52b88a7f2668086278ffecc0a",
+    "review-probes-at-base-r01.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "review-probes-at-base-r01.jsonl": "96a375933b55d7181ba49505fdb113f5502909d994bf9612df2f248062929d34",
+    "review-recovery-green-b01-r01.log": "6f8e52234708fcf3c135a2df4564b952bbc5bbb113261e8103b2164210d4aedd",
+    "review-recovery-red-base-r01.log": "2d713cecdf254688d56b5ca84e29ddf1b34463cfde2a9e4e348a2dbe191bf13d"
+  },
+  "python": "3.10.12",
+  "red_base": "2ab20309ef4acf039b9e0ccb8806149c18788989"
+}
