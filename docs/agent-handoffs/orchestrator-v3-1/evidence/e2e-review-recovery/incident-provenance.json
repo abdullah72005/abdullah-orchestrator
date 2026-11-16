@@ -1,0 +1,22 @@
+{
+  "historical_rejection_dimensions": [
+    "environment",
+    "toolchain"
+  ],
+  "historical_rejection_leaf_snapshot_available": false,
+  "current_observation_comparison": [
+    {
+      "field": "environment.values.PATH.sha256",
+      "recorded": "be9b7af849bb1074c16f93205ded5d48ae28fb8d900c2075322dc210e7a9ccd0",
+      "observed_now": "394a55a392f528c4f2253845c94938362feda5acc8ee7928ae27277d623555e7"
+    },
+    {
+      "field": "toolchain.path_sha256",
+      "recorded": "be9b7af849bb1074c16f93205ded5d48ae28fb8d900c2075322dc210e7a9ccd0",
+      "observed_now": "394a55a392f528c4f2253845c94938362feda5acc8ee7928ae27277d623555e7"
+    }
+  ],
+  "check_toolchain_same_now": true,
+  "source_signature_same_now": true,
+  "source_projection_same_now": true
+}

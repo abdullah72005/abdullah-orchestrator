@@ -1,0 +1,21 @@
+{
+  "head": "b9819a75c10433d9e8d082e049c2a31084d0e416",
+  "original_base": "5d0b8be644580d7da7181d1e7ce05c42f8420d3b",
+  "correction_base": "2ab20309ef4acf039b9e0ccb8806149c18788989",
+  "code_test_revision": "66033a82ce75e08242988b01254c2621e4cb28f4",
+  "python": "3.10.12 (main, Jul 15 2026, 23:40:17) [GCC 11.4.0]",
+  "independent_tests": 100,
+  "independent_test_skips": 0,
+  "independent_test_seconds": 111.764,
+  "independent_test_exit": 0,
+  "safe_probes_exit": 0,
+  "original_base_reproduction_exit": 0,
+  "supplied_evidence_files_verified": 7,
+  "preserved_files_unchanged": 227,
+  "verdict": "APPROVED WITH KNOWN LIMITATIONS",
+  "operational_recovery_performed": false,
+  "file_sha256": {
+    "scripts/orchestrator.py": "79746cc2cad454cd1ab7c4b32f4753574269ad46755903694bc70f42558708de",
+    "scripts/tests/test_v31_review_recovery.py": "68052ca746c72defd9ebb4a3a78e91d93a857afc080eb85bc5bcea383bde4d20"
+  }
+}

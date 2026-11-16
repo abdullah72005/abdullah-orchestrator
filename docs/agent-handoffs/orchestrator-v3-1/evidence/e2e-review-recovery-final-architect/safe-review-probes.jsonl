@@ -1,0 +1,2 @@
+{"probe": "missing-log-and-path-drift", "phase": "review", "status": "blocked", "code": "log_missing", "recovery": false, "masked_code": "provenance_drift"}
+{"probe": "recover-old-review-after-invalidation", "refused": true, "error": "Recovered report belongs to invalidated authority epoch 0; current run epoch is 1. A fresh independent report is required", "run_epoch": 1, "phase": "review", "recovery_records": 0}

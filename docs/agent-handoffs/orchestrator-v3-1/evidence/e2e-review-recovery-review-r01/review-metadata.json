@@ -1,0 +1,13 @@
+{
+  "head": "2ab20309ef4acf039b9e0ccb8806149c18788989",
+  "base": "5d0b8be644580d7da7181d1e7ce05c42f8420d3b",
+  "independent_tests": 56,
+  "test_skips": 0,
+  "test_exit": 0,
+  "test_seconds": 87.76,
+  "probe_exit": 0,
+  "preserved_incident_files": 227,
+  "preservation_mismatches": 0,
+  "verdict": "CHANGES REQUIRED",
+  "production_edited_by_architect": false
+}
