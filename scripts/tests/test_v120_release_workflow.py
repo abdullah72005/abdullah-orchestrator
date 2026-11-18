@@ -1992,5 +1992,457 @@ class BatchCorrectionsR02Tests(ReleaseFixture):
         self.assertNotIn(generated, owned_after)
 
 
+class BatchCorrectionsR03Tests(ReleaseFixture):
+    """Writer-attempt accounting, staged deletion and snapshot identity."""
+
+    def _commit(self, message="fixture"):
+        subprocess.run(["git", "add", "-A"], cwd=self.project, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-qm", message], cwd=self.project,
+                       check=True, capture_output=True)
+
+    def _package(self, sha="verify-r03"):
+        return {"commands": [], "passed": True, "source_unchanged": True,
+                "candidate_hash": orc.signature(
+                    orc.source_snapshot(self.project)),
+                "verification_path": str(self.root / f"{sha}.json"),
+                "verification_sha256": sha, "evidence_version": 2}
+
+    def _projection(self, state, package=None):
+        return orc.prepare_review_projection(
+            self.rundir, state, self.cfg, self.project,
+            state["plan"]["batches"][0], package or self._package())
+
+    def _implementer_job(self, job_id, *, write_boundary=True,
+                         prewrite_index=False):
+        jobdir = self.rundir / "jobs" / f"implementer-{job_id}"
+        jobdir.mkdir(parents=True, exist_ok=True)
+        boundary = None
+        dispatch = {"kind": "implementer", "role": "implementer",
+                    "source": orc.source_snapshot(self.project)}
+        if write_boundary:
+            boundary = orc.capture_batch_boundary(
+                self.project, self.rundir, job_id, batch_index=0,
+                plan_version="v")
+            orc.atomic_json(jobdir / "batch-boundary.json", boundary)
+            dispatch["batch_boundary"] = boundary
+        orc.atomic_json(jobdir / "dispatch.json", dispatch)
+        return jobdir, boundary
+
+    def _finish_job(self, state, job_id, jobdir):
+        (self.project / "app.py").write_text("value = 7\n")
+        snapshot = orc.source_snapshot(self.project)
+        orc.atomic_json(jobdir / "execution.json", {"returncode": 0, "seconds": 1})
+        orc.atomic_json(jobdir / "report.json", {
+            "contract_version": 2, "status": "complete", "summary": "done",
+            "files": ["app.py"], "tests": [], "evidence": ["app.py:1"],
+            "unknowns": [], "blocker": ""})
+        orc.atomic_json(jobdir / "completion.json",
+                        {"final_snapshot": snapshot, "session_id": "ses-r03"})
+        state["active_job"] = {
+            "id": job_id, "kind": "implementer", "role": "implementer",
+            "path": str(jobdir), "status": "running",
+            **baseline.dead_process_identity()}
+        return snapshot
+
+    def test_recovered_writer_delta_reaches_the_review_projection(self):
+        plan = self.plan()
+        state = self.saved(self.state(phase="implement", plan=plan,
+                                      plan_version=orc.content_hash(plan)))
+        job_id = "impl-recovered-r03"
+        jobdir, boundary = self._implementer_job(job_id)
+        # Simulate a crash after the delta index was written but before state.
+        self._finish_job(state, job_id, jobdir)
+        prewritten = orc.finalize_batch_delta(
+            self.project, self.rundir, job_id, boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        orc.save(self.rundir, state)
+        self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
+        records = [item for item in state["batch_deltas"]
+                   if item.get("job_id") == job_id]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertTrue(record["complete"])
+        self.assertEqual(record["index_sha256"], prewritten["index_sha256"])
+        entry = next(item for item in record["paths"] if item["path"] == "app.py")
+        self.assertTrue(entry["changed_in_window"])
+        self.assertTrue(entry["hunks"])
+        # Replay must reuse the exact attempt, never append it again.
+        orc._record_batch_delta(self.rundir, state, self.project, job_id,
+                                boundary, orc.source_snapshot(self.project))
+        self.assertEqual(len([item for item in state["batch_deltas"]
+                              if item.get("job_id") == job_id]), 1)
+        delta = orc.batch_delta_index(state)
+        self.assertEqual(delta["attempts"], 1)
+        self.assertFalse(delta["incomplete_writer_attempts"])
+        state["phase"] = "review"
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        patches = [name for name in projection["files"] if name.endswith(".patch")]
+        self.assertTrue(any("app.py" in name for name in patches))
+        readable = [orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/" + name)
+            for name in patches]
+        self.assertTrue(any("+value = 7" in text for text in readable))
+        index_text = orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/delta/index.json")
+        self.assertEqual(json.loads(index_text)["attempts"], 1)
+
+    def test_missing_writer_boundary_is_a_counted_review_limitation(self):
+        plan = self.plan()
+        state = self.saved(self.state(phase="implement", plan=plan,
+                                      plan_version=orc.content_hash(plan)))
+        job_id = "impl-lost-boundary-r03"
+        jobdir, _ = self._implementer_job(job_id, write_boundary=False)
+        self._finish_job(state, job_id, jobdir)
+        orc.save(self.rundir, state)
+        self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
+        record = next(item for item in state["batch_deltas"]
+                      if item.get("job_id") == job_id)
+        self.assertFalse(record["complete"])
+        self.assertEqual(record["paths"], [])
+        self.assertTrue(any("writer attempt evidence unavailable"
+                            in item["reason"] for item in record["limitations"]))
+        delta = orc.batch_delta_index(state)
+        self.assertEqual(delta["attempts"], 1)
+        self.assertEqual(len(delta["incomplete_writer_attempts"]), 1)
+        state["phase"] = "review"
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertTrue(any("writer attempt evidence unavailable"
+                            in item.get("reason", "")
+                            for item in projection["limitations"]))
+        index_text = orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/delta/index.json")
+        projected = json.loads(index_text)
+        self.assertEqual(projected["attempts"], 1)
+        self.assertEqual(projected["files"], [])
+
+    def test_staged_deletion_has_a_reachable_staged_hunk(self):
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-staged-delete", batch_index=0,
+            plan_version="v")
+        subprocess.run(["git", "rm", "--cached", "-q", "app.py"],
+                       cwd=self.project, check=True, capture_output=True)
+        self.assertEqual((self.project / "app.py").read_text(), "value = 1\n")
+        index_before = subprocess.run(
+            ["git", "-C", str(self.project), "ls-files", "-s"],
+            capture_output=True, text=True, check=True).stdout
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-staged-delete", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entry = next(item for item in result["paths"] if item["path"] == "app.py")
+        self.assertTrue(entry["index_changed_in_window"])
+        self.assertTrue(entry["index_deleted"])
+        self.assertEqual(entry["index_after"], "absent")
+        self.assertEqual(entry["presence_after"], "file")
+        staged = [hunk for hunk in entry["hunks"] if hunk["scope"] == "index"]
+        self.assertEqual(len(staged), 1)
+        text = (Path(result["hunks_dir"]) / Path(staged[0]["path"]).name).read_text()
+        self.assertIn("-value = 1", text)
+        index_after = subprocess.run(
+            ["git", "-C", str(self.project), "ls-files", "-s"],
+            capture_output=True, text=True, check=True).stdout
+        self.assertEqual(index_before, index_after)
+        state = self.saved(self.state(
+            phase="review", plan=self.plan(),
+            plan_version=orc.content_hash(self.plan())))
+        state["plan_version"] = orc.content_hash(state["plan"])
+        state["batch_deltas"] = [{
+            "attempt": 1, "job_id": "impl-staged-delete", "batch_index": 0,
+            "plan_version": state["plan_version"], "complete": True,
+            "hunks_dir": result["hunks_dir"], "paths": result["paths"],
+            "limitations": result["limitations"]}]
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        names = [name for name in projection["files"] if name.endswith(".patch")]
+        projected = [orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/" + name)
+            for name in names]
+        self.assertTrue(any("-value = 1" in text for text in projected))
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.project), "ls-files", "-s"],
+            capture_output=True, text=True, check=True).stdout, index_after)
+
+    def test_already_staged_and_empty_deletions_are_explicit(self):
+        (self.project / "empty.txt").write_text("")
+        self._commit("add empty")
+        subprocess.run(["git", "rm", "--cached", "-q", "empty.txt"],
+                       cwd=self.project, check=True, capture_output=True)
+        (self.project / "app.py").unlink()
+        subprocess.run(["git", "rm", "--cached", "-q", "app.py"],
+                       cwd=self.project, check=True, capture_output=True)
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-predelete", batch_index=0,
+            plan_version="v")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-predelete", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entries = {item["path"]: item for item in result["paths"]}
+        self.assertTrue(entries["app.py"]["index_pre_existing"])
+        self.assertTrue(entries["app.py"]["index_deleted"])
+        self.assertEqual(entries["app.py"]["index_hunks"][0]["scope"],
+                         "index_pre_existing")
+        self.assertTrue(entries["empty.txt"]["index_deleted"])
+        self.assertTrue(entries["empty.txt"]["index_deletion"]["empty"])
+        self.assertFalse(entries["empty.txt"]["index_hunks"])
+
+    def test_uncaptured_staged_bytes_are_not_a_window_change(self):
+        (self.project / "aaa.py").write_text("writer baseline\n")
+        (self.project / "zzz_staged.py").write_text("pre-existing staged\n")
+        subprocess.run(["git", "add", "zzz_staged.py"], cwd=self.project,
+                       check=True, capture_output=True)
+        with patch.object(orc, "DELTA_MAX_PATHS", 1):
+            boundary = orc.capture_batch_boundary(
+                self.project, self.rundir, "impl-cap", batch_index=0,
+                plan_version="v")
+        self.assertIn("zzz_staged.py", boundary["omitted_paths"])
+        (self.project / "aaa.py").write_text("writer changed\n")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-cap", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entry = next(item for item in result["paths"]
+                     if item["path"] == "zzz_staged.py")
+        self.assertEqual(entry["index_comparison"], "unavailable")
+        self.assertFalse(entry.get("index_changed_in_window"))
+        self.assertFalse(any(hunk["scope"].startswith("index")
+                             for hunk in entry.get("hunks") or []))
+        self.assertTrue(any(item.get("reason") == "dispatch index state not captured"
+                            for item in result["limitations"]))
+        state = self.saved(self.state(
+            phase="review", plan=self.plan(),
+            plan_version=orc.content_hash(self.plan())))
+        state["plan_version"] = orc.content_hash(state["plan"])
+        state["batch_deltas"] = [{
+            "attempt": 1, "job_id": "impl-cap", "batch_index": 0,
+            "plan_version": state["plan_version"], "complete": True,
+            "hunks_dir": result["hunks_dir"], "paths": result["paths"],
+            "limitations": result["limitations"]}]
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertTrue(any("dispatch index state not captured"
+                            in item.get("reason", "")
+                            for item in projection["limitations"]))
+        patched = [orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/" + name)
+            for name in projection["files"] if name.endswith(".patch")]
+        self.assertFalse(any("pre-existing staged" in text for text in patched))
+        staged = subprocess.run(
+            ["git", "-C", str(self.project), "show", ":zzz_staged.py"],
+            capture_output=True, text=True, check=True).stdout
+        self.assertEqual(staged, "pre-existing staged\n")
+
+    def test_unchanged_ignored_runtime_input_keeps_continuity(self):
+        exclude = self.project / ".git" / "info" / "exclude"
+        exclude.write_text("local_override.py\n")
+        runtime = self.project / "local_override.py"
+        runtime.write_text("VALUE = 1\n")
+        first = orc.capture_batch_boundary(
+            self.project, self.rundir, "chain-r03-1", batch_index=0,
+            plan_version="v")
+        self.assertEqual(first["source_signature_projection"],
+                         orc.SOURCE_IDENTITY_PROJECTION)
+        first_result = orc.finalize_batch_delta(
+            self.project, self.rundir, "chain-r03-1", first,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        self.assertEqual(first_result["final_snapshot_signature_projection"],
+                         orc.SOURCE_IDENTITY_PROJECTION)
+        second = orc.capture_batch_boundary(
+            self.project, self.rundir, "chain-r03-2", batch_index=0,
+            plan_version="v", previous_job_id="chain-r03-1")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "chain-r03-2", second,
+            final_snapshot=orc.source_snapshot(self.project), attempt=2)
+        self.assertEqual(result["attempt_chain"]["status"], "continuous")
+        self.assertFalse(any("unaccounted changes between writer windows"
+                             in item["reason"] for item in result["limitations"]))
+
+    def test_runtime_input_change_between_attempts_is_not_discarded(self):
+        exclude = self.project / ".git" / "info" / "exclude"
+        exclude.write_text("local_override.py\n")
+        runtime = self.project / "local_override.py"
+        runtime.write_text("VALUE = 1\n")
+        first = orc.capture_batch_boundary(
+            self.project, self.rundir, "chain-r03-a", batch_index=0,
+            plan_version="v")
+        orc.finalize_batch_delta(
+            self.project, self.rundir, "chain-r03-a", first,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        runtime.write_text("VALUE = 2\n")
+        second = orc.capture_batch_boundary(
+            self.project, self.rundir, "chain-r03-b", batch_index=0,
+            plan_version="v", previous_job_id="chain-r03-a")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "chain-r03-b", second,
+            final_snapshot=orc.source_snapshot(self.project), attempt=2)
+        self.assertEqual(result["attempt_chain"]["status"],
+                         "unaccounted_changes")
+        self.assertTrue(any(item.get("evidence") == "worktree_content"
+                            for item in result["attempt_chain"]["mismatches"]))
+        self.assertTrue(any("unaccounted changes between writer windows"
+                            in item["reason"] for item in result["limitations"]))
+
+    def test_incompatible_historical_identity_is_uncertainty(self):
+        first = orc.capture_batch_boundary(
+            self.project, self.rundir, "chain-r03-old", batch_index=0,
+            plan_version="v")
+        orc.finalize_batch_delta(
+            self.project, self.rundir, "chain-r03-old", first,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        index_path = Path(first["dir"]).parent / "after" / "index.json"
+        value = orc.read_json(index_path)
+        value.pop("final_snapshot_signature_projection", None)
+        value["index_sha256"] = orc.content_hash(
+            {key: item for key, item in value.items() if key != "index_sha256"})
+        orc.atomic_json(index_path, value)
+        second = orc.capture_batch_boundary(
+            self.project, self.rundir, "chain-r03-new", batch_index=0,
+            plan_version="v", previous_job_id="chain-r03-old")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "chain-r03-new", second,
+            final_snapshot=orc.source_snapshot(self.project), attempt=2)
+        self.assertEqual(result["attempt_chain"]["status"], "incomplete")
+        self.assertTrue(any(item.get("reason") ==
+                            "source identity projection unavailable"
+                            for item in result["limitations"]))
+
+    # -- recovered Reviewer reuse -----------------------------------------
+    def _reviewer_job(self, state, projection):
+        jobdir = self.rundir / "jobs" / "reviewer-recovered-r03"
+        jobdir.mkdir(parents=True, exist_ok=True)
+        snapshot = orc.source_snapshot(self.project)
+        orc.atomic_json(jobdir / "dispatch.json", {
+            "kind": "reviewer", "role": "reviewer", "source": snapshot,
+            "review_packet": projection["binding"],
+            "dispatch_evidence": projection})
+        orc.atomic_json(jobdir / "completion.json",
+                        {"final_snapshot": snapshot, "session_id": "ses-rv"})
+        orc.atomic_json(jobdir / "report.json", {
+            "contract_version": 2, "status": "complete",
+            "summary": "recovered review", "findings": [], "files": ["app.py"],
+            "tests": [], "evidence": ["app.py:1"], "unknowns": [],
+            "blocker": ""})
+        orc.atomic_json(jobdir / "execution.json", {"returncode": 0})
+        state["active_job"] = {
+            "id": "reviewer-recovered-r03", "kind": "reviewer",
+            "role": "reviewer", "path": str(jobdir), "status": "running",
+            **baseline.dead_process_identity()}
+        return jobdir
+
+    def test_recovered_reviewer_restores_its_packet_identity(self):
+        plan = self.plan()
+        state = self.saved(self.state(phase="review", plan=plan,
+                                      plan_version=orc.content_hash(plan)))
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self._reviewer_job(state, projection)
+        orc.save(self.rundir, state)
+        self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
+        job = state["completed_jobs"][-1]
+        self.assertEqual(job["review_projection_sha256"],
+                         projection["projection_sha256"])
+        self.assertEqual(job["review_verification_sha256"],
+                         projection["verification_sha256"])
+        self.assertTrue(orc.packet_binding_matches(job["review_packet_binding"],
+                                                   projection))
+
+    def test_valid_recovered_review_is_reused_without_a_model_call(self):
+        plan = self.plan()
+        state = self.saved(self.state(phase="review", plan=plan,
+                                      plan_version=orc.content_hash(plan)))
+        package = self._package()
+        projection, rejection = self._projection(state, package)
+        self.assertIsNone(rejection)
+        self._reviewer_job(state, projection)
+        state["review_projection"] = projection
+        orc.save(self.rundir, state)
+        self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
+        state = self.state_file()
+        with patch.object(orc, "review_verification_admission",
+                          return_value=(plan["batches"][0], package)):
+            with patch.object(orc, "call_model") as model:
+                orc.advance(self.rundir, state, self.cfg)
+                model.assert_not_called()
+        self.assertEqual(self.state_file()["review"]["summary"],
+                         "recovered review")
+        self.assertEqual(self.state_file()["phase"], "accept")
+
+    def test_recovered_review_is_rejected_after_verification_changes(self):
+        plan = self.plan()
+        state = self.saved(self.state(phase="review", plan=plan,
+                                      plan_version=orc.content_hash(plan)))
+        old_package = self._package("verify-r03-old")
+        projection, rejection = self._projection(state, old_package)
+        self.assertIsNone(rejection)
+        self._reviewer_job(state, projection)
+        state["review_projection"] = projection
+        orc.save(self.rundir, state)
+        self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
+        state = self.state_file()
+        new_package = self._package("verify-r03-new")
+        fresh = {"contract_version": 2, "status": "complete",
+                 "summary": "fresh review", "findings": [], "files": ["app.py"],
+                 "tests": [], "evidence": ["app.py:1"], "unknowns": [],
+                 "blocker": ""}
+        with patch.object(orc, "review_verification_admission",
+                          return_value=(plan["batches"][0], new_package)):
+            with patch.object(orc, "call_model",
+                              return_value=(fresh, {"id": "fresh-r03"})) as model:
+                orc.advance(self.rundir, state, self.cfg)
+                self.assertEqual(model.call_count, 1)
+        updated = self.state_file()
+        self.assertEqual(updated["review"]["summary"], "fresh review")
+        self.assertEqual(updated["stale_cached_review"]["job_id"],
+                         "reviewer-recovered-r03")
+
+
+    def test_recovered_implementer_report_attribution_is_exact_or_limited(self):
+        state = self.saved(self.state(phase="implement", plan=self.plan()))
+        job_id = "impl-report-recovered"
+        jobdir, boundary = self._implementer_job(job_id)
+        job = {"id": job_id, "kind": "implementer", "role": "implementer",
+               "path": str(jobdir)}
+        state["failed_jobs"] = [job]
+        state["report_recoveries"] = [{
+            "job_id": job_id, "kind": "implementer",
+            "source_signature": boundary["source_signature"]}]
+        exact = orc._record_recovered_writer_attempt(
+            self.rundir, state, self.project, job)
+        self.assertTrue(exact["complete"])
+        self.assertEqual(exact["paths"], [])
+        # A report whose source cannot be tied to the dispatch boundary must
+        # not be presented as a proven clean window.
+        other = self.saved(self.state(phase="implement", plan=self.plan()))
+        other_job = {"id": "impl-report-moved", "kind": "implementer",
+                     "role": "implementer", "path": str(jobdir)}
+        other["failed_jobs"] = [other_job]
+        other["report_recoveries"] = [{
+            "job_id": "impl-report-moved", "kind": "implementer",
+            "source_signature": "different-source"}]
+        limited = orc._record_recovered_writer_attempt(
+            self.rundir, other, self.project, other_job)
+        self.assertFalse(limited["complete"])
+        self.assertEqual(limited["paths"], [])
+        self.assertTrue(any("writer attempt evidence unavailable"
+                            in item["reason"] for item in limited["limitations"]))
+        self.assertTrue(any(item.get("detail") for item in limited["limitations"]))
+
+    def test_recovered_reviewer_with_invalid_packet_keeps_reuse_rejected(self):
+        plan = self.plan()
+        state = self.saved(self.state(phase="review", plan=plan,
+                                      plan_version=orc.content_hash(plan)))
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self._reviewer_job(state, projection)
+        # The packet must still be exactly valid at recovery time.
+        manifest = Path(projection["manifest"])
+        manifest.write_text("{}\n")
+        orc.save(self.rundir, state)
+        self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
+        job = state["completed_jobs"][-1]
+        self.assertIsNone(job.get("review_projection_sha256"))
+        self.assertIsNone(job.get("review_packet_binding"))
+
+
 if __name__ == "__main__":
     unittest.main()

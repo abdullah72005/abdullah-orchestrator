@@ -8356,22 +8356,206 @@ def _route_identity_recheck(route, preflight, cfg, project, role, deadline=None,
 
 
 
-def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapshot,
-                        *, job=None):
-    """Finalize and persist one writer attempt's observed delta (bounded)."""
-    if state is None or not isinstance(boundary, dict) or boundary.get("error"):
+def _existing_batch_delta(state, job_id):
+    """Return the durable delta record for this exact job identity, if any."""
+    if state is None or not job_id:
         return None
-    attempt = (state.get("corrections", 0) or 0) + 1
+    for record in state.get("batch_deltas") or []:
+        if record.get("job_id") == job_id:
+            return record
+    return None
+
+
+def _validate_writer_boundary(run_dir, job_id, boundary):
+    """Validate one durable dispatch boundary against its exact job identity."""
+    if not isinstance(boundary, dict):
+        return None, "writer boundary artifact missing"
+    if boundary.get("error"):
+        return None, "writer boundary capture failed: " + str(boundary.get("error"))
+    if boundary.get("version") != 1:
+        return None, "unsupported writer boundary version"
+    if boundary.get("job_id") != job_id:
+        return None, "writer boundary is not keyed to this exact job"
+    expected = (Path(run_dir) / BATCH_DELTA_DIR / str(job_id)).resolve()
     try:
-        index_value = finalize_batch_delta(
-            project, run_dir, job_id, boundary,
-            final_snapshot=final_snapshot, attempt=attempt)
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        if job is not None:
-            job["batch_delta_error"] = str(exc)
+        base = Path(boundary.get("dir", "")).resolve()
+    except (OSError, ValueError):
+        return None, "writer boundary path is invalid"
+    if base.parent != expected or base.name != "before":
+        return None, "writer boundary belongs to another dispatch"
+    manifest = _safe_read(base / "manifest.json")
+    if not isinstance(manifest, dict):
+        return None, "writer boundary manifest is missing"
+    if manifest.get("job_id") != job_id:
+        return None, "writer boundary manifest is not keyed to this job"
+    core = {key: value for key, value in manifest.items()
+            if key != "manifest_sha256"}
+    if content_hash(core) != boundary.get("manifest_sha256"):
+        return None, "writer boundary manifest changed"
+    return boundary, None
+
+
+def _durable_writer_boundary(run_dir, job):
+    """Load the preserved boundary for a recovered writer attempt.
+
+    The dispatch record is authoritative; the job-local copy and the durable
+    boundary file are fallbacks for a crash between artifacts.
+    """
+    job_id = job.get("id")
+    jpath = Path(job.get("path", ""))
+    candidates = []
+    dispatch = _safe_read(jpath / "dispatch.json")
+    if isinstance(dispatch, dict):
+        candidates.append(dispatch.get("batch_boundary"))
+    candidates.append(_safe_read(jpath / "batch-boundary.json"))
+    candidates.append(_safe_read(
+        Path(run_dir) / BATCH_DELTA_DIR / str(job_id) / "boundary.json"))
+    for value in candidates:
+        if not isinstance(value, dict):
+            continue
+        boundary, problem = _validate_writer_boundary(run_dir, job_id, value)
+        if problem is None:
+            return boundary, None
+        return None, problem
+    return None, "writer boundary artifact missing"
+
+
+def _existing_delta_index(run_dir, job_id, boundary):
+    """Reuse a valid index written before a crash instead of re-deriving it."""
+    try:
+        path = (Path(boundary.get("dir", "")).parent / "after" / "index.json")
+    except (OSError, ValueError):
         return None
+    value = _safe_read(path)
+    if not isinstance(value, dict):
+        return None
+    if value.get("job_id") != job_id:
+        return None
+    if not isinstance(value.get("paths"), list):
+        return None
+    core = {key: item for key, item in value.items() if key != "index_sha256"}
+    if content_hash(core) != value.get("index_sha256"):
+        return None
+    return value
+
+
+def _attach_delta_summary(job, record):
+    if job is None or not isinstance(record, dict):
+        return
+    job["batch_delta"] = {
+        "index_path": record.get("index_path"),
+        "index_sha256": record.get("index_sha256"),
+        "attempt": record.get("attempt"),
+        "paths": len(record.get("paths") or []),
+        "limitations": len(record.get("limitations") or []),
+        "complete": bool(record.get("complete", True)),
+    }
+
+
+def _record_writer_limitation(run_dir, state, job_id, boundary, *, reason,
+                              detail, phase, job=None):
+    """Count a writer attempt whose delta cannot be established."""
+    existing = _existing_batch_delta(state, job_id)
+    if existing is not None:
+        _attach_delta_summary(job, existing)
+        if job is not None and not existing.get("complete", True):
+            job["batch_delta_error"] = detail
+        return existing
+    source = boundary if isinstance(boundary, dict) else {}
+    attempt = (state.get("corrections", 0) or 0) + 1
+    record = {
+        "version": 1, "job_id": job_id, "attempt": attempt,
+        "batch_index": source.get("batch_index", state.get("batch_index", 0)),
+        "plan_version": source.get("plan_version", state.get("plan_version")),
+        "previous_job_id": source.get("previous_job_id"),
+        "index_path": None, "index_sha256": None, "hunks_dir": None,
+        "paths": [], "complete": False, "phase": phase,
+        "limitations": [{"path": None, "reason": reason, "detail": detail,
+                         "phase": phase, "job_id": job_id}],
+        "recorded_at": now(),
+    }
+    state.setdefault("batch_deltas", []).append(record)
+    chain = state.setdefault("batch_delta_chain", [])
+    if job_id not in chain:
+        chain.append(job_id)
+    _attach_delta_summary(job, record)
+    if job is not None:
+        job["batch_delta_error"] = detail
+    journal_event(run_dir, state, "writer_attempt_limitation", job_id=job_id,
+                  reason=reason, phase=phase, attempt=attempt)
+    return record
+
+
+def _record_recovered_writer_attempt(run_dir, state, project, job):
+    """Account for a recovered Implementer report consumed as writer evidence."""
+    if job is None or not job.get("id"):
+        return None
+    existing = _existing_batch_delta(state, job["id"])
+    if existing is not None:
+        return existing
+    boundary, boundary_problem = _durable_writer_boundary(run_dir, job)
+    current = None
+    try:
+        current = source_snapshot(Path(project))
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        current = None
+    record = None
+    for item in reversed(state.get("report_recoveries") or []):
+        if item.get("job_id") == job.get("id"):
+            record = item
+            break
+    exact = (boundary_problem is None and current is not None
+             and isinstance(record, dict)
+             and record.get("source_signature")
+             == boundary.get("source_signature") == signature(current))
+    if exact:
+        return _record_batch_delta(run_dir, state, project, job["id"], boundary,
+                                   current, job=job, phase="recovered-report")
+    return _record_batch_delta(
+        run_dir, state, project, job["id"], boundary, None, job=job,
+        phase="recovered-report",
+        forced_problem=(boundary_problem
+                        or ("the recovered report's source evidence does not "
+                            "match the dispatch boundary; exact attribution is "
+                            "unavailable")))
+
+
+def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapshot,
+                        *, job=None, phase="completion", forced_problem=None):
+    """Finalize and persist one writer attempt's observed delta (bounded).
+
+    The record is keyed by the exact job identity: a crash/retry never appends
+    the same attempt twice.  Missing or unprovable evidence is still counted and
+    carried as a structured limitation instead of an empty "clean" delta.
+    """
+    if state is None:
+        return None
+    existing = _existing_batch_delta(state, job_id)
+    if existing is not None:
+        _attach_delta_summary(job, existing)
+        return existing
+    attempt = (state.get("corrections", 0) or 0) + 1
+    problem = forced_problem
+    index_value = None
+    if problem is None:
+        boundary, problem = _validate_writer_boundary(run_dir, job_id, boundary)
+    if problem is None:
+        index_value = _existing_delta_index(run_dir, job_id, boundary)
+    if problem is None and index_value is None:
+        try:
+            index_value = finalize_batch_delta(
+                project, run_dir, job_id, boundary,
+                final_snapshot=final_snapshot, attempt=attempt)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            problem = "writer delta finalization failed: " + str(exc)
+        if index_value is None:
+            problem = problem or "writer delta finalization returned no index"
     if index_value is None:
-        return None
+        return _record_writer_limitation(
+            run_dir, state, job_id, boundary,
+            reason="writer attempt evidence unavailable",
+            detail=(problem or "the writer attempt could not be attributed"),
+            phase=phase, job=job)
     record = {
         "version": 1, "job_id": job_id, "attempt": attempt,
         "batch_index": boundary.get("batch_index"),
@@ -8382,22 +8566,19 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
         "hunks_dir": index_value.get("hunks_dir"),
         "paths": index_value.get("paths"),
         "limitations": index_value.get("limitations"),
+        "complete": True, "phase": phase,
         "recorded_at": now(),
     }
     state.setdefault("batch_deltas", []).append(record)
-    state.setdefault("batch_delta_chain", []).append(job_id)
-    if job is not None:
-        job["batch_delta"] = {
-            "index_path": record["index_path"],
-            "index_sha256": record["index_sha256"],
-            "attempt": attempt, "paths": len(index_value.get("paths") or []),
-            "limitations": len(index_value.get("limitations") or []),
-        }
+    chain = state.setdefault("batch_delta_chain", [])
+    if job_id not in chain:
+        chain.append(job_id)
+    _attach_delta_summary(job, record)
     journal_event(run_dir, state, "batch_delta_recorded", job_id=job_id,
                   attempt=attempt, batch_index=record["batch_index"],
                   paths=len(index_value.get("paths") or []),
                   limitations=len(index_value.get("limitations") or []),
-                  index_sha256=record["index_sha256"])
+                  index_sha256=record["index_sha256"], phase=phase)
     return record
 
 
@@ -9028,8 +9209,11 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     "Review evidence packet failed its completion gate: "
                     + packet_problem, code="review_packet_invalid",
                     details={"job_id": job_id})
-        delta = _record_batch_delta(run_dir, state, project, job_id, boundary,
-                                    final_snapshot, job=job)
+        delta = None
+        if role == "implementer" and kind == "implementer":
+            delta = _record_batch_delta(run_dir, state, project, job_id, boundary,
+                                        final_snapshot, job=job,
+                                        phase="completion")
         atomic_json(jpath / "report.json", report)
         atomic_json(jpath / "completion.json", {"final_snapshot": final_snapshot,
                                                 "session_id": session_id})
@@ -9133,17 +9317,20 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                      "paths": [], "path_count": 0})
         mutation.update({"kind": kind, "role": role, "job_id": job_id,
                          "phase": "failure"})
-        if failure_snapshot is not None and state is not None:
-            # Attribute the failed attempt's observed work too; a later attempt
-            # then shows both its own delta and the change between attempts.
-            _record_batch_delta(run_dir, state, project, job_id, boundary,
-                                failure_snapshot, job=job)
         inspection = None
         containment = None
         stopped = None
         has_execution_identity = bool(
             proc is not None or any(job_identity(job).values())
             or _launch_identity(_job_launch_file(job)))
+        if (state is not None and job.get("role") == "implementer"
+                and has_execution_identity):
+            # Attribute the failed attempt's observed work too; a later attempt
+            # then shows both its own delta and the change between attempts.  A
+            # missing completion snapshot is recorded as a counted limitation,
+            # never as a silently absent writer.
+            _record_batch_delta(run_dir, state, project, job_id, boundary,
+                                failure_snapshot, job=job, phase="failure")
         if state is not None and has_execution_identity:
             # Wait briefly for the guard, but never infer containment from its
             # exit, from the error class, or from the report's presence.
@@ -9894,6 +10081,10 @@ BATCH_DELTA_DIR = "batch-deltas"
 DELTA_MAX_FILE_BYTES = 2 * 1024 * 1024
 DELTA_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 DELTA_MAX_PATHS = 2000
+# Explicit, shared projection for dispatch/completion source identity.  Both
+# boundaries must record the same projection before their signatures are
+# comparable; a historical capture without it is uncertainty, not a mismatch.
+SOURCE_IDENTITY_PROJECTION = "worktree+runtime-inputs-v1"
 
 
 def _read_bounded(path: Path, limit=DELTA_MAX_FILE_BYTES):
@@ -10087,8 +10278,17 @@ def capture_batch_boundary(project: Path, run_dir, job_id, *, batch_index,
     manifest_sha = content_hash(manifest)
     manifest["manifest_sha256"] = manifest_sha
     atomic_json(base / "manifest.json", manifest)
+    source_projection = None
+    source_provenance_complete = None
     try:
-        worktree_signature = signature(source_snapshot(project, provenance=False))
+        # Use the same explicit identity projection as the completion record.
+        # The earlier worktree-only signature silently omitted discovered ignored
+        # runtime inputs, so an unchanged input looked like an inter-attempt
+        # change (and a changed one could look identical).
+        dispatch_snapshot = source_snapshot(project)
+        worktree_signature = signature(dispatch_snapshot)
+        source_projection = SOURCE_IDENTITY_PROJECTION
+        source_provenance_complete = dispatch_snapshot.get("provenance_complete")
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
         worktree_signature = None
         manifest["source_signature_error"] = str(exc)
@@ -10097,6 +10297,8 @@ def capture_batch_boundary(project: Path, run_dir, job_id, *, batch_index,
                 "manifest_sha256": manifest_sha, "head": head,
                 "index_sha256": index_diff, "status_sha256": status_sha,
                 "source_signature": worktree_signature,
+                "source_signature_projection": source_projection,
+                "source_provenance_complete": source_provenance_complete,
                 "paths": sorted(manifest["entries"]),
                 "dirty_paths": sorted(states),
                 "capture_complete": manifest["capture_complete"],
@@ -10222,6 +10424,7 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
     dirty_before = set(manifest_value.get("dirty_paths")
                        or manifest_value.get("entries") or {})
     dirty_before |= states_before
+    omitted_before = set(boundary.get("omitted_paths") or [])
     states_now = worktree_states(project)
     limitations = []
     comparison_error = None
@@ -10287,7 +10490,8 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
             return None
         return (state.get("kind"), state.get("sha256"), state.get("mode"))
 
-    def index_before_state(relative, manifest_entry, head_entry, head_error):
+    def index_before_state(relative, manifest_entry, head_entry, head_error,
+                           assume_head=False):
         captured = manifest_entry.get("index") if isinstance(manifest_entry, dict) else None
         if isinstance(captured, dict):
             kind = captured.get("kind")
@@ -10307,8 +10511,14 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                                 "bytes": len(data), "data": data}, None
                 return None, "index_before_bytes_unavailable"
             return None, "index_before_" + str(kind or "unavailable")
-        # No captured index entry means the path was clean at dispatch, so the
-        # index equalled HEAD (verified from the recorded tree, never presumed).
+        # No captured index entry.  A path that was already dirty at dispatch
+        # (staged, unstaged, or omitted by the capture budget) cannot be assumed
+        # to equal HEAD: doing so would present pre-existing staged bytes as a
+        # batch-window change.  Only a path independently observed clean at
+        # dispatch may fall back to the recorded HEAD tree.
+        if not assume_head and (relative in dirty_before
+                                or relative in omitted_before):
+            return None, "index_before_not_captured"
         if head_error:
             return None, "dispatch_head_unreadable"
         if head_entry is None:
@@ -10352,7 +10562,8 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                                    != index_signature(index_after))
         head_index = None
         if head_error is None and head_entry is not None:
-            head_index, _ = index_before_state(relative, {}, head_entry, None)
+            head_index, _ = index_before_state(relative, {}, head_entry, None,
+                                               assume_head=True)
         index_differs_from_head = (index_after is not None and head_index is not None
                                    and index_signature(index_after)
                                    != index_signature(head_index))
@@ -10360,9 +10571,16 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                               and index_signature(index_before)
                               != index_signature(head_index))
         if index_before is None:
-            limitations.append({"path": relative,
-                                "reason": "index state unavailable at dispatch",
-                                "detail": index_before_error})
+            limitations.append({
+                "path": relative,
+                "reason": ("dispatch index state not captured"
+                           if index_before_error == "index_before_not_captured"
+                           else "index state unavailable at dispatch"),
+                "detail": (("The path was dirty or outside the capture budget at "
+                            "dispatch, so its staged bytes cannot be compared; no "
+                            "staged hunk is claimed for this window.")
+                           if index_before_error == "index_before_not_captured"
+                           else index_before_error)})
         if index_after is None:
             limitations.append({"path": relative,
                                 "reason": "index state unavailable at completion",
@@ -10373,6 +10591,8 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
             "index_changed_in_window": bool(index_changed_in_window),
             "index_pre_existing": bool(index_pre_existing),
             "index_differs_from_head": bool(index_differs_from_head),
+            "index_comparison": ("unavailable" if index_before is None else
+                                 "compared"),
             "worktree_changed_in_window": bool(presence_changed or data != pre
                                                or mode_changed),
         }
@@ -10404,10 +10624,17 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                          "sha256_before": hashlib.sha256(pre).hexdigest(),
                          "sha256_after": hashlib.sha256(data).hexdigest(),
                          "staged_only": bool(index_differs_from_head
-                                             and not index_changed_in_window),
+                                             and not index_changed_in_window
+                                             and index_before is not None),
                          "note": ("Pre-existing user work observed at both boundaries; "
                                   "no batch-window change is established.")}
                 entry.update(index_fields)
+                if index_before is None:
+                    entry["staged_only"] = None
+                    entry["note"] = (
+                        "Pre-existing user work was observed at dispatch and "
+                        "completion, but the dispatch index state was not captured. "
+                        "Staged bytes cannot be attributed to this window.")
                 if after_kind not in {"file", "symlink"} and pre_kind in {"file", "symlink"}:
                     entry["pre_existing_change_missing"] = True
                     entry["note"] = ("A pre-existing change is no longer present "
@@ -10430,6 +10657,12 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                  "sha256_before": hashlib.sha256(pre).hexdigest(),
                  "sha256_after": hashlib.sha256(data).hexdigest()}
         entry.update(index_fields)
+        if index_before is None:
+            entry["index_ambiguous"] = True
+            entry["note"] = (
+                "The completion index differs from the dispatch record, but the "
+                "dispatch index state was not captured; staged attribution for "
+                "this path is unavailable.")
         if mode_changed:
             entry.update({"mode_before": format(mode_before, "o"),
                           "mode_after": format(mode_after, "o"),
@@ -10490,6 +10723,8 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
         "dispatch_head_comparison_error": comparison_error,
         "attempt_chain": chain_evidence,
         "final_snapshot_signature": signature(final_snapshot) if final_snapshot else None,
+        "final_snapshot_signature_projection": (
+            SOURCE_IDENTITY_PROJECTION if final_snapshot else None),
         "paths": index_entries,
         "hunks_dir": str(hunks_dir),
         "limitations": limitations,
@@ -10512,23 +10747,26 @@ def _append_index_hunks(entry, relative, index_before, index_after, head_index,
     if index_after is None:
         entry["index_unavailable"] = after_error or "completion index unavailable"
         return
-    if index_after.get("kind") not in {"file", "symlink"}:
-        if index_after.get("kind") == "unmerged":
-            entry["index_unmerged"] = True
+    after_kind = index_after.get("kind")
+    if after_kind == "unmerged":
+        entry["index_unmerged"] = True
         return
+    if after_kind not in {"file", "symlink", "absent"}:
+        return
+    def index_state_signature(state):
+        return (state.get("kind"), state.get("sha256"), state.get("mode"))
+
     changed = (index_before is None
-               or (index_before.get("kind"), index_before.get("sha256"),
-                   index_before.get("mode"))
-               != (index_after.get("kind"), index_after.get("sha256"),
-                   index_after.get("mode")))
+               or index_state_signature(index_before)
+               != index_state_signature(index_after))
     compare_before = index_before
     scope = "index"
     if not changed and head_index is not None and (
-            (head_index.get("kind"), head_index.get("sha256"), head_index.get("mode"))
-            != (index_after.get("kind"), index_after.get("sha256"),
-                index_after.get("mode"))):
+            index_state_signature(head_index)
+            != index_state_signature(index_after)):
         # The path was already staged at dispatch. Show those pre-existing
-        # staged bytes rather than hiding them, clearly labelled as overlap.
+        # staged bytes (including a staged deletion) rather than hiding them,
+        # clearly labelled as overlap.
         compare_before = head_index
         scope = "index_pre_existing"
     if compare_before is None or compare_before.get("kind") not in {
@@ -10538,6 +10776,29 @@ def _append_index_hunks(entry, relative, index_before, index_after, head_index,
         return
     if index_before is None and changed:
         entry["index_unavailable"] = before_error or "dispatch index unavailable"
+        return
+    before_kind = compare_before.get("kind")
+    if after_kind == "absent":
+        if before_kind == "absent":
+            return
+        # A tracked file removed from the index is a real staged state change
+        # even when the worktree bytes are untouched.  Keep it distinct from a
+        # worktree deletion and show the removed lines.
+        entry["index_deleted"] = True
+        entry["index_deletion"] = {"scope": scope, "before": before_kind,
+                                   "after": "absent"}
+        hunk = write_hunk(relative, scope, compare_before.get("data") or b"",
+                          b"", "index/staged deletion")
+        if hunk:
+            entry["index_hunks"].append(hunk)
+            entry["hunks"].append(hunk)
+            entry["additions"] = (entry.get("additions") or 0) + hunk["additions"]
+            entry["deletions"] = (entry.get("deletions") or 0) + hunk["deletions"]
+        else:
+            # An empty before-image has no removed lines to render; record the
+            # deletion explicitly instead of silently omitting it.
+            entry["index_deletion"].update({
+                "empty": True, "note": "staged deletion of an empty file"})
         return
     hunk = write_hunk(relative, scope, compare_before.get("data") or b"",
                       index_after.get("data") or b"", "index/staged")
@@ -10579,27 +10840,58 @@ def _delta_chain_evidence(boundary, limitations):
                                  "worktree_status_sha256_at_completion",
                                  "final_snapshot_signature")
                if not previous_index.get(name)]
+    if not boundary.get("source_signature"):
+        missing.append("dispatch_source_signature")
+    projection_mismatch = None
+    previous_projection = previous_index.get("final_snapshot_signature_projection")
+    current_projection = boundary.get("source_signature_projection")
+    if (previous_index.get("final_snapshot_signature")
+            or boundary.get("source_signature")) and not (
+                previous_projection == current_projection
+                == SOURCE_IDENTITY_PROJECTION):
+        # Historical captures recorded different projections.  Comparing them
+        # would turn a representation difference into a false change, so the
+        # continuity of this window is reported as uncertainty instead.
+        projection_mismatch = {
+            "previous_completion": previous_projection,
+            "current_dispatch": current_projection,
+            "expected": SOURCE_IDENTITY_PROJECTION}
     mismatches = []
-    if previous_index.get("index_sha256_at_completion") not in (
-            None, boundary.get("index_sha256")):
-        mismatches.append({"evidence": "index",
-                           "previous_completion": previous_index.get(
-                               "index_sha256_at_completion"),
-                           "current_dispatch": boundary.get("index_sha256")})
-    if previous_index.get("worktree_status_sha256_at_completion") not in (
-            None, boundary.get("status_sha256")):
-        mismatches.append({"evidence": "worktree_status",
-                           "previous_completion": previous_index.get(
-                               "worktree_status_sha256_at_completion"),
-                           "current_dispatch": boundary.get("status_sha256")})
-    if (boundary.get("source_signature")
-            and previous_index.get("final_snapshot_signature")
-            and previous_index.get("final_snapshot_signature")
-            != boundary.get("source_signature")):
-        mismatches.append({"evidence": "worktree_content",
-                           "previous_completion": previous_index.get(
-                               "final_snapshot_signature"),
-                           "current_dispatch": boundary.get("source_signature")})
+    if projection_mismatch is None:
+        if previous_index.get("index_sha256_at_completion") not in (
+                None, boundary.get("index_sha256")):
+            mismatches.append({"evidence": "index",
+                               "previous_completion": previous_index.get(
+                                   "index_sha256_at_completion"),
+                               "current_dispatch": boundary.get("index_sha256")})
+        if previous_index.get("worktree_status_sha256_at_completion") not in (
+                None, boundary.get("status_sha256")):
+            mismatches.append({"evidence": "worktree_status",
+                               "previous_completion": previous_index.get(
+                                   "worktree_status_sha256_at_completion"),
+                               "current_dispatch": boundary.get("status_sha256")})
+        if (boundary.get("source_signature")
+                and previous_index.get("final_snapshot_signature")
+                and previous_index.get("final_snapshot_signature")
+                != boundary.get("source_signature")):
+            mismatches.append({"evidence": "worktree_content",
+                               "previous_completion": previous_index.get(
+                                   "final_snapshot_signature"),
+                               "current_dispatch": boundary.get("source_signature")})
+    if projection_mismatch is not None:
+        evidence.update({"status": "incomplete",
+                         "projection": projection_mismatch,
+                         "missing": missing, "mismatches": []})
+        limitation = {"path": None,
+                      "reason": "source identity projection unavailable",
+                      "detail": ("The previous completion and this dispatch do not "
+                                 "share an explicit source identity projection; "
+                                 "changes between writer windows cannot be compared "
+                                 "and remain uncertain."),
+                      "projection": projection_mismatch, "missing": missing}
+        evidence["limitations"].append(limitation)
+        limitations.append(limitation)
+        return evidence
     if missing or mismatches:
         evidence.update({"status": ("incomplete" if missing else "unaccounted_changes"),
                          "missing": missing, "mismatches": mismatches})
@@ -10627,19 +10919,31 @@ def batch_delta_index(state, batch_index=None):
     records = [entry for entry in state.get("batch_deltas", [])
                if entry.get("batch_index") == index]
     files = []
+    writer_attempts = []
     totals = {"additions": 0, "deletions": 0, "attempts": len(records)}
     for record in records:
+        complete = record.get("complete", True)
+        writer_attempts.append({
+            "job_id": record.get("job_id"), "attempt": record.get("attempt"),
+            "complete": bool(complete),
+            "limitations": len(record.get("limitations") or [])})
         for item in record.get("paths", []):
             files.append({**item, "attempt": record.get("attempt"),
                           "job_id": record.get("job_id")})
             totals["additions"] += item.get("additions", 0) or 0
             totals["deletions"] += item.get("deletions", 0) or 0
+    incomplete = [attempt for attempt in writer_attempts
+                  if not attempt["complete"]]
     return {"batch_index": index, "attempts": len(records), "files": files,
+            "writer_attempts": writer_attempts,
+            "incomplete_writer_attempts": incomplete,
             "totals": totals, "paths": [record.get("index_path") for record in records],
             "note": ("Observed changes between supervisor-issued writer boundaries. "
                      "Pre-existing user work is listed separately. This does not "
-                     "prove who typed a line, and attempts without captured "
-                     "before-images cannot be reconstructed.")}
+                     "prove who typed a line. Attempts marked incomplete were "
+                     "counted but their changes cannot be reconstructed, so an "
+                     "empty file list here is not proof that the writer changed "
+                     "nothing.")}
 
 
 def review_projection_root(project: Path):
@@ -10855,6 +11159,39 @@ def packet_binding_matches(binding, projection):
                            "manifest_sha256", "projection_sha256",
                            "verification_sha256", "files_sha256",
                            "binding_sha256"))
+
+
+def _recovered_review_identity(dispatch_record, final_snapshot):
+    """Restore a crashed Reviewer's packet identity from its producing dispatch.
+
+    Only a packet that still validates against the exact dispatch evidence and
+    the recorded completion source may be restored; otherwise reuse stays
+    rejected under the existing format/version rules.
+    """
+    identity = {"review_projection_sha256": None,
+                "review_verification_sha256": None,
+                "review_packet_binding": None}
+    if not isinstance(dispatch_record, dict):
+        return identity
+    packet = dispatch_record.get("review_packet")
+    evidence = dispatch_record.get("dispatch_evidence")
+    if not isinstance(packet, dict) or not isinstance(evidence, dict):
+        return identity
+    if packet.get("binding_version") != REVIEW_PACKET_BINDING_VERSION:
+        return identity
+    if packet.get("projection_sha256") != evidence.get("projection_sha256"):
+        return identity
+    if packet.get("verification_sha256") != evidence.get("verification_sha256"):
+        return identity
+    if not packet_binding_matches(packet, evidence):
+        return identity
+    if review_packet_problem(packet, expected_candidate=signature(final_snapshot)):
+        return identity
+    identity.update({
+        "review_projection_sha256": packet.get("projection_sha256"),
+        "review_verification_sha256": packet.get("verification_sha256"),
+        "review_packet_binding": packet})
+    return identity
 
 def _owned_projection_extras(path: Path, owner):
     """Relative paths inside an owned packet not attributable to the supervisor."""
@@ -13080,6 +13417,10 @@ def advance(run_dir, state, cfg, deadline=None):
         if recovered is not None:
             report, job = recovered
             state["last_consumed_recovery_job_id"] = job["id"]
+            # A consumed recovered Implementer report is writer evidence too.  If
+            # its source cannot be tied to the exact dispatch boundary, the
+            # attempt is still counted and the loss reaches the Reviewer.
+            _record_recovered_writer_attempt(run_dir, state, project, job)
         elif report is None:
             report, job = call_model(run_dir, state, cfg, "implementer", "implementer",
                                      prompt_request("implementer", context), project,
@@ -13530,8 +13871,11 @@ def recover_finished_dispatch(run_dir, state):
         validate_report(kind, read_json(report_file))
         completion = read_json(completion_file)
         final_snapshot = completion["final_snapshot"]
+        dispatch_record = _safe_read(path / "dispatch.json")
         if job["kind"] in READ_ONLY_STAGE_KINDS:
-            dispatch = read_json(path / "dispatch.json")
+            if not isinstance(dispatch_record, dict):
+                raise ValueError("read-only dispatch metadata missing")
+            dispatch = dispatch_record
             violation = _read_only_source_violation(
                 dispatch.get("source"), final_snapshot, kind=job["kind"],
                 job_id=job.get("id"))
@@ -13565,6 +13909,20 @@ def recover_finished_dispatch(run_dir, state):
     job.update({"status": "complete", "final_snapshot": final_snapshot,
                 "session_id": completion.get("session_id"),
                 "recovery_gate": {"alive": False, "reason": "session_stopped"}})
+    if job.get("kind") == "implementer":
+        # A crashed writer attempt still reaches review.  Reuse or reconstruct
+        # its exact durable delta; if that is impossible, count the attempt and
+        # carry a structured limitation instead of reporting an empty change set.
+        boundary, boundary_problem = _durable_writer_boundary(run_dir, job)
+        _record_batch_delta(
+            run_dir, state, Path(state["project"]), job.get("id"), boundary,
+            final_snapshot, job=job, phase="recovered-dispatch",
+            forced_problem=boundary_problem)
+    elif job.get("kind") == "reviewer":
+        # Restore the producing packet identity/verification binding so a
+        # still-current recovered review can be consumed without another model
+        # call.  Invalid or missing evidence leaves reuse rejected.
+        job.update(_recovered_review_identity(dispatch_record, final_snapshot))
     binding_file = path / "decision-binding.json"
     if binding_file.is_file():
         try:
