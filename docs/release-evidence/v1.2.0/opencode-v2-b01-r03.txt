@@ -9,7 +9,7 @@ test_run_help_supports_generated_flags (test_opencode_v2_integration.OpenCodeV2B
 test_version_is_tested_v2_line (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
 
 ----------------------------------------------------------------------
-Ran 8 tests in 39.721s
+Ran 8 tests in 44.761s
 
 OK
 EXIT:0

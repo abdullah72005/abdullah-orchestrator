@@ -207,7 +207,7 @@ candidate identified by the revision in
 
 The original candidate (`49f2b62`) evidence is preserved in the release-evidence
 directory, as are the r01 (`26f515b`) and r02 (`345ddb4`) correction logs. The
-r03 correction (`e42e170`, code and tests) closes the remaining Batch 1 recovery,
+r03 correction (`52e5287`, code and tests) closes the remaining Batch 1 recovery,
 snapshot-identity and staged-deletion findings; its evidence commit only adds
 documentation and logs. No live model call was made by any of these gates.
 
@@ -217,9 +217,9 @@ documentation and logs. No live model call was made by any of these gates.
 | Full deterministic suite (original candidate `49f2b62`) | exit 0 — **911 tests, OK, 7 skipped** |
 | Focused correction gate r01 (`26f515b`) | exit 0 — **241 tests, OK** |
 | Focused correction gate r02 (`345ddb4`) | exit 0 — **157 tests, OK** |
-| Focused correction gate r03 (`e42e170`) | exit 0 — **194 tests, OK** |
+| Focused correction gate r03 (`52e5287`) | exit 0 — **195 tests, OK** |
 | Full deterministic suite (corrected candidate) | exit 0 — **953 tests, OK, 8 skipped** |
-| Full deterministic suite (r03 candidate) | exit 0 — **966 tests, OK, 8 skipped** |
+| Full deterministic suite (r03 candidate) | exit 0 — **967 tests, OK, 8 skipped** |
 | Installed OpenCode V2 compatibility module (r03) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Installed OpenCode V2 compatibility module (r02) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Compile | exit 0 |

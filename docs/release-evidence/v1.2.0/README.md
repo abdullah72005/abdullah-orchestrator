@@ -13,7 +13,7 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
   The follow-up evidence commit changes documentation, logs and test/evidence
   assertions only.
 - Batch 1 final corrections (r03, this candidate): code and tests at
-  `e42e170bc911ac9ef62e6e29166187594befafb9`; the evidence commit is its
+  `52e52879cb708cdc97a03c3adc2b76cdcbdd4abb`; the evidence commit is its
   documentation-only child. The r03 suite ran from that exact code/test tree.
 - Public product version: `1.2.0`
 - Internal identifiers: supervisor `3.1.0`, state/config schema `3`,
@@ -76,7 +76,7 @@ returns the exact bytes of a supervisor-generated projection hunk. It does not
 attest a real Reviewer Read-tool invocation, model transport, permission
 enforcement or native terminal behavior.
 
-## Batch 1 final corrections (r03 code `e42e170`)
+## Batch 1 final corrections (r03 code `52e5287`)
 
 The r03 correction closes the remaining Batch 1 findings in the same batch:
 
@@ -105,9 +105,9 @@ The r03 correction closes the remaining Batch 1 findings in the same batch:
 
 | Check | Command | Result |
 |---|---|---|
-| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_orchestrator test_v31_review_recovery test_v31_acceptance_integrity test_v31_dispatch_safety` | exit 0 — **194 tests, OK** in 266.4 s (`focused-b01-r03.txt`) |
-| Full suite | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **966 tests, OK, 8 skipped** in 1244.3 s (`suite-b01-r03.txt`) |
-| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** in 39.7 s on `opencode v2.2.7` (`opencode-v2-b01-r03.txt`) |
+| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_orchestrator test_v31_review_recovery test_v31_acceptance_integrity test_v31_dispatch_safety` | exit 0 — **195 tests, OK** in 284.4 s (`focused-b01-r03.txt`) |
+| Full suite | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **967 tests, OK, 8 skipped** in 1011.3 s (`suite-b01-r03.txt`) |
+| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** in 44.8 s on `opencode v2.2.7` (`opencode-v2-b01-r03.txt`) |
 | Compile / version / diff | `python3 -m compileall -q scripts`, `orchestrator.py version`, `git diff --check 7c050ee..HEAD` | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` (`version-b01-r03.json`) |
 
 The eight full-suite skips remain the opt-in OpenCode V2 module, run separately

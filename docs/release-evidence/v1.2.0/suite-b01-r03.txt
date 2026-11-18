@@ -610,6 +610,7 @@ test_recovered_reviewer_with_invalid_packet_keeps_reuse_rejected (test_v120_rele
 test_recovered_writer_delta_reaches_the_review_projection (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_runtime_input_change_between_attempts_is_not_discarded (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_staged_deletion_has_a_reachable_staged_hunk (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
+test_unavailable_index_before_image_stays_explicit (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_uncaptured_staged_bytes_are_not_a_window_change (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_unchanged_ignored_runtime_input_keeps_continuity (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_valid_recovered_review_is_reused_without_a_model_call (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
@@ -969,7 +970,7 @@ test_subscription_grant_is_consumed_even_when_the_attempt_fails (test_v31_worker
 test_unapproved_api_route_fails_before_spawn (test_v31_worker_routes.WorkerRouteTests) ... ok
 
 ----------------------------------------------------------------------
-Ran 966 tests in 1244.344s
+Ran 967 tests in 1011.293s
 
 OK (skipped=8)
 Reconciled. Check candidate source and resume when safe.

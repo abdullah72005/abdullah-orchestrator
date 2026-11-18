@@ -21,6 +21,7 @@ test_recovered_reviewer_with_invalid_packet_keeps_reuse_rejected (test_v120_rele
 test_recovered_writer_delta_reaches_the_review_projection (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_runtime_input_change_between_attempts_is_not_discarded (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_staged_deletion_has_a_reachable_staged_hunk (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
+test_unavailable_index_before_image_stays_explicit (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_uncaptured_staged_bytes_are_not_a_window_change (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_unchanged_ignored_runtime_input_keeps_continuity (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
 test_valid_recovered_review_is_reused_without_a_model_call (test_v120_release_workflow.BatchCorrectionsR03Tests) ... ok
@@ -194,7 +195,7 @@ test_unreadable_managed_directory_fails_closed (test_v31_dispatch_safety.Dispatc
 test_unreadable_managed_dropin_fails_closed (test_v31_dispatch_safety.DispatchSafetyTests) ... ok
 
 ----------------------------------------------------------------------
-Ran 194 tests in 266.398s
+Ran 195 tests in 284.433s
 
 OK
 {"job_id": "expl-1", "report": {"contract_version": 2, "status": "complete", "summary": "explored", "files": [], "tests": [], "evidence": [], "unknowns": [], "blocker": ""}}
