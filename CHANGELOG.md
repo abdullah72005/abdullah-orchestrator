@@ -319,8 +319,8 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.2.0...HEAD
-[1.2.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.2.0
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.0.0...main
+[1.2.0]: docs/release-evidence/v1.2.0/README.md
 [1.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0
 [3.1.0]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...main
 [3.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v3.0.0

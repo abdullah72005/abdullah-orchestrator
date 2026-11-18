@@ -27,7 +27,7 @@ provider, model, reasoning variant and billing classification per role. The
 default worker route is OpenCode Go.
 
 > [!IMPORTANT]
-> **Project status — v1.2.0 local release candidate.** Codex + OpenCode V2 is
+> **Project status — v1.2.0 release candidate.** Codex + OpenCode V2 is
 > the primary route; Codex + OpenCode Go end-to-end execution and
 > interrupted-run recovery are demonstrated. OpenCode V1 remains experimental
 > and Claude Code is supported at its demonstrated fake-CLI/registration level.
@@ -151,12 +151,12 @@ cd abdullah-orchestrator
 python3 scripts/install_wsl.py --register-codex
 ```
 
-The v1.2.0 candidate is **not published under its own public tag**. To install
-it, run the installer from a local candidate checkout (for example the
-`feat/orchestrator-v1-2` worktree) or from an explicit commit:
+The v1.2.0 candidate is available on `main` without a v1.2.0 release tag.
+To install a specific candidate, check out its recorded commit and run the
+installer:
 
 ```bash
-cd /path/to/abdullah-orchestrator-v1.2.0
+cd /path/to/abdullah-orchestrator
 git rev-parse HEAD
 python3 scripts/install_wsl.py --register-codex
 ```
@@ -347,10 +347,10 @@ Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
 ## Tested behavior
 
 **Deterministic suite (offline, no model calls):** the corrected v1.2.0
-candidate runs **953 tests, all green, 8 skipped** on Python 3.10.12 (945.5 s).
-The initial v1.2.0 candidate ran 911 tests (7 skipped); 42 correction-cycle
-regressions account for the difference. The previous v1.0.0 baseline was 870
-tests. Skips are opt-in only: all 8 are the real-OpenCode introspection module,
+candidate ran **980 tests, with 972 passing and 8 skipped** on Python 3.10.12
+(1030.1 s). The initial v1.2.0 candidate ran 911 tests (7 skipped). The
+previous v1.0.0 baseline was 870 tests. All 8 skips are the opt-in OpenCode
+introspection module,
 which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set; it passes all 8 tests
 against the installed `opencode v2.2.7`. A guard replaces real `codex`, `claude`
 and `opencode` processes with fakes. CI configuration for Python 3.10, 3.12 and
@@ -440,7 +440,7 @@ Reporting: [SECURITY.md](SECURITY.md).
 
 ## Project status
 
-**v1.2.0 local release candidate.** Adds immediate escalation, versioned
+**v1.2.0 release candidate.** Adds immediate escalation, versioned
 requirement replans, verbatim user requirements for workers, independent review
 evidence with batch-delta attribution, stdin prompt transport for Codex/Claude,
 byte-aware OpenCode exec checks, foreground stage announcements, the ordinary
