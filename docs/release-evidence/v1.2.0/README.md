@@ -15,9 +15,13 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
 - Batch 1 final corrections (r03): code and tests at
   `52e52879cb708cdc97a03c3adc2b76cdcbdd4abb`; the evidence commit is its
   documentation-only child. The r03 suite ran from that exact code/test tree.
-- Batch 1 delta-binding correction (r04, this candidate): code and tests at
+- Batch 1 delta-binding correction (r04): code and tests at
   `c575199a8fd627812d52686bc318e964a91ffe86`; the evidence commit is its
   documentation-only child. The r04 suite ran from that exact code/test tree.
+- Batch 1 reconstruction-attestation correction (r05, this candidate): code and
+  tests at `4a00126143ed5ab6f9a1ad08afa66754d0f3aeed`; the evidence commit is
+  its documentation-only child. The r05 suite ran from that exact code/test
+  tree.
 - Public product version: `1.2.0`
 - Internal identifiers: supervisor `3.1.0`, state/config schema `3`,
   report contract `2`, verification evidence `2`
@@ -78,6 +82,44 @@ above. The installed read test proves only that the binary's filesystem endpoint
 returns the exact bytes of a supervisor-generated projection hunk. It does not
 attest a real Reviewer Read-tool invocation, model transport, permission
 enforcement or native terminal behavior.
+
+## Batch 1 reconstruction attestation (r05 code `4a00126`)
+
+The r05 correction closes the rebuild-drift gap in `_record_batch_delta()`:
+
+- Rebuilding a delta samples the live checkout. The source identity is now
+  observed under the shared projection before sampling, compared with the
+  recorded completion signature, and observed again after the index and hunks
+  are prepared. Any mismatch, unavailable identity, or change during
+  reconstruction yields one counted incomplete attempt with the reason
+  `writer delta reconstruction not attributable` (detail distinguishes
+  pre-rebuild drift from mid-reconstruction drift).
+- A prepared index from a drifted scan is renamed to
+  `after/index.drifted-<id>.json`, so it can never later pass an
+  exact-completion reuse check. User source bytes and recoverable hunk
+  artifacts are preserved.
+- The same shared rebuild path serves normal completion, failed/interrupted
+  attempts and crash recovery. Exact retained-index reuse, r04 completion
+  binding, containment, verification provenance, packet binding and retry
+  checks are unchanged.
+
+Regressions (real Git, controlled workers): pre-rebuild drift (`value = 2`
+recorded completion, current `value = 3`), a write during reconstruction with
+matching initial source, and an unchanged reconstruction that projects the
+correct `+value = 2` hunk. Incomplete diagnostics are asserted in the actual
+projected `delta/index.json` and Reviewer limitations.
+
+| Check | Command | Result |
+|---|---|---|
+| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_orchestrator test_v31_review_recovery test_v31_dispatch_safety` | exit 0 — **192 tests, OK** in 261.7 s (`focused-b01-r05.txt`) |
+| Full suite (single stabilized run) | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **976 tests, OK, 8 skipped** in 1014.2 s (`suite-b01-r05.txt`) |
+| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** in 31.7 s on `opencode v2.2.7` (`opencode-v2-b01-r05.txt`) |
+| Compile / version / diff | `python3 -m compileall -q scripts`, `orchestrator.py version`, `git diff --check 7c050ee..HEAD` | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` (`version-b01-r05.json`) |
+
+The prior r04 timing-sensitive `test_decision_child_is_clipped_to_the_remaining_stage_budget`
+failure remains a separate, pre-existing full-suite flake; it passed its exact
+isolated command on this tree and the single recorded r05 full run passed. The
+eight skips remain the opt-in OpenCode V2 module.
 
 ## Batch 1 delta completion binding (r04 code `c575199`)
 
