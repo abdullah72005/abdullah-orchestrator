@@ -7,11 +7,14 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
 - Corrected candidate (Batch 1 review):
   `26f515b60801582cdc9d6c4261628d7874d3d7bb` (implementation, tests and
   changelog).
-- Batch 1 follow-up corrections (r02, this candidate): code and tests at
+- Batch 1 follow-up corrections (r02): code and tests at
   `345ddb43b62226e03d995f02bba8d46d2f385dab`; the evidence commit is its
   documentation-only child. The full suite below ran from the r02 code tree.
   The follow-up evidence commit changes documentation, logs and test/evidence
   assertions only.
+- Batch 1 final corrections (r03, this candidate): code and tests at
+  `e42e170bc911ac9ef62e6e29166187594befafb9`; the evidence commit is its
+  documentation-only child. The r03 suite ran from that exact code/test tree.
 - Public product version: `1.2.0`
 - Internal identifiers: supervisor `3.1.0`, state/config schema `3`,
   report contract `2`, verification evidence `2`
@@ -72,6 +75,49 @@ above. The installed read test proves only that the binary's filesystem endpoint
 returns the exact bytes of a supervisor-generated projection hunk. It does not
 attest a real Reviewer Read-tool invocation, model transport, permission
 enforcement or native terminal behavior.
+
+## Batch 1 final corrections (r03 code `e42e170`)
+
+The r03 correction closes the remaining Batch 1 findings in the same batch:
+
+- Every writer attempt that can reach review is accounted for. Recovery reuses
+  a valid preserved delta index or finalizes the exact attempt from its durable
+  dispatch boundary; repeated recovery does not append the attempt twice. When
+  the boundary, manifest or finalization evidence is missing or unprovable, the
+  attempt is still counted and a structured limitation flows through
+  `delta/index.json` and the review projection instead of an empty clean list.
+  Consumed recovered Implementer reports follow the same exact-attribution rule.
+- Dispatch and completion now share one explicit source identity projection
+  that includes discovered ignored runtime inputs. An unchanged runtime input
+  keeps attempt-chain continuity, a real change is reported as unaccounted, and
+  a historical capture without the projection is uncertainty rather than a
+  false mismatch.
+- Staged bytes outside the capture budget are no longer reconstructed from
+  HEAD. The staged hunk and affirmative attribution are suppressed and a
+  reviewer-visible limitation names the uncaptured dispatch index state.
+- A file removed only from the index now yields a staged deletion hunk while
+  the worktree state stays distinct; already-staged and empty deletions are
+  explicit, and evidence collection leaves the real index unchanged.
+- A crash-recovered Reviewer restores its producing packet/verification
+  binding only after the source, packet and process-stop checks, so a still
+  current review is reusable once; invalid or changed evidence keeps reuse
+  rejected.
+
+| Check | Command | Result |
+|---|---|---|
+| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_orchestrator test_v31_review_recovery test_v31_acceptance_integrity test_v31_dispatch_safety` | exit 0 — **194 tests, OK** in 266.4 s (`focused-b01-r03.txt`) |
+| Full suite | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **966 tests, OK, 8 skipped** in 1244.3 s (`suite-b01-r03.txt`) |
+| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** in 39.7 s on `opencode v2.2.7` (`opencode-v2-b01-r03.txt`) |
+| Compile / version / diff | `python3 -m compileall -q scripts`, `orchestrator.py version`, `git diff --check 7c050ee..HEAD` | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` (`version-b01-r03.json`) |
+
+The eight full-suite skips remain the opt-in OpenCode V2 module, run separately
+above. The installed test still proves only that the binary's filesystem
+endpoint returns the exact bytes of a supervisor-generated hunk under the
+checkout review projection. It is distinct from an authenticated Reviewer Read
+tool, native terminal lifecycle, model transport, permission enforcement and any
+live quality or quota evaluation. All new r03 fixtures use real Git for
+staged/worktree behavior and controlled fake workers for dispatch; no live
+dispatch occurred.
 
 ## Correction cycle results (corrected candidate `26f515b`)
 

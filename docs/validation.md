@@ -206,16 +206,22 @@ candidate identified by the revision in
 [release evidence](release-evidence/v1.2.0/README.md), not a published tag.
 
 The original candidate (`49f2b62`) evidence is preserved in the release-evidence
-directory. These rows describe the corrected candidate; the correction commits
-and exact command output are recorded alongside the logs.
+directory, as are the r01 (`26f515b`) and r02 (`345ddb4`) correction logs. The
+r03 correction (`e42e170`, code and tests) closes the remaining Batch 1 recovery,
+snapshot-identity and staged-deletion findings; its evidence commit only adds
+documentation and logs. No live model call was made by any of these gates.
 
 | Check | Result |
 |---|---|
 | Focused v1.2.0 modules (original candidate `49f2b62`) | exit 0 — 300 tests, OK |
 | Full deterministic suite (original candidate `49f2b62`) | exit 0 — **911 tests, OK, 7 skipped** |
-| Focused correction gate (`26f515b` plus batch corrections) | exit 0 — 157 tests, OK |
+| Focused correction gate r01 (`26f515b`) | exit 0 — **241 tests, OK** |
+| Focused correction gate r02 (`345ddb4`) | exit 0 — **157 tests, OK** |
+| Focused correction gate r03 (`e42e170`) | exit 0 — **194 tests, OK** |
 | Full deterministic suite (corrected candidate) | exit 0 — **953 tests, OK, 8 skipped** |
-| Installed OpenCode V2 compatibility module | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
+| Full deterministic suite (r03 candidate) | exit 0 — **966 tests, OK, 8 skipped** |
+| Installed OpenCode V2 compatibility module (r03) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
+| Installed OpenCode V2 compatibility module (r02) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Compile | exit 0 |
 | `orchestrator.py version` | product `1.2.0`; supervisor `3.1.0`; schema `3`; contract `2` |
 | Config/risk policy | valid; mechanical 1 check/no review, ordinary 1 check/review, high 2 checks/review |
