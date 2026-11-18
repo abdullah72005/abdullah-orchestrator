@@ -5,9 +5,17 @@ This directory holds the review trail for the v3.1 remediation described in
 auditor can inspect the corrected source, understand the four original defects,
 rerun the regressions, and judge what is still unproven.
 
-**Status of the candidate:** Architect-approved with known limitations at
-`0ea5381aa6e1a26e9ee0e1935c494b33800c62ae`. An independent remediation-closure
-audit and real end-to-end testing are **pending**. Nothing here certifies
+> **Historical status.** This packet records the state at
+> `0ea5381aa6e1a26e9ee0e1935c494b33800c62ae`. It has since been superseded by the
+> stale-review recovery correction (`b9819a75c10433d9e8d082e049c2a31084d0e416`),
+> its final Architect acceptance, and the completed real end-to-end run
+> `20261116T124500-973e8c02`. Current release status, evidence and remaining
+> limitations are in [`docs/versioning.md`](../../versioning.md) and
+> [`docs/validation.md`](../../validation.md).
+
+**Status at the time of this packet:** Architect-approved with known limitations
+at `0ea5381aa6e1a26e9ee0e1935c494b33800c62ae`. An independent remediation-closure
+audit and real end-to-end testing were **pending**. Nothing here certified
 production readiness, authenticated provider compatibility, or a stable release.
 
 ## Source identity
