@@ -50,7 +50,7 @@ if name == 'codex':
     output.write_text(json.dumps(report))
     sys.exit(0)
 if name == 'claude':
-    prompt = args[-1]
+    prompt = sys.stdin.read()
     if 'Create a complete' in prompt:
         kind, report = 'plan', plan_report(int(os.environ.get('FAKE_BATCHES', '1')))
     elif 'Inspect end-to-end' in prompt:

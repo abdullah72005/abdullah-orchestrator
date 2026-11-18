@@ -425,14 +425,19 @@ class InteractiveWorkflowTests(unittest.TestCase):
         self.assertTrue(amended["persisted"])
         _, state = orc.load(self.state["id"])
         self.assertEqual(state["amendments"][-1]["text"], "Add keyboard accessibility")
-        self.assertEqual(state["phase"], "diagnose")
+        # A clear new requirement goes directly to a versioned replan; it no
+        # longer needs an intermediate diagnosis hop.
+        self.assertEqual(state["phase"], "plan")
+        self.assertIsNone(state["plan"])
+        self.assertEqual(state["status"], "paused")
         with patch.object(orc, "DEFAULT_STATE", self.runs), \
                 patch.dict(os.environ, self.env):
             orc.resume_run(self.state["id"])
-            diagnosed = orc.stage_run(self.state["id"])
-        self.assertEqual(diagnosed["stage"], "diagnose")
+            replanned = orc.stage_run(self.state["id"])
+        self.assertEqual(replanned["stage"], "plan")
         _, state = orc.load(self.state["id"])
-        self.assertEqual(state["phase"], "plan")
+        self.assertEqual(state["plan_revision"], 2)
+        self.assertGreater(state["amendment_epoch"], 0)
         self.assertNotIn("implementer", self.history.read_text().splitlines())
 
 
@@ -504,7 +509,7 @@ class InteractiveWorkflowTests(unittest.TestCase):
         strong.assert_not_called()
         self.assertEqual(self.history.read_text().splitlines(), before)
         _, state = orc.load(started["run_id"])
-        self.assertEqual(state["model_routes"]["architect"]["model"], "gpt-6.1-sol")
+        self.assertEqual(state["model_routes"]["architect"]["model"], "gpt-6.2-sol")
         self.assertTrue(state["model_routes"]["implementer"]["model"].startswith("opencode-go/"))
 
     def test_interactive_workers_do_not_receive_architect_evidence_root(self):

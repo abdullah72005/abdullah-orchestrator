@@ -1,6 +1,6 @@
 # Installation
 
-This guide installs Abdullah Orchestrator v1.0.0 from a fresh clone, verifies it
+This guide installs Abdullah Orchestrator v1.2.0 from a fresh clone, verifies it
 without spending a model call, and shows how to upgrade, roll back and uninstall.
 
 If anything here fails on your platform, treat it as a release blocker rather
@@ -54,7 +54,7 @@ would move work to unexpected API billing.
 ```bash
 git clone https://github.com/abdullah72005/abdullah-orchestrator.git
 cd abdullah-orchestrator
-git checkout v1.0.0          # pin the release you intend to run
+git checkout v1.2.0          # pin the release you intend to run
 python3 scripts/install_wsl.py --register-codex
 ```
 
@@ -127,7 +127,7 @@ complete example is the minimum that passes the shipped validator:
 {
   "schema_version": 3,
   "architect": {
-    "codex":  {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
+    "codex":  {"model": "gpt-6.2-sol", "effort": "high", "auth": "subscription"},
     "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
   },
   "workers": {
@@ -162,7 +162,7 @@ resolved route per role. Full reference: [configuration.md](configuration.md).
 ## 5. First run
 
 Open one Codex chat (the verified configuration uses Luna Medium as the visible
-coordinator and `gpt-6.1-sol` high as the Architect) and invoke:
+coordinator and `gpt-6.2-sol` high as the Architect) and invoke:
 
 ```text
 $abdullah-orchestrator
@@ -218,7 +218,7 @@ followed by a preflight. Your config and run state are separate and untouched.
 cd /path/to/abdullah-orchestrator
 git fetch --tags
 git status --short                 # stop if you have local changes you care about
-git checkout v1.0.0                # or a newer release tag
+git checkout v1.2.0                # or a newer release tag
 python3 -m unittest discover -s scripts/tests
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
 ```

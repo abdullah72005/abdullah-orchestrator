@@ -8,6 +8,77 @@ uses [Semantic Versioning](https://semver.org/).
 
 Nothing yet.
 
+## [1.2.0] — 2026-11-18
+
+**Local release candidate.** Discrete workflow and evidence improvements over
+`1.0.0`. Internal identifiers are unchanged: supervisor protocol `3.1.0`,
+state/config schema `3`, worker report contract `2`, verification evidence `2`.
+
+### Added
+
+- Explicit Implementer `needs_architect` now routes directly to durable strong
+  diagnosis carrying the question, evidence, unknowns, batch and plan identity.
+  Routine attributable check failures retain one bounded cheap retry.
+- User requirement amendments create a versioned strong replan. Prior plan
+  authority, verification, review, verdicts, decision bindings, batch-delta
+  chain and worker continuation are invalidated under the existing lock; plan,
+  accepted-batch and delta artifacts remain archived and inspectable.
+- Implementer and Reviewer receive one canonical `requirements` block with the
+  user's exact goal and ordered amendments (IDs and kind), distinct from the
+  Architect's interpretation. A plan that omits a requirement cannot replace it.
+- Supervisor-owned batch boundaries capture retrievable before-images for dirty
+  tracked and pre-existing untracked paths, use the recorded HEAD for pristine
+  tracked paths, compare against commits/staged/worktree state, and record
+  observed per-file hunks with explicit pre-existing/overlap/attribution limits.
+- A digest-bound, checkout-local read-only review projection exposes acceptance
+  criteria, requirements, the delta index, readable hunks and independent check
+  results to the Reviewer without Implementer conclusions or raw reports.
+- Codex `codex exec … -` and Claude print-mode prompts are delivered on stdin
+  through the existing guard. OpenCode retains its supported positional prompt
+  with byte-aware per-string and combined argv/environment checks and a
+  pre-dispatch refusal path.
+- Foreground stage previews and results carry local start time with offset,
+  role, configured and effective model/effort, batch identity, task, expected
+  output, monotonic elapsed time, outcome, blocker and next action. Recap and
+  status expose the last stage.
+- Run-creation `ordinary_planning_trial` opt-in (MCP and CLI) for a task declared
+  ordinary before dispatch: the pinned Codex Sol 6.2 subscription route uses
+  Medium for the initial plan only. High-risk trial plans are not admitted;
+  replans, diagnosis, integration and acceptance stay High.
+- The shipped Codex Architect default is `gpt-6.2-sol` at `high`, subscription.
+- An `## Active orchestrator run` policy is delivered in each worker's effective
+  input (OpenCode V1/V2 profile or Codex/Claude inline), scoping out
+  `writing-plans`, `executing-plans` and `subagent-driven-development` while
+  retaining systematic debugging and focused TDD.
+
+### Changed
+
+- A user requirement amendment no longer takes an intermediate diagnosis hop;
+  a material correction that needs investigation keeps it.
+- Minor-correction text references the amendment ID; the raw text stays in the
+  single canonical requirements block.
+- OpenCode probes validate help on the real option shape without treating the
+  stdin `-` marker as an option.
+- The entry skill's startup reads are optional for the ordinary loop; detailed
+  operations, role and contract references are loaded on demand.
+
+### Preserved
+
+- Checkout ownership, guarded process containment, cancellation/reconciliation,
+  route and billing preflight, one-shot fallback consent, mechanical review
+  exemption, independent review for ordinary/high risk, the two-check high-risk
+  minimum, source-bound acceptance and recovery of historical runs.
+- Historical model pins and saved-route compatibility are not rewritten.
+
+### Verification
+
+- Focused v1.2.0 workflow cases plus the full deterministic suite and compile,
+  version, config-policy, installation and MCP smoke checks. Exact commands,
+  counts and skip reasons are recorded in
+  [docs/release-evidence/v1.2.0/README.md](docs/release-evidence/v1.2.0/README.md).
+  Live Medium/High quota comparisons and native terminal UX were not measured in
+  this offline candidate; see that evidence file for the explicit limitations.
+
 ## [1.0.0] — 2026-11-18
 
 **First official public release.** The internal supervisor remains `3.1.0`; state
@@ -221,7 +292,8 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.2.0
 [1.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0
 [3.1.0]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...main
 [3.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v3.0.0

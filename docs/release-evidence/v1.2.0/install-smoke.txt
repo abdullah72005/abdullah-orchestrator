@@ -1,0 +1,83 @@
+Installed: /tmp/opencode/v120-smoke/home/.agents/skills/abdullah-orchestrator -> /home/abdullah/abdullah-orchestrator-v1.2.0
+Installed: /tmp/opencode/v120-smoke/home/.claude/skills/abdullah-orchestrator -> /home/abdullah/abdullah-orchestrator-v1.2.0
+Created editable model config: /tmp/opencode/v120-smoke/home/.config/abdullah-orchestrator/config.json
+Registered Codex MCP server: abdullah-orchestrator
+Registered Claude MCP server: abdullah-orchestrator
+Manual command: claude mcp add --scope user --transport stdio abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py mcp
+Interactive host environment: export CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0
+Foreground host settings snippet (destination /tmp/opencode/v120-smoke/home/.claude/settings.json):
+{
+  "env": {
+    "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"
+  }
+}
+User MCP server snippet (destination /tmp/opencode/v120-smoke/home/.claude/.claude.json):
+{
+  "abdullah-orchestrator": {
+    "type": "stdio",
+    "command": "/usr/bin/python3",
+    "args": [
+      "/home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py",
+      "mcp"
+    ],
+    "timeout": 18000000
+  }
+}
+Manual step that installs the timeout:
+  claude mcp add-json --scope user abdullah-orchestrator '{"type":"stdio","command":"/usr/bin/python3","args":["/home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py","mcp"],"timeout":18000000}'
+Merge: Merge the foreground env keys into /tmp/opencode/v120-smoke/home/.claude/settings.json (user scope) or export them in the interactive host environment before launch.
+Merge: Merge the server entry into the user-scoped MCP store /tmp/opencode/v120-smoke/home/.claude/.claude.json; do not put mcpServers in settings.json.
+Merge: `claude mcp add` does not install the per-server timeout. Either register with the printed `claude mcp add-json` command or add "timeout": 18000000 to the existing entry in /tmp/opencode/v120-smoke/home/.claude/.claude.json.
+Merge: Preserve unrelated settings and MCP servers; re-running the installer must be a no-op for an identical registration.
+Verify: Run /mcp inside Claude Code and confirm the server is connected.
+Verify: Run `claude mcp get abdullah-orchestrator` to inspect scope/command.
+Verify: Confirm the user MCP entry in /tmp/opencode/v120-smoke/home/.claude/.claude.json has timeout 18000000.
+Verify: A foreground tool call should not auto-background; Ctrl-C/Esc should cancel it and the supervisor should preserve recoverable state.
+MCP registration command:
+  codex mcp add abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py mcp
+Claude manual registration command:
+  claude mcp add --scope user --transport stdio abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py mcp
+Next: check Go model and CLI with python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py doctor --project /absolute/path/to/development/repo
+Open Codex with Luna medium, invoke $abdullah-orchestrator, and give it a goal.
+--- second run (idempotence) ---
+Already linked: /tmp/opencode/v120-smoke/home/.agents/skills/abdullah-orchestrator
+Already linked: /tmp/opencode/v120-smoke/home/.claude/skills/abdullah-orchestrator
+Preserved existing model config: /tmp/opencode/v120-smoke/home/.config/abdullah-orchestrator/config.json
+Codex MCP server already registered: abdullah-orchestrator
+Already registered Claude MCP server: abdullah-orchestrator
+Manual command: claude mcp add --scope user --transport stdio abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py mcp
+Interactive host environment: export CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0
+Foreground host settings snippet (destination /tmp/opencode/v120-smoke/home/.claude/settings.json):
+{
+  "env": {
+    "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"
+  }
+}
+User MCP server snippet (destination /tmp/opencode/v120-smoke/home/.claude/.claude.json):
+{
+  "abdullah-orchestrator": {
+    "type": "stdio",
+    "command": "/usr/bin/python3",
+    "args": [
+      "/home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py",
+      "mcp"
+    ],
+    "timeout": 18000000
+  }
+}
+Manual step that installs the timeout:
+  claude mcp add-json --scope user abdullah-orchestrator '{"type":"stdio","command":"/usr/bin/python3","args":["/home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py","mcp"],"timeout":18000000}'
+Merge: Merge the foreground env keys into /tmp/opencode/v120-smoke/home/.claude/settings.json (user scope) or export them in the interactive host environment before launch.
+Merge: Merge the server entry into the user-scoped MCP store /tmp/opencode/v120-smoke/home/.claude/.claude.json; do not put mcpServers in settings.json.
+Merge: `claude mcp add` does not install the per-server timeout. Either register with the printed `claude mcp add-json` command or add "timeout": 18000000 to the existing entry in /tmp/opencode/v120-smoke/home/.claude/.claude.json.
+Merge: Preserve unrelated settings and MCP servers; re-running the installer must be a no-op for an identical registration.
+Verify: Run /mcp inside Claude Code and confirm the server is connected.
+Verify: Run `claude mcp get abdullah-orchestrator` to inspect scope/command.
+Verify: Confirm the user MCP entry in /tmp/opencode/v120-smoke/home/.claude/.claude.json has timeout 18000000.
+Verify: A foreground tool call should not auto-background; Ctrl-C/Esc should cancel it and the supervisor should preserve recoverable state.
+MCP registration command:
+  codex mcp add abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py mcp
+Claude manual registration command:
+  claude mcp add --scope user --transport stdio abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py mcp
+Next: check Go model and CLI with python3 /home/abdullah/abdullah-orchestrator-v1.2.0/scripts/orchestrator.py doctor --project /absolute/path/to/development/repo
+Open Codex with Luna medium, invoke $abdullah-orchestrator, and give it a goal.

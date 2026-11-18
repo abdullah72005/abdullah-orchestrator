@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the implementation that ships in `scripts/orchestrator.py`
-(public product version **1.0.0**; internal supervisor version **3.1.0**;
+(public product version **1.2.0**; internal supervisor version **3.1.0**;
 state/config schema 3; worker report contract 2). It is written for someone who
 needs to modify, audit, or debug the workflow — not as marketing material.
 
@@ -28,7 +28,7 @@ needs to modify, audit, or debug the workflow — not as marketing material.
 | Supervisor | `scripts/orchestrator.py` | State machine, guards, verification, evidence, recovery |
 | MCP server | `orchestrator.py mcp` | Nine foreground tools over stdio JSON-RPC |
 | Guard | `orchestrator.py _guard` | Session/process-group leader; kills the tree if the lease closes |
-| Architect | Codex `gpt-6.1-sol` or Claude Opus, high effort | Plan, diagnose, integrate, accept |
+| Architect | Codex `gpt-6.2-sol` or Claude Opus, high effort | Plan, diagnose, integrate, accept |
 | Explorer | OpenCode Go, low variant | Read-only investigation |
 | Implementer | OpenCode Go, high variant | One bounded writer per batch |
 | Reviewer | OpenCode Go, high variant, fresh context | Independent findings |
@@ -296,7 +296,7 @@ entitlement or execution.
 
 | Identifier | Value | Meaning |
 |---|---|---|
-| `PRODUCT_VERSION` | `1.0.0` | Public product release, independent of everything below |
+| `PRODUCT_VERSION` | `1.2.0` | Public product release, independent of everything below |
 | `SUPERVISOR_VERSION` | `3.1.0` | Internal supervisor/protocol version, pinned in config |
 | `STATE_SCHEMA_VERSION` | `3` | On-disk run state shape |
 | `CONFIG_SCHEMA_VERSION` | `3` | Configuration shape |

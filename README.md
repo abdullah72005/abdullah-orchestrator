@@ -7,7 +7,7 @@
 <p align="center"><strong>Strong-model decisions. Cost-conscious execution. Independent verification. One controlling conversation.</strong></p>
 
 <p align="center">
-  <a href="https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0"><img alt="Release v1.0.0" src="https://img.shields.io/badge/release-v1.0.0-2f6f4e"></a>
+  <a href="https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.2.0"><img alt="Release v1.2.0" src="https://img.shields.io/badge/release-v1.2.0-2f6f4e"></a>
   <a href="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab"></a>
   <a href="#requirements"><img alt="Runtime: standard library only" src="https://img.shields.io/badge/runtime-stdlib%20only-4b5563"></a>
@@ -27,11 +27,12 @@ provider, model, reasoning variant and billing classification per role. The
 default worker route is OpenCode Go.
 
 > [!IMPORTANT]
-> **Project status — v1.0.0, first public release.** Codex + OpenCode Go
-> end-to-end execution and interrupted-run recovery are demonstrated. Broader
-> live compatibility (Claude Code, OpenCode V1, alternative providers) and
-> long-duration endurance testing remain ongoing. See
-> [Tested behavior](#tested-behavior) and
+> **Project status — v1.2.0 local release candidate.** Codex + OpenCode V2 is
+> the primary route; Codex + OpenCode Go end-to-end execution and
+> interrupted-run recovery are demonstrated. OpenCode V1 remains experimental
+> and Claude Code is supported at its demonstrated fake-CLI/registration level.
+> Broader live compatibility and long-duration endurance testing remain ongoing.
+> See [Tested behavior](#tested-behavior) and
 > [Security and limitations](#security-and-limitations).
 
 ---
@@ -197,7 +198,7 @@ shipped validator:
 {
   "schema_version": 3,
   "architect": {
-    "codex":  {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
+    "codex":  {"model": "gpt-6.2-sol", "effort": "high", "auth": "subscription"},
     "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
   },
   "workers": {
@@ -218,6 +219,14 @@ shipped validator:
 | Architect (Codex) | `architect.codex.model` / `.effort` | Passed through; confirm it exists in your Codex catalog. |
 | Architect (Claude) | `architect.claude.model` / `.effort` | Same, for the Claude host. |
 | Explorer | `workers.explorer` | Optional read-only investigation. |
+
+The shipped Codex Architect default is `gpt-6.2-sol` at `high` on subscription
+billing. Final acceptance always uses that High route. A run may explicitly opt
+into `ordinary_planning_trial` at creation to use Medium for the **initial plan
+only** on a task declared ordinary; a high-risk plan from that trial is not
+admitted, and replans, diagnosis, integration and acceptance stay High. The
+trial is validated against the pinned Codex Sol 6.2 subscription route and never
+mutates the Architect route.
 | Implementer | `workers.implementer` | The only writer. |
 | Reviewer | `workers.reviewer` | Fresh independent context. |
 
@@ -296,16 +305,39 @@ running ──verified interrupt──► paused ──resume──► running
 Operations reference: [references/operation.md](references/operation.md).
 Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
 
+## What changed in 1.2.0
+
+- An explicit Implementer `needs_architect` routes straight to durable strong
+  diagnosis with its question, evidence and unknowns, not to a cheap retry.
+  Routine, attributable check failures keep one bounded cheap attempt.
+- A user requirement amendment triggers a versioned strong replan; prior plan,
+  checks, review, approval, decision bindings and worker continuation are
+  invalidated while artifacts and audit history remain readable.
+- Implementer and Reviewer receive the user's verbatim goal and amendments once,
+  separate from the Architect's interpretation. The fresh Reviewer also receives
+  acceptance criteria, an observed batch-delta index and supervisor-generated
+  check results through a digest-bound read-only projection inside the checkout.
+- Codex and Claude receive the full request on stdin (no positional prompt);
+  OpenCode keeps its supported positional transport behind byte-aware exec
+  checks. Stable policy is delivered once per effective route.
+- Each foreground stage announces local time, role, exact configured/effective
+  model and effort, batch identity, task and expected output, then reports
+  elapsed time, outcome and next action.
+- Active orchestrator workers bypass the overlapping Superpowers
+  `writing-plans`, `executing-plans` and `subagent-driven-development` skills
+  while retaining systematic debugging and focused TDD.
+
 ## Tested behavior
 
-**Deterministic suite (offline, no model calls):** 870 tests, executed by CI on
-Python 3.10, 3.12 and 3.13 for every push to `main` (461–471 s per job, all
-green). Skips are opt-in or platform-gated: 7 on the maintainer host and 8 on
-GitHub runners. The main opt-in module is the real-OpenCode introspection suite,
-which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set. A guard replaces real
-`codex`, `claude` and `opencode` processes with fakes. The previously accepted
-pre-release revision `b9819a7` passed 866 tests locally; v1.0.0 adds
-release-identity coverage and version reporting.
+**Deterministic suite (offline, no model calls):** the v1.2.0 candidate runs
+**911 tests, all green, 7 skipped** on Python 3.10.12 (875.2 s). The previous
+v1.0.0 baseline was 870 tests; 41 v1.2.0 workflow cases and updated transport/
+transition assertions account for the difference. Skips are opt-in or
+platform-gated: 7 here and 8 on GitHub runners. The main opt-in module is the
+real-OpenCode introspection suite, which runs only when
+`ABDULLAH_OPENCODE_V2_BIN` is set. A guard replaces real `codex`, `claude` and
+`opencode` processes with fakes. CI configuration for Python 3.10, 3.12 and 3.13
+is unchanged; this candidate's local evidence is Python 3.10 only.
 
 **Real end-to-end milestone (2026-11-16 → 2026-11-18):**
 
@@ -313,7 +345,7 @@ release-identity coverage and version reporting.
 |---|---|
 | Run | `20261116T124500-973e8c02` |
 | Host / coordinator | Codex CLI on a dedicated isolated profile |
-| Architect | `gpt-6.1-sol`, effort `high` (subscription) |
+| Architect | `gpt-6.1-sol`, effort `high` (subscription) — historical v1.0.0 run |
 | Workers | OpenCode `v2.2.7`, OpenCode Go `deepseek-v4.1-flash` (implementation `high`, review `high`) |
 | Explorer | Not dispatched (`explorer_policy: none`) |
 | Real work | Implemented a duration-parsing contract in a disposable fixture repo |
@@ -391,11 +423,18 @@ Reporting: [SECURITY.md](SECURITY.md).
 
 ## Project status
 
-**v1.0.0 — First public release.** Codex + OpenCode Go E2E and interrupted-run
-recovery demonstrated. Broader live compatibility and endurance testing remain
-ongoing. Earlier internal tags (`v3.0.0`, `v3.1.0-audit-candidate.1`) are
-historical engineering milestones and are preserved; the public product version
-is independent of the internal supervisor, schema and contract versions. See
+**v1.2.0 local release candidate.** Adds immediate escalation, versioned
+requirement replans, verbatim user requirements for workers, independent review
+evidence with batch-delta attribution, stdin prompt transport for Codex/Claude,
+byte-aware OpenCode exec checks, foreground stage announcements, the ordinary
+Medium planning trial, the `gpt-6.2-sol` Codex Architect default, and scoped
+Superpowers instructions for active runs. The candidate suite result is recorded
+in [docs/release-evidence/v1.2.0/](docs/release-evidence/v1.2.0/README.md).
+Codex + OpenCode Go E2E and interrupted-run recovery demonstrated at v1.0.0.
+Broader live compatibility and endurance testing remain ongoing. Earlier
+internal tags (`v3.0.0`, `v3.1.0-audit-candidate.1`) are historical engineering
+milestones and are preserved; the public product version is independent of the
+internal supervisor, schema and contract versions. See
 [docs/versioning.md](docs/versioning.md).
 
 ## Contributing

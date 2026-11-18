@@ -42,27 +42,22 @@ class CheckpointDEfficiency(unittest.TestCase):
         self.assertTrue(result["persisted"])
         saved = orc.read_json(self.rundir / "state.json")
         self.assertEqual(saved["amendments"][-1]["kind"], "material")
-        self.assertEqual(saved["phase"], "diagnose")
+        self.assertEqual(saved["phase"], "plan")
         self.assertEqual(saved["accepted_batches"], [])
         self.assertEqual(saved["accepted_history"][0]["invalidated_by"],
                          saved["amendments"][-1]["id"])
         self.assertEqual(saved["plan_history"][-1]["plan_version"], plan and orc.content_hash(plan))
         self.assertIsNone(saved["verification"])
         self.assertIsNone(saved["review"])
-        diagnosed = {"verdict": "changes_required", "reason": "new requirement",
-                     "inspected": ["app.py"], "correction": "replan"}
         new_plan = {"contract_version": 2, "status": "complete", "summary": "new",
                     "invariants": ["new invariant"],
                     "batches": [{"title": "new", "goal": "new", "acceptance": ["new"],
                                  "checks": [["true"]], "risk": "ordinary"}],
                     "blocker": ""}
-        with patch.object(orc, "strong_call", side_effect=[diagnosed, new_plan]):
+        # A clear new requirement replans directly; no diagnosis hop.
+        with patch.object(orc, "strong_call", side_effect=[new_plan]):
             orc.resume_run("test-run00")
             orc.advance(self.rundir, orc.read_json(self.rundir / "state.json"), self.cfg)
-            state = orc.read_json(self.rundir / "state.json")
-            self.assertEqual(state["phase"], "plan")
-            self.assertIsNone(state["plan"])
-            orc.advance(self.rundir, state, self.cfg)
         final = orc.read_json(self.rundir / "state.json")
         self.assertEqual(final["phase"], "implement")
         self.assertEqual(final["plan_revision"], 2)
@@ -78,7 +73,9 @@ class CheckpointDEfficiency(unittest.TestCase):
         self.assertEqual(saved["amendments"][-1]["kind"], "minor")
         self.assertEqual(saved["phase"], "implement")
         self.assertEqual(saved["plan_version"], orc.content_hash(plan))
-        self.assertIn("Fix the typo", saved["correction"])
+        amendment = saved["amendments"][-1]
+        self.assertIn(amendment["id"], saved["correction"])
+        self.assertEqual(amendment["text"], "Fix the typo")
 
     def test_mechanical_batch_skips_independent_review(self):
         self._with_plan()
@@ -176,7 +173,7 @@ class CheckpointDEfficiency(unittest.TestCase):
         orc.amend_run("test-run00", "minor follow-up", architect_review=False)
         saved = orc.read_json(self.rundir / "state.json")
         self.assertEqual(saved["amendments"][-1]["kind"], "material")
-        self.assertEqual(saved["phase"], "diagnose")
+        self.assertEqual(saved["phase"], "plan")
         self.assertTrue(saved.get("amendment_material"))
 
     def test_pre_amendment_cached_plan_is_not_reused(self):

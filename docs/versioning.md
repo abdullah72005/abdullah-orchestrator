@@ -6,7 +6,7 @@ what each one controls.
 
 | Identifier | Current value | Where it lives | What breaks if you change it |
 |---|---|---|---|
-| **Public product version** | `1.0.0` | Git tag / GitHub release / `PRODUCT_VERSION` / `orchestrator.py version` | Nothing at runtime. It names the published release. |
+| **Public product version** | `1.2.0` | Git tag / GitHub release / `PRODUCT_VERSION` / `orchestrator.py version` | Nothing at runtime. It names the published release. |
 | **Supervisor protocol version** | `3.1.0` | `SUPERVISOR_VERSION`; pinned in `runtime.supervisor_version` | A pin mismatch refuses to run; saved runs record it and report `supervisor_changed`. |
 | **State schema version** | `3` | `state.json` → `schema_version` | Older state needs an explicit, backup-first `migrate-run`; newer state is refused. |
 | **Config schema version** | `3` | `config.json` → `schema_version` | A newer config schema is refused rather than silently reinterpreted. |
@@ -24,7 +24,7 @@ python3 scripts/orchestrator.py version
 ```json
 {
   "product": "abdullah-orchestrator",
-  "product_version": "1.0.0",
+  "product_version": "1.2.0",
   "supervisor_version": "3.1.0",
   "state_schema_version": 3,
   "config_schema_version": 3,
@@ -62,6 +62,7 @@ schema ordering.
 | `v3.1.0-audit-candidate.1` | Internal v3.1 audit candidate | Preserved; never moved |
 | `final-audit-baseline`, `final-hardening-checkpoint` | Internal checkpoints | Preserved; never moved |
 | **`v1.0.0`** | **First public release** | Immutable release tag |
+| **`v1.2.0`** | **Workflow and review-evidence release candidate** | Local candidate; tag only when published |
 
 Tags are never force-moved or deleted. If a release must be corrected, publish a
 new patch tag rather than rewriting an existing one.

@@ -7,7 +7,7 @@ description: Run or resume Abdullah's durable, quota-aware software engineering 
 
 One interactive conversation is the coordinator. The visible model (Luna Medium in Codex) talks to the user and invokes a bundled Python MCP supervisor. The supervisor owns execution state, process lifecycle, checkpoints, verification and recovery; a separate strong Architect (Sol High in Codex) makes consequential decisions. The **original** `abdullah-architect` and `abdullah-implementer` remain untouched.
 
-Public product version **1.0.0**. The internal supervisor protocol remains
+Public product version **1.2.0**. The internal supervisor protocol remains
 `3.1.0`, state/config schema `3`, and report contract `2`; a public tag never
 renumbers them. `python3 scripts/orchestrator.py version` prints all identifiers.
 See `docs/versioning.md` for upgrade and compatibility policy.
@@ -29,7 +29,9 @@ Legacy detached `start --background` mode is optional, is **not** the default, a
 
 ## Setup
 
-1. Read [operations](references/operation.md), [roles](references/roles.md) and [report contracts](references/contracts.md).
+1. You do not need to read the references first; the ordinary loop is below.
+   Load them only when needed: [operations and recovery](references/operation.md),
+   [role policies](references/roles.md), [report contracts](references/contracts.md).
 2. Copy the whole skill directory onto the WSL filesystem and run `python3 scripts/install_wsl.py` from its root. The installer links the skill into `~/.agents/skills/abdullah-orchestrator` (Codex discovery) and `~/.claude/skills/abdullah-orchestrator` (Claude discovery), refuses to overwrite unrelated files, and creates the editable config.
 3. Edit `~/.config/abdullah-orchestrator/config.json`; verify the paid Go account and exact model/variant identifiers. Run:
    `python3 scripts/orchestrator.py doctor --project /absolute/dev/project`
@@ -45,6 +47,19 @@ Legacy detached `start --background` mode is optional, is **not** the default, a
    ```
 
    Do not apply this timeout globally. Codex's 300-second default is too short for a legitimate Architect, Implementer or Reviewer stage. Five hours deliberately exceeds the default whole-stage (`max_stage_seconds`, 17,000 s) and per-child caps so the host cannot race the supervisor at the boundary; it is a communication upper bound, not a stuck-worker detector.
+
+   For Claude Code, register the same server in the project/user MCP
+   configuration with a server-scoped timeout in milliseconds, for example:
+
+   ```json
+   {"mcpServers": {"abdullah-orchestrator": {
+     "command": "python3",
+     "args": ["<SKILL_DIR>/scripts/orchestrator.py", "mcp"],
+     "timeout": 18000000}}}
+   ```
+
+   `18000000` ms is five hours. Registration only configures the host's
+   communication bound; it does not apply a timeout by itself.
 5. Restart Codex, open **one** chat with Luna Medium, and invoke `$abdullah-orchestrator`.
 
 The runtime selects OpenCode V1 or V2 configuration based on the installed CLI version, supports the tested ranges `>=1.18 <2.0` and `>=2.2 <3.0`, and rejects untested versions. It never silently switches from paid Go to free models or from subscription auth to billed API credentials.
@@ -53,7 +68,14 @@ The runtime selects OpenCode V1 or V2 configuration based on the installed CLI v
 
 Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrator_runs` takes `run_id`. Do not invent tool names or bypass these operations with ad-hoc supervisor commands.
 
-1. **Start a run** — `orchestrator_start` with the absolute `project`, a precise `goal`, and the required controlling `host` (`codex` or `claude`). Other optional arguments: `plan_approval`, `require_explorer`, `allow_explorer`, `explorer_policy` (`none`|`on_demand`|`required`), `approved_handoff` plus `authorize_handoff`, `skip_doctor`. New and legacy runs default to `explorer_policy=none` unless permission is explicit. It creates durable state and does **not** dispatch a worker.
+1. **Start a run** — `orchestrator_start` with the absolute `project`, a precise `goal`, and the required controlling `host` (`codex` or `claude`). Other optional arguments: `plan_approval`, `require_explorer`, `allow_explorer`, `explorer_policy` (`none`|`on_demand`|`required`), `approved_handoff` plus `authorize_handoff`, `skip_doctor`, and `ordinary_planning_trial` (with `planning_trial_risk: "ordinary"`). New and legacy runs default to `explorer_policy=none` unless permission is explicit. It creates durable state and does **not** dispatch a worker.
+
+   The ordinary planning trial is an explicit, run-scoped opt-in for a task the
+   operator declares ordinary before dispatch. It uses the pinned Codex Sol 6.2
+   route at Medium effort for the **initial plan only**. If that plan contains
+   high-risk work it is not admitted; resume for a fresh High plan. Replans,
+   consequential diagnosis, integration and final acceptance always use the
+   pinned High route. Do not opt in when the risk is unknown.
 2. **Execute one stage** — `orchestrator_stage` with `run_id`. It runs exactly one of plan, explore, implement, verify, review, accept, diagnose or integrate. Announce the agent, task and expected output first. Never hide several stages in one call.
 3. **Inspect status** — `orchestrator_status` with `run_id`. Deterministic compact status, active job/check, next action and run directory; makes no model call.
 4. **Interrupt or pause** — `orchestrator_interrupt` with `run_id` and a short `reason`. Persists the interruption, terminates the process session and descendants, verifies termination and preserves changes. A verified stop leaves `paused`; an unverified stop leaves `uncertain`.
@@ -72,14 +94,20 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
 For every engineering task use this loop:
 
 1. Call `orchestrator_start` with the absolute project path, precise goal, and explicit `host`.
-2. Call `orchestrator_stage` once per stage. Announce first, in a compact message, exactly what the user's example shows:
+2. Call `orchestrator_stage` once per stage. Announce first, in a compact message built from the returned `next` preview, for example:
 
-   **Starting Architect — Sol High**
-   - Task: inspect the project and design the plan.
-   - Expected output: invariants, batches, acceptance criteria and check argv.
+   **14:32 (local) · Architect / Sol gpt-6.2-sol · High · Batch 1/1**
+   - Task: review concurrent webhook retries in the candidate.
+   - Expected: an acceptance verdict or a specific correction.
 
-3. `orchestrator_stage` is one foreground tool call. Codex shows its native running-tool indicator and elapsed time; when it returns, report only the compact result and the next stage. Never hide several stages inside one call.
+   `next` supplies `started_at` with its offset, `agent_label`, `model`, `effort`,
+   `batch` and `expected_phase`. When `config_route_differs` is true, show both the
+   configured and the effective route.
+
+3. `orchestrator_stage` is one foreground tool call. Codex shows its native running-tool indicator and elapsed time; when it returns, report the elapsed time, outcome, any blocker and the next action (`next` / `next_action`). Never hide several stages inside one call.
 4. Repeat `orchestrator_stage` until the run is complete, paused, blocked or uncertain.
+
+Pass `expected_phase` from the preview if you want the supervisor to reject a stale announcement instead of running a different stage.
 
 Do not poll with a model; status and recap are deterministic. Do not select the legacy background mode in an interactive chat.
 
@@ -126,6 +154,10 @@ Recovery from a new chat: `orchestrator_runs` → `orchestrator_status` → `orc
 ## Engineering principles
 
 - Strong Architect owns difficult invariants, critical code inspection, conflict resolution and final acceptance. Cheap workers handle exploration, implementation and independent review. A serious Reviewer finding cannot be voted away by multiple cheap agents.
+- The user's verbatim goal and amendments are handed once to Implementer and Reviewer as a `requirements` block, separate from the Architect's interpretation. A plan that omits a user requirement does not replace it.
+- The fresh Reviewer receives the acceptance criteria, the observed batch delta index and the supervisor's independent check results through a digest-bound read-only projection inside the checkout. It does not receive the Implementer's conclusions.
+- An explicit Implementer `needs_architect` goes straight to strong diagnosis with its question and evidence. A routine, attributable check failure gets at most one cheap retry before diagnosis. A clear new user requirement triggers a versioned strong replan and leaves nothing stale authorized.
+- **Superpowers scoping:** inside an active orchestrator stage, do not use the `writing-plans`, `executing-plans` or `subagent-driven-development` skills: the supervisor already owns plans, sequencing and dispatch. Keep `systematic-debugging` for real failures and focused test-driven development for the behavior being changed. Brainstorming may precede an unsettled run. The standalone manual `abdullah-architect` and `abdullah-implementer` skills are unaffected and remain separate tools.
 - Architect can synchronously dispatch and consume cheap Explorer findings during planning or diagnosis through `orchestrator.py explore`, only when the run's explicit `explorer_policy` permits it. Missing/legacy policy means no nested dispatch.
 - Risk-based QA: one fresh Reviewer for ordinary behavior, targeted finding verification when useful, no fixed jury, no endless debate.
 - Supervisor runs the approved checks and records the actual worktree fingerprint and Docker source identity. Never accept a green run against a stale or unrelated checkout.
@@ -180,7 +212,7 @@ All run commands accept either a positional `<ID>` or `--run <ID>`, never both. 
 
 All model routes are read from `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`) on every operation:
 
-- **Architect** — `architect.codex` and `architect.claude` select the model and effort for each host. The value is passed through unchanged, so confirm it against the installed Codex/Claude catalog; keep `auth: "subscription"`.
+- **Architect** — `architect.codex` and `architect.claude` select the model and effort for each host. The shipped default is `gpt-6.2-sol` at `high` for Codex and `claude-opus-5-5` at `high` for Claude. The value is passed through unchanged, so confirm it against the installed Codex/Claude catalog; keep `auth: "subscription"`. Final Architect acceptance always uses this High route, including after an ordinary Medium planning trial.
 - **Workers** — `workers.explorer`, `workers.implementer` and `workers.reviewer` select a fully qualified `provider/model` ID, an optional `provider` (must match the prefix), `variant`, and `billing`. The default remains `opencode-go/...` with `billing: "go"`. Non-Go routes (`subscription`, `api`, `free`, `local`) require an explicit human `authorize-route` grant bound to the role, run and exact route; a route-scoped fallback needs separate one-dispatch consent.
 - **Discovery** — `opencode models --verbose` (V1, includes variants) or `opencode models` (V2, IDs only), then `python3 scripts/orchestrator.py doctor --project <abs>` to confirm `route_models_listed`, `variant_verified`, `billing_preflight`, `provider_availability` and resolved routes.
 

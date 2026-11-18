@@ -295,8 +295,10 @@ class AmendmentsAndContext(unittest.TestCase):
         saved = orc.read_json(self.rundir / "state.json")
         self.assertEqual(saved["amendments"][-1]["kind"], "material")
         self.assertEqual(saved["amendments"][-1]["request_kind"], "requirement")
-        self.assertEqual(saved["phase"], "diagnose")
+        self.assertEqual(saved["phase"], "plan")
+        self.assertEqual(saved["amendments"][-1]["routed_to"], "plan")
         self.assertIsNone(saved["verification"])
+        self.assertIsNone(saved["plan"])
         self.assertEqual(saved["plan_history"][-1]["plan_version"], orc.content_hash(plan))
 
     def test_explicit_correction_stays_bounded(self):

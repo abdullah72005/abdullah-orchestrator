@@ -208,6 +208,9 @@ class ReliabilityRepair(ControlTests):
             orc.strong_call(self.rundir, self.state, self.cfg, 'decision',
                             {'final_evidence': modern})
         prompt = captured['prompt']
+        if isinstance(prompt, dict) and orc.PROMPT_REQUEST_KEY in prompt:
+            request = prompt[orc.PROMPT_REQUEST_KEY]
+            prompt = orc.render_prompt(request["kind"], request["context"])
         self.assertIn('"verification_evidence"', prompt)
         self.assertIn('tests passed', prompt)
         self.assertIn('untrusted data', prompt)

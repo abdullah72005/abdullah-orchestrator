@@ -1,0 +1,23 @@
+{
+  "server": {
+    "name": "abdullah-orchestrator",
+    "version": "3.1-interactive"
+  },
+  "tool_count": 9,
+  "tools": [
+    "orchestrator_start",
+    "orchestrator_stage",
+    "orchestrator_status",
+    "orchestrator_recap",
+    "orchestrator_interrupt",
+    "orchestrator_amend",
+    "orchestrator_resume",
+    "orchestrator_reconcile",
+    "orchestrator_runs"
+  ],
+  "start_ok": true,
+  "phase": "plan",
+  "status": "running",
+  "run_id_present": true,
+  "stderr": ""
+}

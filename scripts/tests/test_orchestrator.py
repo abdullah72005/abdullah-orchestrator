@@ -368,7 +368,11 @@ class ControlTests(unittest.TestCase):
             orc.advance(self.rundir, self.state, self.cfg)
         self.assertEqual(captured["role"], "architect")
         self.assertEqual(captured["kind"], "plan")
-        self.assertIn("Architect — strong Sol / Opus", captured["prompt"])
+        request = captured["prompt"][orc.PROMPT_REQUEST_KEY]
+        self.assertEqual(request["kind"], "plan")
+        self.assertEqual(request["context"]["goal"], "Add a feature")
+        self.assertIn("Architect — strong Sol / Opus",
+                      orc.render_prompt(request["kind"], request["context"]))
         self.assertEqual(self.state["phase"], "implement")
         self.assertEqual(self.state["id"], "test-run00")
         self.assertEqual(self.state["goal"], "Add a feature")

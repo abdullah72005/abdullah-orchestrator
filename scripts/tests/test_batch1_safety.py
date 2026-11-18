@@ -347,16 +347,23 @@ class Batch1Safety(unittest.TestCase):
     def test_architect_subprocess_receives_parent_job_environment(self):
         captured = {}
         def fake_spawn(command, cwd, env, log, **kwargs):
-            captured.update({"command": command, "env": env})
+            captured.update({"command": command, "env": env,
+                             "stdin_data": kwargs.get("stdin_data")})
             raise KeyboardInterrupt("stop before spawn")
+        request = orc.prompt_request(
+            "plan", {"goal": "plan",
+                     "explorer_dispatch":
+                         "python3 orchestrator.py explore --parent-job __ABDULLAH_PARENT_JOB__"})
         with patch.object(orc, "_spawn_guarded", side_effect=fake_spawn):
             with self.assertRaises(KeyboardInterrupt):
                 orc.call_model(self.rundir, self.state, self.cfg, "architect",
-                               "plan", "prompt __ABDULLAH_PARENT_JOB__", self.project)
+                               "plan", request, self.project)
         self.assertEqual(captured["env"]["ABDULLAH_RUN_ID"], "test-run00")
         self.assertTrue(captured["env"]["ABDULLAH_PARENT_JOB"])
         self.assertEqual(captured["env"]["ABDULLAH_STAGE"], "plan")
-        prompt = captured["command"][-1]
+        # The prompt travels on stdin for Codex; argv carries only the marker.
+        self.assertEqual(captured["command"][-1], "-")
+        prompt = captured["stdin_data"]
         self.assertIn(captured["env"]["ABDULLAH_PARENT_JOB"], prompt)
         self.assertNotIn("__ABDULLAH_PARENT_JOB__", prompt)
 

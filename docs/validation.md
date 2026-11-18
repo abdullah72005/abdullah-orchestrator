@@ -197,6 +197,32 @@ real-OpenCode introspection module, which requires `ABDULLAH_OPENCODE_V2_BIN`.
 The release environment has OpenCode V2.2.7 installed, and `doctor` performed
 real configuration normalization without inference.
 
+### v1.2.0 release candidate (2026-11-18)
+
+Candidate base `7c050ee`; offline worktree with Python 3.10.12 on WSL2. No live
+model call, subscription usage, paid request, native terminal session or
+installed V2 binary was used for this candidate evidence.
+
+| Check | Result |
+|---|---|
+| Focused v1.2.0 modules | exit 0 — 300 tests, OK |
+| Full deterministic suite | exit 0 — **911 tests, OK, 7 skipped** in 875.2 s |
+| Compile | exit 0 |
+| `orchestrator.py version` | product `1.2.0`; supervisor `3.1.0`; schema `3`; contract `2` |
+| Config/risk policy | valid; mechanical 1 check/no review, ordinary 1 check/review, high 2 checks/review |
+| `git diff --check` against base | exit 0 |
+| Fresh-`HOME` install, twice | exit 0; links created once; config created then preserved; Codex/Claude registration idempotent |
+| MCP initialize/tools/state-only start | 9 tools; start `ok: true`, phase `plan`, no dispatch |
+
+The seven skips are the opt-in `test_opencode_v2_integration` module, which
+requires `ABDULLAH_OPENCODE_V2_BIN`. Detailed logs are in
+[release-evidence/v1.2.0](release-evidence/v1.2.0/README.md).
+
+Not measured in this candidate: live Medium-vs-High planning quality/cost,
+token or wall-time savings, native terminal duration/Esc/reconnect behavior,
+authenticated Codex/Claude/OpenCode stages, and the installed V2 read-policy
+proof. Fake-CLI and fake-host fixtures establish supervisor behavior only.
+
 ### Real end-to-end milestone (2026-11-16 → 2026-11-18)
 
 Run `20261116T124500-973e8c02`, on a dedicated isolated Codex profile, config,

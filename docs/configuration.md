@@ -55,7 +55,7 @@ show individual keys to merge into your config, not standalone files.
 {
   "schema_version": 3,
   "architect": {
-    "codex":  {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
+    "codex":  {"model": "gpt-6.2-sol", "effort": "high", "auth": "subscription"},
     "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
   },
   "workers": {
@@ -121,7 +121,7 @@ Example — move the Codex Architect to a different high-effort model:
 ```json
 {
   "architect": {
-    "codex": {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"}
+    "codex": {"model": "gpt-6.2-sol", "effort": "high", "auth": "subscription"}
   }
 }
 ```
@@ -424,6 +424,25 @@ timeout. The previous per-child caps are still enforced independently.
 Keep the Codex MCP `tool_timeout_sec` strictly above the largest of the three
 stage caps. Raising a stage cap without raising the MCP timeout lets the client
 race the supervisor at the boundary.
+
+## Ordinary planning trial
+
+`orchestrator_start` / `orchestrator.py start` accepts
+`ordinary_planning_trial: true` (CLI: `--ordinary-planning-trial`) with
+`planning_trial_risk: "ordinary"` (CLI: `--planning-trial-risk`). This is an
+explicit declaration made **before** dispatch, not an automatic downgrade:
+
+- it validates the pinned Codex Architect route is Sol 6.2 at `high` with
+  `subscription` billing and refuses another host or model;
+- only the initial plan uses Medium effort; the Architect route itself is not
+  mutated and saved runs keep the route they pinned;
+- a plan containing high-risk batches is not admitted — resume for a fresh High
+  plan;
+- replans, consequential diagnosis, integration and final acceptance remain
+  High, and a Medium fallback cannot satisfy them.
+
+If the risk is unknown, do not opt in. Historical runs and expressly pinned
+routes keep their existing behavior.
 
 ## Permissions and risk
 
