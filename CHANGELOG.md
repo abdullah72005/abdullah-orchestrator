@@ -6,11 +6,39 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Remediation of the four AOR31 findings from the independent Architect audit.
-**Status: Architect-approved engineering candidate** at `0ea5381`; an independent
-remediation-closure audit and real end-to-end testing are still pending. No
-stable release is tagged. Review packet:
-[`docs/agent-handoffs/orchestrator-v3-1/`](docs/agent-handoffs/orchestrator-v3-1/).
+Nothing yet.
+
+## [1.0.0] — 2026-11-18
+
+**First official public release.** The internal supervisor remains `3.1.0`; state
+and configuration schema remain `3`; the worker report contract remains `2`. The
+public product version starts at `1.0.0` and does not renumber any internal
+identifier. See [docs/versioning.md](docs/versioning.md).
+
+### Added
+
+- `PRODUCT_VERSION = "1.0.0"` and an `orchestrator.py version` command that
+  reports the public version separately from the supervisor, state/config schema,
+  report contract and evidence formats. `doctor` now reports the same identifiers.
+- `docs/installation.md`: supported versus unverified environments, clean install,
+  Codex/Claude MCP registration, per-server timeouts, upgrade, rollback and
+  uninstall, including a repeatable clean-`HOME` installation check.
+- `docs/troubleshooting.md`: symptom → classified cause → exact recovery command
+  for preflight, containment, checkout, evidence and report failures.
+- `docs/versioning.md`: public/product, protocol, schema, contract and saved-run
+  compatibility policy, including the historical v3.x tags.
+
+### Changed
+
+- README restructured for first use: value proposition, architecture diagram,
+  capability table, quickstart, configuration, usage, tested behavior, security
+  boundaries, documentation index and explicit release status.
+- Validation evidence now includes the real Codex + OpenCode Go end-to-end run
+  `20261116T124500-973e8c02`: planning, implementation, 44-test verification,
+  interrupted Reviewer, containment, stale-provenance rewind, fresh review and
+  Architect acceptance.
+- Historical `v3.0.0` and `v3.1.0-audit-candidate.1` tags are retained unchanged
+  and relabelled as internal milestones in the changelog narrative.
 
 ### Fixed
 
@@ -60,11 +88,20 @@ stable release is tagged. Review packet:
 - `restore-run` fully validates a backup before atomic mutation and preserves
   pre-restore state and backup provenance.
 
-## [3.1.0] — unreleased candidate (2026-11-13)
+### Security
+
+- Release audit found no credentials, private keys, session transcripts, live run
+  state or personal operational paths in tracked files. Sanitized fixtures and
+  engineering evidence are intentionally included.
+
+## [3.1.0] — internal candidate (2026-11-13)
+
+Internal engineering milestone. Tagged only as `v3.1.0-audit-candidate.1`; never
+published as a stable product release. Superseded by `1.0.0`.
 
 Closes audit findings AOR-01 through AOR-07 and adds reviewed multi-provider
 OpenCode worker routes. Supervisors report `SUPERVISOR_VERSION 3.1.0`, state and
-config schema `3`, and verification evidence `2`. This is an implementation
+config schema `3`, and verification evidence `2`. This was an implementation
 candidate for independent audit, not a published release.
 
 ### Fixed
@@ -110,8 +147,9 @@ candidate for independent audit, not a published release.
 
 ## [3.0.0] — 2026-11-13
 
-First public release of the supervisor that passed the real end-to-end pilot
-(run `20261113T104752-32561af8`). Supervisors report `SUPERVISOR_VERSION 3.0.0`,
+Early preview tag from the development series, now superseded by the `1.0.0`
+public release. First supervisor to pass a real end-to-end pilot (run
+`20261113T104752-32561af8`). Supervisors report `SUPERVISOR_VERSION 3.0.0`,
 state schema `2`, config schema `2`, verification evidence `2`.
 
 ### Added
@@ -183,6 +221,7 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0
 [3.1.0]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...main
 [3.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v3.0.0

@@ -4,12 +4,15 @@
 
 | Version | Supported |
 |---|---|
-| `3.0.x` | Yes |
-| `< 3.0` | No |
+| `1.0.x` (public release) | Yes |
+| `v3.0.0`, `v3.1.0-audit-candidate.1` (internal milestones) | No — upgrade to a `1.0.x` release |
 
-Security fixes are applied to the latest release line. This is a local
-developer tool that can run shell commands and Docker through a worker; treat
-it accordingly.
+Security fixes are applied to the latest public release line. The internal
+supervisor version (`3.1.0`) is not a support boundary; see
+[`docs/versioning.md`](docs/versioning.md).
+
+This is a local developer tool that can run shell commands and Docker through a
+worker; treat it accordingly.
 
 ## Reporting a vulnerability
 

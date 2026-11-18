@@ -83,9 +83,14 @@ ROLE_POLICIES = {"plan": "architect", "decision": "architect", "diagnose": "arch
                  "implementer": "implementer", "reviewer": "independent reviewer"}
 SOURCE_PROVENANCE_VERSION = 3
 VERIFICATION_EVIDENCE_VERSION = 2
+# Public product release.  Independent of the internal supervisor/protocol
+# version, state schema and worker report contract so that a public tag never
+# invalidates pinned configuration or saved runs.
+PRODUCT_VERSION = "1.0.0"
 SUPERVISOR_VERSION = "3.1.0"
 STATE_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 3
+REPORT_CONTRACT_VERSION = 2
 # Stage kinds that must never write to the candidate checkout.  Only an
 # Implementer may edit source; legitimate Architect corrections are dispatched
 # as Implementer work instead of granting a strong model a write exception.
@@ -11312,12 +11317,35 @@ def probe_opencode_config(project, role, dialect):
         return False
 
 
+def version_info():
+    """Report public, protocol, schema and contract identifiers separately."""
+    return {
+        "product": "abdullah-orchestrator",
+        "product_version": PRODUCT_VERSION,
+        "supervisor_version": SUPERVISOR_VERSION,
+        "state_schema_version": STATE_SCHEMA_VERSION,
+        "config_schema_version": CONFIG_SCHEMA_VERSION,
+        "report_contract_version": REPORT_CONTRACT_VERSION,
+        "source_provenance_version": SOURCE_PROVENANCE_VERSION,
+        "verification_evidence_version": VERIFICATION_EVIDENCE_VERSION,
+        "python": "%d.%d.%d" % sys.version_info[:3],
+        "note": (
+            "product_version is the public release. supervisor_version, "
+            "state/config schema and report contract versions are independent; "
+            "a public release never resets or reinterprets them."),
+    }
+
+
 def doctor(project: Path, host="codex"):
     validate_workflow()
     cfg = config()
     project = project.resolve()
     checks = {"project": str(project), "valid_repo": False, "commands": {},
               "versions": {}, "cli_compatible": {}, "route": {}}
+    checks["product_version"] = PRODUCT_VERSION
+    checks["supervisor_version"] = SUPERVISOR_VERSION
+    checks["state_schema_version"] = STATE_SCHEMA_VERSION
+    checks["report_contract_version"] = REPORT_CONTRACT_VERSION
     if project.is_dir():
         try:
             snap = source_snapshot(project)
@@ -11605,7 +11633,7 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
                  "accepted_batches": [], "accepted_history": [],
                  "review": None, "implementation": None,
                  "verification": None, "amendments": [], "interruptions": [],
-                 "amendment_epoch": 0, "contract_version_required": 2,
+                 "amendment_epoch": 0, "contract_version_required": REPORT_CONTRACT_VERSION,
                  "usage": {"strong_calls": 0, "cheap_calls": 0, "failed_attempts": 0,
                            "interrupted_attempts": 0, "corrections": 0,
                            "human_interventions": 0, "reported_tokens": None,
@@ -13738,6 +13766,7 @@ def main(argv=None):
     d = subs.add_parser("doctor", help="Check this WSL project's prerequisites and model entitlement")
     d.add_argument("--project", required=True)
     d.add_argument("--host", choices=("codex", "claude"), default="codex")
+    subs.add_parser("version", help="Print product, supervisor, schema and report contract versions")
     snap = subs.add_parser("snapshot", help="Print source identity for an approved handoff")
     snap.add_argument("--project", required=True)
     s = subs.add_parser("start", help="Create and run a durable goal")
@@ -13868,6 +13897,9 @@ def main(argv=None):
             result = doctor(Path(opts.project), opts.host)
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0 if result["ready"] else 2
+        if opts.command == "version":
+            print(json.dumps(version_info(), indent=2))
+            return 0
         if opts.command == "snapshot":
             print(json.dumps(source_snapshot(Path(opts.project).expanduser().resolve()), indent=2))
             return 0

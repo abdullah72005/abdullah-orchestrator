@@ -95,7 +95,7 @@ The previously observed 300-second default is too short for a legitimate foregro
 
 Cancellation is not an MCP tool. Interrupt first with `orchestrator_interrupt` (or the host's Esc cancel) and confirm `stopped: true`; then, only with explicit user authorization, the CLI `cancel <ID>` writes a cancellation control request that a running supervisor consumes. A paused run is preserved for audit.
 
-The legacy CLI `start --background` is an optional detached mode for unattended operation. It is **not** the default and must not be selected without the user's explicit authorization. Its supervisor survives closing a chat only while WSL stays awake; a sleeping laptop cannot execute jobs.
+The legacy CLI `start` is **not** equivalent to the `orchestrator_start` MCP tool: without `--background` it creates the run and immediately serves it, dispatching real workers stage after stage. Use the MCP tool for state-only creation in the interactive workflow. `start --background` is an optional detached mode for unattended operation. It is **not** the default and must not be selected without the user's explicit authorization. Its supervisor survives closing a chat only while WSL stays awake; a sleeping laptop cannot execute jobs.
 
 ## Supervisor ownership and interruption
 

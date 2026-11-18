@@ -85,11 +85,21 @@ the relevant test module when behavior changes.
 - [ ] If the OpenCode/Codex CLI contract changed, `doctor` and the dialect
       tests were updated together.
 
+## Releases and version identifiers
+
+The public release version (`1.0.0`) is independent of the internal supervisor
+(`3.1.0`), state/config schema (`3`) and report contract (`2`). Never reset an
+internal identifier to match a public tag. When behavior changes, update the
+relevant constant, the release notes and `docs/versioning.md` together.
+
 ## Documentation
 
 - Agent-facing operation: `SKILL.md` and `references/`.
-- Human-facing design: `docs/`.
+- Human-facing design: `docs/` (`installation`, `configuration`, `architecture`,
+  `troubleshooting`, `versioning`, `validation`, `security-model`, `maintenance`).
 - Audit history: `docs/audit/`. Do not rewrite past findings; add a new entry.
+- Test evidence: `docs/validation.md`, with raw logs under the corresponding
+  evidence directory. A skip is never recorded as a pass.
 
 ## License
 

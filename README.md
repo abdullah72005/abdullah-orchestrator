@@ -1,150 +1,156 @@
 <p align="center">
-  <img src="assets/icon.svg" width="64" height="64" alt="Abdullah Orchestrator icon">
+  <img src="assets/icon.svg" width="72" height="72" alt="Abdullah Orchestrator icon">
 </p>
 
-# Abdullah Orchestrator
+<h1 align="center">Abdullah Orchestrator</h1>
 
-**Durable, quota-aware multi-agent engineering from a single chat — with a deterministic Python supervisor, verified evidence, and recoverable checkpoints.**
+<p align="center"><strong>Strong-model decisions. Cost-conscious execution. Independent verification. One controlling conversation.</strong></p>
 
-[![Tests](https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg)](https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Standard library only](https://img.shields.io/badge/runtime-stdlib%20only-success.svg)](#requirements)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-
-> **Project status: v3.1 Architect-approved engineering candidate.**
-> The four AOR31 remediation findings are closed and independently
-> Architect-approved at `0ea5381`. An independent remediation-closure audit and
-> real end-to-end testing are still pending. No stable `v3.1.0` release is
-> tagged. See [validation](docs/validation.md) and the
-> [closure-audit handoff](docs/agent-handoffs/orchestrator-v3-1/aor31-closure-auditor-handoff.md).
+<p align="center">
+  <a href="https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0"><img alt="Release v1.0.0" src="https://img.shields.io/badge/release-v1.0.0-2f6f4e"></a>
+  <a href="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg"></a>
+  <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab"></a>
+  <a href="#requirements"><img alt="Runtime: standard library only" src="https://img.shields.io/badge/runtime-stdlib%20only-4b5563"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2f6f4e"></a>
+</p>
 
 Abdullah Orchestrator turns one interactive Codex or Claude conversation into a
-disciplined engineering workflow. A cheap visible coordinator drives a bundled
-Python **supervisor**; a strong **Architect** plans and accepts; OpenCode
-**Explorer**, **Implementer**, and independent **Reviewer** workers do the
-bounded work. OpenCode Go is the default, and each worker can use a separately
-configured provider and model with explicit billing authorization. The
-supervisor — not the language model — owns state, process lifecycle,
-verification, and recovery.
+disciplined engineering workflow. A visible coordinator talks to you and calls a
+bundled Python **supervisor**; a strong **Architect** plans, diagnoses and
+accepts; OpenCode **Explorer**, **Implementer** and fresh **Reviewer** workers do
+the bounded work. The supervisor — not the language model — owns run state,
+process ownership, verification and recovery, so an interrupted chat, a drifted
+toolchain or an unverified "it works" cannot silently become accepted work.
 
-Every model identifier is configurable in one JSON file: Architect models per
-host, and worker providers, models, variants, and billing classifications per
-role. See [Model configuration](#configure-models).
+Every model identifier is configurable: Architect models per host, and worker
+provider, model, reasoning variant and billing classification per role. The
+default worker route is OpenCode Go.
 
-It was built for long-running work on a real repository where a dropped chat,
-a wrong checkout, or an unverified "it works" is expensive.
+> [!IMPORTANT]
+> **Project status — v1.0.0, first public release.** Codex + OpenCode Go
+> end-to-end execution and interrupted-run recovery are demonstrated. Broader
+> live compatibility (Claude Code, OpenCode V1, alternative providers) and
+> long-duration endurance testing remain ongoing. See
+> [Tested behavior](#tested-behavior) and
+> [Security and limitations](#security-and-limitations).
 
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    U["You<br/>one Codex or Claude conversation"] --> C["Visible coordinator<br/>Codex Luna Medium / Claude chat"]
+    C <-->|"stdio MCP · 9 foreground tools"| S["Python supervisor<br/>state · containment · evidence · recovery"]
+
+    S --> A["Strong Architect<br/>plan · diagnose · integrate · accept"]
+    S --> E["Explorer<br/>optional, read-only"]
+    S --> I["Implementer<br/>one bounded writer"]
+    S --> V["Supervisor verification<br/>executes plan argv, binds evidence"]
+    S --> R["Independent Reviewer<br/>fresh context, read-only"]
+
+    V --> R
+    R --> A
+    A -->|"changes required"| I
+    A -->|"approved"| D["Complete<br/>durable evidence on disk"]
+
+    S -.->|"persists before launch"| ST[("Run state<br/>state.json · journal.jsonl<br/>jobs · verification logs")]
+    S -.->|"guards"| G["Process-session guard<br/>lease pipe · containment gate"]
+
+    H["Human-only CLI actions<br/>approve-plan · authorize-route<br/>approve-fallback · retire"] -.->|"never MCP tools"| S
 ```
-        you
-         │
-         ▼
-┌──────────────────────────┐        stdio MCP         ┌────────────────────────────┐
-│ Visible coordinator      │ ◄──────────────────────► │ Python supervisor (stdlib) │
-│ Codex Luna / Claude chat │                          │ state · guard · evidence   │
-└──────────────────────────┘                          └─────────────┬──────────────┘
-                                                                   │ guarded process sessions
-                              ┌────────────────┬───────────────────┼───────────────────┐
-                              ▼                ▼                   ▼                   ▼
-                       ┌────────────┐   ┌────────────┐      ┌────────────┐      ┌────────────┐
-                       │ Architect  │   │ Explorer   │      │ Implementer│      │ Reviewer   │
-                       │ strong     │   │ OpenCode   │      │ OpenCode   │      │ OpenCode   │
-                       │ plan/accept│   │ read-only  │      │ one writer │      │ read-only  │
-                       └────────────┘   └────────────┘      └────────────┘      └────────────┘
-```
+
+Every stage is one visible foreground call. The coordinator announces the worker
+and expected output first, then reports only the structured result. Nothing is
+hidden inside a single "do everything" call.
+
+**The split that matters:** the model decides, and the supervisor enforces.
+
+| Concern | Owner |
+|---|---|
+| Design, invariants, acceptance criteria, final verdict | Strong Architect |
+| State transitions, checkpoints, process ownership, command execution, evidence binding, recovery | Deterministic Python supervisor |
+| Exploration, implementation, independent review | Worker models with bounded briefs |
 
 ## Why this exists
 
-Most "agent loops" put state in the model's context. When the chat is
-interrupted, the context is compacted, or the wrong worktree is checked out,
-the loop silently loses correctness. Abdullah Orchestrator separates the two
-concerns:
+Most agent loops keep correctness in the model's context. When the chat is
+compacted, the host sleeps, the worktree changes or a toolchain is upgraded, the
+loop loses its footing and keeps going. Abdullah Orchestrator separates durable
+engineering state from conversational state:
 
-- **The model decides.** The Architect owns design, invariants, acceptance
-  criteria, and the final verdict.
-- **The supervisor enforces.** It persists dispatch intent *before* launch,
-  binds every verification result to the exact source snapshot, guards worker
-  process trees, and fails closed when ownership is uncertain.
+- Dispatch intent is written to disk **before** a process starts.
+- Verification evidence is bound to the exact source snapshot, runtime inputs,
+  environment, config and toolchain that produced it.
+- Ownership that cannot be proven is `uncertain`, never "probably stopped".
+- Acceptance checks the evidence again instead of trusting a previous message.
 
-That split is what makes the workflow resumable, auditable, and safe to leave
-running for hours.
+That is what makes a run resumable from a new chat, auditable after the fact and
+safe to leave running for hours.
 
-## Highlights
+## Key capabilities
 
 | Capability | What it means in practice |
 |---|---|
-| **Durable runs** | Every stage, report, log, and checkpoint is on disk under a run ID. Recovery from a new chat is `runs → status → resume`. |
-| **Verified evidence** | Acceptance evidence is bound to git HEAD, dirty-file hashes, runtime inputs, environment values, config hash, toolchain identity, verification argv, and plan revision. Change any of them and old evidence is rejected. |
-| **Containment** | Workers run in a guarded session/process group with a lease pipe. Interrupt, reconcile, and completion all use one fail-closed containment gate. |
-| **Risk-based QA** | Mechanical work can skip the separate reviewer; ordinary work gets an independent review; high-risk work needs two distinct checks and a nonempty verification purpose. |
-| **Explicit cost control** | Strong-model calls are reserved for planning, consequential diagnosis, and acceptance. Recaps and status are deterministic and free. |
-| **Typed handoffs** | Every worker emits one JSON object against a generated, strict schema. Contract v2 fields are required; legacy reports cannot masquerade as fresh evidence. |
-| **OpenCode V1 + V2** | Generates the correct dialect for the installed CLI, validates effective V2 permissions through the real CLI, and refuses untested versions. |
-| **Human-only boundaries** | Plan approval, fallback authorization, retirement, and adoption are operator CLI actions — never MCP tools a model can call for itself. |
+| **Strong Architect ownership** | Planning, consequential diagnosis, integration and final acceptance use a strong model; routine status and recaps make no model call. |
+| **Optional cheap exploration** | Explorer runs only when the run's explicit policy allows it (`none` by default). |
+| **Configurable worker providers** | Each worker role has its own `provider/model`, `variant` and `billing`; OpenCode Go is the default. |
+| **Per-role models and variants** | Pin a cheaper Explorer and a stronger Implementer/Reviewer without touching code. |
+| **Deterministic verification** | The supervisor executes the approved argv (never `shell=True`) and records exit codes, logs, hashes and containment. |
+| **Fresh independent review** | Ordinary work gets a separate Reviewer context; high-risk work needs two distinct checks. Review/decision authority is invalidated when verification is redone. |
+| **Source-bound acceptance** | Evidence is rejected if HEAD, dirty files, runtime inputs, environment, config, toolchain, plan revision or checked executable changed. |
+| **Correction cycles** | A `changes_required` verdict returns to a bounded Implementer correction instead of restarting the batch. |
+| **Durable run state** | Atomic `state.json`, append-only journal, per-job artifacts and verification logs under one run ID. |
+| **Crash and interruption recovery** | Verified interrupt → `paused`; unverified → `uncertain` → reconcile only after containment proves every marked process stopped. |
+| **Stale-provenance recovery** | Compatible environment/toolchain drift on intact evidence rewinds once to `verify`, preserving implementation and history, and disarms pre-invalidation review authority. |
+| **Explicit billing authorization** | Non-Go routes require a human `authorize-route` grant bound to role, run and exact route material; unknown routes refuse rather than silently bill an API. |
+| **Fallback safety** | Fallback is never automatic and never inherited from another route. |
+| **Checkout ownership** | One lease per canonical Git checkout; conflicts return resolution commands instead of retrying. |
+| **Codex and Claude host integration** | stdio MCP server plus installer registration for both hosts; Claude long-stage behavior is not yet live-certified. |
 
-## How a run works
-
-One conversation, one stage per visible foreground MCP call:
-
-| Stage | Agent | Produces |
-|---|---|---|
-| `plan` | Architect | Invariants, coherent batches, acceptance criteria, argv checks |
-| `explore` | Explorer | Read-only investigation when policy allows it |
-| `implement` | Implementer | One bounded batch in the authorized checkout |
-| `verify` | Supervisor | Executes the plan's argv against the exact candidate |
-| `review` | Reviewer | Independent findings with severity and disposition |
-| `accept` | Architect | Evidence-based verdict; correction wave if needed |
-| `diagnose` | Architect | Recovery plan for a blocked or uncertain run |
-| `integrate` | Architect | Final integration checks and closing assessment |
-
-The coordinator announces the worker, task, and expected output before each
-stage, then reports only the structured result. It never hides several stages
-inside one call and never claims completion without supervisor evidence.
+Implemented behavior and *live-validated* behavior are deliberately separated.
+See [Tested behavior](#tested-behavior) and [docs/validation.md](docs/validation.md).
 
 ## Requirements
 
-- Linux or WSL, **Python 3.10+** (standard library only — no pip install)
-- `git`
-- Codex CLI (Codex host) or Claude Code CLI (Claude host)
-- OpenCode CLI on a tested line (`>=1.18 <2.0` or `>=2.2 <3.0`) with a paid
-  **OpenCode Go** account by default, or another provider with explicit billing
-  authorization
-- Docker/Compose only for projects whose verification uses containers
+| Requirement | Detail |
+|---|---|
+| OS | **Linux or WSL2 (Ubuntu)** — the verified platform. Native macOS/Windows and managed configuration delivery are not certified. |
+| Python | **3.10+**, standard library only (no `pip install`, no virtualenv required). CI runs 3.10, 3.12 and 3.13. |
+| Git | Any reasonably current `git`; verification uses real checkouts and worktrees. |
+| Host CLI | Codex CLI **or** Claude Code CLI, both authenticated for your own account. |
+| Worker CLI | OpenCode on a tested line: `>=1.18 <2.0` or `>=2.2 <3.0`. Other versions are refused instead of guessed. |
+| Worker account | **OpenCode Go** subscription by default, or another OpenCode provider with an explicit, human-authorized billing route. |
+| Docker | Only for projects whose verification needs containers. |
+
+`doctor` verifies the installed CLIs, supported OpenCode line, generated argv,
+configured model IDs, route/billing classification and (on OpenCode V2) effective
+application permissions. It never launches inference.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/abdullah72005/abdullah-orchestrator.git
 cd abdullah-orchestrator
-python3 scripts/install_wsl.py
+python3 scripts/install_wsl.py --register-codex
 ```
 
-The installer links the skill into `~/.agents/skills/abdullah-orchestrator`
-(Codex) and `~/.claude/skills/abdullah-orchestrator` (Claude; use `--no-claude`
-to skip), refuses to overwrite unrelated files, and creates
-`~/.config/abdullah-orchestrator/config.json` without overwriting an existing
-config.
+This is idempotent and refuses to overwrite unrelated skills or servers. It:
 
-Edit the config and confirm the exact model/variant identifiers in your
-installed catalog ([full configuration reference](docs/configuration.md)), then
-run the preflight:
+1. links the skill into `~/.agents/skills/abdullah-orchestrator` (Codex) and
+   `~/.claude/skills/abdullah-orchestrator` (Claude; `--no-claude` to skip);
+2. creates `~/.config/abdullah-orchestrator/config.json` from the example
+   **without overwriting an existing config**;
+3. with `--register-codex`, registers the stdio supervisor if it is absent.
+
+Edit the config for your catalog, then preflight a real project:
 
 ```bash
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
+python3 scripts/orchestrator.py version
 ```
 
-`doctor` checks CLI options, configured models/variants, billing route, and — on
-OpenCode V2 — the *effective* permissions the CLI reports. It does not launch a
-model session or prove entitlement.
-
-Register the stdio supervisor once per Codex profile:
-
-```bash
-python3 scripts/install_wsl.py --register-codex
-# or manually:
-codex mcp add abdullah-orchestrator -- python3 "$PWD/scripts/orchestrator.py" mcp
-```
-
-Set the per-server timeout in `~/.codex/config.toml` and restart Codex:
+Add the **per-server** timeout to `~/.codex/config.toml`, then restart Codex:
 
 ```toml
 [mcp_servers.abdullah-orchestrator]
@@ -153,300 +159,229 @@ args = ["/absolute/path/to/abdullah-orchestrator/scripts/orchestrator.py", "mcp"
 tool_timeout_sec = 18000
 ```
 
-Keep this bound strictly above the largest configured `limits` value. Five
-hours deliberately exceeds the default whole-stage (`max_stage_seconds`) and
-per-child caps so the host cannot race the supervisor at the boundary. Do not
-apply it globally.
+Keep this strictly above the largest configured `limits` value; do not apply it
+globally. Open **one** Codex chat and invoke the skill:
 
-### Claude Code
-
-The same supervisor serves a Claude conversation. Register it once at user
-scope:
-
-```bash
-python3 scripts/install_wsl.py --register-claude
-# or manually:
-claude mcp add --scope user --transport stdio abdullah-orchestrator -- \
-  python3 "$PWD/scripts/orchestrator.py" mcp
+```text
+$abdullah-orchestrator
 ```
 
-Two Claude-specific details matter:
+Then give it an absolute project path and a precise goal. The detailed,
+verified installation walkthrough — including a clean-environment test, Claude
+Code setup, upgrades, rollback and uninstall — is in
+**[docs/installation.md](docs/installation.md)**.
 
-- Keep `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` in the user settings
-  (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) so a
-  foreground stage cannot be auto-backgrounded.
-- `claude mcp add` does not install a per-server timeout. Re-register with the
-  printed `claude mcp add-json` command or add `"timeout": 18000000` to the
-  `abdullah-orchestrator` entry in the user MCP store (`~/.claude.json`, or
-  `$CLAUDE_CONFIG_DIR/.claude.json`). Do not put `mcpServers` in
-  `settings.json`.
+## Configuration
 
-Verify with `claude mcp get abdullah-orchestrator` and `/mcp` inside Claude
-Code. Claude host mode is covered by fake-CLI tests; authenticated long stages,
-Esc/cancel and reconnect behavior are not yet certified.
-
-Open one Codex or Claude chat, invoke `$abdullah-orchestrator`, give it an
-absolute project path and a precise goal. Full walkthrough:
-[`docs/architecture.md`](docs/architecture.md).
-
-## Configure models
-
-Everything lives in `~/.config/abdullah-orchestrator/config.json` (or
-`ABDULLAH_CONFIG`). Routes resolve deterministically:
-
-| Role | Config field | Constraint |
-|---|---|---|
-| Architect (Codex host) | `architect.codex.model` / `.effort` | Passed through; confirm it is in the Codex catalog |
-| Architect (Claude host) | `architect.claude.model` / `.effort` | Passed through; confirm it is in the Claude catalog |
-| Explorer | `workers.explorer` | OpenCode provider/model, variant, and explicit billing |
-| Implementer | `workers.implementer` | OpenCode provider/model, variant, and explicit billing |
-| Reviewer | `workers.reviewer` | OpenCode provider/model, variant, and explicit billing |
-
-Example — pin the Implementer to a different Go model while keeping the cheaper
-Explorer:
+One file: `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`).
+The full reference is [docs/configuration.md](docs/configuration.md); every
+example there is validated by the shipped loader.
 
 ```json
 {
+  "architect": {
+    "codex":  {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
+    "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
+  },
   "workers": {
-    "explorer":    {"model": "opencode-go/deepseek-v4.1-flash", "variant": "low",  "billing": "go"},
-    "implementer": {"model": "opencode-go/glm-5.3",             "variant": "high", "billing": "go"},
-    "reviewer":    {"model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
-  }
+    "explorer":    {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "low",  "billing": "go"},
+    "implementer": {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"},
+    "reviewer":    {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
+  },
+  "limits": {"max_stage_seconds": 17000, "max_worker_seconds": 14400},
+  "schema_version": 3,
+  "runtime": {"supervisor_version": "3.1.0", "opencode_supported": [">=1.18 <2.0", ">=2.2 <3.0"]}
 }
 ```
 
-Discover valid IDs before editing:
+| Role | Field | Notes |
+|---|---|---|
+| Architect (Codex) | `architect.codex.model` / `.effort` | Passed through; confirm it exists in your Codex catalog. |
+| Architect (Claude) | `architect.claude.model` / `.effort` | Same, for the Claude host. |
+| Explorer | `workers.explorer` | Optional read-only investigation. |
+| Implementer | `workers.implementer` | The only writer. |
+| Reviewer | `workers.reviewer` | Fresh independent context. |
+
+Discover valid worker IDs before editing:
 
 ```bash
 opencode models opencode-go --verbose   # V1: includes variants
 opencode models                         # V2: IDs only
-```
-
-Then confirm with `doctor`:
-
-```bash
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/repo
 ```
 
-`doctor` reports `route_models_listed` (and the compatibility alias
-`paid_go_model_listed`), `variant_verified`, `billing_preflight`,
-`provider_availability`, and the resolved pinned route per role. The default
-configuration remains paid OpenCode Go. Schema 3 allows per-role OpenCode
-providers with explicit billing (`go`, `subscription`, `api`, `free`, `local`),
-but any non-Go route requires a human `authorize-route` grant before dispatch;
-unknown/unapproved routes are rejected rather than silently moving work to API
-billing. Architect models and all worker model IDs/variants are editable. Set
-them before starting a run: changing the config mid-run marks the run
-`config_changed` and blocks further stages. New runs must name their host
-explicitly (`host: codex|claude`).
+Rules the supervisor enforces:
 
-**OpenCode Go stays the default.** Existing Go configs and schema-2 runs keep
-working: legacy Go configuration is normalized in memory without rewriting the
-file, and `billing: "go"` is accepted only for the unchanged `opencode-go`
-route. Schema-2 paused runs need an explicit, backup-first `migrate-run`;
-historical completed history stays readable but is not retroactively
-recertified.
+- `billing: "go"` is valid only for the unchanged `opencode-go` route.
+- Any other provider/billing needs an explicit human grant in the run's
+  operator terminal: `orchestrator.py authorize-route <RUN> --role <role> ...`.
+- Configuration changes mid-run mark the run `config_changed` and block stages;
+  start a new run or migrate deliberately.
+- New runs must state their host (`codex` or `claude`); there is no implicit
+  default.
 
-**Grants are durable and human-issued.** Every route that preflight requires a
-grant for — including non-Go `subscription`, `free`, and `local` — reserves
-exactly one dispatch in a separately locked run ledger keyed by reservation ID.
-Concurrent Explorer/Implementer dispatch therefore cannot overspend
-`--max-dispatches`, and a parent Architect save cannot erase nested consumption.
-Grants bind role, run, exact route, and source/executable material: a moved
-checkout, binary upgrade, or route change requires explicit re-authorization.
+## Usage
 
-**Fallback is never automatic.** A configured `fallback` route is selected only
-after a genuine rate limit or model error, and only with human one-dispatch
-consent (`approve-worker-fallback`); a non-Go fallback also needs its own
-`authorize-route --fallback` grant. Strong-host automatic fallback
-(`fallback.enabled`) remains prohibited for worker routes.
-
-Complete reference, limits, fallback, and recipes:
-[`docs/configuration.md`](docs/configuration.md).
-
-## MCP surface
-
-Nine tools, deliberately small:
+Inside the Codex/Claude chat, the skill drives nine MCP tools:
 
 | Tool | Purpose |
 |---|---|
-| `orchestrator_start` | Create durable run state; requires an explicit `host` (`codex`|`claude`). Does **not** dispatch a worker. |
+| `orchestrator_start` | Create durable run state (does not dispatch a worker). |
 | `orchestrator_stage` | Run exactly one stage in the foreground. |
-| `orchestrator_status` | Deterministic compact status. No model call. |
-| `orchestrator_recap` | Quick or developer recap from persisted evidence. No model call. |
-| `orchestrator_interrupt` | Persist, terminate, and verify an interruption. |
+| `orchestrator_status` | Deterministic compact status; no model call. |
+| `orchestrator_recap` | Quick or developer recap from recorded evidence. |
+| `orchestrator_interrupt` | Persist, terminate and verify an interruption. |
 | `orchestrator_amend` | Record a requirement/correction amendment and pause safely. |
-| `orchestrator_resume` | Mark a paused run runnable. Does not execute a stage. |
+| `orchestrator_resume` | Mark a paused run runnable (does not execute a stage). |
 | `orchestrator_reconcile` | Clear an attempt only after containment proves it stopped. |
 | `orchestrator_runs` | List recent runs for recovery from a new chat. |
 
-Plan approval and fallback authorization are **not** MCP tools. They run in an
-interactive operator terminal and require the exact typed confirmation:
-
-```bash
-python3 scripts/orchestrator.py approve-plan <ID> --confirm approve-plan:<ID>
-python3 scripts/orchestrator.py approve-fallback <ID> --role implementer \
-  --confirm approve-fallback:<ID>
-```
-
-A model cannot approve its own plan or authorize its own fallback.
-
-## Interruption, recovery, and uncertainty
+The stage loop is:
 
 ```text
-running ──interrupt (verified)──► paused ──resume──► running
-   │
-   └──interrupt (unverified)──► uncertain ──reconcile (all stopped)──► paused
+plan → implement → verify → review → accept → complete
+                        └── changes_required ──► implement (correction)
 ```
 
-- A **verified** stop preserves partial work and leaves the run `paused`.
-- An **unverified** stop leaves it `uncertain`. Do not retry and do not launch a
-  duplicate worker; reconcile first.
-- If no launch identity was ever persisted, the user must inspect the situation
-  and run the audited `reconcile <ID> --launch-missing --evidence '...'` path.
-- The MCP server has no cancel tool. Interrupt, verify `stopped: true`, then use
-  the explicit CLI `cancel` if the user authorizes it.
+Human-only actions are **not** MCP tools and run in your own terminal:
 
-Details: [`references/operation.md`](references/operation.md).
+```bash
+python3 scripts/orchestrator.py approve-plan <RUN> --confirm approve-plan:<RUN>
+python3 scripts/orchestrator.py authorize-route <RUN> --role implementer ...
+python3 scripts/orchestrator.py approve-fallback <RUN> --role implementer --confirm approve-fallback:<RUN>
+```
 
-## State and configuration
+> [!WARNING]
+> The CLI `start` command is **not** the state-only `orchestrator_start` tool.
+> Without `--background`, `orchestrator.py start` runs the supervisor loop in the
+> foreground and dispatches real models immediately. Use the MCP tool for the
+> interactive workflow; use the CLI form only when you intend to run the legacy
+> supervised loop. See [troubleshooting](docs/troubleshooting.md#cli-start-dispatched-models-immediately).
 
-| What | Default |
+Pause, resume and recover:
+
+```text
+running ──verified interrupt──► paused ──resume──► running
+   │
+   └──unverified interrupt──► uncertain ──reconcile (all stopped)──► paused
+```
+
+- Never retry an `uncertain` run before `orchestrator_reconcile` proves
+  containment.
+- Attach from a new chat with `orchestrator_runs` → `orchestrator_status` →
+  `orchestrator_resume`.
+- A blocked stale-verification run recovers by `resume` + `stage`: the supervisor
+  rewinds once to `verify`, keeps the old evidence inspectable, and requires a new
+  Reviewer and a new acceptance.
+
+Operations reference: [references/operation.md](references/operation.md).
+Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
+
+## Tested behavior
+
+**Deterministic suite (offline, no model calls):** 870 tests, 7 opt-in skips,
+executed by CI on Python 3.10, 3.12 and 3.13 for every push to `main`. The seven
+skips are the real-OpenCode introspection module, which runs only when
+`ABDULLAH_OPENCODE_V2_BIN` is set. A guard replaces real `codex`, `claude` and
+`opencode` processes with fakes. The previously accepted pre-release revision
+`b9819a7` passed 866 tests locally; v1.0.0 adds release-identity coverage and
+version reporting.
+
+**Real end-to-end milestone (2026-11-16 → 2026-11-18):**
+
+| Item | Value |
 |---|---|
-| Run state | `~/.local/state/abdullah-orchestrator/runs/<ID>` |
-| Checkout leases | `~/.local/state/abdullah-orchestrator/runs-checkouts` |
-| Config | `~/.config/abdullah-orchestrator/config.json` |
+| Run | `20261116T124500-973e8c02` |
+| Host / coordinator | Codex CLI on a dedicated isolated profile |
+| Architect | `gpt-6.1-sol`, effort `high` (subscription) |
+| Workers | OpenCode `v2.2.7`, OpenCode Go `deepseek-v4.1-flash` (implementation `high`, review `high`) |
+| Explorer | Not dispatched (`explorer_policy: none`) |
+| Real work | Implemented a duration-parsing contract in a disposable fixture repo |
+| Supervisor verification | `python3 -m unittest discover -s tests -t . -v` → exit 0, **44 tests OK** |
+| Incident | The Reviewer was interrupted mid-stage by an operator command timeout |
+| Recovery | Verified interrupt → `paused`; later resume detected stale verification provenance and rewound once to `verify` |
+| Fresh completion | New verification, **new independent Reviewer**, Architect inspection and `approved` verdict, status `complete` |
+| Accounting | 2 strong + 2 cheap calls; OpenCode Go reported `cost: 0`; no API-billed route |
 
-Override with `ABDULLAH_STATE_DIR`, `ABDULLAH_CHECKOUT_REGISTRY`, and
-`ABDULLAH_CONFIG`. Runtime state, generated configs, and bytecode are not
-tracked by Git.
+What this demonstrates: real planning, real implementation, deterministic
+verification, interruption containment, stale-provenance recovery, fresh review
+and source-bound acceptance — with no surviving jobs or checkout conflicts.
 
-A run directory contains atomic `state.json`, an append-only `journal.jsonl`,
-per-job dispatch/report artifacts, verification logs, checkpoints, and the
-supervisor lock. The checkout registry names exactly one owner per working
-tree and exposes resolution commands instead of retrying a conflicting stage.
-
-## Security model in one paragraph
-
-The Implementer is a broad-trust local development agent: it may edit the
-authorized checkout and run local shell/Docker commands. Explorer and Reviewer
-are read-only. Generated **V2** OpenCode profiles deny pushes, destructive Git,
-`docker compose down -v`, external directories, web access, subagents, and
-`.env` reads. Verification executes argv arrays, never `shell=True`, and the
-shipped command policy rejects shell wrappers, interpreter string evaluation,
-indirect Docker, and arbitrary script files unless an explicit scoped exception
-is recorded. **These are application-level permissions, not an OS sandbox.** Use
-a dedicated user or container for valuable repositories, and keep production
-credentials away from the workflow.
-
-Full threat model: [`docs/security-model.md`](docs/security-model.md).
-
-## Validation
-
-**Current status:** v3.1 Architect-approved engineering candidate. The four
-AOR31 remediation findings are closed within the supported offline boundary and
-independently Architect-approved at
-`0ea5381aa6e1a26e9ee0e1935c494b33800c62ae`. An **independent closure audit and
-real end-to-end testing are still pending**; no stable `v3.1.0` release exists.
-
-- **866 deterministic tests** in the default suite (7 opt-in skips) covering
-  state transitions, containment, provenance, command policy, recovery, report
-  ingestion, permissions, routing, billing grants, and structured output. No
-  model calls; model CLIs are replaced with fakes and a guard blocks real
-  `codex`, `claude`, or `opencode` processes.
-- **Architect-executed remediation evidence:** 135 focused remediation tests,
-  89 integration/provenance/migration tests, and 7 real OpenCode V2.2.7
-  configuration tests, all green with no skips.
-- **A historical real end-to-end pilot** on 2026-11-13 completed a goal through
-  Architect plan → Implementer → supervisor verification (22 tests) →
-  independent review → Architect acceptance, using Codex `gpt-6.1-sol` and
-  OpenCode Go `deepseek-v4.1-flash` on OpenCode `v2.2.7`. It is v3.0.0 evidence
-  and does not recertify v3.1. The pilot surfaced three genuine defects
-  (invalid strict JSON schema, missing `contract_version`, and report ingestion
-  recovery); all were fixed with regression tests and are documented in
-  [`docs/validation.md`](docs/validation.md).
+What it does **not** demonstrate: uninterrupted multi-hour operation, measured
+quota savings, strong-only quality parity, provider monetary settlement,
+authenticated Claude Code compatibility, or live alternative-provider support.
+The run began on `0ea5381`; its recovery and acceptance were completed on
+2026-11-18 with the accepted recovery build (`b9819a7`).
 
 Reproduce the deterministic suite:
 
 ```bash
-python3 -m unittest discover -s scripts/tests
+python3 -m compileall -q scripts
+python3 -m unittest discover -s scripts/tests -v
 ```
 
-The opt-in real-CLI suite makes no model call:
+Details, historical pilot evidence and explicit non-claims:
+[docs/validation.md](docs/validation.md).
 
-```bash
-ABDULLAH_OPENCODE_V2_BIN=/path/to/opencode-2.2.7 \
-  python3 -m unittest discover -s scripts/tests -p "test_opencode_v2_integration.py"
-```
+## Security and limitations
 
-## Repository layout
+The Implementer is a broad-trust local development agent: it may edit the
+authorized checkout and run local shell/Docker commands. Explorer and Reviewer
+are read-only. Generated OpenCode V2 profiles deny pushes, destructive Git,
+`docker compose down -v`, external directories, web access, subagents and `.env`
+reads; verification executes argv arrays, never a shell string.
 
-```text
-.
-├── SKILL.md                  # Skill entry point (installation and operation)
-├── agents/openai.yaml        # Agent interface metadata
-├── scripts/
-│   ├── orchestrator.py       # Supervisor CLI + stdio MCP server
-│   ├── install_wsl.py        # Installer, Codex/Claude MCP registration
-│   ├── config.example.json   # Editable model, limit, permission defaults
-│   └── tests/                # 830-test deterministic suite and fixtures
-├── references/               # Operation, roles, contracts, approved handoff
-├── docs/
-│   ├── architecture.md       # Components, state model, stage lifecycle
-│   ├── configuration.md      # Models, limits, permissions, recipes
-│   ├── security-model.md     # Trust boundaries and limitations
-│   ├── validation.md         # Test evidence and the real end-to-end pilot
-│   ├── maintenance.md        # Distribution, backup, rollback, upgrade
-│   ├── audit/                # Independent-audit findings and before/after probes
-│   └── agent-handoffs/       # AOR31 remediation review and closure-audit packet
-├── assets/icon.svg
-├── CHANGELOG.md
-├── CONTRIBUTING.md
-├── SECURITY.md
-└── LICENSE
-```
+**These are application-level permissions, not an OS sandbox.** A process that
+shares your OS account, clears its environment or changes user can escape these
+controls. Use a dedicated user, VM or container for valuable repositories, and
+keep production credentials away from the workflow.
 
-`scripts/orchestrator.py` is intentionally a single standard-library file: the
-skill is installed by symlinking the repository directory, and a single module
-keeps installation, import, and dependency surface trivial. The trade-off and
-module map are documented in [`docs/architecture.md`](docs/architecture.md).
+Other limitations:
+
+- Single sequential writer; no daemon, database, queue or notifications.
+- Same-user trust boundary: human-only CLI gates are real but not cryptographic.
+- `runtime_inputs.complete` means declared/discovered inputs were hashed without
+  truncation — not a proof of the complete runtime dependency graph.
+- Billing classifications are policy/attestation; there is no hard dollar cap and
+  no inference of provider-side settlement.
+- `doctor` does not authenticate, prove entitlement or execute a model.
+- OpenCode V1 has no live runtime verification; Claude host mode is fake-CLI
+  tested only; macOS/Windows managed configuration is not certified.
+
+Full threat model: [docs/security-model.md](docs/security-model.md).
+Reporting: [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [`SKILL.md`](SKILL.md) | The agent-facing skill: setup, operations, recovery, principles |
-| [`references/operation.md`](references/operation.md) | Detailed operation and trust boundaries |
-| [`references/contracts.md`](references/contracts.md) | Exact JSON contracts for plan, worker, reviewer, verdict |
-| [`references/roles.md`](references/roles.md) | Role responsibilities and escalation rules |
-| [`docs/architecture.md`](docs/architecture.md) | Internal design, state layout, failure handling |
-| [`docs/configuration.md`](docs/configuration.md) | Models, limits, permissions, fallback, recipes |
-| [`docs/security-model.md`](docs/security-model.md) | Threat model, permissions, operator boundaries |
-| [`docs/validation.md`](docs/validation.md) | Test evidence and the real end-to-end pilot |
-| [`docs/maintenance.md`](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 |
-| [`docs/audit/`](docs/audit/) | Audit findings, corrections, and before/after probes |
-| [`docs/agent-handoffs/orchestrator-v3-1/`](docs/agent-handoffs/orchestrator-v3-1/) | AOR31 remediation packet: briefs, reviews, final acceptance, closure-audit handoff, saved evidence |
+| [docs/installation.md](docs/installation.md) | Supported environments, clean install, MCP registration, upgrades, rollback, uninstall |
+| [docs/configuration.md](docs/configuration.md) | Models, providers, variants, billing grants, fallback, limits, permissions |
+| [docs/architecture.md](docs/architecture.md) | Components, state layout, stage lifecycle, containment, provenance |
+| [references/operation.md](references/operation.md) | Detailed operator workflow and recovery semantics |
+| [references/contracts.md](references/contracts.md) | Exact JSON contracts for plan, worker, reviewer and verdict reports |
+| [references/roles.md](references/roles.md) | Role responsibilities and escalation rules |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → exact recovery command |
+| [docs/versioning.md](docs/versioning.md) | Public release vs supervisor, schema and contract versions |
+| [docs/validation.md](docs/validation.md) | Test evidence, E2E milestone, explicit non-claims |
+| [docs/security-model.md](docs/security-model.md) | Trust boundaries, permissions, limitations |
+| [docs/maintenance.md](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 handoff |
+| [docs/audit/](docs/audit/) | Independent audit findings and before/after probes |
+| [SKILL.md](SKILL.md) | The agent-facing skill definition |
 
-## Limitations
+## Project status
 
-- Single sequential writer. No nested Implementer agents, daemon installation,
-  database, or notifications.
-- Same-user trust boundary: the honor system behind human-only actions is real
-  but not cryptographic. A shell-capable process with the same OS account can
-  still edit config or import the module.
-- Application-level permissions are defense in depth, not an OS sandbox.
-  A process that clears its environment or changes user can escape the
-  verification survivor scan.
-- `runtime_inputs.complete` means the discovered/declared inputs were hashed
-  without truncation and required inputs were found. It is not a proof of the
-  complete runtime dependency graph.
-- `doctor` is a preflight check: it does not authenticate, prove entitlement, or
-  execute a model.
+**v1.0.0 — First public release.** Codex + OpenCode Go E2E and interrupted-run
+recovery demonstrated. Broader live compatibility and endurance testing remain
+ongoing. Earlier internal tags (`v3.0.0`, `v3.1.0-audit-candidate.1`) are
+historical engineering milestones and are preserved; the public product version
+is independent of the internal supervisor, schema and contract versions. See
+[docs/versioning.md](docs/versioning.md).
 
 ## Contributing
 
-Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first;
-security reports should follow [`SECURITY.md`](SECURITY.md).
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first; security
+reports follow [SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -1,8 +1,9 @@
 # Architecture
 
 This document describes the implementation that ships in `scripts/orchestrator.py`
-(supervisor version **3.1.0**, state/config schema 3). It is written for someone who needs to modify,
-audit, or debug the workflow — not as marketing material.
+(public product version **1.0.0**; internal supervisor version **3.1.0**;
+state/config schema 3; worker report contract 2). It is written for someone who
+needs to modify, audit, or debug the workflow — not as marketing material.
 
 ## Design goals
 
@@ -295,19 +296,24 @@ entitlement or execution.
 
 | Identifier | Value | Meaning |
 |---|---|---|
-| `SUPERVISOR_VERSION` | `3.1.0` | Release version of the supervisor |
+| `PRODUCT_VERSION` | `1.0.0` | Public product release, independent of everything below |
+| `SUPERVISOR_VERSION` | `3.1.0` | Internal supervisor/protocol version, pinned in config |
 | `STATE_SCHEMA_VERSION` | `3` | On-disk run state shape |
 | `CONFIG_SCHEMA_VERSION` | `3` | Configuration shape |
+| `REPORT_CONTRACT_VERSION` | `2` | Worker/decision report contract |
 | `VERIFICATION_EVIDENCE_VERSION` | `2` | Verification evidence shape |
+| `SOURCE_PROVENANCE_VERSION` | `3` | Source snapshot shape |
 | `MCP_SERVER_VERSION` | `3.1-interactive` | MCP tool-surface revision, reported in `serverInfo` |
 
-The MCP version describes the protocol/tool surface and is intentionally not the
-release version. `compatibility` compares the supervisor, config, and state
-versions; it refuses newer state schemas.
+The public release version names the product and never renumbers the protocol or
+schemas. `orchestrator.py version` prints all identifiers; `doctor` repeats the
+public, supervisor, schema and contract versions. `compatibility` compares the
+supervisor, config, and state versions; it refuses newer state schemas. See
+[versioning](versioning.md).
 
 ## Why one large module?
 
-`orchestrator.py` is ~8.6k lines. The alternative — a package — would require
+`orchestrator.py` is ~14k lines. The alternative — a package — would require
 import-path handling for a directory that is symlinked into `~/.agents/skills`
 and `~/.claude/skills`, plus a build/install step the project deliberately
 avoids. A single module means:

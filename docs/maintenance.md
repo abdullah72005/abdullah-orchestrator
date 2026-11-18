@@ -97,9 +97,14 @@ original failed job/dispatch epoch: after invalidation, a late or re-applied old
 Reviewer report is refused even with the exact operator acknowledgment, while
 same-epoch recovery remains valid. Active or uncertain execution must be
 reconciled first. Do not manually edit `phase`, `verification` or `review` to
-work around a rejection, and do not weaken the provenance loader. The preserved
-E2E incident run still needs a separate authorization, backup and
-disposable-copy validation before operational recovery.
+work around a rejection, and do not weaken the provenance loader. The completed
+real E2E run `20261116T124500-973e8c02` is retained as an immutable audit
+artifact under its isolated state root; do not resume, reconcile or mutate it for
+testing.
+
+For installation, upgrade, rollback and uninstall from a released tag, see
+[installation](installation.md). This page covers maintaining and distributing a
+source checkout.
 
 ## Rollback
 

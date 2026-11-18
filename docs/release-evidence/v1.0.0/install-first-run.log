@@ -1,0 +1,9 @@
+Installed: /tmp/opencode-release/install2.QqiZA1/home/.agents/skills/abdullah-orchestrator -> /home/abdullah/.local/src/abdullah-orchestrator-v3-1
+Created editable model config: /tmp/opencode-release/install2.QqiZA1/home/.config/abdullah-orchestrator/config.json
+Registered Codex MCP server: abdullah-orchestrator
+MCP registration command:
+  codex mcp add abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/.local/src/abdullah-orchestrator-v3-1/scripts/orchestrator.py mcp
+Claude manual registration command:
+  claude mcp add --scope user --transport stdio abdullah-orchestrator -- /usr/bin/python3 /home/abdullah/.local/src/abdullah-orchestrator-v3-1/scripts/orchestrator.py mcp
+Next: check Go model and CLI with python3 /home/abdullah/.local/src/abdullah-orchestrator-v3-1/scripts/orchestrator.py doctor --project /absolute/path/to/development/repo
+Open Codex with Luna medium, invoke $abdullah-orchestrator, and give it a goal.

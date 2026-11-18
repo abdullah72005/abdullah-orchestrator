@@ -10,7 +10,7 @@ reproduce or challenge the claims.
 python3 -m unittest discover -s scripts/tests
 ```
 
-- **866 tests**, 7 opt-in skips, roughly 14 minutes on a laptop (Python 3.10.12;
+- **870 tests**, 7 opt-in skips, roughly 14 minutes on a laptop (Python 3.10.12;
   CI also targets 3.12/3.13). The 7 skips are the real-OpenCode introspection
   module, which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set. `pytest` may
   show a different skip distribution.
@@ -44,6 +44,7 @@ Coverage areas:
 | OpenCode dialects | V1/V2 profile generation, effective-permission validation, glob-overlap rejection; version-aware source discovery and authoritative V2 normalization |
 | Usage accounting | nested OpenCode usage, derived/partial totals, bounded 429 detection |
 | MCP surface | nine tools, no approval/grant tools, cancellation, recovery guidance |
+| Release identity | `test_release_version.py`: public version separated from supervisor/schema/contract identifiers, version command, pinned example config |
 | Security regressions | credential env scrubbing, API-billing fail-closed, sensitive CLI gating |
 
 The opt-in real-CLI suite makes no model call:
@@ -60,7 +61,7 @@ normalization for a parent config above the Git root and disjoint legacy/native
 provider retention. A failed or unavailable V2 normalizer is intentionally not a
 substitute source of authorization.
 
-## 2. v3.1 candidate evidence
+## 2. v3.1 internal candidate evidence (historical)
 
 The v3.1 batch was validated entirely offline:
 
@@ -133,8 +134,8 @@ block instead of being laundered into a rewind. Controls confirm clean drift
 still rewinds, clean evidence still reaches fresh review, and current-epoch
 recovery still consumes without a model call.
 
-Architect review and rerunning the saved failure are still required before
-acceptance.
+Both findings were subsequently accepted at `b9819a7`, and the preserved
+operational run recovered and completed on 2026-11-18 (see section 3).
 
 ### Correction round r01
 
@@ -158,7 +159,71 @@ Evidence classes are kept separate:
 | Historical pilot claims | A real v3.0.0 run completed | Historical, not v3.1 recertification |
 | Authenticated E2E | Real Claude/Codex stages, Esc/reconnect, new provider routes | **Not executed**; requires separate bounded human authorization |
 
-## 3. Historical real end-to-end pilot (v3.0.0)
+## 3. v1.0.0 release validation (2026-11-18)
+
+Release preparation was verified independently of the earlier Implementer report.
+Checks that do not execute the test suite ran as a non-root user on WSL2 Ubuntu
+22.04.5 with Python 3.10.12. No model call, subscription inference or paid request
+was made.
+
+Test execution for the release commit is delegated to continuous integration,
+which runs the full deterministic suite on Python 3.10, 3.12 and 3.13. The
+accepted pre-release revision `b9819a7` carries the last local full-suite
+evidence (866 tests, section 2); v1.0.0 adds four release-identity tests and
+additive version reporting.
+
+```bash
+python3 -m compileall -q scripts
+python3 scripts/orchestrator.py version
+python3 scripts/orchestrator.py doctor --project /path/to/disposable/repo
+```
+
+| Check | Result |
+|---|---|
+| Compile | OK |
+| `doctor` against a disposable Git repo | `ready: true`, dialect `v2`, Go routes, no API billing risk |
+| MCP handshake | `serverInfo` 3.1-interactive, 9 tools, no stderr |
+| MCP `orchestrator_start` + `orchestrator_status` | state created, `phase: plan`, no dispatch, isolated state root |
+| Fresh-`HOME` install | links created, config `0600`, idempotent second run |
+| Conflicting pre-existing skill | refused, existing content preserved |
+| Example configuration | parses; pins supervisor `3.1.0` and schema `3` |
+| Documentation links | 67 relative links, 0 broken files or anchors |
+| Credential scan | no keys, tokens, auth databases, env files or private transcripts in tracked files |
+| Full deterministic suite | executed by CI on the release commit, Python 3.10/3.12/3.13 |
+
+The seven skips are the real-OpenCode introspection module, which requires
+`ABDULLAH_OPENCODE_V2_BIN`. The release environment has OpenCode V2.2.7 installed,
+and `doctor` performed real configuration normalization without inference.
+
+### Real end-to-end milestone (2026-11-16 → 2026-11-18)
+
+Run `20261116T124500-973e8c02`, on a dedicated isolated Codex profile, config,
+state root and disposable project:
+
+| Stage | Route | Observed |
+|---|---|---|
+| plan | Codex subscription, `gpt-6.1-sol` high | Completed, plan versioned |
+| implement | OpenCode Go `deepseek-v4.1-flash` high | Completed, `duration.py` implemented |
+| verify | `python3 -m unittest discover -s tests -t . -v` | Exit 0, **44 tests OK** |
+| review #1 | OpenCode Go, high | Interrupted by an operator command timeout at ~85 s; guard contained it, `stopped: true`, no survivors |
+| review #2 | — | Blocked: stale verification provenance (PATH/toolchain drift), then rewound once to `verify` after the r01 correction |
+| verify #2 | same command | Exit 0, 44 tests OK against the unchanged candidate |
+| review #3 | New independent OpenCode Go Reviewer | Completed with findings and dispositions |
+| accept | Codex `gpt-6.1-sol` | `approved`; evidence and decision binding revalidated |
+| Final state | — | `complete`, no active job/check, no checkout conflict |
+
+Recorded usage: 2 strong calls, 2 cheap calls, 0 API-billed dispatches, reported
+provider cost `0.0` (subscription/Go). Model time ~402 s; elapsed wall clock
+spanned operator pauses and is **not** endurance evidence.
+
+The run began on `0ea5381`; its interrupted-review recovery and acceptance were
+completed on 2026-11-18 with the accepted recovery implementation (`b9819a7`).
+The initial `start` invocation unintentionally used the CLI form, which serves
+the run immediately; that is documented as an operator footgun in
+[troubleshooting](troubleshooting.md#cli-start-dispatched-models-immediately).
+Containment, route pinning and billing classification behaved as designed.
+
+## 4. Historical real end-to-end pilot (v3.0.0)
 
 This pilot predates v3.1 and is retained as historical evidence, not as proof
 that the v3.1 acceptance-binding, host-gating, stage-deadline, installer, or
@@ -229,7 +294,7 @@ decision call was made — acceptance did not silently reuse a failed job.
 - Recovery was exercised: the run survived two supervisor restarts and resumed
   from persisted state without repeating completed stages.
 
-## 4. Independent audit trail
+## 5. Independent audit trail
 
 The implementation was audited in stages before this release. Documents are
 preserved in [`docs/audit/`](audit/):
@@ -252,14 +317,15 @@ Highlights of what changed as a result:
 - Partial token totals are labelled instead of being reported as complete.
 - Scoped command exceptions require a project identity.
 
-## 5. What is not verified
+## 6. What is not verified
 
 Be explicit with reviewers and users:
 
-- **The independent remediation-closure audit has not happened.** The Architect
-  verdict at `0ea5381` is APPROVED WITH KNOWN LIMITATIONS; it is not a
-  substitute for the independent audit described in the
-  [closure-audit handoff](agent-handoffs/orchestrator-v3-1/aor31-closure-auditor-handoff.md).
+- **A separate third-party closure audit has not happened.** The AOR31
+  remediation received a final independent Architect acceptance
+  (“APPROVED WITH KNOWN LIMITATIONS”, accepted HEAD
+  `b9819a75c10433d9e8d082e049c2a31084d0e416`) and the real E2E below. That is not
+  the same as an external security audit.
 - **The literal independent-auditor scripts were never supplied.** Saved
   Architect reconstructions and regression equivalents were rerun; no claim is
   made that the unavailable scripts ran.
@@ -267,14 +333,13 @@ Be explicit with reviewers and users:
   tested with fixtures and fakes against the pinned upstream contracts; no V1
   binary was available, so no V1 compatibility claim is made. V2.2.7 was tested
   for normalization and permissions, not for provider inference.
-- **Authenticated model execution is not covered by the default suite.** The
-  historical pilot proves one real v3.0.0 path; it is not a compatibility matrix
-  and does not recertify v3.1.
+- **Authenticated model execution is not covered by the default suite.** Two real
+  paths exist: the historical v3.0.0 pilot and the v1.0.0 milestone run, both
+  Codex + OpenCode Go. Neither is a compatibility matrix.
 - **Claude host mode** was not exercised end-to-end. Registration, rollback,
   snippets, flags and a whole-stage deadline are covered by fake-CLI tests; no
   real Claude long stage, Esc/cancel/reconnect or `/mcp` UX is part of this
   evidence.
-- **OpenCode V1** profile generation is unit-tested; the pilot used V2.2.7.
 - **New provider routes and fallback** are exercised with fake CLIs and route
   policy tests, not with paid/local provider accounts. Billing classifications
   are attested policy, not provider settlement; no dollar/token cap is proven.
@@ -284,14 +349,15 @@ Be explicit with reviewers and users:
   application-level; a dedicated user/container remains the operator's job.
 - **Long-duration behavior** (multi-hour stages, host sleep, network partition)
   is covered by design and deterministic timing tests, not by a timed production
-  run. Same-user write-and-restore between snapshots is not detectable.
+  run. The milestone run's elapsed time was wall-clock idle plus ~7 minutes of
+  recorded model/verification time, so it is not endurance evidence.
 - **Docker verification** was unit-tested with synthetic Compose evidence; the
-  pilot project did not use containers.
+  milestone project did not use containers.
 - **Linux-only managed configuration.** Managed OpenCode/Claude files are
   covered on Linux; macOS and Windows managed delivery is not certified.
 - **`doctor`** does not authenticate, prove entitlement, or run a model.
 
-## 6. Reproducing the checks
+## 7. Reproducing the checks
 
 ```bash
 # deterministic suite (offline)

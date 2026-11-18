@@ -630,10 +630,12 @@ Keep the experiment file out of Git (the default `.gitignore` excludes
 ## Verifying a configuration
 
 ```bash
+python3 scripts/orchestrator.py version
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/repo
 ```
 
-`doctor` is a preflight check. It validates configuration shape, CLI
-compatibility, generated argv, worker permission contracts, model inventory, and
-structured-output schemas. It does not authenticate, prove entitlement, or run
-a model.
+`version` prints the public release, internal supervisor, schema and contract
+identifiers separately ([versioning](versioning.md)). `doctor` is a preflight
+check. It validates configuration shape, CLI compatibility, generated argv,
+worker permission contracts, model inventory, and structured-output schemas. It
+does not authenticate, prove entitlement, or run a model.

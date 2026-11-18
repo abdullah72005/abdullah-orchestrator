@@ -9,18 +9,18 @@ implementation is defect-free.
 | [`final-hardening-notes.md`](final-hardening-notes.md) | 2026-11-12 | Baseline findings, OpenCode V2 investigation, initial gap list |
 | [`final-audit-evidence.md`](final-audit-evidence.md) | 2026-11-12 | Before/after probes: command policy, provenance drift, MCP approvals, acceptance gates |
 | [`delta-audit.md`](delta-audit.md) | 2026-11-13 | Five reproduced acceptance blockers (P1-01…P2-02) and their certified fixes |
-| [`../agent-handoffs/orchestrator-v3-1/`](../agent-handoffs/orchestrator-v3-1/) | 2026-11-14 | AOR31 remediation: investigation, batch brief, three review rounds, final Architect acceptance, closure-audit handoff, and saved evidence |
+| [`../agent-handoffs/orchestrator-v3-1/`](../agent-handoffs/orchestrator-v3-1/) | 2026-11-14 → 2026-11-18 | AOR31 remediation: investigation, batch brief, three review rounds, final Architect acceptance, closure-audit handoff, and saved evidence |
 
 ## Current review gate
 
-The v3.1 candidate is **Architect-approved with known limitations** at
-`0ea5381`, and the AOR31 remediation findings are closed within the supported
-offline boundary. The open gate is an **independent remediation-closure audit**
-plus separately authorized real end-to-end testing; neither has happened yet.
-Start from the
-[closure-audit handoff](../agent-handoffs/orchestrator-v3-1/aor31-closure-auditor-handoff.md)
-and the
-[final Architect review](../agent-handoffs/orchestrator-v3-1/aor31-final-architect-review.md),
+The AOR31 remediation and the stale-review recovery correction are
+**Architect-accepted with known limitations** at
+`b9819a75c10433d9e8d082e049c2a31084d0e416`, and the real end-to-end milestone
+run completed on 2026-11-18. A separate third-party security/closure audit has
+**not** been performed, and broader live compatibility remains unverified. Start
+from the
+[final E2E review](../agent-handoffs/orchestrator-v3-1/e2e-review-recovery-final-architect-review.md)
+and [validation](../validation.md).
 
 ## How to read them
 

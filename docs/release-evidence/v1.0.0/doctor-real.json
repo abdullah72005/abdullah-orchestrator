@@ -1,0 +1,1360 @@
+{
+  "project": "/tmp/opencode-release/smoke.nBHbQ6/repo",
+  "valid_repo": true,
+  "commands": {
+    "git": true,
+    "python3": true,
+    "opencode": true,
+    "codex": true,
+    "docker": true
+  },
+  "versions": {
+    "git": "git version 2.34.1",
+    "python3": "Python 3.10.12",
+    "opencode": "opencode v2.2.7",
+    "codex": "codex-cli 0.169.1"
+  },
+  "cli_compatible": {
+    "opencode_version": true,
+    "opencode_run": true,
+    "codex": true
+  },
+  "route": {
+    "explorer": {
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "effort": "low",
+      "billing": "go",
+      "routing_fingerprint": "b43d1c281f9f28a178b1b674837aa3b9ba452471eb58f36a73f83c543e5a927a"
+    },
+    "implementer": {
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "effort": "high",
+      "billing": "go",
+      "routing_fingerprint": "00b1b7080960903a5d741701f16ebe39dc8f4d795dfa0f3f2c1ccfc35d7f011e"
+    },
+    "reviewer": {
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "effort": "high",
+      "billing": "go",
+      "routing_fingerprint": "00b1b7080960903a5d741701f16ebe39dc8f4d795dfa0f3f2c1ccfc35d7f011e"
+    },
+    "architect": {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "high",
+      "billing": "subscription"
+    }
+  },
+  "product_version": "1.0.0",
+  "supervisor_version": "3.1.0",
+  "state_schema_version": 3,
+  "report_contract_version": 2,
+  "git_head": "618af5432e3c45690cfd773f76bc8a0b60ae3d69",
+  "dirty_file_count": 0,
+  "opencode_version_policy": {
+    "pin": "auto",
+    "ranges": [
+      [
+        "1.18",
+        "2.0"
+      ],
+      [
+        "2.2",
+        "3.0"
+      ]
+    ],
+    "supported": [
+      ">=1.18 <2.0",
+      ">=2.2 <3.0"
+    ]
+  },
+  "opencode_version_error": null,
+  "opencode_dialect": "v2",
+  "host": "codex",
+  "billing_preflight": {
+    "explorer": {
+      "version": 1,
+      "role": "explorer",
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "billing": "go",
+      "classification": "go_subscription",
+      "ok": true,
+      "reasons": [],
+      "warnings": [
+        "OpenCode Go entitlement is attested by configuration only; no inference request was made."
+      ],
+      "route_sha256": "ceea0ce6a062f50c9a4ed5a1029b0ba5eeadde68760c17bc75fc1af930f6cf2a",
+      "observed": {
+        "provider": "opencode-go",
+        "config": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "providers": [],
+        "available": true,
+        "error": null,
+        "dialect": "v2",
+        "effective_files": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "sources": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "inline_preserved": [],
+        "inline_neutralized": [],
+        "inline_dropped": [],
+        "inspection": "normalized",
+        "inspection_reason": null,
+        "boundary": {
+          "adapter_complete": true,
+          "external_hazards": [],
+          "plugin_config_present": false,
+          "plugin_sources": []
+        },
+        "cancel_requested": false,
+        "deadline_expired": false,
+        "inspection_disagreement": false,
+        "executable": {
+          "available": true,
+          "path": "/home/abdullah/.opencode/bin/opencode",
+          "resolved": "/home/abdullah/.opencode/bin/opencode",
+          "fingerprint": [
+            2112,
+            835243,
+            258848944,
+            499162500000000000,
+            1794495406436822033
+          ],
+          "version": {
+            "returncode": 0,
+            "text": "opencode v2.2.7",
+            "sha256": "19007f95b540679e29eccf524dc4209aa8cc084c466012540855f12d0a364631"
+          }
+        },
+        "source_identity": [
+          {
+            "kind": "global",
+            "path": "/home/abdullah/.config/opencode/opencode.json",
+            "required": false,
+            "present": true,
+            "sha256": "76d01e9b68082a05f7758fa9f6cff07d22f4050cfc269eb11fa4a35ff1b6e31d",
+            "routing_sha256": "f6dc5fa630a83da4caedcf395b0d770b3a8d84162eea2995095582a15b89bf84",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "global",
+            "path": "/home/abdullah/.config/opencode/opencode.jsonc",
+            "required": false,
+            "present": true,
+            "sha256": "4e901f9e457c8d52ab31f9fb4ea637a8c9104ebdbf23fe8b3600f35ad46d4a61",
+            "routing_sha256": "2f247c38908c7311e4e105dc90672885804ee909dede9e5b1f643c3111a60bdb",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "inline",
+            "path": null,
+            "required": false,
+            "present": false,
+            "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "routing_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/managed.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          }
+        ],
+        "unresolved_routing": [],
+        "routing_material_sha256": "d193090cf5208471761b7a400c3b59c8e7df0fb3798e34a8b715cdca5483ab3b"
+      },
+      "checked_at": "2026-11-18T02:14:21+00:00",
+      "route_material_sha256": "d193090cf5208471761b7a400c3b59c8e7df0fb3798e34a8b715cdca5483ab3b",
+      "current_routing_fingerprint": "b43d1c281f9f28a178b1b674837aa3b9ba452471eb58f36a73f83c543e5a927a"
+    },
+    "implementer": {
+      "version": 1,
+      "role": "implementer",
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "billing": "go",
+      "classification": "go_subscription",
+      "ok": true,
+      "reasons": [],
+      "warnings": [
+        "OpenCode Go entitlement is attested by configuration only; no inference request was made."
+      ],
+      "route_sha256": "8755104213c35a7a84bfe546080dfc43d53a20df7329f20c6c651b0ec089e445",
+      "observed": {
+        "provider": "opencode-go",
+        "config": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "providers": [],
+        "available": true,
+        "error": null,
+        "dialect": "v2",
+        "effective_files": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "sources": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "inline_preserved": [],
+        "inline_neutralized": [],
+        "inline_dropped": [],
+        "inspection": "normalized",
+        "inspection_reason": null,
+        "boundary": {
+          "adapter_complete": true,
+          "external_hazards": [],
+          "plugin_config_present": false,
+          "plugin_sources": []
+        },
+        "cancel_requested": false,
+        "deadline_expired": false,
+        "inspection_disagreement": false,
+        "executable": {
+          "available": true,
+          "path": "/home/abdullah/.opencode/bin/opencode",
+          "resolved": "/home/abdullah/.opencode/bin/opencode",
+          "fingerprint": [
+            2112,
+            835243,
+            258848944,
+            499162500000000000,
+            1794495406436822033
+          ],
+          "version": {
+            "returncode": 0,
+            "text": "opencode v2.2.7",
+            "sha256": "19007f95b540679e29eccf524dc4209aa8cc084c466012540855f12d0a364631"
+          }
+        },
+        "source_identity": [
+          {
+            "kind": "global",
+            "path": "/home/abdullah/.config/opencode/opencode.json",
+            "required": false,
+            "present": true,
+            "sha256": "76d01e9b68082a05f7758fa9f6cff07d22f4050cfc269eb11fa4a35ff1b6e31d",
+            "routing_sha256": "f6dc5fa630a83da4caedcf395b0d770b3a8d84162eea2995095582a15b89bf84",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "global",
+            "path": "/home/abdullah/.config/opencode/opencode.jsonc",
+            "required": false,
+            "present": true,
+            "sha256": "4e901f9e457c8d52ab31f9fb4ea637a8c9104ebdbf23fe8b3600f35ad46d4a61",
+            "routing_sha256": "2f247c38908c7311e4e105dc90672885804ee909dede9e5b1f643c3111a60bdb",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "inline",
+            "path": null,
+            "required": false,
+            "present": false,
+            "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "routing_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/managed.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          }
+        ],
+        "unresolved_routing": [],
+        "routing_material_sha256": "e0073837f193067ed66a16bf5aa2197609f38b0e4948755420a3cb0f06b3dc09"
+      },
+      "checked_at": "2026-11-18T02:14:23+00:00",
+      "route_material_sha256": "e0073837f193067ed66a16bf5aa2197609f38b0e4948755420a3cb0f06b3dc09",
+      "current_routing_fingerprint": "00b1b7080960903a5d741701f16ebe39dc8f4d795dfa0f3f2c1ccfc35d7f011e"
+    },
+    "reviewer": {
+      "version": 1,
+      "role": "reviewer",
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "billing": "go",
+      "classification": "go_subscription",
+      "ok": true,
+      "reasons": [],
+      "warnings": [
+        "OpenCode Go entitlement is attested by configuration only; no inference request was made."
+      ],
+      "route_sha256": "8755104213c35a7a84bfe546080dfc43d53a20df7329f20c6c651b0ec089e445",
+      "observed": {
+        "provider": "opencode-go",
+        "config": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "providers": [],
+        "available": true,
+        "error": null,
+        "dialect": "v2",
+        "effective_files": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "sources": [
+          "/home/abdullah/.config/opencode/opencode.json",
+          "/home/abdullah/.config/opencode/opencode.jsonc"
+        ],
+        "inline_preserved": [],
+        "inline_neutralized": [],
+        "inline_dropped": [],
+        "inspection": "normalized",
+        "inspection_reason": null,
+        "boundary": {
+          "adapter_complete": true,
+          "external_hazards": [],
+          "plugin_config_present": false,
+          "plugin_sources": []
+        },
+        "cancel_requested": false,
+        "deadline_expired": false,
+        "inspection_disagreement": false,
+        "executable": {
+          "available": true,
+          "path": "/home/abdullah/.opencode/bin/opencode",
+          "resolved": "/home/abdullah/.opencode/bin/opencode",
+          "fingerprint": [
+            2112,
+            835243,
+            258848944,
+            499162500000000000,
+            1794495406436822033
+          ],
+          "version": {
+            "returncode": 0,
+            "text": "opencode v2.2.7",
+            "sha256": "19007f95b540679e29eccf524dc4209aa8cc084c466012540855f12d0a364631"
+          }
+        },
+        "source_identity": [
+          {
+            "kind": "global",
+            "path": "/home/abdullah/.config/opencode/opencode.json",
+            "required": false,
+            "present": true,
+            "sha256": "76d01e9b68082a05f7758fa9f6cff07d22f4050cfc269eb11fa4a35ff1b6e31d",
+            "routing_sha256": "f6dc5fa630a83da4caedcf395b0d770b3a8d84162eea2995095582a15b89bf84",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "global",
+            "path": "/home/abdullah/.config/opencode/opencode.jsonc",
+            "required": false,
+            "present": true,
+            "sha256": "4e901f9e457c8d52ab31f9fb4ea637a8c9104ebdbf23fe8b3600f35ad46d4a61",
+            "routing_sha256": "2f247c38908c7311e4e105dc90672885804ee909dede9e5b1f643c3111a60bdb",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/.opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "project_directory",
+            "path": "/tmp/opencode-release/smoke.nBHbQ6/repo/.opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "inline",
+            "path": null,
+            "required": false,
+            "present": false,
+            "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "routing_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "expansion": {
+              "env": {},
+              "files": {}
+            },
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/opencode.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/opencode.jsonc",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          },
+          {
+            "kind": "managed",
+            "path": "/etc/opencode/managed.json",
+            "required": false,
+            "present": false,
+            "sha256": null,
+            "routing_sha256": null,
+            "expansion": {},
+            "unresolved": [],
+            "error": null
+          }
+        ],
+        "unresolved_routing": [],
+        "routing_material_sha256": "e0073837f193067ed66a16bf5aa2197609f38b0e4948755420a3cb0f06b3dc09"
+      },
+      "checked_at": "2026-11-18T02:14:25+00:00",
+      "route_material_sha256": "e0073837f193067ed66a16bf5aa2197609f38b0e4948755420a3cb0f06b3dc09",
+      "current_routing_fingerprint": "00b1b7080960903a5d741701f16ebe39dc8f4d795dfa0f3f2c1ccfc35d7f011e"
+    },
+    "architect": {
+      "version": 1,
+      "role": "architect",
+      "provider": "codex",
+      "worker_provider": null,
+      "model": "gpt-6.1-sol",
+      "billing": "subscription",
+      "classification": "subscription",
+      "ok": true,
+      "reasons": [],
+      "warnings": [
+        "Configuration-only check; subscription entitlement is not proven."
+      ],
+      "route_sha256": "8ec957c04be6c3312461b30fae5a1e523425b89b6d70e91a8c969255eaeb256b",
+      "observed": {
+        "env": {}
+      },
+      "checked_at": "2026-11-18T02:14:27+00:00"
+    }
+  },
+  "generated_commands": {
+    "architect-plan": true,
+    "architect-decision": true,
+    "architect-diagnose": true,
+    "architect-integration": true,
+    "explorer-explorer": true,
+    "implementer-implementer": true,
+    "reviewer-reviewer": true,
+    "fallback-explorer-explorer": true,
+    "fallback-implementer-implementer": true,
+    "fallback-reviewer-reviewer": true
+  },
+  "worker_profiles": {
+    "explorer": true,
+    "implementer": true,
+    "reviewer": true
+  },
+  "worker_profiles_cli": {
+    "explorer": true,
+    "implementer": true,
+    "reviewer": true
+  },
+  "worker_profiles_note": "worker_profiles validates the generated contract; worker_profiles_cli recomputes effective last-match permissions from the installed binary's normalized V2 agents. Application permissions are not OS-level isolation.",
+  "model_inventory": "listed",
+  "variant_verified": "unavailable",
+  "configured_route_models": [
+    "opencode-go/deepseek-v4.1-flash"
+  ],
+  "route_models_listed": true,
+  "paid_go_model_listed": true,
+  "variant_note": "Variants are checked against the installed OpenCode catalog when the CLI exposes them; V2 `models` does not, so variant support remains unverified there. Actual model execution and entitlement remain untested.",
+  "execution_note": "Generated argv is checked against installed help and parsed using --help; no model session or authentication was exercised.",
+  "api_billing_risk": [],
+  "route_authorization_required": [],
+  "billing_preflight_note": "Doctor reports the same deterministic route/billing classification used before dispatch. No credential, model session or inference request is made; subscription entitlement and provider-side spend are not proven.",
+  "provider_availability": {
+    "explorer": {
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "classification": "go_subscription",
+      "configuration_available": true,
+      "provider_configured": null,
+      "auth_observability": null,
+      "configuration_error": null,
+      "execution_verified": false
+    },
+    "implementer": {
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "classification": "go_subscription",
+      "configuration_available": true,
+      "provider_configured": null,
+      "auth_observability": null,
+      "configuration_error": null,
+      "execution_verified": false
+    },
+    "reviewer": {
+      "provider": "opencode",
+      "worker_provider": "opencode-go",
+      "classification": "go_subscription",
+      "configuration_available": true,
+      "provider_configured": null,
+      "auth_observability": null,
+      "configuration_error": null,
+      "execution_verified": false
+    },
+    "architect": {
+      "provider": "codex",
+      "worker_provider": null,
+      "classification": "subscription",
+      "configuration_available": null,
+      "provider_configured": null,
+      "auth_observability": null,
+      "configuration_error": null,
+      "execution_verified": false
+    }
+  },
+  "routing_inspection": {
+    "explorer": {
+      "mode": "normalized",
+      "reason": null,
+      "disagreement": false,
+      "dialect": "v2",
+      "effective_files": [
+        "/home/abdullah/.config/opencode/opencode.json",
+        "/home/abdullah/.config/opencode/opencode.jsonc"
+      ],
+      "routing_material_sha256": "d193090cf5208471761b7a400c3b59c8e7df0fb3798e34a8b715cdca5483ab3b",
+      "executable": {
+        "returncode": 0,
+        "text": "opencode v2.2.7",
+        "sha256": "19007f95b540679e29eccf524dc4209aa8cc084c466012540855f12d0a364631"
+      }
+    },
+    "implementer": {
+      "mode": "normalized",
+      "reason": null,
+      "disagreement": false,
+      "dialect": "v2",
+      "effective_files": [
+        "/home/abdullah/.config/opencode/opencode.json",
+        "/home/abdullah/.config/opencode/opencode.jsonc"
+      ],
+      "routing_material_sha256": "e0073837f193067ed66a16bf5aa2197609f38b0e4948755420a3cb0f06b3dc09",
+      "executable": {
+        "returncode": 0,
+        "text": "opencode v2.2.7",
+        "sha256": "19007f95b540679e29eccf524dc4209aa8cc084c466012540855f12d0a364631"
+      }
+    },
+    "reviewer": {
+      "mode": "normalized",
+      "reason": null,
+      "disagreement": false,
+      "dialect": "v2",
+      "effective_files": [
+        "/home/abdullah/.config/opencode/opencode.json",
+        "/home/abdullah/.config/opencode/opencode.jsonc"
+      ],
+      "routing_material_sha256": "e0073837f193067ed66a16bf5aa2197609f38b0e4948755420a3cb0f06b3dc09",
+      "executable": {
+        "returncode": 0,
+        "text": "opencode v2.2.7",
+        "sha256": "19007f95b540679e29eccf524dc4209aa8cc084c466012540855f12d0a364631"
+      }
+    },
+    "architect": {
+      "mode": null,
+      "reason": null,
+      "disagreement": false,
+      "dialect": null,
+      "effective_files": null,
+      "routing_material_sha256": null,
+      "executable": null
+    }
+  },
+  "execution_verified": false,
+  "execution_verified_note": "No provider route is execution-verified by Doctor; fake-CLI tests do not establish authenticated entitlement, provider-side retries or billing.",
+  "worker_profiles_cli_verified": true,
+  "structured_output_schemas": {
+    "plan": {
+      "ok": true
+    },
+    "implementer": {
+      "ok": true
+    },
+    "explorer": {
+      "ok": true
+    },
+    "reviewer": {
+      "ok": true
+    },
+    "decision": {
+      "ok": true
+    }
+  },
+  "ready": true,
+  "compatibility_note": "ready proves local configuration, version-policy, argv, contract checks, strict structured-output schema compatibility and ordered V2 application-permission effects from CLI introspection. Application permissions are not OS-level isolation. It does not prove authenticated model execution, entitlement, or enforcement by every tool runtime."
+}

@@ -7,6 +7,11 @@ description: Run or resume Abdullah's durable, quota-aware software engineering 
 
 One interactive conversation is the coordinator. The visible model (Luna Medium in Codex) talks to the user and invokes a bundled Python MCP supervisor. The supervisor owns execution state, process lifecycle, checkpoints, verification and recovery; a separate strong Architect (Sol High in Codex) makes consequential decisions. The **original** `abdullah-architect` and `abdullah-implementer` remain untouched.
 
+Public product version **1.0.0**. The internal supervisor protocol remains
+`3.1.0`, state/config schema `3`, and report contract `2`; a public tag never
+renumbers them. `python3 scripts/orchestrator.py version` prints all identifiers.
+See `docs/versioning.md` for upgrade and compatibility policy.
+
 ## Default mode: one interactive foreground conversation
 
 Interactive foreground mode is the default. The user opens **one Codex CLI chat** with Luna Medium as the visible coordinator, invokes `$abdullah-orchestrator`, and stays in that same conversation.
@@ -136,7 +141,6 @@ Recovery from a new chat: `orchestrator_runs` → `orchestrator_status` → `orc
 The MCP tools are the primary interface. The same durable operations remain available if MCP is unavailable:
 
 ```bash
-python3 <SKILL_DIR>/scripts/orchestrator.py start --project <PROJECT> --goal-file <GOAL_FILE> --host codex
 python3 <SKILL_DIR>/scripts/orchestrator.py stage <ID>
 python3 <SKILL_DIR>/scripts/orchestrator.py status <ID>
 python3 <SKILL_DIR>/scripts/orchestrator.py recap <ID> --detail developer
@@ -149,7 +153,26 @@ python3 <SKILL_DIR>/scripts/orchestrator.py pause <ID>
 python3 <SKILL_DIR>/scripts/orchestrator.py cancel <ID>
 ```
 
-`start --background` is the optional detached legacy mode described above; omit it for the interactive workflow. `pause` and `cancel` write control requests consumed by a running supervisor; they are not substitutes for a verified `interrupt`.
+**Danger: the CLI `start` command is not state-only.** Unlike the MCP
+`orchestrator_start` tool, `orchestrator.py start` creates the run and then runs
+the supervisor loop in the foreground when `--background` is absent, dispatching
+real workers immediately:
+
+```bash
+# This dispatches real models as soon as it starts:
+python3 <SKILL_DIR>/scripts/orchestrator.py start \
+  --project <ABSOLUTE_PROJECT> --goal-file <GOAL_FILE> --host codex
+```
+
+Use the MCP `orchestrator_start` tool (state only) for the interactive workflow.
+Only an operator who explicitly wants the legacy supervised loop should run the
+CLI form, and `--background` detaches it instead. This distinction caused a real
+incident during the 2026-11-16 E2E run: a timeout-bounded foreground `start`
+dispatched plan and implement before being interrupted. The supervisor contained
+it correctly, but quota was spent without intent.
+
+`pause` and `cancel` write control requests consumed by a running supervisor;
+they are not substitutes for a verified `interrupt`.
 
 All run commands accept either a positional `<ID>` or `--run <ID>`, never both. For example `resume <ID>` and `resume --run <ID>` are equivalent.
 
