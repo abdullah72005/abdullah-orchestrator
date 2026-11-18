@@ -2646,5 +2646,132 @@ class BatchCorrectionsR04Tests(ReleaseFixture):
                              for item in state.get("batch_deltas", [])))
 
 
+class BatchCorrectionsR05Tests(ReleaseFixture):
+    """Rebuilt deltas must be sampled at the recorded completion identity."""
+
+    def _package(self, sha="verify-r05"):
+        return {"commands": [], "passed": True, "source_unchanged": True,
+                "candidate_hash": orc.signature(
+                    orc.source_snapshot(self.project)),
+                "verification_path": str(self.root / f"{sha}.json"),
+                "verification_sha256": sha, "evidence_version": 2}
+
+    def _projection(self, state):
+        return orc.prepare_review_projection(
+            self.rundir, state, self.cfg, self.project,
+            state["plan"]["batches"][0], self._package())
+
+    def _state_and_boundary(self, job_id):
+        state = self.saved(self.state(
+            phase="implement", plan=self.plan(),
+            plan_version=orc.content_hash(self.plan())))
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, job_id, batch_index=0,
+            plan_version=state["plan_version"])
+        return state, boundary
+
+    def _assert_incomplete_review_limitation(self, state, record, reason,
+                                             forbidden=None):
+        self.assertFalse(record["complete"])
+        self.assertEqual(record["paths"], [])
+        self.assertTrue(any(item["reason"] == reason
+                            for item in record["limitations"]))
+        delta = orc.batch_delta_index(state)
+        self.assertEqual(delta["attempts"], 1)
+        self.assertEqual(len(delta["incomplete_writer_attempts"]), 1)
+        state["phase"] = "review"
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertTrue(any(item.get("reason") == reason
+                            for item in projection["limitations"]))
+        projected = [orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/" + name)
+            for name in projection["files"] if name.endswith(".patch")]
+        if forbidden is not None:
+            self.assertFalse(any(forbidden in text for text in projected))
+        index_text = orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/delta/index.json")
+        self.assertEqual(json.loads(index_text)["files"], [])
+
+    def test_pre_rebuild_drift_is_not_attributed_to_the_completion(self):
+        job_id = "impl-pre-drift-r05"
+        state, boundary = self._state_and_boundary(job_id)
+        (self.project / "app.py").write_text("value = 2\n")
+        recorded_completion = orc.source_snapshot(self.project)
+        (self.project / "app.py").write_text("value = 3\n")
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary,
+            recorded_completion, phase="completion")
+        self._assert_incomplete_review_limitation(
+            state, record, "writer delta reconstruction not attributable",
+            forbidden="+value = 3")
+        self.assertTrue(any("does not match the recorded writer completion"
+                            in item["detail"]
+                            for item in record["limitations"]))
+        self.assertFalse((Path(boundary["dir"]).parent / "after"
+                          / "index.json").exists())
+        self.assertEqual((self.project / "app.py").read_text(), "value = 3\n")
+
+    def test_write_during_reconstruction_is_detected_and_never_reusable(self):
+        job_id = "impl-mid-drift-r05"
+        state, boundary = self._state_and_boundary(job_id)
+        (self.project / "app.py").write_text("value = 2\n")
+        recorded_completion = orc.source_snapshot(self.project)
+        real_finalize = orc.finalize_batch_delta
+
+        def drifting_finalize(*args, **kwargs):
+            value = real_finalize(*args, **kwargs)
+            (self.project / "app.py").write_text("value = 4\n")
+            return value
+
+        with patch.object(orc, "finalize_batch_delta",
+                          side_effect=drifting_finalize):
+            record = orc._record_batch_delta(
+                self.rundir, state, self.project, job_id, boundary,
+                recorded_completion, phase="completion")
+        self._assert_incomplete_review_limitation(
+            state, record, "writer delta reconstruction not attributable",
+            forbidden="+value = 4")
+        self.assertTrue(any("source changed during delta reconstruction"
+                            in item["detail"]
+                            for item in record["limitations"]))
+        canonical = Path(boundary["dir"]).parent / "after" / "index.json"
+        self.assertFalse(canonical.exists())
+        quarantined = list(canonical.parent.glob("index.drifted-*.json"))
+        self.assertEqual(len(quarantined), 1)
+        reusable, _problem = orc._reusable_delta_index(
+            self.rundir, job_id, boundary, recorded_completion, 1)
+        self.assertIsNone(reusable)
+        self.assertEqual((self.project / "app.py").read_text(), "value = 4\n")
+
+    def test_unchanged_reconstruction_projects_the_correct_hunk(self):
+        job_id = "impl-clean-rebuild-r05"
+        state, boundary = self._state_and_boundary(job_id)
+        (self.project / "app.py").write_text("value = 2\n")
+        completion = orc.source_snapshot(self.project)
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary,
+            completion, phase="completion")
+        self.assertTrue(record["complete"])
+        self.assertEqual(record["limitations"], [])
+        entry = next(item for item in record["paths"] if item["path"] == "app.py")
+        hunk_text = (Path(record["hunks_dir"])
+                     / Path(entry["hunks"][0]["path"]).name).read_text()
+        self.assertIn("+value = 2", hunk_text)
+        state["phase"] = "review"
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        patches = [name for name in projection["files"]
+                   if name.endswith(".patch")]
+        projected = [orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/" + name)
+            for name in patches]
+        self.assertTrue(any("+value = 2" in text for text in projected))
+        self.assertFalse(any("+value = 3" in text for text in projected))
+        delta = orc.batch_delta_index(state)
+        self.assertEqual(delta["attempts"], 1)
+        self.assertFalse(delta["incomplete_writer_attempts"])
+
+
 if __name__ == "__main__":
     unittest.main()

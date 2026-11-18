@@ -8590,6 +8590,40 @@ def _record_recovered_writer_attempt(run_dir, state, project, job):
                             "unavailable")))
 
 
+def _observed_source_identity(project):
+    """Observe current source identity under the shared projection."""
+    try:
+        snapshot = source_snapshot(Path(project))
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+        return None, "source identity could not be observed: " + str(exc)
+    return signature(snapshot), None
+
+
+def _quarantine_delta_index(boundary, reason):
+    """Move a drifted prepared index aside so it can never be reused."""
+    try:
+        path = Path(boundary.get("dir", "")).parent / "after" / "index.json"
+    except (OSError, ValueError):
+        return None
+    if not path.is_file():
+        return None
+    target = path.with_name(f"index.drifted-{uuid.uuid4().hex[:8]}.json")
+    try:
+        os.replace(path, target)
+        return target
+    except OSError:
+        # Preserve the audit trail if possible; otherwise make the canonical
+        # path explicitly invalid so it cannot pass an exact-completion check.
+        marker = {"version": 1, "invalidated": True, "reason": reason,
+                  "paths": []}
+        marker["index_sha256"] = content_hash(marker)
+        try:
+            atomic_json(path, marker)
+        except OSError:
+            pass
+        return None
+
+
 def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapshot,
                         *, job=None, phase="completion", forced_problem=None):
     """Finalize and persist one writer attempt's observed delta (bounded).
@@ -8608,6 +8642,7 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
     problem = forced_problem
     completion_problem = None
     retained_problem = None
+    rebuild_problem = None
     index_value = None
     if not isinstance(final_snapshot, dict):
         # A delta is evidence about a completion.  Without an attested
@@ -8623,23 +8658,55 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
         index_value, retained_problem = _reusable_delta_index(
             run_dir, job_id, boundary, final_snapshot, attempt)
     if problem is None and index_value is None:
-        try:
-            index_value = finalize_batch_delta(
-                project, run_dir, job_id, boundary,
-                final_snapshot=final_snapshot, attempt=attempt)
-        except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            problem = "writer delta finalization failed: " + str(exc)
-        if index_value is None:
-            problem = problem or "writer delta finalization returned no index"
-        if problem and retained_problem:
-            problem = (problem + "; retained index rejected: "
-                       + retained_problem)
+        # Rebuilding samples the live checkout.  It may only be attributed to
+        # the recorded completion when the source identity still matches before
+        # and after that sampling; otherwise the prepared hunk would carry
+        # another state's bytes under the recorded completion signature.
+        expected_identity = signature(final_snapshot)
+        before_identity, before_problem = _observed_source_identity(project)
+        if before_problem:
+            rebuild_problem = before_problem
+        elif before_identity != expected_identity:
+            rebuild_problem = (
+                "the current source does not match the recorded writer "
+                "completion; delta reconstruction is not attributable")
+        if rebuild_problem is None:
+            try:
+                index_value = finalize_batch_delta(
+                    project, run_dir, job_id, boundary,
+                    final_snapshot=final_snapshot, attempt=attempt)
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                rebuild_problem = ("writer delta finalization failed: "
+                                   + str(exc))
+            if index_value is None:
+                rebuild_problem = (rebuild_problem
+                                   or "writer delta finalization returned no index")
+        if index_value is not None:
+            after_identity, after_problem = _observed_source_identity(project)
+            if after_problem:
+                rebuild_problem = after_problem
+            elif after_identity != before_identity:
+                rebuild_problem = (
+                    "source changed during delta reconstruction; the prepared "
+                    "delta is not bound to the recorded completion")
+        if rebuild_problem is not None:
+            # A prepared index from a drifted scan must never become reusable
+            # as complete evidence.  Preserve it aside; keep user source as-is.
+            _quarantine_delta_index(
+                boundary, rebuild_problem + ((" (" + retained_problem + ")")
+                                             if retained_problem else ""))
+            index_value = None
+            problem = rebuild_problem
     if index_value is None:
+        reason = "writer attempt evidence unavailable"
+        if completion_problem:
+            reason = "writer completion not attested"
+        elif rebuild_problem:
+            reason = "writer delta reconstruction not attributable"
         return _record_writer_limitation(
             run_dir, state, job_id, boundary,
-            reason=("writer completion not attested" if completion_problem
-                    else "writer attempt evidence unavailable"),
-            detail=(problem or retained_problem
+            reason=reason,
+            detail=(problem or retained_problem or rebuild_problem
                     or "the writer attempt could not be attributed"),
             phase=phase, job=job)
     record = {
