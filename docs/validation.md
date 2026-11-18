@@ -10,10 +10,11 @@ reproduce or challenge the claims.
 python3 -m unittest discover -s scripts/tests
 ```
 
-- **870 tests**, 7 opt-in skips, roughly 14 minutes on a laptop (Python 3.10.12;
-  CI also targets 3.12/3.13). The 7 skips are the real-OpenCode introspection
-  module, which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set. `pytest` may
-  show a different skip distribution.
+- **870 tests**, 461–471 s per CI job (Python 3.10, 3.12 and 3.13), with
+  opt-in/platform-gated skips: 7 on the maintainer host and 8 on GitHub runners.
+  The main opt-in module is the real-OpenCode introspection suite, which runs
+  only when `ABDULLAH_OPENCODE_V2_BIN` is set; the remaining skip is
+  platform-gated. `pytest` may show a different skip distribution.
 - No model calls. A guard replaces `codex`, `claude`, and `opencode` with fakes
   and raises if a test tries to launch a real model CLI.
 - Tests are hermetic: exported `ABDULLAH_CONFIG`, `ABDULLAH_STATE_DIR`, and
@@ -187,13 +188,14 @@ python3 scripts/orchestrator.py doctor --project /path/to/disposable/repo
 | Fresh-`HOME` install | links created, config `0600`, idempotent second run |
 | Conflicting pre-existing skill | refused, existing content preserved |
 | Example configuration | parses; pins supervisor `3.1.0` and schema `3` |
-| Documentation links | 67 relative links, 0 broken files or anchors |
+| Documentation links | 68 relative links, 0 broken files or anchors |
 | Credential scan | no keys, tokens, auth databases, env files or private transcripts in tracked files |
-| Full deterministic suite | executed by CI on the release commit, Python 3.10/3.12/3.13 |
+| Full deterministic suite | 870 tests, all green in CI on Python 3.10/3.12/3.13 (461–471 s per job) |
 
-The seven skips are the real-OpenCode introspection module, which requires
-`ABDULLAH_OPENCODE_V2_BIN`. The release environment has OpenCode V2.2.7 installed,
-and `doctor` performed real configuration normalization without inference.
+Skipped tests are opt-in/platform-gated (8 on the CI runner). The main one is the
+real-OpenCode introspection module, which requires `ABDULLAH_OPENCODE_V2_BIN`.
+The release environment has OpenCode V2.2.7 installed, and `doctor` performed
+real configuration normalization without inference.
 
 ### Real end-to-end milestone (2026-11-16 → 2026-11-18)
 

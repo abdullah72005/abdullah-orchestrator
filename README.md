@@ -298,13 +298,14 @@ Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Tested behavior
 
-**Deterministic suite (offline, no model calls):** 870 tests, 7 opt-in skips,
-executed by CI on Python 3.10, 3.12 and 3.13 for every push to `main`. The seven
-skips are the real-OpenCode introspection module, which runs only when
-`ABDULLAH_OPENCODE_V2_BIN` is set. A guard replaces real `codex`, `claude` and
-`opencode` processes with fakes. The previously accepted pre-release revision
-`b9819a7` passed 866 tests locally; v1.0.0 adds release-identity coverage and
-version reporting.
+**Deterministic suite (offline, no model calls):** 870 tests, executed by CI on
+Python 3.10, 3.12 and 3.13 for every push to `main` (461–471 s per job, all
+green). Skips are opt-in or platform-gated: 7 on the maintainer host and 8 on
+GitHub runners. The main opt-in module is the real-OpenCode introspection suite,
+which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set. A guard replaces real
+`codex`, `claude` and `opencode` processes with fakes. The previously accepted
+pre-release revision `b9819a7` passed 866 tests locally; v1.0.0 adds
+release-identity coverage and version reporting.
 
 **Real end-to-end milestone (2026-11-16 → 2026-11-18):**
 
