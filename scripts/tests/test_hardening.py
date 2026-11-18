@@ -122,6 +122,15 @@ print(json.dumps({'sessionID':'ses_retry','type':'step_finish','part':{'reason':
     def test_diagnosis_intent_persists_before_call_and_restarts(self):
         self.state['phase'] = 'accept'
         self.state['corrections'] = 1
+        self.state['plan'] = {'contract_version': 2, 'status': 'complete',
+                              'summary': 'plan', 'invariants': ['behavior'],
+                              'batches': [{'title': 'one', 'goal': 'edit',
+                                           'acceptance': ['works'],
+                                           'checks': [['true']], 'risk': 'ordinary'}],
+                              'blocker': '', 'required_exploration': {
+                                  'job_id': '', 'scope_satisfied': True}}
+        self.state['plan_version'] = orc.content_hash(self.state['plan'])
+        self.state['batch_index'] = 0
         orc.handle_repair(self.rundir, self.state, self.cfg, 'second failure')
         restored = orc.read_json(self.rundir / 'state.json')
         self.assertEqual(restored['phase'], 'diagnose')

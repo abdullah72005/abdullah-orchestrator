@@ -370,7 +370,9 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(captured["kind"], "plan")
         request = captured["prompt"][orc.PROMPT_REQUEST_KEY]
         self.assertEqual(request["kind"], "plan")
-        self.assertEqual(request["context"]["goal"], "Add a feature")
+        self.assertEqual(request["context"]["requirements"]["original_goal"],
+                         "Add a feature")
+        self.assertNotIn("goal", request["context"])
         self.assertIn("Architect — strong Sol / Opus",
                       orc.render_prompt(request["kind"], request["context"]))
         self.assertEqual(self.state["phase"], "implement")

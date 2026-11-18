@@ -7,7 +7,7 @@
 <p align="center"><strong>Strong-model decisions. Cost-conscious execution. Independent verification. One controlling conversation.</strong></p>
 
 <p align="center">
-  <a href="https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.2.0"><img alt="Release v1.2.0" src="https://img.shields.io/badge/release-v1.2.0-2f6f4e"></a>
+  <a href="docs/release-evidence/v1.2.0/README.md"><img alt="Release v1.2.0 candidate" src="https://img.shields.io/badge/release-v1.2.0%20candidate-2f6f4e"></a>
   <a href="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab"></a>
   <a href="#requirements"><img alt="Runtime: standard library only" src="https://img.shields.io/badge/runtime-stdlib%20only-4b5563"></a>
@@ -151,7 +151,24 @@ cd abdullah-orchestrator
 python3 scripts/install_wsl.py --register-codex
 ```
 
-This is idempotent and refuses to overwrite unrelated skills or servers. It:
+The v1.2.0 candidate is **not published under its own public tag**. To install
+it, run the installer from a local candidate checkout (for example the
+`feat/orchestrator-v1-2` worktree) or from an explicit commit:
+
+```bash
+cd /path/to/abdullah-orchestrator-v1.2.0
+git rev-parse HEAD
+python3 scripts/install_wsl.py --register-codex
+```
+
+The last published release instructions remain
+[the existing `v1.0.0` tag](https://github.com/abdullah72005/abdullah-orchestrator/tree/v1.0.0).
+The candidate's deterministic evidence is in
+[docs/release-evidence/v1.2.0/](docs/release-evidence/v1.2.0/README.md).
+Do not assume a public `v1.2.0` tag or release exists.
+
+The installer is idempotent and refuses to overwrite unrelated skills or
+servers. It:
 
 1. links the skill into `~/.agents/skills/abdullah-orchestrator` (Codex) and
    `~/.claude/skills/abdullah-orchestrator` (Claude; `--no-claude` to skip);

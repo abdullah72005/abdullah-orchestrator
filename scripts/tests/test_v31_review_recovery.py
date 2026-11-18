@@ -125,6 +125,15 @@ class ReviewRecoveryTests(unittest.TestCase):
         plan = plan or make_plan(1)
         evidence = self.prepare(plan, phase="review", review=False)
         self.state["schema_version"] = orc.STATE_SCHEMA_VERSION
+        # The authority record planning normally creates.  Recovery must keep
+        # the unchanged approved plan usable for fresh checks/review.
+        self.state["plan_authority"] = {
+            "plan_version": orc.content_hash(plan), "plan_revision": 1,
+            "amendment_epoch": 0, "authority_epoch": 0,
+            "approved": True, "approval": {
+                "plan_version": orc.content_hash(plan), "plan_revision": 1,
+                "amendment_epoch": 0, "approved_at": orc.now()},
+            "source": "architect_plan", "recorded_at": orc.now()}
         self.state["implementation"] = {
             "status": "complete", "summary": "already implemented",
             "files": ["app.py"], "tests": [], "evidence": [], "unknowns": [],
@@ -134,7 +143,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         return plan, evidence
 
     def add_failed_reviewer(self, *, job_id="oldreview01", authority_epoch=0,
-                            include_epoch=True):
+                            include_epoch=True, dispatch_evidence=None):
         """Public-recovery fixture: preserved Reviewer stream at an old epoch."""
         self.data_root = self.root / "opencode-data"
         self.tree = ingestion.RecoveryRegressions._commit_candidate(self)
@@ -150,6 +159,8 @@ class ReviewRecoveryTests(unittest.TestCase):
             job["authority_epoch"] = authority_epoch
         dispatch = {"kind": "reviewer", "role": "reviewer",
                     "source": orc.source_snapshot(self.project)}
+        if dispatch_evidence is not None:
+            dispatch["dispatch_evidence"] = dispatch_evidence
         if include_epoch:
             dispatch["authority_epoch"] = authority_epoch
         orc.atomic_json(self.job_dir / "dispatch.json", dispatch)
@@ -214,6 +225,13 @@ class ReviewRecoveryTests(unittest.TestCase):
             "blocker": "", "findings": []}
         self.state.update({
             "schema_version": orc.STATE_SCHEMA_VERSION,
+            "plan_authority": {
+                "plan_version": orc.content_hash(plan), "plan_revision": 1,
+                "amendment_epoch": 0, "authority_epoch": 0,
+                "approved": True, "approval": {
+                    "plan_version": orc.content_hash(plan), "plan_revision": 1,
+                    "amendment_epoch": 0, "approved_at": orc.now()},
+                "source": "architect_plan", "recorded_at": orc.now()},
             "implementation": copy.deepcopy(implementation),
             "implementation_job": "implementer-old",
             "route_authorizations": [{"id": "grant", "role": "reviewer",
@@ -260,6 +278,10 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertIn("toolchain", recovery["dimensions"])
         self.assertEqual(recovery["evidence"]["sha256"],
                          orc.hashlib.sha256(evidence_bytes).hexdigest())
+        self.assertTrue(recovery.get("plan_approval_preserved"))
+        # The unchanged approved plan remains usable at the advanced evidence
+        # epoch; only cached Reviewer/decision artifacts were invalidated.
+        self.assertEqual(orc._review_plan_guard(state)["title"], "batch 1")
         self.assertTrue(any("PATH" in item["field"]
                             for item in recovery["differences"]["environment"]))
         self.assertEqual(state["implementation"], implementation)
@@ -1075,6 +1097,39 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.stage("review")
         self.assertEqual(self.state_file()["phase"], "verify")
         self.assertEqual(len(self.state_file()["review_recoveries"]), 1)
+
+    def test_unapproved_plan_authority_is_still_rejected(self):
+        plan = make_plan(1)
+        state = self.state_file()
+        state.update({
+            "plan": plan, "plan_version": orc.content_hash(plan),
+            "plan_revision": 1, "batch_index": 0,
+            "plan_authority": {
+                "plan_version": orc.content_hash(plan), "plan_revision": 1,
+                "amendment_epoch": 0, "authority_epoch": 0,
+                "approved": False, "approval": None,
+                "source": "architect_plan", "recorded_at": orc.now()}})
+        with self.assertRaises(orc.VerificationEvidenceRejected) as raised:
+            orc._review_plan_guard(state)
+        self.assertEqual(raised.exception.code, "plan_not_approved")
+
+    def test_recovered_report_keeps_producing_packet_identity(self):
+        old = {"projection_sha256": "old-packet", "verification_sha256": "old-verify"}
+        self.add_failed_reviewer(dispatch_evidence=old)
+        self.pause_state()
+        state = self.state_file()
+        # A newer packet now exists in state; recovery must not borrow its id.
+        state["review_projection"] = {
+            "projection_sha256": "new-packet", "verification_sha256": "new-verify"}
+        orc.save(self.rundir, state)
+        result = self.apply_reviewer_recovery()
+        self.assertTrue(result["applied"])
+        record = self.state_file()["report_recoveries"][-1]
+        self.assertEqual(record["review_projection_sha256"], "old-packet")
+        self.assertEqual(record["review_verification_sha256"], "old-verify")
+        self.assertIsNone(
+            orc.cached_recovered_job_report(self.rundir, self.state_file(),
+                                            "reviewer"))
 
 
 if __name__ == "__main__":

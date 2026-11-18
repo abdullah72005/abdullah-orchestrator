@@ -5,6 +5,7 @@ fake CLI executables. They make no live model calls and never touch live state.
 """
 from __future__ import annotations
 
+import copy
 import errno
 import hashlib
 import json
@@ -121,6 +122,9 @@ class ReleaseFixture(unittest.TestCase):
         orc.save(self.rundir, state)
         orc.atomic_json(self.rundir / "control.json", {"action": "run"})
         return state
+
+    def state_file(self):
+        return orc.read_json(self.rundir / "state.json")
 
     def plan(self, risk="ordinary", checks=None, batches=1):
         return {
@@ -940,6 +944,625 @@ class ReleaseIdentityV120Tests(unittest.TestCase):
         evidence = root / "docs" / "release-evidence" / "v1.2.0"
         self.assertTrue(evidence.is_dir())
         self.assertTrue((evidence / "README.md").is_file())
+
+
+class CorrectionCycleF120Tests(ReleaseFixture):
+    """Findings F1/A1/A4/F2/F4/F5 from the Batch 1 review."""
+
+    def _planned_state(self, **overrides):
+        plan = self.plan()
+        state = self.state(plan=plan, plan_version=orc.content_hash(plan))
+        state.update(overrides)
+        return self.saved(state), plan
+
+    # -- F1 ---------------------------------------------------------------
+    def test_material_correction_diagnoses_then_replans_never_implements_null(self):
+        state, _plan = self._planned_state(phase="implement")
+        result = orc.amend_run(state["id"], "Retry semantics look wrong",
+                               architect_review=True, kind="correction")
+        self.assertTrue(result["persisted"])
+        _, state = orc.load(state["id"])
+        self.assertEqual(state["phase"], "diagnose")
+        self.assertIsNone(state["plan"])
+        self.assertTrue(state["correction_replan"])
+        seen = []
+
+        def diagnose(_dir, saved, _cfg, kind, extra=None, **kw):
+            seen.append(kind)
+            return {"verdict": "changes_required", "reason": "investigated",
+                    "inspected": ["app.py"], "correction": "Redo retries",
+                    "blocker": ""}
+
+        with patch.object(orc, "cached_job_report", return_value=None), \
+                patch.object(orc, "strong_call", side_effect=diagnose):
+            orc.advance(self.rundir, state, self.cfg)
+        self.assertEqual(seen, ["diagnose"])
+        self.assertEqual(state["phase"], "plan")
+        self.assertIsNone(state["plan"])
+
+        plan = self.plan()
+        with patch.object(orc, "cached_job_report", return_value=None), \
+                patch.object(orc, "strong_call", return_value=plan):
+            orc.advance(self.rundir, state, self.cfg)
+        self.assertEqual(state["phase"], "implement")
+        self.assertEqual(state["plan_version"], orc.content_hash(plan))
+        self.assertGreater(state["plan_revision"], 0)
+
+    def test_pending_requirement_replan_keeps_route_and_both_entries(self):
+        state, _plan = self._planned_state(phase="plan", status="paused", plan=None,
+                                       plan_version=None, amendment_material=True,
+                                       amendments=[{"id": "req-1", "at": orc.now(),
+                                                     "text": "MUST support offline resume",
+                                                     "request_kind": "requirement",
+                                                     "kind": "material",
+                                                     "routed_to": "plan"}])
+        orc.amend_run(state["id"], "Also keep the legacy endpoint",
+                      architect_review=True, kind="correction")
+        _, state = orc.load(state["id"])
+        self.assertEqual(state["phase"], "plan")
+        self.assertIsNone(state["plan"])
+        self.assertTrue(state["amendment_material"])
+        self.assertEqual([item["text"] for item in state["amendments"]],
+                         ["MUST support offline resume",
+                          "Also keep the legacy endpoint"])
+        self.assertEqual(state["amendments"][-1]["routed_to"], "plan")
+        self.assertEqual(state["status"], "paused")
+
+    def test_ordinary_correction_without_plan_reaches_planning(self):
+        state, _plan = self._planned_state(phase="implement", plan=None,
+                                       plan_version=None)
+        orc.amend_run(state["id"], "Rename the helper", kind="correction")
+        _, state = orc.load(state["id"])
+        self.assertEqual(state["phase"], "plan")
+        self.assertIsNone(state["plan"])
+        self.assertEqual(state["amendments"][-1]["routed_to"], "plan")
+
+    def test_blocked_diagnosis_never_reaches_implementation(self):
+        state, _plan = self._planned_state(phase="implement")
+        orc.amend_run(state["id"], "Retry semantics look wrong",
+                      architect_review=True, kind="correction")
+        _, state = orc.load(state["id"])
+        with patch.object(orc, "cached_job_report", return_value=None), \
+                patch.object(orc, "strong_call",
+                             return_value={"verdict": "blocked",
+                                           "reason": "contradiction",
+                                           "inspected": [], "correction": "",
+                                           "blocker": "contradiction"}):
+            orc.advance(self.rundir, state, self.cfg)
+        self.assertEqual(state["phase"], "diagnose")
+        self.assertIsNone(state["plan"])
+        self.assertNotEqual(state["status"], "running")
+
+    def test_lock_time_active_dispatch_recheck_rejects_the_amendment(self):
+        state, _plan = self._planned_state(phase="implement")
+        clean = copy.deepcopy(state)
+        active = copy.deepcopy(state)
+        active["active_job"] = {"id": "live", "role": "implementer",
+                                "status": "running"}
+        responses = iter([(self.rundir, clean), (self.rundir, active)])
+        stream = object()
+        with patch.object(orc, "load", side_effect=lambda _id: next(responses)), \
+                patch.object(orc, "_acquire_lock_file", return_value=stream), \
+                patch.object(orc, "_release_lock_file", return_value=None):
+            result = orc.amend_run(state["id"], "Apply this mid-flight",
+                                   architect_review=True, kind="correction")
+        self.assertFalse(result["ok"])
+        self.assertIn("became active", result["error"])
+        self.assertEqual(clean["amendments"], [])
+        self.assertEqual(clean["phase"], "implement")
+
+    # -- A4 ---------------------------------------------------------------
+    def test_protected_decision_rejects_medium_default_route_before_dispatch(self):
+        state, _plan = self._planned_state(phase="accept")
+        route = {"provider": "codex", "model": "gpt-6.2-sol",
+                 "effort": "medium", "billing": "subscription"}
+        with self.assertRaisesRegex(RuntimeError, "Protected Architect decision"):
+            orc.call_model(self.rundir, state, self.cfg, "architect", "decision",
+                           "prompt", self.project, route=dict(route))
+        self.assertIsNone(state.get("active_job"))
+
+    def test_authorized_medium_architect_fallback_is_rejected_and_consent_kept(self):
+        state, _plan = self._planned_state(phase="accept", host="codex")
+        state["fallback_authorization"] = {"role": "architect", "used": 0}
+        cfg = copy.deepcopy(self.cfg)
+        cfg["fallback"]["codex"] = {"model": "gpt-6-luna", "effort": "medium"}
+        with patch.object(orc, "config", return_value=cfg):
+            with self.assertRaisesRegex(RuntimeError, "approved fallback"):
+                orc.call_model(self.rundir, state, cfg, "architect", "decision",
+                               "prompt", self.project)
+        self.assertEqual(state["fallback_authorization"],
+                         {"role": "architect", "used": 0})
+
+    def test_high_acceptance_route_is_admitted_for_dispatch(self):
+        state, _plan = self._planned_state(phase="accept")
+        route = {"provider": "codex", "model": "gpt-6.2-sol",
+                 "effort": "high", "billing": "subscription"}
+        with patch.object(orc, "route_preflight",
+                          side_effect=RuntimeError("sentinel-preflight")) as preflight:
+            with self.assertRaisesRegex(RuntimeError, "sentinel-preflight"):
+                orc.call_model(self.rundir, state, self.cfg, "architect",
+                               "decision", "prompt", self.project, route=route)
+        preflight.assert_called()
+
+    # -- F2 ---------------------------------------------------------------
+    def test_compacted_reviewer_prompt_keeps_packet_and_delta_pointer(self):
+        project = self.project
+        state, plan = self._planned_state(phase="review", plan_version=None)
+        state["plan_version"] = orc.content_hash(plan)
+        boundary = orc.capture_batch_boundary(
+            project, self.rundir, "impl-f2", batch_index=0,
+            plan_version=state["plan_version"])
+        (project / "app.py").write_text("value = 42\n")
+        result = orc.finalize_batch_delta(
+            project, self.rundir, "impl-f2", boundary,
+            final_snapshot=orc.source_snapshot(project), attempt=1)
+        state["batch_deltas"] = [{
+            "attempt": 1, "job_id": "impl-f2", "batch_index": 0,
+            "plan_version": state["plan_version"], "hunks_dir": result["hunks_dir"],
+            "paths": result["paths"], "limitations": result["limitations"]}]
+        package = {"commands": [{"argv": ["true"], "returncode": 0,
+                                 "log": str(self.root / "log.txt"), "log_sha256": "a",
+                                 "log_bytes": 1, "output_tail": "ok"}],
+                   "passed": True, "source_unchanged": True,
+                   "candidate_hash": orc.signature(orc.source_snapshot(project)),
+                   "verification_path": str(self.root / "verification.json"),
+                   "verification_sha256": "verify-f2", "evidence_version": 2}
+        projection, rejection = orc.prepare_review_projection(
+            self.rundir, state, self.cfg, project, plan["batches"][0], package)
+        self.assertIsNone(rejection)
+        real_hunk = next(Path(result["hunks_dir"]) / Path(h["path"]).name
+                         for item in result["paths"] for h in item.get("hunks", []))
+        self.assertTrue(real_hunk.is_file())
+        files = {name: {"sha256": orc._sha256_file(real_hunk), "bytes": 1}
+                 for name in [f"delta/fake-{n}.patch" for n in range(45)]}
+        context = {
+            "project": str(project), "batch": plan["batches"][0],
+            "plan_version": state["plan_version"],
+            "source": orc.source_snapshot(project), "verification": package,
+            "requirements": orc.user_requirements(state),
+            "review_evidence": {**projection, "files": files,
+                                "untrusted_files": ["verification.json"]},
+            "delta_index": {"batch_index": 0, "attempts": 1,
+                            "files": [{"path": f"f{n}.py", "hunks": [
+                                {"path": str(real_hunk)}]} for n in range(60)],
+                            "totals": {"additions": 1, "deletions": 0},
+                            "paths": [result.get("index_path") or
+                                      str(Path(result["hunks_dir"]).parent / "index.json")],
+                            "note": "delta"},
+            "invariants": plan["invariants"],
+            "instruction": "Review independently.",
+            "bulk_optional_noise": "x" * 60_000,
+        }
+        cfg = copy.deepcopy(self.cfg)
+        cfg.setdefault("limits", {})["max_context_chars"] = 40_000
+        with patch.object(orc, "config", return_value=cfg):
+            prompt = orc.render_prompt("reviewer", context)
+        body = prompt.split("Task and evidence:\n", 1)[1]
+        body = body.rsplit("\n\nReply with ONE valid JSON object", 1)[0]
+        parsed = json.loads(body)
+        self.assertTrue(parsed["_context_budget"]["truncated"])
+        evidence = parsed["review_evidence"]
+        self.assertEqual(evidence["root"], projection["root"])
+        self.assertEqual(evidence["manifest"], projection["manifest"])
+        self.assertTrue(Path(evidence["manifest"]).is_file())
+        self.assertTrue(evidence["files_truncated"])
+        delta = parsed["delta_index"]
+        self.assertTrue(delta["files_truncated"])
+        self.assertTrue(delta["index_paths"])
+        self.assertTrue(Path(delta["index_paths"][0]).is_file())
+        hunk_path = Path(delta["files"][0]["hunks"][0]["path"])
+        self.assertTrue(hunk_path.is_file())
+        self.assertIn("+value = 42", hunk_path.read_text())
+        # The pointer is readable through the Reviewer's real read policy.
+        relative = Path(projection["root"]).name + "/" + \
+            next(name for name in projection["files"] if name.endswith(".patch"))
+        self.assertIn("value = 42",
+                      orc.read_review_projection(project, relative))
+
+    # -- F4 ---------------------------------------------------------------
+    def test_medium_plan_stage_reports_attempted_trial_route_and_outcome(self):
+        trial = orc.validate_planning_trial(self.cfg, "codex", True)
+        state = self.saved(self.state(phase="plan", plan=None,
+                                      ordinary_planning_trial=trial))
+        with patch.object(orc, "strong_call", return_value=self.plan()):
+            payload = orc.stage_run(state["id"])
+        self.assertEqual(payload["outcome"], "complete")
+        self.assertEqual(payload["route_source"], "ordinary_planning_trial")
+        self.assertEqual(payload["effort"], "medium")
+        self.assertEqual(payload["batch"]["label"], "planning")
+        self.assertEqual(self.state_file()["ordinary_planning_trial"]["state"],
+                         "adopted")
+        events = [json.loads(line) for line in
+                  (self.rundir / "journal.jsonl").read_text().splitlines()]
+        start = [event for event in events if event["event"] == "stage_start"][-1]
+        end = [event for event in events if event["event"] == "stage_end"][-1]
+        self.assertEqual(start["route"]["route_source"], "ordinary_planning_trial")
+        self.assertEqual(end["outcome"], "complete")
+        recap = orc.recap_run(state["id"])
+        self.assertEqual(recap["facts"]["last_stage"]["outcome"], "complete")
+
+    def test_verification_completion_uses_one_outcome_and_one_stage(self):
+        state, plan = self._planned_state(phase="verify")
+        passed = {"passed": True, "source_unchanged": True,
+                  "candidate_hash": orc.signature(orc.source_snapshot(self.project)),
+                  "commands": [], "path": None}
+        with patch.object(orc, "run_checks", return_value=passed):
+            payload = orc.stage_run(state["id"])
+        self.assertEqual(payload["outcome"], "complete")
+        self.assertEqual(self.state_file()["phase"], "review")
+        self.assertEqual(self.state_file()["status"], "running")
+        events = [json.loads(line) for line in
+                  (self.rundir / "journal.jsonl").read_text().splitlines()]
+        self.assertEqual(sum(1 for event in events
+                             if event["event"] == "stage_start"), 1)
+        self.assertEqual(sum(1 for event in events
+                             if event["event"] == "stage_end"), 1)
+        self.assertEqual([event["outcome"] for event in events
+                          if event["event"] == "stage_end"], ["complete"])
+        recap = orc.recap_run(state["id"])
+        self.assertEqual(recap["facts"]["last_stage"]["outcome"], "complete")
+
+    def test_phase_changing_stage_keeps_pre_transition_batch_and_route(self):
+        state, plan = self._planned_state(phase="implement")
+        report = {"contract_version": 2, "status": "complete", "summary": "done",
+                  "files": ["app.py"], "tests": [], "evidence": ["app.py:1"],
+                  "unknowns": [], "blocker": ""}
+        job = {"id": "impl-f4", "kind": "implementer", "role": "implementer",
+               "path": str(self.rundir / "jobs")}
+        with patch.object(orc, "cached_job_report", return_value=None), \
+                patch.object(orc, "call_model", return_value=(dict(report), job)):
+            payload = orc.stage_run(state["id"])
+        self.assertEqual(payload["batch"]["label"], "Batch 1/1")
+        self.assertEqual(payload["route_source"], "pinned")
+        self.assertIsNotNone(payload["started_at_offset"])
+        self.assertGreaterEqual(payload["elapsed_seconds"], 0)
+        self.assertEqual(self.state_file()["phase"], "verify")
+        self.assertEqual(payload["next_phase"], "verify")
+        self.assertEqual(payload["outcome"], "complete")
+
+    # -- F5 ---------------------------------------------------------------
+    def test_nested_explorer_is_route_aware_and_carries_requirements_once(self):
+        plan = self.plan()
+        state = self.state(phase="plan", plan=plan,
+                           plan_version=orc.content_hash(plan),
+                           explorer_policy="on_demand")
+        state["goal"] = "Add a feature"
+        state["amendments"] = [{"id": "am1", "at": orc.now(),
+                                "text": "MUST support offline resume",
+                                "request_kind": "requirement",
+                                "kind": "material", "routed_to": "plan"}]
+        state["active_job"] = {"id": "architect-parent", "role": "architect",
+                               "status": "running"}
+        self.saved(state)
+        captured = {}
+
+        def model(*args, **kwargs):
+            captured["prompt"] = args[5]
+            return ({"contract_version": 2, "status": "complete", "summary": "explored",
+                     "files": [], "tests": [], "evidence": [], "unknowns": [],
+                     "blocker": ""},
+                    {"id": "expl-1", "role": "explorer"})
+
+        from types import SimpleNamespace
+        os.environ.pop("ABDULLAH_PARENT_JOB", None)
+        os.environ.pop("ABDULLAH_RUN_ID", None)
+        with patch.object(orc, "call_model", side_effect=model):
+            orc.explore(SimpleNamespace(run=state["id"], task="find callers",
+                                        parent_job="architect-parent"))
+        request = captured["prompt"][orc.PROMPT_REQUEST_KEY]
+        context = request["context"]
+        self.assertNotIn("goal", context)
+        self.assertEqual(context["requirements"]["original_goal"], "Add a feature")
+        self.assertEqual(context["requirements"]["amendments"][0]["text"],
+                         "MUST support offline resume")
+        rendered = orc.render_prompt(request["kind"], context, include_policy=True)
+        self.assertEqual(rendered.count("MUST support offline resume"), 1)
+        self.assertEqual(rendered.count("Add a feature"), 1)
+
+    def test_strong_architect_context_has_no_duplicate_goal_or_amendment(self):
+        plan = self.plan()
+        state = self.state(phase="plan", plan=None)
+        state["goal"] = "Add a feature"
+        state["amendments"] = [{"id": "am1", "at": orc.now(),
+                                "text": "MUST support offline resume",
+                                "request_kind": "requirement",
+                                "kind": "material", "routed_to": "plan"}]
+        self.saved(state)
+        captured = {}
+
+        def model(*args, **kwargs):
+            captured["prompt"] = args[5]
+            return plan, {"id": "plan-f5"}
+
+        with patch.object(orc, "cached_job_report", return_value=None), \
+                patch.object(orc, "call_model", side_effect=model):
+            orc.advance(self.rundir, state, self.cfg)
+        context = captured["prompt"][orc.PROMPT_REQUEST_KEY]["context"]
+        self.assertNotIn("goal", context)
+        self.assertNotIn("user_amendments", context)
+        self.assertEqual(context["requirements"]["original_goal"], "Add a feature")
+        rendered = orc.render_prompt("plan", context, include_policy=True)
+        self.assertEqual(rendered.count("MUST support offline resume"), 1)
+        self.assertEqual(rendered.count("Add a feature"), 1)
+
+
+class DeltaFidelityF120Tests(ReleaseFixture):
+    def _edit(self, relative, text):
+        path = self.project / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def _commit(self, message="fixture"):
+        subprocess.run(["git", "add", "-A"], cwd=self.project, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-qm", message], cwd=self.project,
+                       check=True, capture_output=True)
+
+    def test_mode_only_change_and_empty_add_delete_are_tracked(self):
+        self._edit("mode.sh", "#!/bin/sh\nexit 0\n")
+        self._edit("empty.txt", "")
+        self._commit()
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-a3", batch_index=0,
+            plan_version="v")
+        (self.project / "mode.sh").chmod(0o755)
+        (self.project / "empty.txt").unlink()
+        self._edit("new-empty.txt", "")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-a3", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entries = {item["path"]: item for item in result["paths"]}
+        self.assertTrue(entries["mode.sh"]["mode_changed"])
+        self.assertTrue(entries["mode.sh"]["changed_in_window"])
+        self.assertEqual(entries["empty.txt"]["presence_before"], "file")
+        self.assertEqual(entries["empty.txt"]["presence_after"], "absent")
+        self.assertTrue(entries["empty.txt"]["changed_in_window"])
+        self.assertEqual(entries["new-empty.txt"]["presence_before"], "absent")
+        self.assertEqual(entries["new-empty.txt"]["presence_after"], "file")
+        self.assertTrue(entries["new-empty.txt"]["changed_in_window"])
+
+    def test_nonempty_deletion_records_removed_lines(self):
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-del", batch_index=0,
+            plan_version="v")
+        (self.project / "app.py").unlink()
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-del", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entry = next(item for item in result["paths"]
+                     if item["path"] == "app.py")
+        self.assertTrue(entry["changed_in_window"])
+        self.assertEqual(entry["presence_after"], "absent")
+        self.assertTrue(entry.get("hunks"))
+        patch_path = Path(result["hunks_dir"]) / Path(entry["hunks"][0]["path"]).name
+        text = patch_path.read_text()
+        self.assertIn("-value = 1", text)
+        self.assertGreater(entry["deletions"], 0)
+
+    def test_restored_head_bytes_are_labelled_as_overlap(self):
+        self._edit("app.py", "user pre-existing\n")
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-restore", batch_index=0,
+            plan_version="v")
+        self._edit("app.py", "value = 1\n")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-restore", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entry = next(item for item in result["paths"]
+                     if item["path"] == "app.py")
+        self.assertTrue(entry["changed_in_window"])
+        self.assertTrue(entry["overlap"])
+        self.assertTrue(entry.get("restored_to_head"))
+        self.assertTrue(entry.get("after_matches_head"))
+
+    def test_unavailable_capture_budget_marks_dirty_path_not_clean(self):
+        self._edit("first.py", "one\n")
+        self._edit("second.py", "two\n")
+        with patch.object(orc, "DELTA_MAX_PATHS", 1):
+            boundary = orc.capture_batch_boundary(
+                self.project, self.rundir, "impl-limit", batch_index=0,
+                plan_version="v")
+        self.assertFalse(boundary["capture_complete"])
+        self.assertTrue(boundary["omitted_paths"])
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-limit", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entries = {item["path"]: item for item in result["paths"]}
+        omitted = boundary["omitted_paths"][0]
+        self.assertEqual(entries[omitted]["attributable"], "unavailable")
+        self.assertIn("before_image_not_captured", entries[omitted]["base_source"])
+        self.assertEqual(entries[omitted]["before"], "pre_existing_worktree")
+        self.assertFalse(entries[omitted].get("changed_in_window", False))
+
+    def test_unreachable_head_and_comparison_failure_are_reported(self):
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-bad-head", batch_index=0,
+            plan_version="v")
+        boundary["head"] = "0" * 40
+        snapshot = orc.source_snapshot(self.project)
+        real_git = orc.git
+
+        def failing_git(project, args, *a, **kw):
+            if args and args[0] == "diff":
+                raise orc.subprocess.CalledProcessError(128, ["git", "diff"])
+            return real_git(project, args, *a, **kw)
+
+        with patch.object(orc, "git", side_effect=failing_git):
+            result = orc.finalize_batch_delta(
+                self.project, self.rundir, "impl-bad-head", boundary,
+                final_snapshot=snapshot, attempt=1)
+        self.assertEqual(result["dispatch_head_comparison"], "unavailable")
+        self.assertTrue(any(item.get("reason") ==
+                            "dispatch-head comparison unavailable"
+                            for item in result["limitations"]))
+
+    def test_index_and_worktree_state_are_labelled(self):
+        self._edit("app.py", "value = 9\n")
+        subprocess.run(["git", "add", "app.py"], cwd=self.project, check=True,
+                       capture_output=True)
+        self._edit("extra.py", "unstaged\n")
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-state", batch_index=0,
+            plan_version="v")
+        index_before = subprocess.run(
+            ["git", "-C", str(self.project), "diff", "--cached", "--binary",
+             "HEAD", "--"], capture_output=True, check=True).stdout
+        self._edit("feature.py", "new\n")
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-state", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        index_after = subprocess.run(
+            ["git", "-C", str(self.project), "diff", "--cached", "--binary",
+             "HEAD", "--"], capture_output=True, check=True).stdout
+        self.assertEqual(index_before, index_after)
+        self.assertEqual(result["index_sha256_at_dispatch"],
+                         boundary["index_sha256"])
+        self.assertEqual(result["worktree_status_sha256_at_dispatch"],
+                         boundary["status_sha256"])
+        self.assertIn("app.py", result["pre_existing_dirty_paths"])
+        self.assertIn("extra.py", result["pre_existing_dirty_paths"])
+        self.assertEqual(result["dispatch_head_comparison"], "complete")
+
+
+class ProjectionIntegrityF120Tests(ReleaseFixture):
+    def _package(self, sha="verify-one"):
+        return {"commands": [{"argv": ["true"], "returncode": 0,
+                              "log": str(self.root / "log.txt"),
+                              "log_sha256": "a", "log_bytes": 1,
+                              "output_tail": "ok"}],
+                "passed": True, "source_unchanged": True,
+                "candidate_hash": orc.signature(orc.source_snapshot(self.project)),
+                "verification_path": str(self.root / f"{sha}.json"),
+                "verification_sha256": sha, "evidence_version": 2}
+
+    def _projection(self, state, package=None):
+        return orc.prepare_review_projection(
+            self.rundir, state, self.cfg, self.project,
+            state["plan"]["batches"][0], package or self._package())
+
+    def _review_state(self):
+        plan = self.plan()
+        state = self.state(phase="review", plan=plan,
+                           plan_version=orc.content_hash(plan))
+        self.saved(state)
+        return state
+
+    def test_corrupt_and_missing_packet_files_are_rebuilt_not_reused(self):
+        state = self._review_state()
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertIsNone(orc._validate_projection_packet(projection))
+        requirements = Path(projection["root"]) / "requirements.json"
+        requirements.write_text("{corrupt")
+        self.assertIsNotNone(orc._validate_projection_packet(projection))
+        repaired, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertIsNone(orc._validate_projection_packet(repaired))
+        self.assertIn("Add a feature",
+                      json.loads(requirements.read_text())["original_goal"])
+        target = Path(repaired["root"]) / "batch.json"
+        target.unlink()
+        self.assertIsNotNone(orc._validate_projection_packet(repaired))
+        rebuilt, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertTrue((Path(rebuilt["root"]) / "batch.json").is_file())
+
+    def test_interrupted_staging_is_retryable_and_unowned_path_is_refused(self):
+        state = self._review_state()
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        root, _mode = orc.review_projection_root(self.project)
+        name = Path(projection["root"]).name
+        staging = root / (".staging-" + name)
+        staging.mkdir()
+        orc.atomic_json(staging / "STAGING.json", {
+            "generated_by": "abdullah-orchestrator",
+            "run_id": state["id"], "project": str(self.project)})
+        state.pop("review_projection", None)
+        retried, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertFalse(staging.exists())
+        self.assertIsNone(orc._validate_projection_packet(retried))
+
+        unowned = root / (name + "-unowned")
+        unowned.mkdir()
+        (unowned / "user.txt").write_text("user content\n")
+        state.pop("review_projection", None)
+        package = self._package("verify-unowned")
+        package["candidate_hash"] = "x" * 40
+        with patch.object(orc, "review_projection_root",
+                          return_value=(unowned.parent, "git_metadata")), \
+                patch.object(orc, "_projection_owner_problem", return_value=None), \
+                patch.object(orc, "signature", return_value="x" * 40):
+            target_name = (f"{state['id']}-b{state.get('batch_index', 0)}-"
+                           f"{('x' * 40)[:12]}-verify-unown")
+            if unowned.name != target_name:
+                unowned.rename(unowned.parent / target_name)
+            result, rejection = orc.prepare_review_projection(
+                self.rundir, state, self.cfg, self.project,
+                state["plan"]["batches"][0], package)
+        self.assertIsNone(result)
+        self.assertIsNotNone(rejection)
+        self.assertEqual((unowned.parent / target_name / "user.txt").read_text(),
+                         "user content\n")
+
+    def test_linked_worktree_excludes_only_verified_generated_files(self):
+        linked = self.root / "linked-f3"
+        subprocess.run(["git", "worktree", "add", "-q", str(linked), "-b",
+                        "linked-f3"], cwd=self.project, check=True,
+                       capture_output=True)
+        plan = self.plan()
+        state = self.state(phase="review", plan=plan,
+                           plan_version=orc.content_hash(plan),
+                           project=str(linked))
+        self.saved(state)
+        package = self._package("linked-verify")
+        package["candidate_hash"] = orc.signature(orc.source_snapshot(linked))
+        projection, rejection = orc.prepare_review_projection(
+            self.rundir, state, self.cfg, linked, plan["batches"][0], package)
+        self.assertIsNone(rejection)
+        scratch = Path(projection["root"]).parent
+        (scratch / "user-notes.txt").write_text("unrelated user content\n")
+        root, owned = orc._projection_owned_paths(linked)
+        self.assertEqual(root, scratch)
+        self.assertIn(".abdullah-review/OWNER.json", owned)
+        self.assertNotIn(str((scratch / "user-notes.txt").relative_to(linked)),
+                         owned)
+        cfg = copy.deepcopy(self.cfg)
+        cfg["verification"]["runtime_inputs"] = {
+            "patterns": ["*"], "heuristic": False, "declared": [],
+            "required": [], "exclude": [], "max_files": 5000,
+            "max_total_bytes": 20 * 1024 * 1024}
+        manifest = orc.runtime_input_manifest(linked, cfg)
+        names = set(manifest["files"])
+        relative_user = str((scratch / "user-notes.txt").relative_to(linked))
+        self.assertIn(relative_user, names)
+        relative_generated = str((Path(projection["root"]) / "requirements.json")
+                                 .relative_to(linked))
+        self.assertNotIn(relative_generated, names)
+
+    def test_new_verification_identity_gets_a_new_packet_not_the_old_one(self):
+        state = self._review_state()
+        first, rejection = self._projection(state, self._package("verify-old"))
+        self.assertIsNone(rejection)
+        second, rejection = self._projection(state, self._package("verify-new"))
+        self.assertIsNone(rejection)
+        self.assertNotEqual(first["root"], second["root"])
+        self.assertNotEqual(first["verification_sha256"],
+                            second["verification_sha256"])
+        self.assertTrue(Path(first["root"]).is_dir())
+        self.assertIsNone(orc._validate_projection_packet(first))
+        self.assertIsNone(orc._validate_projection_packet(second))
+
+    def test_evidence_candidate_mismatch_is_refused(self):
+        state = self._review_state()
+        package = self._package("wrong-candidate")
+        package["candidate_hash"] = "not-the-current-candidate"
+        projection, rejection = self._projection(state, package)
+        self.assertIsNone(projection)
+        self.assertIsNotNone(rejection)
+        self.assertEqual(rejection.code, "review_projection_unavailable")
 
 
 if __name__ == "__main__":

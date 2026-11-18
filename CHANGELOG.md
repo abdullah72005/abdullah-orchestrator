@@ -62,6 +62,33 @@ state/config schema `3`, worker report contract `2`, verification evidence `2`.
 - The entry skill's startup reads are optional for the ordinary loop; detailed
   operations, role and contract references are loaded on demand.
 
+### Fixed
+
+- Material corrections now pause at diagnosis and return to a new versioned plan
+  when diagnosis finds changes required; a correction never reaches
+  implementation with a null/unapproved plan, and a correction arriving while a
+  clear requirement replan is pending preserves that route and both verbatim
+  entries.
+- Review verification recovery keeps the unchanged approved plan usable for
+  fresh checks and review while still invalidating every pre-invalidation cached
+  or recovered Reviewer/decision artifact.
+- Review packets are bound to the exact candidate, plan revision and verification
+  record, validate indexed paths/sizes/digests before reuse, are staged privately
+  and published complete, and record the producing packet identity at dispatch.
+- Batch-delta evidence now tracks presence/type/mode independently of bytes,
+  records readable deletions, labels restored HEAD bytes as overlap, marks
+  uncaptured dirty paths unavailable instead of clean, and survives an
+  unreachable dispatch HEAD or comparison failure.
+- Protected High acceptance/diagnosis rejects a Medium default, fallback or legacy
+  decision route before dispatch without consuming one-shot consent.
+- Compacted Reviewer prompts retain the verified packet root, manifest digest,
+  delta-index path and check evidence; only bulky per-file lists are bounded.
+- Foreground stages report the route attempted before the transition and use one
+  outcome for the result, end journal and recap; the next stage comes from the
+  existing preview.
+- Nested Explorer uses the route-aware prompt path with canonical requirements;
+  duplicate goal/amendment text is removed from Architect and Explorer contexts.
+
 ### Preserved
 
 - Checkout ownership, guarded process containment, cancellation/reconciliation,

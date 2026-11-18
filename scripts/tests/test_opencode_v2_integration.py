@@ -180,6 +180,42 @@ class OpenCodeV2Binary(unittest.TestCase):
                 with self.subTest(role=role):
                     self.assertIs(orc.probe_opencode_config(self.project, role, "v2"), True)
 
+    def test_installed_binary_fs_read_returns_actual_projection_hunk(self):
+        """Precise boundary: the installed V2 binary's filesystem read path.
+
+        This is not a model-driven Read-tool invocation and does not attest
+        agent permission enforcement; the profile test above covers the
+        effective allow/deny rules.  It does prove that the installed binary can
+        retrieve the exact bytes of a supervisor-generated hunk inside the
+        checkout's `.git` projection, which is what the Reviewer must inspect.
+        """
+        packet = (self.project / ".git" / "abdullah-review" / "probe-packet"
+                  / "delta" / "attempt-1")
+        packet.mkdir(parents=True)
+        hunk = packet / "0001.patch"
+        hunk.write_text("--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n"
+                        "-value = 1\n+value = 42\n")
+        home = Path(self.tmp.name) / "read-home"
+        home.mkdir()
+        env = {
+            "PATH": str(Path(self.bin).parent) + os.pathsep + os.environ["PATH"],
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "XDG_STATE_HOME": str(home / "state"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_FREE_MODELS": "1",
+        }
+        result = subprocess.run(
+            [self.bin, "api", "--standalone", "get",
+             "/api/fs/read/" + str(hunk.resolve())],
+            cwd=self.project, env=env, capture_output=True, text=True,
+            timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, hunk.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
