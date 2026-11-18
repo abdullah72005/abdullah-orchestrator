@@ -6,8 +6,12 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
 - Initial candidate: `49f2b626baf8e8fb495cb990ad4e2cb5d9345acc`
 - Corrected candidate (Batch 1 review):
   `26f515b60801582cdc9d6c4261628d7874d3d7bb` (implementation, tests and
-  changelog). The follow-up evidence commit changes documentation, logs and test/evidence
-  assertions only; the suite below was run from that final tree.
+  changelog).
+- Batch 1 follow-up corrections (r02, this candidate): code and tests at
+  `345ddb43b62226e03d995f02bba8d46d2f385dab`; the evidence commit is its
+  documentation-only child. The full suite below ran from the r02 code tree.
+  The follow-up evidence commit changes documentation, logs and test/evidence
+  assertions only.
 - Public product version: `1.2.0`
 - Internal identifiers: supervisor `3.1.0`, state/config schema `3`,
   report contract `2`, verification evidence `2`
@@ -32,6 +36,42 @@ ABDULLAH_CONFIG="$PWD/scripts/config.example.json" python3 -B -c \
   'import sys; sys.path.insert(0, "scripts"); import orchestrator as o; c = o.config(); o.validate_workflow(); print([o.risk_policy(r, c) for r in ("mechanical", "ordinary", "high")])'
 git diff --check 7c050ee75d90efb22b96c5c7fafa35e7f04712f7
 ```
+
+## Batch 1 follow-up corrections (r02 code `345ddb4`)
+
+The r02 correction closes the four remaining review findings in the same batch:
+
+- Batch deltas capture and compare the real index separately from worktree
+  bytes, so staged-only changes and pre-existing staging appear as labelled
+  hunks (or a precise unavailable reason). Attempt-chain evidence compares the
+  previous completion signature with the next dispatch boundary and records
+  explicit uncertainty when that evidence is missing or changed. A Git error
+  identifying the dispatch HEAD is reported as unreadable, never as absence.
+- Review handoffs are compacted against the selected transport's byte limit
+  before admission, preserving the verified packet manifest, delta index and
+  check-evidence paths. Truly oversized mandatory context is refused before any
+  child is created, with zero model-call counts and consent unspent.
+- The exact review packet is validated before launch, at admission and before a
+  completed/recovered report gains authority. New-format jobs require the
+  producing dispatch binding; historical packet-less jobs keep their old
+  behavior. Cleanup quarantines unrecognized files instead of deleting them,
+  and linked-worktree exclusions trust only independently validated artifacts.
+- Installation guidance distinguishes the published `v1.0.0` tag from the local
+  v1.2.0 candidate. The installed V2 read test now generates its hunk through
+  the actual supervisor delta path rather than a hand-written patch fixture.
+
+| Check | Command | Result |
+|---|---|---|
+| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_v31_review_recovery test_v31_dispatch_safety test_v31_acceptance_integrity` | exit 0 — **157 tests, OK** (`focused-b01-r02.txt`) |
+| Full suite | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **953 tests, OK, 8 skipped** in 945.5 s (`suite-b01-r02.txt`) |
+| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** on `opencode v2.2.7` (`opencode-v2-b01-r02.txt`) |
+| Compile / version / diff | `compileall`, `orchestrator.py version`, `git diff --check 7c050ee..HEAD` | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` (`version-b01-r02.json`) |
+
+The eight full-suite skips are the same opt-in OpenCode V2 tests, run separately
+above. The installed read test proves only that the binary's filesystem endpoint
+returns the exact bytes of a supervisor-generated projection hunk. It does not
+attest a real Reviewer Read-tool invocation, model transport, permission
+enforcement or native terminal behavior.
 
 ## Correction cycle results (corrected candidate `26f515b`)
 

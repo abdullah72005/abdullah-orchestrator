@@ -213,8 +213,8 @@ and exact command output are recorded alongside the logs.
 |---|---|
 | Focused v1.2.0 modules (original candidate `49f2b62`) | exit 0 — 300 tests, OK |
 | Full deterministic suite (original candidate `49f2b62`) | exit 0 — **911 tests, OK, 7 skipped** |
-| Focused correction gate (`26f515b` plus batch corrections) | exit 0 — 241 tests, OK |
-| Full deterministic suite (corrected candidate) | exit 0 — **940 tests, OK, 8 skipped** |
+| Focused correction gate (`26f515b` plus batch corrections) | exit 0 — 157 tests, OK |
+| Full deterministic suite (corrected candidate) | exit 0 — **953 tests, OK, 8 skipped** |
 | Installed OpenCode V2 compatibility module | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Compile | exit 0 |
 | `orchestrator.py version` | product `1.2.0`; supervisor `3.1.0`; schema `3`; contract `2` |

@@ -347,8 +347,8 @@ Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
 ## Tested behavior
 
 **Deterministic suite (offline, no model calls):** the corrected v1.2.0
-candidate runs **940 tests, all green, 8 skipped** on Python 3.10.12 (911.8 s).
-The initial v1.2.0 candidate ran 911 tests (7 skipped); 29 correction-cycle
+candidate runs **953 tests, all green, 8 skipped** on Python 3.10.12 (945.5 s).
+The initial v1.2.0 candidate ran 911 tests (7 skipped); 42 correction-cycle
 regressions account for the difference. The previous v1.0.0 baseline was 870
 tests. Skips are opt-in only: all 8 are the real-OpenCode introspection module,
 which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set; it passes all 8 tests
