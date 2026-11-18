@@ -40,29 +40,25 @@ default worker route is OpenCode Go.
 
 ```mermaid
 flowchart TD
-    U["You<br/>one Codex or Claude conversation"] --> C["Visible coordinator<br/>Codex Luna Medium / Claude chat"]
-    C <-->|"stdio MCP · 9 foreground tools"| S["Python supervisor<br/>state · containment · evidence · recovery"]
-
-    S --> A["Strong Architect<br/>plan · diagnose · integrate · accept"]
-    S --> E["Explorer<br/>optional, read-only"]
-    S --> I["Implementer<br/>one bounded writer"]
-    S --> V["Supervisor verification<br/>executes plan argv, binds evidence"]
-    S --> R["Independent Reviewer<br/>fresh context, read-only"]
-
-    V --> R
-    R --> A
-    A -->|"changes required"| I
-    A -->|"approved"| D["Complete<br/>durable evidence on disk"]
-
-    S -.->|"persists before launch"| ST[("Run state<br/>state.json · journal.jsonl<br/>jobs · verification logs")]
-    S -.->|"guards"| G["Process-session guard<br/>lease pipe · containment gate"]
-
-    H["Human-only CLI actions<br/>approve-plan · authorize-route<br/>approve-fallback · retire"] -.->|"never MCP tools"| S
+    U["You"] --> C["Codex / Claude conversation<br/>visible coordinator"]
+    C -->|"stdio MCP · 9 tools"| A["Strong Architect<br/>plan · diagnose · accept"]
+    A --> E["Explorer · optional<br/>read-only"]
+    E --> I["Implementer<br/>one bounded writer"]
+    I --> V["Supervisor verification<br/>executes argv · binds evidence"]
+    V --> R["Independent Reviewer<br/>fresh context"]
+    R --> D{"Architect verdict"}
+    D -->|"changes required"| I
+    D -->|"approved"| Z["Complete<br/>durable evidence on disk"]
 ```
 
 Every stage is one visible foreground call. The coordinator announces the worker
 and expected output first, then reports only the structured result. Nothing is
 hidden inside a single "do everything" call.
+
+The supervisor, not a model, owns `state.json`, the journal, dispatch records,
+process containment and verification. Explorer is skipped unless the run's policy
+allows it. Human-only actions (`approve-plan`, `authorize-route`,
+`approve-fallback`, `retire`) are operator CLI commands — never MCP tools.
 
 **The split that matters:** the model decides, and the supervisor enforces.
 
