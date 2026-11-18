@@ -8466,6 +8466,29 @@ def _reusable_delta_index(run_dir, job_id, boundary, final_snapshot, attempt):
     core = {key: item for key, item in value.items() if key != "index_sha256"}
     if content_hash(core) != value.get("index_sha256"):
         return None, "retained delta index checksum changed"
+    attestation = value.get("attestation")
+    if not isinstance(attestation, dict):
+        return None, "retained delta index has no durable attestation"
+    if attestation.get("version") != DELTA_ATTESTATION_VERSION:
+        return None, "retained delta index attestation version is unsupported"
+    completion = signature(final_snapshot)
+    attested = {
+        "completion_signature": (attestation.get("completion_signature"),
+                                 completion),
+        "dispatch_signature": (attestation.get("dispatch_signature"),
+                               boundary.get("source_signature")),
+        "projection": (attestation.get("projection"),
+                       SOURCE_IDENTITY_PROJECTION),
+        "source_before": (attestation.get("source_before"), completion),
+        "source_after": (attestation.get("source_after"), completion),
+    }
+    for name, (stored, expected_value) in attested.items():
+        if stored != expected_value:
+            return None, (
+                "retained delta attestation does not match this attempt's "
+                + name)
+    if attestation.get("artifact_set_sha256") != _delta_artifact_set_sha(value):
+        return None, "retained delta attestation artifact set changed"
     expected = {
         "job_id": (value.get("job_id"), job_id),
         "attempt": (value.get("attempt"), attempt),
@@ -8599,15 +8622,15 @@ def _observed_source_identity(project):
     return signature(snapshot), None
 
 
-def _quarantine_delta_index(boundary, reason):
-    """Move a drifted prepared index aside so it can never be reused."""
+def _quarantine_delta_index(boundary, reason, prefix="drifted"):
+    """Move a non-reusable prepared index aside so it can never be reused."""
     try:
         path = Path(boundary.get("dir", "")).parent / "after" / "index.json"
     except (OSError, ValueError):
         return None
     if not path.is_file():
         return None
-    target = path.with_name(f"index.drifted-{uuid.uuid4().hex[:8]}.json")
+    target = path.with_name(f"index.{prefix}-{uuid.uuid4().hex[:8]}.json")
     try:
         os.replace(path, target)
         return target
@@ -8622,6 +8645,46 @@ def _quarantine_delta_index(boundary, reason):
         except OSError:
             pass
         return None
+
+
+def _delta_artifact_set_sha(index_value):
+    """Identity of the exact hunk artifact set referenced by one index."""
+    entries = sorted({
+        json.dumps([hunk.get("path"), hunk.get("scope"), hunk.get("bytes"),
+                    hunk.get("sha256")], sort_keys=True)
+        for item in index_value.get("paths") or []
+        for hunk in ((item.get("hunks") or []) + (item.get("index_hunks") or []))})
+    return content_hash(entries)
+
+
+def _attest_and_publish_delta_index(boundary, index_value, final_snapshot,
+                                    source_before, source_after):
+    """Atomically publish a rebuilt index only after its checks succeeded."""
+    index = copy.deepcopy(index_value)
+    completion = signature(final_snapshot)
+    provisional = Path(index.get("index_path") or "")
+    canonical = Path(boundary.get("dir", "")).parent / "after" / "index.json"
+    index["index_path"] = str(canonical)
+    index["provisional"] = False
+    index["attestation"] = {
+        "version": DELTA_ATTESTATION_VERSION,
+        "dispatch_signature": boundary.get("source_signature"),
+        "completion_signature": completion,
+        "projection": SOURCE_IDENTITY_PROJECTION,
+        "source_before": source_before,
+        "source_after": source_after,
+        "artifact_set_sha256": _delta_artifact_set_sha(index),
+        "attested_at": now(),
+    }
+    index["index_sha256"] = content_hash(
+        {key: value for key, value in index.items() if key != "index_sha256"})
+    try:
+        atomic_json(provisional, index)
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(provisional, canonical)
+    except OSError as exc:
+        return None, "durable delta index publication failed: " + str(exc)
+    return index, None
 
 
 def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapshot,
@@ -8674,7 +8737,7 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
             try:
                 index_value = finalize_batch_delta(
                     project, run_dir, job_id, boundary,
-                    final_snapshot=final_snapshot, attempt=attempt)
+                    final_snapshot=final_snapshot, attempt=attempt, stage=True)
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
                 rebuild_problem = ("writer delta finalization failed: "
                                    + str(exc))
@@ -8689,6 +8752,19 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
                 rebuild_problem = (
                     "source changed during delta reconstruction; the prepared "
                     "delta is not bound to the recorded completion")
+        if index_value is not None and rebuild_problem is None:
+            # Preserve any rejected prior-format index before superseding it,
+            # then publish the reusable index atomically only now that dispatch,
+            # completion, hunk and post-scan source checks all succeeded.
+            _quarantine_delta_index(
+                boundary,
+                "superseded unproven index: " + (retained_problem or "rebuild"),
+                prefix="prior")
+            index_value, publish_problem = _attest_and_publish_delta_index(
+                boundary, index_value, final_snapshot, before_identity,
+                after_identity)
+            if publish_problem:
+                rebuild_problem = publish_problem
         if rebuild_problem is not None:
             # A prepared index from a drifted scan must never become reusable
             # as complete evidence.  Preserve it aside; keep user source as-is.
@@ -8714,7 +8790,8 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
         "batch_index": boundary.get("batch_index"),
         "plan_version": boundary.get("plan_version"),
         "previous_job_id": boundary.get("previous_job_id"),
-        "index_path": str(Path(boundary["dir"]).parent / "after" / "index.json"),
+        "index_path": (index_value.get("index_path")
+                       or str(Path(boundary["dir"]).parent / "after" / "index.json")),
         "index_sha256": index_value.get("index_sha256"),
         "hunks_dir": index_value.get("hunks_dir"),
         "paths": index_value.get("paths"),
@@ -10244,6 +10321,7 @@ DELTA_MAX_PATHS = 2000
 # boundaries must record the same projection before their signatures are
 # comparable; a historical capture without it is uncertainty, not a mismatch.
 SOURCE_IDENTITY_PROJECTION = "worktree+runtime-inputs-v1"
+DELTA_ATTESTATION_VERSION = 1
 
 
 def _read_bounded(path: Path, limit=DELTA_MAX_FILE_BYTES):
@@ -10563,18 +10641,24 @@ def _text_lines(data):
 
 
 def finalize_batch_delta(project, run_dir, job_id, boundary, *,
-                         final_snapshot=None, attempt=1):
+                         final_snapshot=None, attempt=1, stage=False):
     """Compare the completion boundary with the dispatch boundary and record hunks.
 
     Boundary evidence supports an *observed* delta between two supervisor-issued
-    snapshots.  It is not proof of who typed a particular line.
+    snapshots.  It is not proof of who typed a particular line.  With
+    ``stage=True`` the index and referenced hunks are written under a unique
+    provisional directory, never over an already-published artifact set.
     """
     project = Path(project)
     if not isinstance(boundary, dict):
         return None
     base = Path(boundary.get("dir", ""))
     after_root = base.parent / "after"
-    hunks_dir = after_root / "hunks"
+    if stage:
+        work_root = after_root / f"staging-{uuid.uuid4().hex[:12]}"
+    else:
+        work_root = after_root
+    hunks_dir = work_root / "hunks"
     hunks_dir.mkdir(parents=True, exist_ok=True)
     states_before = set(boundary.get("paths") or [])
     manifest_value = _safe_read(base / "manifest.json")
@@ -10893,8 +10977,12 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                  "from worktree bytes. Pre-existing user work is listed separately "
                  "from observed batch-window changes; it does not prove authorship."),
     }
-    index_value["index_sha256"] = content_hash(index_value)
-    atomic_json(after_root / "index.json", index_value)
+    index_value["index_path"] = str(work_root / "index.json")
+    index_value["provisional"] = bool(stage)
+    index_value["index_sha256"] = content_hash(
+        {key: value for key, value in index_value.items()
+         if key != "index_sha256"})
+    atomic_json(work_root / "index.json", index_value)
     return index_value
 
 

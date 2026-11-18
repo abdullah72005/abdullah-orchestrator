@@ -2051,11 +2051,14 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
                                       plan_version=orc.content_hash(plan)))
         job_id = "impl-recovered-r03"
         jobdir, boundary = self._implementer_job(job_id)
-        # Simulate a crash after the delta index was written but before state.
+        # Simulate a crash after the delta index was published but before state.
         self._finish_job(state, job_id, jobdir)
-        prewritten = orc.finalize_batch_delta(
-            self.project, self.rundir, job_id, boundary,
-            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        completion = orc.source_snapshot(self.project)
+        publisher = copy.deepcopy(state)
+        prewritten = orc._record_batch_delta(
+            self.rundir, publisher, self.project, job_id, boundary,
+            completion, phase="completion")
+        self.assertTrue(prewritten["complete"])
         orc.save(self.rundir, state)
         rolled_back = copy.deepcopy(state)
         self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
@@ -2528,9 +2531,10 @@ class BatchCorrectionsR04Tests(ReleaseFixture):
         state, boundary = self._boundary_and_state(job_id)
         (self.project / "app.py").write_text("value = 5\n")
         snapshot = orc.source_snapshot(self.project)
-        retained = orc.finalize_batch_delta(
-            self.project, self.rundir, job_id, boundary,
-            final_snapshot=snapshot, attempt=1)
+        publisher = copy.deepcopy(state)
+        retained = orc._record_batch_delta(
+            self.rundir, publisher, self.project, job_id, boundary,
+            snapshot, phase="completion")
         record = orc._record_batch_delta(
             self.rundir, state, self.project, job_id, boundary, snapshot,
             phase="completion")
@@ -2546,15 +2550,16 @@ class BatchCorrectionsR04Tests(ReleaseFixture):
         state, boundary = self._boundary_and_state(job_id)
         (self.project / "app.py").write_text("value = 6\n")
         stale_snapshot = orc.source_snapshot(self.project)
-        stale = orc.finalize_batch_delta(
-            self.project, self.rundir, job_id, boundary,
-            final_snapshot=stale_snapshot, attempt=1)
+        publisher = copy.deepcopy(state)
+        stale = orc._record_batch_delta(
+            self.rundir, publisher, self.project, job_id, boundary,
+            stale_snapshot, phase="completion")
         (self.project / "app.py").write_text("value = 8\n")
         current = orc.source_snapshot(self.project)
         value, problem = orc._reusable_delta_index(
             self.rundir, job_id, boundary, current, 1)
         self.assertIsNone(value)
-        self.assertIn("completion_source", problem)
+        self.assertIn("completion_signature", problem)
         record = orc._record_batch_delta(
             self.rundir, state, self.project, job_id, boundary, current,
             phase="completion")
@@ -2573,9 +2578,10 @@ class BatchCorrectionsR04Tests(ReleaseFixture):
         state, boundary = self._boundary_and_state(job_id)
         (self.project / "app.py").write_text("value = 9\n")
         snapshot = orc.source_snapshot(self.project)
-        retained = orc.finalize_batch_delta(
-            self.project, self.rundir, job_id, boundary,
-            final_snapshot=snapshot, attempt=1)
+        publisher = copy.deepcopy(state)
+        retained = orc._record_batch_delta(
+            self.rundir, publisher, self.project, job_id, boundary,
+            snapshot, phase="completion")
         hunk = next(h for item in retained["paths"] for h in item["hunks"])
         artifact = Path(retained["hunks_dir"]) / Path(hunk["path"]).name
         artifact.write_text("tampered\n")
@@ -2737,8 +2743,8 @@ class BatchCorrectionsR05Tests(ReleaseFixture):
                             for item in record["limitations"]))
         canonical = Path(boundary["dir"]).parent / "after" / "index.json"
         self.assertFalse(canonical.exists())
-        quarantined = list(canonical.parent.glob("index.drifted-*.json"))
-        self.assertEqual(len(quarantined), 1)
+        provisional = list(canonical.parent.glob("staging-*/index.json"))
+        self.assertEqual(len(provisional), 1)
         reusable, _problem = orc._reusable_delta_index(
             self.rundir, job_id, boundary, recorded_completion, 1)
         self.assertIsNone(reusable)
@@ -2771,6 +2777,172 @@ class BatchCorrectionsR05Tests(ReleaseFixture):
         delta = orc.batch_delta_index(state)
         self.assertEqual(delta["attempts"], 1)
         self.assertFalse(delta["incomplete_writer_attempts"])
+
+
+class BatchCorrectionsR06Tests(ReleaseFixture):
+    """Crash-safe delta publication at the three interruption boundaries."""
+
+    def _package(self, sha="verify-r06"):
+        return {"commands": [], "passed": True, "source_unchanged": True,
+                "candidate_hash": orc.signature(
+                    orc.source_snapshot(self.project)),
+                "verification_path": str(self.root / f"{sha}.json"),
+                "verification_sha256": sha, "evidence_version": 2}
+
+    def _projection(self, state):
+        return orc.prepare_review_projection(
+            self.rundir, state, self.cfg, self.project,
+            state["plan"]["batches"][0], self._package())
+
+    def _state_and_boundary(self, job_id):
+        state = self.saved(self.state(
+            phase="implement", plan=self.plan(),
+            plan_version=orc.content_hash(self.plan())))
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, job_id, batch_index=0,
+            plan_version=state["plan_version"])
+        return state, boundary
+
+    def _canonical_index(self, boundary):
+        return Path(boundary["dir"]).parent / "after" / "index.json"
+
+    def _provisional_indexes(self, boundary):
+        return sorted((Path(boundary["dir"]).parent / "after")
+                      .glob("staging-*/index.json"))
+
+    def _hunk_text(self, index_value):
+        texts = []
+        for item in index_value.get("paths") or []:
+            for hunk in item.get("hunks") or []:
+                texts.append((Path(index_value["hunks_dir"])
+                              / Path(hunk["path"]).name).read_text())
+        return "\n".join(texts)
+
+    def _projected_hunks(self, state):
+        state["phase"] = "review"
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        texts = [orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/" + name)
+            for name in projection["files"] if name.endswith(".patch")]
+        return projection, "\n".join(texts)
+
+    def test_crash_after_staging_before_post_check_never_publishes_drift(self):
+        job_id = "impl-crash-staging-r06"
+        state, boundary = self._state_and_boundary(job_id)
+        (self.project / "app.py").write_text("value = 2\n")
+        completion = orc.source_snapshot(self.project)
+        real_finalize = orc.finalize_batch_delta
+
+        def drifting_then_crash(*args, **kwargs):
+            # Drift during reconstruction, then stop before r05's post check.
+            (self.project / "app.py").write_text("value = 3\n")
+            real_finalize(*args, **kwargs)
+            raise RuntimeError("simulated crash after provisional index write")
+
+        with patch.object(orc, "finalize_batch_delta",
+                          side_effect=drifting_then_crash):
+            with self.assertRaises(RuntimeError):
+                orc._record_batch_delta(
+                    self.rundir, state, self.project, job_id, boundary,
+                    completion, phase="completion")
+        self.assertFalse(self._canonical_index(boundary).exists())
+        provisional = self._provisional_indexes(boundary)
+        self.assertEqual(len(provisional), 1)
+        staged = orc.read_json(provisional[0])
+        self.assertIn("+value = 3", self._hunk_text(staged))
+        self.assertEqual(state.get("batch_deltas", []), [])
+        # A provisional index is invisible to the durable reuse path.
+        reusable, _problem = orc._reusable_delta_index(
+            self.rundir, job_id, boundary, completion, 1)
+        self.assertIsNone(reusable)
+        # User restores the recorded completion and recovery resumes.
+        (self.project / "app.py").write_text("value = 2\n")
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary,
+            completion, phase="recovery")
+        self.assertTrue(record["complete"])
+        self.assertTrue(self._canonical_index(boundary).exists())
+        self.assertIn("+value = 2", self._hunk_text(orc.read_json(
+            self._canonical_index(boundary))))
+        _projection, projected = self._projected_hunks(state)
+        self.assertIn("+value = 2", projected)
+        self.assertNotIn("+value = 3", projected)
+
+    def test_crash_after_validation_before_publish_leaves_only_staging(self):
+        job_id = "impl-crash-publish-r06"
+        state, boundary = self._state_and_boundary(job_id)
+        (self.project / "app.py").write_text("value = 2\n")
+        completion = orc.source_snapshot(self.project)
+        with patch.object(orc, "_attest_and_publish_delta_index",
+                          side_effect=RuntimeError("simulated crash before publish")):
+            with self.assertRaises(RuntimeError):
+                orc._record_batch_delta(
+                    self.rundir, state, self.project, job_id, boundary,
+                    completion, phase="completion")
+        self.assertFalse(self._canonical_index(boundary).exists())
+        self.assertEqual(len(self._provisional_indexes(boundary)), 1)
+        self.assertEqual(state.get("batch_deltas", []), [])
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary,
+            completion, phase="recovery")
+        self.assertTrue(record["complete"])
+        published = orc.read_json(self._canonical_index(boundary))
+        self.assertIn("attestation", published)
+        self.assertEqual(published["attestation"]["completion_signature"],
+                         orc.signature(completion))
+        self.assertIn("+value = 2", self._hunk_text(published))
+
+    def test_crash_after_publish_before_state_commit_reuses_attested_index(self):
+        job_id = "impl-crash-state-r06"
+        state, boundary = self._state_and_boundary(job_id)
+        (self.project / "app.py").write_text("value = 2\n")
+        completion = orc.source_snapshot(self.project)
+        publisher = copy.deepcopy(state)
+        published = orc._record_batch_delta(
+            self.rundir, publisher, self.project, job_id, boundary,
+            completion, phase="completion")
+        self.assertTrue(published["complete"])
+        canonical = orc.read_json(self._canonical_index(boundary))
+        self.assertIn("attestation", canonical)
+        # The state commit never happened; recovery must reuse the exact index.
+        self.assertEqual(state.get("batch_deltas", []), [])
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary,
+            completion, phase="recovery")
+        self.assertTrue(record["complete"])
+        self.assertEqual(record["index_sha256"], published["index_sha256"])
+        self.assertEqual(len([item for item in state["batch_deltas"]
+                              if item.get("job_id") == job_id]), 1)
+        _projection, projected = self._projected_hunks(state)
+        self.assertIn("+value = 2", projected)
+        self.assertNotIn("+value = 3", projected)
+
+    def test_unattested_prior_format_index_is_rebuilt_not_trusted(self):
+        job_id = "impl-legacy-index-r06"
+        state, boundary = self._state_and_boundary(job_id)
+        (self.project / "app.py").write_text("value = 2\n")
+        completion = orc.source_snapshot(self.project)
+        legacy = orc.finalize_batch_delta(
+            self.project, self.rundir, job_id, boundary,
+            final_snapshot=completion, attempt=1)
+        self.assertNotIn("attestation", legacy)
+        reusable, problem = orc._reusable_delta_index(
+            self.rundir, job_id, boundary, completion, 1)
+        self.assertIsNone(reusable)
+        self.assertIn("no durable attestation", problem)
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary,
+            completion, phase="recovery")
+        self.assertTrue(record["complete"])
+        published = orc.read_json(self._canonical_index(boundary))
+        self.assertIn("attestation", published)
+        self.assertIn("+value = 2", self._hunk_text(published))
+        self.assertNotEqual(record["index_sha256"], legacy["index_sha256"])
+        prior = list((Path(boundary["dir"]).parent / "after")
+                     .glob("index.prior-*.json"))
+        self.assertEqual(len(prior), 1)
+        self.assertNotIn("attestation", orc.read_json(prior[0]))
 
 
 if __name__ == "__main__":
