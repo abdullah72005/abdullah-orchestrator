@@ -944,6 +944,17 @@ class ReleaseIdentityV120Tests(unittest.TestCase):
         evidence = root / "docs" / "release-evidence" / "v1.2.0"
         self.assertTrue(evidence.is_dir())
         self.assertTrue((evidence / "README.md").is_file())
+        readme = (evidence / "README.md").read_text()
+        self.assertIn("opencode-v2.txt", readme)
+        self.assertIn("Installed OpenCode V2 module", readme)
+        self.assertIn("correction", readme.lower())
+        self.assertTrue((evidence / "opencode-v2.txt").is_file())
+        self.assertTrue((evidence / "suite-correction.txt").is_file())
+        # Candidate documentation links to a real path, not an unpublished tag.
+        project_readme = (root / "README.md").read_text()
+        self.assertNotIn("releases/tag/v1.2.0", project_readme)
+        self.assertIn("docs/release-evidence/v1.2.0/README.md", project_readme)
+        self.assertIn("tree/v1.0.0", project_readme)
 
 
 class CorrectionCycleF120Tests(ReleaseFixture):
@@ -1396,6 +1407,25 @@ class DeltaFidelityF120Tests(ReleaseFixture):
         self.assertTrue(any(item.get("reason") ==
                             "dispatch-head comparison unavailable"
                             for item in result["limitations"]))
+
+    def test_tracked_file_deleted_before_dispatch_is_not_treated_as_clean(self):
+        self._edit("gone.py", "removed before dispatch\n")
+        self._commit("add gone")
+        (self.project / "gone.py").unlink()
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-gone", batch_index=0,
+            plan_version="v")
+        self.assertIn("gone.py", boundary["dirty_paths"])
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-gone", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entry = next(item for item in result["paths"]
+                     if item["path"] == "gone.py")
+        self.assertEqual(entry["before"], "pre_existing_worktree")
+        self.assertFalse(entry["changed_in_window"])
+        self.assertTrue(entry["pre_existing"])
+        self.assertEqual(entry["presence_before"], "absent")
+        self.assertEqual(entry["presence_after"], "absent")
 
     def test_index_and_worktree_state_are_labelled(self):
         self._edit("app.py", "value = 9\n")

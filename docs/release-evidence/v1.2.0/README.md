@@ -3,6 +3,11 @@
 Prepared 18 November 2026 for the local v1.2.0 release candidate.
 
 - Candidate base: `7c050ee75d90efb22b96c5c7fafa35e7f04712f7`
+- Initial candidate: `49f2b626baf8e8fb495cb990ad4e2cb5d9345acc`
+- Corrected candidate (Batch 1 review):
+  `26f515b60801582cdc9d6c4261628d7874d3d7bb` (implementation, tests and
+  changelog). The follow-up evidence commit changes documentation, logs and test/evidence
+  assertions only; the suite below was run from that final tree.
 - Public product version: `1.2.0`
 - Internal identifiers: supervisor `3.1.0`, state/config schema `3`,
   report contract `2`, verification evidence `2`
@@ -28,7 +33,34 @@ ABDULLAH_CONFIG="$PWD/scripts/config.example.json" python3 -B -c \
 git diff --check 7c050ee75d90efb22b96c5c7fafa35e7f04712f7
 ```
 
-## Results
+## Correction cycle results (corrected candidate `26f515b`)
+
+The Batch 1 review correction commit is
+`26f515b60801582cdc9d6c4261628d7874d3d7bb` on `feat/orchestrator-v1-2`.
+It fixes F1–F5, F7–F10 and A1–A4 without changing the public version or internal
+identifiers. The original candidate evidence below is preserved as historical
+evidence.
+
+| Check | Command | Result |
+|---|---|---|
+| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_v31_review_recovery test_v31_acceptance_integrity test_interactive_recovery test_v31_dispatch_safety test_v31_worker_routes test_v31_stage_invariants test_v31_claude_setup test_release_version` | exit 0 — **241 tests, OK** (`focused-correction.txt`) |
+| Full suite | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **940 tests, OK, 8 skipped** (`suite-correction.txt`) |
+| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** on `opencode v2.2.7` (`opencode-v2.txt`) |
+| Compile / version / diff | `compileall`, `orchestrator.py version`, `git diff --check 7c050ee..HEAD` | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` |
+
+The eight full-suite skips are all opt-in OpenCode V2 tests in
+`test_opencode_v2_integration`; they are run separately above and all pass.
+
+The installed V2 module now also proves, with an isolated `HOME` and no model
+transport, that the binary's filesystem read path returns the exact bytes of a
+supervisor-generated hunk under the checkout's `.git` review projection. That is
+the precise boundary verified; it is **not** a model-driven Read-tool invocation
+and does not by itself attest agent permission enforcement (the profile test
+still asserts effective `read` allow / `external_directory`, `edit`, `shell` and
+`subagent` deny). Actual Reviewer tool calls and model transport remain
+unevaluated offline.
+
+## Initial candidate results (historical, `49f2b62`)
 
 | Check | Command | Result |
 |---|---|---|
