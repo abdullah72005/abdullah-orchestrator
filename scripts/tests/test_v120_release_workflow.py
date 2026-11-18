@@ -2453,8 +2453,10 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
             self.rundir, other, self.project, other_job)
         self.assertFalse(limited["complete"])
         self.assertEqual(limited["paths"], [])
-        self.assertTrue(any("writer attempt evidence unavailable"
-                            in item["reason"] for item in limited["limitations"]))
+        self.assertTrue(any(item["reason"] in {
+            "writer attempt evidence unavailable",
+            "writer completion not attested"}
+            for item in limited["limitations"]))
         self.assertTrue(any(item.get("detail") for item in limited["limitations"]))
 
     def test_recovered_reviewer_with_invalid_packet_keeps_reuse_rejected(self):
@@ -2472,6 +2474,176 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
         job = state["completed_jobs"][-1]
         self.assertIsNone(job.get("review_projection_sha256"))
         self.assertIsNone(job.get("review_packet_binding"))
+
+
+class BatchCorrectionsR04Tests(ReleaseFixture):
+    """Writer-delta records must be bound to an attested completion."""
+
+    def _package(self, sha="verify-r04"):
+        return {"commands": [], "passed": True, "source_unchanged": True,
+                "candidate_hash": orc.signature(
+                    orc.source_snapshot(self.project)),
+                "verification_path": str(self.root / f"{sha}.json"),
+                "verification_sha256": sha, "evidence_version": 2}
+
+    def _projection(self, state):
+        return orc.prepare_review_projection(
+            self.rundir, state, self.cfg, self.project,
+            state["plan"]["batches"][0], self._package())
+
+    def _boundary_and_state(self, job_id):
+        state = self.saved(self.state(phase="implement", plan=self.plan(),
+                                      plan_version=orc.content_hash(self.plan())))
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, job_id, batch_index=0,
+            plan_version=state["plan_version"])
+        return state, boundary
+
+    def test_missing_completion_is_counted_and_reviewer_visible(self):
+        job_id = "impl-no-completion-r04"
+        state, boundary = self._boundary_and_state(job_id)
+        (self.project / "app.py").write_text("value = 4\n")
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary, None,
+            phase="failure")
+        self.assertFalse(record["complete"])
+        self.assertEqual(record["paths"], [])
+        self.assertTrue(any(item["reason"] == "writer completion not attested"
+                            for item in record["limitations"]))
+        delta = orc.batch_delta_index(state)
+        self.assertEqual(delta["attempts"], 1)
+        self.assertEqual(len(delta["incomplete_writer_attempts"]), 1)
+        state["phase"] = "review"
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        self.assertTrue(any("writer completion not attested"
+                            in item.get("reason", "")
+                            for item in projection["limitations"]))
+        index_text = orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/delta/index.json")
+        self.assertEqual(json.loads(index_text)["files"], [])
+
+    def test_valid_retained_index_is_reused_with_its_hunk(self):
+        job_id = "impl-retained-r04"
+        state, boundary = self._boundary_and_state(job_id)
+        (self.project / "app.py").write_text("value = 5\n")
+        snapshot = orc.source_snapshot(self.project)
+        retained = orc.finalize_batch_delta(
+            self.project, self.rundir, job_id, boundary,
+            final_snapshot=snapshot, attempt=1)
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary, snapshot,
+            phase="completion")
+        self.assertTrue(record["complete"])
+        self.assertEqual(record["index_sha256"], retained["index_sha256"])
+        entry = next(item for item in record["paths"] if item["path"] == "app.py")
+        text = (Path(record["hunks_dir"])
+                / Path(entry["hunks"][0]["path"]).name).read_text()
+        self.assertIn("+value = 5", text)
+
+    def test_retained_index_for_wrong_completion_is_not_reused(self):
+        job_id = "impl-wrong-completion-r04"
+        state, boundary = self._boundary_and_state(job_id)
+        (self.project / "app.py").write_text("value = 6\n")
+        stale_snapshot = orc.source_snapshot(self.project)
+        stale = orc.finalize_batch_delta(
+            self.project, self.rundir, job_id, boundary,
+            final_snapshot=stale_snapshot, attempt=1)
+        (self.project / "app.py").write_text("value = 8\n")
+        current = orc.source_snapshot(self.project)
+        value, problem = orc._reusable_delta_index(
+            self.rundir, job_id, boundary, current, 1)
+        self.assertIsNone(value)
+        self.assertIn("completion_source", problem)
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary, current,
+            phase="completion")
+        self.assertTrue(record["complete"])
+        self.assertNotEqual(record["index_sha256"], stale["index_sha256"])
+        index_value = orc.read_json(Path(record["index_path"]))
+        self.assertEqual(index_value["final_snapshot_signature"],
+                         orc.signature(current))
+        entry = next(item for item in record["paths"] if item["path"] == "app.py")
+        text = (Path(record["hunks_dir"])
+                / Path(entry["hunks"][0]["path"]).name).read_text()
+        self.assertIn("+value = 8", text)
+
+    def test_tampered_retained_hunk_is_not_accepted_as_complete(self):
+        job_id = "impl-tampered-hunk-r04"
+        state, boundary = self._boundary_and_state(job_id)
+        (self.project / "app.py").write_text("value = 9\n")
+        snapshot = orc.source_snapshot(self.project)
+        retained = orc.finalize_batch_delta(
+            self.project, self.rundir, job_id, boundary,
+            final_snapshot=snapshot, attempt=1)
+        hunk = next(h for item in retained["paths"] for h in item["hunks"])
+        artifact = Path(retained["hunks_dir"]) / Path(hunk["path"]).name
+        artifact.write_text("tampered\n")
+        value, problem = orc._reusable_delta_index(
+            self.rundir, job_id, boundary, snapshot, 1)
+        self.assertIsNone(value)
+        self.assertIn("delta hunk", problem)
+        record = orc._record_batch_delta(
+            self.rundir, state, self.project, job_id, boundary, snapshot,
+            phase="completion")
+        self.assertTrue(record["complete"])
+        rebuilt = Path(record["hunks_dir"]) / Path(hunk["path"]).name
+        self.assertIn("+value = 9", rebuilt.read_text())
+
+    def test_failed_guard_attempt_binds_delta_after_stop(self):
+        job_id = None
+        state = self.saved(self.state(phase="implement", plan=self.plan()))
+        state["model_routes"]["implementer"] = {
+            "provider": "codex", "model": "gpt-6-luna",
+            "effort": "medium", "billing": "subscription"}
+        self.saved(state)
+        fake = self.bin / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            "Path('app.py').write_text('value = 11\\n')\n"
+            "raise SystemExit(1)\n")
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {
+                "PATH": str(self.bin) + ":" + os.environ.get("PATH", "")}):
+            with self.assertRaises(RuntimeError):
+                orc.call_model(self.rundir, state, self.cfg, "implementer",
+                               "implementer", "task", self.project)
+        records = [item for item in state.get("batch_deltas", [])
+                   if item.get("phase") == "failure"]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertTrue(record["complete"])
+        entry = next(item for item in record["paths"] if item["path"] == "app.py")
+        text = (Path(record["hunks_dir"])
+                / Path(entry["hunks"][0]["path"]).name).read_text()
+        self.assertIn("+value = 11", text)
+
+    def test_unproven_stop_does_not_record_complete_evidence(self):
+        state = self.saved(self.state(phase="implement", plan=self.plan()))
+        state["model_routes"]["implementer"] = {
+            "provider": "codex", "model": "gpt-6-luna",
+            "effort": "medium", "billing": "subscription"}
+        self.saved(state)
+        fake = self.bin / "codex"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            "Path('app.py').write_text('value = 12\\n')\n"
+            "raise SystemExit(1)\n")
+        fake.chmod(0o755)
+        unproven = {"stopped": False, "reasons": ["synthetic survivor"],
+                    "survivors": [{"pid": 999999}],
+                    "liveness": {"alive": None, "reason": "synthetic"}}
+        with patch.dict(os.environ, {
+                "PATH": str(self.bin) + ":" + os.environ.get("PATH", "")}), \
+                patch.object(orc, "inspect_execution", return_value=unproven):
+            with self.assertRaises(RuntimeError):
+                orc.call_model(self.rundir, state, self.cfg, "implementer",
+                               "implementer", "task", self.project)
+        self.assertFalse(any(item.get("phase") == "failure"
+                             and item.get("complete", True)
+                             for item in state.get("batch_deltas", [])))
 
 
 if __name__ == "__main__":

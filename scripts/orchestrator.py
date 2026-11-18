@@ -8420,22 +8420,92 @@ def _durable_writer_boundary(run_dir, job):
     return None, "writer boundary artifact missing"
 
 
-def _existing_delta_index(run_dir, job_id, boundary):
-    """Reuse a valid index written before a crash instead of re-deriving it."""
+def _delta_index_artifact_problem(index_value):
+    """Validate every hunk referenced by a retained delta index."""
+    hunks_dir = index_value.get("hunks_dir")
+    if not hunks_dir:
+        return "retained delta index has no hunk directory"
+    for item in index_value.get("paths") or []:
+        if not isinstance(item, dict):
+            return "retained delta index has a malformed path entry"
+        for hunk in (item.get("hunks") or []) + (item.get("index_hunks") or []):
+            if not isinstance(hunk, dict):
+                return "retained delta index has a malformed hunk entry"
+            name = Path(str(hunk.get("path") or "")).name
+            if not name:
+                return "retained delta index has a hunk without a path"
+            artifact = Path(hunks_dir) / name
+            if not artifact.is_file():
+                return f"retained delta hunk is missing: {hunk.get('path')}"
+            try:
+                if artifact.stat().st_size != hunk.get("bytes"):
+                    return f"retained delta hunk size changed: {hunk.get('path')}"
+            except (OSError, TypeError, ValueError):
+                return f"retained delta hunk is unreadable: {hunk.get('path')}"
+            if _sha256_file(artifact) != hunk.get("sha256"):
+                return f"retained delta hunk digest changed: {hunk.get('path')}"
+    return None
+
+
+def _reusable_delta_index(run_dir, job_id, boundary, final_snapshot, attempt):
+    """Return ``(index, problem)`` for a retained index bound to this attempt.
+
+    An index checksum proves only its own bytes.  It is reused only when its
+    dispatch identity, expected completion identity and referenced hunks also
+    agree with the preserved boundary and this job's attested completion.
+    """
     try:
         path = (Path(boundary.get("dir", "")).parent / "after" / "index.json")
     except (OSError, ValueError):
-        return None
+        return None, None
     value = _safe_read(path)
     if not isinstance(value, dict):
-        return None
-    if value.get("job_id") != job_id:
-        return None
+        return None, None
     if not isinstance(value.get("paths"), list):
-        return None
+        return None, "retained delta index has no path list"
     core = {key: item for key, item in value.items() if key != "index_sha256"}
     if content_hash(core) != value.get("index_sha256"):
+        return None, "retained delta index checksum changed"
+    expected = {
+        "job_id": (value.get("job_id"), job_id),
+        "attempt": (value.get("attempt"), attempt),
+        "batch_index": (value.get("batch_index"), boundary.get("batch_index")),
+        "plan_version": (value.get("plan_version"), boundary.get("plan_version")),
+        "previous_job_id": (value.get("previous_job_id"),
+                            boundary.get("previous_job_id")),
+        "dispatch_head": (value.get("dispatch_head"), boundary.get("head")),
+        "dispatch_source": (value.get("source_signature_at_dispatch"),
+                            boundary.get("source_signature")),
+        "completion_source": (value.get("final_snapshot_signature"),
+                              signature(final_snapshot)),
+        "completion_projection": (
+            value.get("final_snapshot_signature_projection"),
+            boundary.get("source_signature_projection")),
+    }
+    for name, (stored, expected_value) in expected.items():
+        if stored != expected_value:
+            return None, (
+                "retained delta index does not match this attempt's " + name)
+    if expected["completion_projection"][1] != SOURCE_IDENTITY_PROJECTION:
+        return None, "retained delta index has no supported completion projection"
+    artifact_problem = _delta_index_artifact_problem(value)
+    if artifact_problem:
+        return None, artifact_problem
+    return value, None
+
+
+def _existing_delta_index(run_dir, job_id, boundary, final_snapshot=None,
+                          attempt=None):
+    """Compatibility lookup for a retained index with a proven completion.
+
+    Without the expected completion identity an index cannot be proven to
+    describe this attempt, so the unbound form never reuses it.  Internal
+    callers use ``_reusable_delta_index`` to retain the precise reason.
+    """
+    if not isinstance(final_snapshot, dict) or attempt is None:
         return None
+    value, _problem = _reusable_delta_index(
+        run_dir, job_id, boundary, final_snapshot, attempt)
     return value
 
 
@@ -8536,11 +8606,22 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
         return existing
     attempt = (state.get("corrections", 0) or 0) + 1
     problem = forced_problem
+    completion_problem = None
+    retained_problem = None
     index_value = None
+    if not isinstance(final_snapshot, dict):
+        # A delta is evidence about a completion.  Without an attested
+        # completion snapshot there is nothing to bind it to, so this attempt
+        # is counted as incomplete rather than reported as a clean delta.
+        completion_problem = (
+            "no attested completion source identity was recorded for this "
+            "writer attempt")
+        problem = problem or completion_problem
     if problem is None:
         boundary, problem = _validate_writer_boundary(run_dir, job_id, boundary)
     if problem is None:
-        index_value = _existing_delta_index(run_dir, job_id, boundary)
+        index_value, retained_problem = _reusable_delta_index(
+            run_dir, job_id, boundary, final_snapshot, attempt)
     if problem is None and index_value is None:
         try:
             index_value = finalize_batch_delta(
@@ -8550,11 +8631,16 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
             problem = "writer delta finalization failed: " + str(exc)
         if index_value is None:
             problem = problem or "writer delta finalization returned no index"
+        if problem and retained_problem:
+            problem = (problem + "; retained index rejected: "
+                       + retained_problem)
     if index_value is None:
         return _record_writer_limitation(
             run_dir, state, job_id, boundary,
-            reason="writer attempt evidence unavailable",
-            detail=(problem or "the writer attempt could not be attributed"),
+            reason=("writer completion not attested" if completion_problem
+                    else "writer attempt evidence unavailable"),
+            detail=(problem or retained_problem
+                    or "the writer attempt could not be attributed"),
             phase=phase, job=job)
     record = {
         "version": 1, "job_id": job_id, "attempt": attempt,
@@ -9209,11 +9295,6 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     "Review evidence packet failed its completion gate: "
                     + packet_problem, code="review_packet_invalid",
                     details={"job_id": job_id})
-        delta = None
-        if role == "implementer" and kind == "implementer":
-            delta = _record_batch_delta(run_dir, state, project, job_id, boundary,
-                                        final_snapshot, job=job,
-                                        phase="completion")
         atomic_json(jpath / "report.json", report)
         atomic_json(jpath / "completion.json", {"final_snapshot": final_snapshot,
                                                 "session_id": session_id})
@@ -9284,6 +9365,12 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                               sid=job.get("sid"))
                 handled_failure = True
                 raise violation
+            if role == "implementer" and kind == "implementer":
+                # Record only after the existing containment gate proves the
+                # writer's execution stopped and no source violation blocks it.
+                _record_batch_delta(run_dir, state, project, job_id, boundary,
+                                    final_snapshot, job=job,
+                                    phase="completion")
             job["status"] = "complete"
             state.setdefault("completed_jobs", []).append(job)
             state["active_job"] = None
@@ -9323,14 +9410,6 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         has_execution_identity = bool(
             proc is not None or any(job_identity(job).values())
             or _launch_identity(_job_launch_file(job)))
-        if (state is not None and job.get("role") == "implementer"
-                and has_execution_identity):
-            # Attribute the failed attempt's observed work too; a later attempt
-            # then shows both its own delta and the change between attempts.  A
-            # missing completion snapshot is recorded as a counted limitation,
-            # never as a silently absent writer.
-            _record_batch_delta(run_dir, state, project, job_id, boundary,
-                                failure_snapshot, job=job, phase="failure")
         if state is not None and has_execution_identity:
             # Wait briefly for the guard, but never infer containment from its
             # exit, from the error class, or from the report's presence.
@@ -9350,6 +9429,19 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     job, run_id=run_identity, include_run=bool(run_identity),
                     exclude_identity=parent_identity)
             stopped = bool(inspection["stopped"])
+        if (state is not None and job.get("role") == "implementer"
+                and has_execution_identity and stopped is True):
+            # Attribute the failed attempt's observed work only after the
+            # existing owner checks prove the child and descendants stopped.
+            # The completion identity is sampled after that gate; if it cannot
+            # be attested the attempt is recorded as incomplete, never clean.
+            completion = None
+            try:
+                completion = source_snapshot(project)
+            except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+                completion = None
+            _record_batch_delta(run_dir, state, project, job_id, boundary,
+                                completion, job=job, phase="failure")
         if kind in READ_ONLY_STAGE_KINDS and mutation.get("mutated"):
             job["source_mutation"] = mutation
             job["source_mutation"]["containment"] = inspection
