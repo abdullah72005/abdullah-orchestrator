@@ -114,6 +114,7 @@ WORKER_EPOCH_KINDS = frozenset({"implementer", "explorer"})
 # worktree has a `.git` file, so the narrow fallback below is used instead.
 REVIEW_PROJECTION_DIR = "abdullah-review"
 REVIEW_SCRATCH_DIR = ".abdullah-review"
+REVIEW_PACKET_BINDING_VERSION = 2
 # Linux derives the per-string execve limit from the page size (32 pages).
 ARG_MAX_PER_STRING_PAGES = 32
 # Conservative fraction of RLIMIT/SC_ARG_MAX reserved for the wrapper, inline
@@ -5021,6 +5022,14 @@ def _projection_owned_paths(project: Path):
                 or not packet_root or not str(packet_root).startswith(str(root))
                 or manifest_path.parent != packet_root):
             continue
+        # Trust only independently verified artifacts: the manifest digest, the
+        # projected identity and every indexed file's type/size/digest.
+        packet = {"root": str(packet_root),
+                  "manifest": str(manifest_path),
+                  "manifest_sha256": _sha256_file(manifest_path),
+                  "projection_sha256": manifest.get("projection_sha256")}
+        if _validate_projection_packet(packet) is not None:
+            continue
         owned.add(str(manifest_path.relative_to(project)))
         marker = packet_root / "STAGING.json"
         if marker.is_file() and not marker.is_symlink():
@@ -6485,23 +6494,31 @@ def _critical_context_value(key, value):
     return value
 
 
-def _bounded_context(context, limit):
-    """Serialize context to valid JSON within a character budget.
+def _context_fits(raw, limit, byte_limit=None):
+    """True when serialized context fits both the char and optional byte budget."""
+    if len(raw) > limit:
+        return False
+    return byte_limit is None or len(raw.encode("utf-8")) <= byte_limit
+
+
+def _bounded_context(context, limit, byte_limit=None):
+    """Serialize context to valid JSON within character and byte budgets.
 
     Requirement/scope fields and decision-critical evidence (independent
     review findings, acceptance evidence, user amendments, source identity and
     durable artifact references) are never silently dropped. Oversized
     non-critical fields become validated references; critical evidence is
-    condensed while retaining paths and hashes. If the mandatory handoff
-    cannot fit, fail closed so the caller raises the budget or supplies
-    concise validated references.
+    condensed while retaining paths and hashes. ``byte_limit`` lets a transport
+    that carries the request in argv bound UTF-8 bytes, not just characters. If
+    the mandatory handoff cannot fit either budget, fail closed so the caller
+    raises the budget or supplies concise validated references.
     """
     if not isinstance(context, dict):
         context = {"task": context}
     serialized = lambda value: json.dumps(value, ensure_ascii=False, indent=2, default=str)
     raw = serialized(context)
     original_chars = len(raw)
-    if original_chars <= limit:
+    if _context_fits(raw, limit, byte_limit):
         return raw
     mandatory = {key: value for key, value in context.items()
                  if key in MANDATORY_CONTEXT_KEYS}
@@ -6538,7 +6555,7 @@ def _bounded_context(context, limit):
                  "Only non-critical bulk fields were replaced with references."),
     }
     raw = serialized(compact)
-    if len(raw) <= limit:
+    if _context_fits(raw, limit, byte_limit):
         return raw
     # Drop only non-critical bulk references. Small stage inputs (booleans,
     # correction text, short failure notes) stay inline.
@@ -6558,7 +6575,7 @@ def _bounded_context(context, limit):
                  "Durable artifact paths remain available in the run directory."),
     }
     raw = serialized(minimal)
-    if len(raw) <= limit:
+    if _context_fits(raw, limit, byte_limit):
         return raw
     # Last resort: mandatory decision evidence only, then fail closed.
     bare = {key: value for key, value in compact.items() if key in mandatory}
@@ -6573,16 +6590,19 @@ def _bounded_context(context, limit):
         "note": "Only mandatory decision evidence fits the handoff budget.",
     }
     raw = serialized(bare)
-    if len(raw) <= limit:
+    if _context_fits(raw, limit, byte_limit):
         return raw
     sizes = sorted(((len(serialized(value)), key)
                     for key, value in mandatory.items()), reverse=True)[:8]
     raise ValueError(
         "Essential handoff context exceeds the configured budget ("
-        f"{len(raw)} > {limit} chars). Mandatory keys by size (chars, key): "
-        f"{sizes}. Provide validated concise file references, reduce inline "
-        "evidence, or raise limits.max_context_chars; refusing to drop "
-        "requirements, findings, evidence or user amendments.")
+        f"{len(raw)} chars / {len(raw.encode('utf-8'))} UTF-8 bytes; "
+        f"limit {limit} chars"
+        + (f", {byte_limit} bytes" if byte_limit is not None else "")
+        + f"). Mandatory keys by size (chars, key): {sizes}. Provide validated "
+        "concise file references, reduce inline evidence, or raise "
+        "limits.max_context_chars; refusing to drop requirements, findings, "
+        "evidence or user amendments.")
 
 
 PROMPT_REQUEST_KEY = "__abdullah_prompt_request__"
@@ -6597,11 +6617,14 @@ def prompt_request(kind, context):
     return {PROMPT_REQUEST_KEY: {"kind": kind, "context": context}}
 
 
-def render_prompt(kind, context, *, include_policy=True, parent_job=None):
+def render_prompt(kind, context, *, include_policy=True, parent_job=None,
+                  byte_limit=None):
     """Assemble one request: optional stable policy plus task/evidence.
 
     The parent-job placeholder is substituted only inside the supervisor-authored
     Explorer instruction, never across user-supplied requirement text.
+    ``byte_limit`` bounds the encoded request for transports (such as an argv
+    positional prompt) whose real limit is bytes rather than characters.
     """
     if isinstance(context, dict):
         explorer_dispatch = context.get("explorer_dispatch")
@@ -6631,7 +6654,11 @@ def render_prompt(kind, context, *, include_policy=True, parent_job=None):
               "comments. Do not invent files, tests or results; raise uncertainty instead "
               "of guessing. Keep the task bounded.")
     available = max(1000, budget - len(prefix) - len(suffix))
-    payload = _bounded_context(context, available)
+    available_bytes = None
+    if byte_limit is not None:
+        available_bytes = max(1000, byte_limit - len(prefix.encode("utf-8"))
+                              - len(suffix.encode("utf-8")))
+    payload = _bounded_context(context, available, byte_limit=available_bytes)
     return prefix + payload + suffix
 
 
@@ -8374,6 +8401,26 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
     return record
 
 
+def _record_prelaunch_refusal(run_dir, state, jpath, preflight, job_id, kind,
+                              role, *, reason_code, reasons,
+                              decision="preflight_rejected"):
+    """Persist an uncounted pre-dispatch refusal without spending consent."""
+    rejection_path = Path(jpath) / "preflight-rejected.json"
+    rejection = {**(preflight or {}), "kind": kind, "job_id": job_id,
+                 "role": role, "decision": decision,
+                 "reason_code": reason_code, "reasons": list(reasons),
+                 "active_job_created": False, "model_calls_counted": False}
+    atomic_json(rejection_path, rejection)
+    if state is not None:
+        state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
+        pause_with(run_dir, state,
+                   "Dispatch not attempted: " + "; ".join(reasons), "blocked")
+        journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
+                      role=role, kind=kind, reason_code=reason_code,
+                      reasons=list(reasons))
+    return rejection_path
+
+
 def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, archive=None,
                deadline=None, decision_binding=None, route=None, grant_state=None,
                grant_dir=None, expected_source=None, dispatch_evidence=None):
@@ -8621,11 +8668,17 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             boundary = {"version": 0, "error": str(exc), "job_id": job_id}
         atomic_json(jpath / "batch-boundary.json", boundary)
+    review_packet = None
+    if (role == "reviewer" and isinstance(dispatch_evidence, dict)
+            and dispatch_evidence.get("root")):
+        review_packet = (dispatch_evidence.get("binding")
+                         or review_packet_binding(dispatch_evidence))
     atomic_json(jpath / "dispatch.json", {"kind": kind, "role": role, "route": route,
                                            "source": dispatch_snapshot,
                                            "decision_binding": decision_binding,
                                            "batch_boundary": boundary,
                                            "dispatch_evidence": dispatch_evidence,
+                                           "review_packet": review_packet,
                                            "preflight": preflight,
                                            "created_at": now()})
     continuation = None
@@ -8642,12 +8695,45 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 continuation = None
             else:
                 continuation = prior["session_id"]
+    request = None
+    request_context = None
     if isinstance(prompt, dict) and PROMPT_REQUEST_KEY in prompt:
         request = prompt[PROMPT_REQUEST_KEY] or {}
-        prompt = render_prompt(
-            request.get("kind") or kind, request.get("context") or {},
+        request_context = request.get("context") or {}
+    # A positional argv transport is byte-limited, not character-limited. Bound
+    # the rendered packet up front so a large-but-character-valid review cannot
+    # reach the exec boundary and be refused after preparation.
+    transport_byte_limit = None
+    if request_context is not None and route["provider"] == "opencode":
+        transport_byte_limit = max(4096, _arg_string_limit() - 1024)
+
+    def assemble_prompt(byte_limit):
+        if request_context is None:
+            return prompt
+        return render_prompt(
+            request.get("kind") or kind, request_context,
             include_policy=route["provider"] in {"codex", "claude"},
-            parent_job=job_id)
+            parent_job=job_id, byte_limit=byte_limit)
+
+    try:
+        prompt = assemble_prompt(transport_byte_limit)
+    except ValueError as exc:
+        if reservation is not None:
+            try:
+                release_route_grant(
+                    authorization_state, authoritative_dir, role, route,
+                    "handoff context refused before launch",
+                    reservation_id=job_id, cfg=cfg, deadline=deadline)
+            except GrantLedgerTimeout:
+                pass
+        _record_prelaunch_refusal(
+            run_dir, state, jpath, preflight, job_id, kind, role,
+            reason_code="transport_too_large",
+            reasons=["The mandatory reviewer/worker handoff cannot fit the "
+                     "selected transport: " + str(exc)])
+        raise RuntimeError(
+            "Dispatch not attempted (transport): mandatory handoff context "
+            f"cannot fit the selected route. {exc}")
     # Final launch boundary: re-observe sources after snapshots/preparation.
     try:
         drift = _route_identity_recheck(
@@ -8752,10 +8838,57 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             env["ABDULLAH_STAGE"] = kind
     # Refuse an infeasible exec before a model child, active job, billable call
     # count or one-shot dispatch consent is spent.
+    if review_packet is not None:
+        packet_problem = review_packet_problem(
+            review_packet, expected_candidate=signature(dispatch_snapshot))
+        if packet_problem:
+            if reservation is not None:
+                try:
+                    release_route_grant(
+                        authorization_state, authoritative_dir, role, route,
+                        "review packet invalid before launch",
+                        reservation_id=job_id, cfg=cfg, deadline=deadline)
+                except GrantLedgerTimeout:
+                    pass
+            _record_prelaunch_refusal(
+                run_dir, state, jpath, preflight, job_id, kind, role,
+                reason_code="review_packet_invalid",
+                reasons=["The review evidence packet changed before launch: "
+                         + packet_problem])
+            raise RuntimeError(
+                "Dispatch not attempted (review packet): " + packet_problem)
     transport_problem = transport_space_error(
         cmd, env, prompt=(prompt if output_format == "jsonl" else None),
         lease_fds=2)
+    compaction_error = None
+    compaction_round = 0
+    while (transport_problem and request_context is not None
+           and transport_byte_limit is not None and compaction_round < 3):
+        compaction_round += 1
+        transport_byte_limit = max(4096, int(transport_byte_limit * 0.75))
+        try:
+            prompt = assemble_prompt(transport_byte_limit)
+        except ValueError as exc:
+            compaction_error = str(exc)
+            break
+        cmd, env, output_format = cli_command(
+            route["provider"] if strong else host, role, route, prompt, jpath,
+            continuation, evidence_root=run_dir if role == "architect" else None,
+            prepared=launch)
+        env = dict(env)
+        if state is not None:
+            env["ABDULLAH_RUN_ID"] = str(state.get("id") or state.get("run_id") or "")
+            env["ABDULLAH_JOB_ID"] = job_id
+            if role == "architect":
+                env["ABDULLAH_PARENT_JOB"] = job_id
+                env["ABDULLAH_STAGE"] = kind
+        transport_problem = transport_space_error(
+            cmd, env, prompt=(prompt if output_format == "jsonl" else None),
+            lease_fds=2)
     if transport_problem:
+        detail = transport_problem
+        if compaction_error:
+            detail += " Mandatory handoff content still cannot fit: " + compaction_error
         if reservation is not None:
             try:
                 release_route_grant(
@@ -8764,25 +8897,13 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     cfg=cfg, deadline=deadline)
             except GrantLedgerTimeout:
                 pass
-        rejection_path = jpath / "preflight-rejected.json"
-        rejection = {**preflight, "kind": kind, "job_id": job_id, "role": role,
-                     "decision": "transport_rejected",
-                     "reason_code": "transport_too_large",
-                     "reasons": [transport_problem],
-                     "active_job_created": False,
-                     "model_calls_counted": False}
-        atomic_json(rejection_path, rejection)
-        if state is not None:
-            state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
-            pause_with(run_dir, state,
-                       "Dispatch not attempted: " + transport_problem, "blocked")
-            journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
-                          role=role, kind=kind,
-                          reason_code="transport_too_large",
-                          reasons=[transport_problem])
+        _record_prelaunch_refusal(
+            run_dir, state, jpath, preflight, job_id, kind, role,
+            reason_code="transport_too_large", reasons=[detail],
+            decision="transport_rejected")
         raise RuntimeError(
-            "Dispatch not attempted (transport): " + transport_problem
-            + f" (diagnostic: {rejection_path})")
+            "Dispatch not attempted (transport): " + detail
+            + f" (diagnostic: {jpath / 'preflight-rejected.json'})")
     if ((fallback and fallback.get("role") == role
          and authorization_state.get("fallback_authorization"))
             or fallback_selected):
@@ -8801,6 +8922,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
            "authority_epoch": (state.get("authority_epoch", 0) if state is not None else 0),
            "launch_file": str(jpath / "launch.json"),
            "dispatch_evidence": dispatch_evidence,
+           "review_packet_binding": review_packet,
            "continued_session": continuation}
     if state is not None:
         state["active_job"] = job
@@ -8893,6 +9015,19 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         integrity.update({"kind": kind, "role": role, "job_id": job_id,
                           "checked_at": now()})
         atomic_json(jpath / "source-integrity.json", integrity)
+        if review_packet is not None:
+            # A packet that changed around the dispatch/return boundary cannot
+            # supply review or acceptance authority, even if source is equal.
+            packet_problem = review_packet_problem(
+                review_packet, expected_candidate=signature(final_snapshot))
+            if packet_problem:
+                atomic_json(jpath / "review-packet-violation.json", {
+                    "at": now(), "job_id": job_id, "reason": packet_problem,
+                    "binding": review_packet})
+                raise VerificationEvidenceRejected(
+                    "Review evidence packet failed its completion gate: "
+                    + packet_problem, code="review_packet_invalid",
+                    details={"job_id": job_id})
         delta = _record_batch_delta(run_dir, state, project, job_id, boundary,
                                     final_snapshot, job=job)
         atomic_json(jpath / "report.json", report)
@@ -9606,6 +9741,26 @@ def validate_preserved_stage_source(job, job_path, kind):
                 "Recorded stage source binding contradicts its preserved artifacts",
                 {"mutated": True, "kind": kind, "job_id": job.get("id"),
                  "reasons": ["recorded_binding_mismatch"]})
+    if kind == "reviewer":
+        binding = dispatch.get("review_packet")
+        if binding is None:
+            evidence = dispatch.get("dispatch_evidence")
+            if isinstance(evidence, dict) and evidence.get("root"):
+                return SourceMutationError(
+                    "A new-format review job has no packet binding; its report "
+                    "cannot gain authority",
+                    {"mutated": None, "kind": kind, "job_id": job.get("id"),
+                     "reasons": ["review_packet_binding_missing"]})
+        else:
+            problem = review_packet_problem(binding)
+            if problem:
+                atomic_json(job_path / "review-packet-violation.json",
+                            {"at": now(), "reason": problem, "binding": binding})
+                return SourceMutationError(
+                    "Review evidence packet no longer matches its dispatch: "
+                    + problem,
+                    {"mutated": None, "kind": kind, "job_id": job.get("id"),
+                     "reasons": ["review_packet_changed"]})
     return None
 
 
@@ -9778,6 +9933,57 @@ def worktree_states(project: Path):
     return states
 
 
+def _index_entry(project: Path, relative):
+    """Read-only state of one path in the real index.
+
+    Returns ``(entry, error)``.  The real index is never staged, reset or
+    rewritten: only ``git ls-files -s`` and ``git cat-file`` are used.  A path
+    with no index entry is ``absent``.  Unmerged entries are reported as such
+    instead of being collapsed into a guessed single blob.
+    """
+    try:
+        raw = git(project, ["ls-files", "-s", "-z", "--", relative])
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc) or exc.__class__.__name__
+    records = []
+    for item in raw.split(b"\0"):
+        if not item or b"\t" not in item:
+            continue
+        meta, _, path = item.partition(b"\t")
+        if os.fsdecode(path) != relative:
+            continue
+        fields = meta.split()
+        if len(fields) < 3:
+            continue
+        records.append({"mode": os.fsdecode(fields[0]),
+                        "sha": os.fsdecode(fields[1])})
+    if not records:
+        return {"kind": "absent", "mode": None, "sha256": None, "bytes": 0}, None
+    if len(records) > 1:
+        return {"kind": "unmerged", "mode": None, "sha256": None, "bytes": 0,
+                "stages": len(records)}, None
+    entry = dict(records[0])
+    entry["kind"] = "symlink" if entry["mode"] == "120000" else "file"
+    try:
+        data = git(project, ["cat-file", "blob", entry["sha"]])
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc) or exc.__class__.__name__
+    entry["sha256"] = hashlib.sha256(data).hexdigest()
+    entry["bytes"] = len(data)
+    entry["data"] = data
+    return entry, None
+
+
+def _index_digest(project: Path):
+    """Digest of the real index diff against HEAD (read-only)."""
+    try:
+        return hashlib.sha256(
+            git(project, ["diff", "--cached", "--binary", "--no-ext-diff",
+                          "HEAD", "--"])).hexdigest(), None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc) or exc.__class__.__name__
+
+
 def _path_before_image(project: Path, relative, limit=DELTA_MAX_FILE_BYTES):
     path = project / relative
     try:
@@ -9830,6 +10036,7 @@ def capture_batch_boundary(project: Path, run_dir, job_id, *, batch_index,
                 "omitted_paths": sorted(states)[DELTA_MAX_PATHS:],
                 "entries": {}, "skipped": []}
     used = 0
+    index_used = 0
     for relative in sorted(states)[:DELTA_MAX_PATHS]:
         state = states[relative]
         image = _path_before_image(project, relative)
@@ -9851,16 +10058,45 @@ def capture_batch_boundary(project: Path, run_dir, job_id, *, batch_index,
                 manifest["skipped"].append({"path": relative,
                                             "reason": "budget" if not image.get("truncated")
                                             else "file_too_large"})
+        # The index is a distinct input from the worktree: a staged-only edit
+        # has no worktree byte difference at all.  Capture it separately so the
+        # completion comparison can report it (or its precise unavailability).
+        index_entry, index_error = _index_entry(project, relative)
+        if index_entry is None:
+            index_entry = {"kind": "unreadable", "mode": None, "sha256": None,
+                           "bytes": 0, "error": index_error}
+            manifest["skipped"].append({"path": relative,
+                                        "reason": "index_unreadable"})
+        else:
+            index_data = index_entry.pop("data", b"")
+            if index_entry["kind"] in {"file", "symlink"}:
+                if index_used + len(index_data) <= DELTA_MAX_TOTAL_BYTES:
+                    blob = blobs / ("index-" + index_entry["sha256"])
+                    if not blob.exists():
+                        blob.write_bytes(index_data)
+                    index_used += len(index_data)
+                    index_entry["blob"] = str(blob)
+                else:
+                    index_entry["blob"] = None
+                    manifest["skipped"].append({"path": relative,
+                                                "reason": "index_budget"})
+        image["index"] = index_entry
         manifest["entries"][relative] = image
     manifest["capture_complete"] = (manifest["capture_complete"]
                                     and not manifest["skipped"])
     manifest_sha = content_hash(manifest)
     manifest["manifest_sha256"] = manifest_sha
     atomic_json(base / "manifest.json", manifest)
+    try:
+        worktree_signature = signature(source_snapshot(project, provenance=False))
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+        worktree_signature = None
+        manifest["source_signature_error"] = str(exc)
     boundary = {"version": 1, "job_id": job_id, "batch_index": batch_index,
                 "plan_version": plan_version, "dir": str(base),
                 "manifest_sha256": manifest_sha, "head": head,
                 "index_sha256": index_diff, "status_sha256": status_sha,
+                "source_signature": worktree_signature,
                 "paths": sorted(manifest["entries"]),
                 "dirty_paths": sorted(states),
                 "capture_complete": manifest["capture_complete"],
@@ -9872,22 +10108,35 @@ def capture_batch_boundary(project: Path, run_dir, job_id, *, batch_index,
 
 
 def _head_blob(project: Path, head, relative):
-    if not head:
-        return None
+    """Return ``(data, error)`` for one path at the dispatch HEAD.
+
+    ``data`` is ``None`` only when the path is genuinely absent from that tree.
+    A Git failure is returned as an error and must never be interpreted as
+    confirmed absence.
+    """
+    entry, error = _head_tree_entry(project, head, relative)
+    if error:
+        return None, error
+    if entry is None:
+        return None, None
     try:
-        return git(project, ["cat-file", "blob", f"{head}:{relative}"])
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
+        return git(project, ["cat-file", "blob", f"{head}:{relative}"]), None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc) or exc.__class__.__name__
 
 
 def _head_tree_entry(project: Path, head, relative):
-    """Return the recorded HEAD mode/type for a path, or ``None`` if untracked."""
+    """Return ``(entry, error)`` for a path at the recorded HEAD.
+
+    ``entry`` is ``None`` only when ``ls-tree`` succeeded and reported no such
+    path.  An unreadable/unknown HEAD yields an error, not an absent path.
+    """
     if not head:
-        return None
+        return None, "dispatch head is missing"
     try:
         raw = git(project, ["ls-tree", "-z", head, "--", relative])
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc) or exc.__class__.__name__
     for item in raw.split(b"\0"):
         if not item or b"\t" not in item:
             continue
@@ -9898,8 +10147,8 @@ def _head_tree_entry(project: Path, head, relative):
         if len(fields) < 3:
             continue
         return {"mode": os.fsdecode(fields[0]), "type": os.fsdecode(fields[1]),
-                "sha": os.fsdecode(fields[2])}
-    return None
+                "sha": os.fsdecode(fields[2])}, None
+    return None, None
 
 
 def _pre_image_bytes(project, boundary, relative, *, dirty_before=None):
@@ -9932,9 +10181,14 @@ def _pre_image_bytes(project, boundary, relative, *, dirty_before=None):
         dirty = set(manifest.get("dirty_paths") or manifest.get("entries") or {})
     if relative in dirty:
         return None, "before_image_not_captured"
-    data = _head_blob(project, boundary.get("head"), relative)
-    if data is None:
+    head_entry, head_error = _head_tree_entry(project, boundary.get("head"), relative)
+    if head_error:
+        return None, "dispatch_head_unreadable"
+    if head_entry is None:
         return b"", "absent_at_dispatch_head"
+    data, blob_error = _head_blob(project, boundary.get("head"), relative)
+    if blob_error is not None or data is None:
+        return None, "dispatch_head_unreadable"
     return data, "dispatch_head_blob"
 
 
@@ -9997,12 +10251,76 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
             return None
 
     def head_state(relative):
-        entry = _head_tree_entry(project, dispatch_head, relative)
-        if not isinstance(entry, dict):
-            return None, None
-        kind = ("symlink" if entry.get("mode") == "120000"
-                else "directory" if entry.get("type") == "tree" else "file")
-        return kind, mode_bits(entry.get("mode"))
+        tree_entry, error = _head_tree_entry(project, dispatch_head, relative)
+        if error:
+            return None, None, error, None
+        if not isinstance(tree_entry, dict):
+            return None, None, None, None
+        kind = ("symlink" if tree_entry.get("mode") == "120000"
+                else "directory" if tree_entry.get("type") == "tree" else "file")
+        return kind, mode_bits(tree_entry.get("mode")), None, tree_entry
+
+    def write_hunk(relative, scope, before, after, label):
+        nonlocal hunk_number
+        try:
+            diff = list(difflib.unified_diff(
+                _text_lines(before), _text_lines(after),
+                fromfile=f"a/{relative} ({label})",
+                tofile=f"b/{relative} ({label})", n=3))
+        except (ValueError, MemoryError):
+            diff = []
+        if not diff:
+            return None
+        hunk_number += 1
+        prefix = "index-" if scope.startswith("index") else ""
+        patch = hunks_dir / f"{prefix}{hunk_number:04d}.patch"
+        patch.write_text("".join(diff), encoding="utf-8")
+        return {"path": str(patch.relative_to(after_root)), "scope": scope,
+                "bytes": patch.stat().st_size, "sha256": _sha256_file(patch),
+                "additions": sum(1 for line in diff
+                                 if line.startswith("+") and not line.startswith("+++")),
+                "deletions": sum(1 for line in diff
+                                 if line.startswith("-") and not line.startswith("---"))}
+
+    def index_signature(state):
+        if not isinstance(state, dict):
+            return None
+        return (state.get("kind"), state.get("sha256"), state.get("mode"))
+
+    def index_before_state(relative, manifest_entry, head_entry, head_error):
+        captured = manifest_entry.get("index") if isinstance(manifest_entry, dict) else None
+        if isinstance(captured, dict):
+            kind = captured.get("kind")
+            if kind == "absent":
+                return {"kind": "absent", "mode": None, "sha256": None,
+                        "bytes": 0}, None
+            if kind == "unmerged":
+                return {"kind": "unmerged", "mode": None, "sha256": None,
+                        "bytes": 0}, None
+            if kind in {"file", "symlink"}:
+                blob = captured.get("blob")
+                if blob and Path(blob).is_file():
+                    data = Path(blob).read_bytes()
+                    if hashlib.sha256(data).hexdigest() == captured.get("sha256"):
+                        return {"kind": kind, "mode": captured.get("mode"),
+                                "sha256": captured.get("sha256"),
+                                "bytes": len(data), "data": data}, None
+                return None, "index_before_bytes_unavailable"
+            return None, "index_before_" + str(kind or "unavailable")
+        # No captured index entry means the path was clean at dispatch, so the
+        # index equalled HEAD (verified from the recorded tree, never presumed).
+        if head_error:
+            return None, "dispatch_head_unreadable"
+        if head_entry is None:
+            return {"kind": "absent", "mode": None, "sha256": None,
+                    "bytes": 0}, None
+        kind = ("symlink" if head_entry.get("mode") == "120000" else "file")
+        data, blob_error = _head_blob(project, dispatch_head, relative)
+        if blob_error is not None or data is None:
+            return None, "dispatch_head_unreadable"
+        return {"kind": kind, "mode": mode_bits(head_entry.get("mode")),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data), "data": data}, None
 
     for relative in candidates:
         pre, source = _pre_image_bytes(project, boundary, relative,
@@ -10014,7 +10332,7 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                          else "clean")
         status_now = (states_now.get(relative) or {}).get("code") or "clean"
         manifest_entry = (manifest_value.get("entries") or {}).get(relative) or {}
-        head_kind, head_mode = head_state(relative)
+        head_kind, head_mode, head_error, head_entry = head_state(relative)
         if isinstance(manifest_entry, dict) and manifest_entry.get("kind"):
             pre_kind = manifest_entry.get("kind")
         else:
@@ -10026,20 +10344,58 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
         mode_changed = (mode_before is not None and mode_after is not None
                         and mode_before != mode_after)
         presence_changed = pre_kind != after_kind
+        index_before, index_before_error = index_before_state(
+            relative, manifest_entry, head_entry, head_error)
+        index_after, index_after_error = _index_entry(project, relative)
+        index_changed_in_window = (index_before is not None and index_after is not None
+                                   and index_signature(index_before)
+                                   != index_signature(index_after))
+        head_index = None
+        if head_error is None and head_entry is not None:
+            head_index, _ = index_before_state(relative, {}, head_entry, None)
+        index_differs_from_head = (index_after is not None and head_index is not None
+                                   and index_signature(index_after)
+                                   != index_signature(head_index))
+        index_pre_existing = (index_before is not None and head_index is not None
+                              and index_signature(index_before)
+                              != index_signature(head_index))
+        if index_before is None:
+            limitations.append({"path": relative,
+                                "reason": "index state unavailable at dispatch",
+                                "detail": index_before_error})
+        if index_after is None:
+            limitations.append({"path": relative,
+                                "reason": "index state unavailable at completion",
+                                "detail": index_after_error})
+        index_fields = {
+            "index_before": (index_before or {}).get("kind") if index_before else None,
+            "index_after": (index_after or {}).get("kind") if index_after else None,
+            "index_changed_in_window": bool(index_changed_in_window),
+            "index_pre_existing": bool(index_pre_existing),
+            "index_differs_from_head": bool(index_differs_from_head),
+            "worktree_changed_in_window": bool(presence_changed or data != pre
+                                               or mode_changed),
+        }
         if pre is None:
             limitations.append({"path": relative,
                                 "reason": "dispatch-time bytes unavailable",
                                 "detail": source})
-            index_entries.append({
+            entry = {
                 "path": relative, "before": status_before,
                 "after": status_now, "base_source": source,
                 "presence_before": pre_kind, "presence_after": after_kind,
                 "attributable": "unavailable",
                 "note": ("The dispatch-time image was not captured. No hunk is "
-                         "manufactured from a presumed baseline.")})
+                         "manufactured from a presumed baseline.")}
+            entry.update(index_fields)
+            _append_index_hunks(entry, relative, index_before, index_after,
+                                head_index, index_before_error, index_after_error,
+                                write_hunk, limitations)
+            index_entries.append(entry)
             continue
-        if not presence_changed and data == pre and not mode_changed:
-            if relative in dirty_before:
+        if (not presence_changed and data == pre and not mode_changed
+                and not index_changed_in_window):
+            if relative in dirty_before or index_differs_from_head:
                 entry = {"path": relative, "before": status_before, "after": status_now,
                          "base_source": source, "changed_in_window": False,
                          "pre_existing": True, "overlap": False,
@@ -10047,18 +10403,25 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                          "size_before": len(pre), "size_after": len(data),
                          "sha256_before": hashlib.sha256(pre).hexdigest(),
                          "sha256_after": hashlib.sha256(data).hexdigest(),
+                         "staged_only": bool(index_differs_from_head
+                                             and not index_changed_in_window),
                          "note": ("Pre-existing user work observed at both boundaries; "
                                   "no batch-window change is established.")}
+                entry.update(index_fields)
                 if after_kind not in {"file", "symlink"} and pre_kind in {"file", "symlink"}:
                     entry["pre_existing_change_missing"] = True
                     entry["note"] = ("A pre-existing change is no longer present "
                                      "after the writer window.")
+                _append_index_hunks(entry, relative, index_before, index_after,
+                                    head_index, index_before_error, index_after_error,
+                                    write_hunk, limitations)
                 index_entries.append(entry)
             continue
         entry = {"path": relative, "before": status_before, "after": status_now,
                  "base_source": source, "changed_in_window": True,
                  "pre_existing": status_before == "pre_existing_worktree",
                  "overlap": status_before == "pre_existing_worktree",
+                 "index_overlap": bool(index_pre_existing and index_changed_in_window),
                  "presence_before": pre_kind, "presence_after": after_kind,
                  "presence_changed": presence_changed,
                  "binary": after_kind not in {"file", "symlink"}
@@ -10066,14 +10429,19 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                  "size_before": len(pre), "size_after": len(data),
                  "sha256_before": hashlib.sha256(pre).hexdigest(),
                  "sha256_after": hashlib.sha256(data).hexdigest()}
+        entry.update(index_fields)
         if mode_changed:
             entry.update({"mode_before": format(mode_before, "o"),
                           "mode_after": format(mode_after, "o"),
                           "mode_changed": True})
         # Distinguish restored HEAD bytes from a genuinely new observed edit.
         if head_kind in {"file", "symlink"}:
-            head_bytes = _head_blob(project, dispatch_head, relative)
-            if head_bytes is not None:
+            head_bytes, head_blob_error = _head_blob(project, dispatch_head, relative)
+            if head_blob_error is not None:
+                limitations.append({"path": relative,
+                                    "reason": "dispatch-head bytes unavailable",
+                                    "detail": head_blob_error})
+            elif head_bytes is not None:
                 entry["after_matches_head"] = data == head_bytes
                 if (after_kind in {"file", "symlink"} and data == head_bytes
                         and pre != head_bytes):
@@ -10081,33 +10449,26 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
                     entry["restored_overlap"] = status_before == "pre_existing_worktree"
         readable = (after_kind in {"file", "symlink"} and not image.get("truncated"))
         deletion = (after_kind == "absent" and pre_kind in {"file", "symlink"})
+        hunks = []
         if readable or deletion:
-            try:
-                diff = list(difflib.unified_diff(
-                    _text_lines(pre), _text_lines(data),
-                    fromfile=f"a/{relative}", tofile=f"b/{relative}", n=3))
-            except (ValueError, MemoryError):
-                diff = []
-            if diff:
-                hunk_number += 1
-                patch = hunks_dir / f"{hunk_number:04d}.patch"
-                patch.write_text("".join(diff), encoding="utf-8")
-                entry["hunks"] = [{"path": str(patch.relative_to(after_root)),
-                                   "bytes": patch.stat().st_size,
-                                   "sha256": _sha256_file(patch)}]
-                additions = sum(1 for line in diff
-                                if line.startswith("+") and not line.startswith("+++"))
-                deletions = sum(1 for line in diff
-                                if line.startswith("-") and not line.startswith("---"))
-                entry.update({"additions": additions, "deletions": deletions})
-            else:
-                entry.setdefault("hunks", [])
-                if not presence_changed:
-                    entry["content_equal"] = True
+            hunk = write_hunk(relative, "worktree", pre, data, "worktree")
+            if hunk:
+                hunks.append(hunk)
+                entry.update({"additions": hunk["additions"],
+                              "deletions": hunk["deletions"]})
+            elif not presence_changed:
+                entry["content_equal"] = True
         else:
-            entry.setdefault("hunks", [])
             entry["binary_or_truncated"] = True
+        _append_index_hunks(entry, relative, index_before, index_after,
+                            head_index, index_before_error, index_after_error,
+                            write_hunk, limitations)
+        entry.setdefault("hunks", [])
+        entry["hunks"] = hunks + entry["hunks"]
         index_entries.append(entry)
+    chain_evidence = _delta_chain_evidence(boundary, limitations)
+    index_now, index_now_error = _index_digest(project)
+    completion_states = worktree_states(project)
     index_value = {
         "version": 1, "job_id": job_id, "attempt": attempt,
         "batch_index": boundary.get("batch_index"),
@@ -10117,24 +10478,147 @@ def finalize_batch_delta(project, run_dir, job_id, boundary, *,
         "boundary_manifest_sha256": boundary.get("manifest_sha256"),
         "index_sha256_at_dispatch": boundary.get("index_sha256"),
         "worktree_status_sha256_at_dispatch": boundary.get("status_sha256"),
+        "source_signature_at_dispatch": boundary.get("source_signature"),
+        "index_sha256_at_completion": index_now,
+        "index_completion_error": index_now_error,
+        "worktree_status_sha256_at_completion": content_hash(completion_states),
         "pre_existing_dirty_paths": sorted(dirty_before),
         "capture_complete": bool(boundary.get("capture_complete", True)),
         "capture_omitted_paths": list(boundary.get("omitted_paths") or []),
         "dispatch_head_comparison": ("complete" if dispatch_head and comparison_error is None
                                      else "unavailable"),
         "dispatch_head_comparison_error": comparison_error,
+        "attempt_chain": chain_evidence,
         "final_snapshot_signature": signature(final_snapshot) if final_snapshot else None,
         "paths": index_entries,
         "hunks_dir": str(hunks_dir),
         "limitations": limitations,
         "attribution": ("observed_delta_between_supervisor_boundaries"),
         "note": ("This index compares supervisor-issued dispatch and completion "
-                 "boundaries. Pre-existing user work is listed separately from "
-                 "observed batch-window changes; it does not prove authorship."),
+                 "boundaries, including the real index (staged) state separately "
+                 "from worktree bytes. Pre-existing user work is listed separately "
+                 "from observed batch-window changes; it does not prove authorship."),
     }
     index_value["index_sha256"] = content_hash(index_value)
     atomic_json(after_root / "index.json", index_value)
     return index_value
+
+
+def _append_index_hunks(entry, relative, index_before, index_after, head_index,
+                        before_error, after_error, write_hunk, limitations):
+    """Record staged-only evidence separately from worktree hunks."""
+    entry.setdefault("hunks", [])
+    entry.setdefault("index_hunks", [])
+    if index_after is None:
+        entry["index_unavailable"] = after_error or "completion index unavailable"
+        return
+    if index_after.get("kind") not in {"file", "symlink"}:
+        if index_after.get("kind") == "unmerged":
+            entry["index_unmerged"] = True
+        return
+    changed = (index_before is None
+               or (index_before.get("kind"), index_before.get("sha256"),
+                   index_before.get("mode"))
+               != (index_after.get("kind"), index_after.get("sha256"),
+                   index_after.get("mode")))
+    compare_before = index_before
+    scope = "index"
+    if not changed and head_index is not None and (
+            (head_index.get("kind"), head_index.get("sha256"), head_index.get("mode"))
+            != (index_after.get("kind"), index_after.get("sha256"),
+                index_after.get("mode"))):
+        # The path was already staged at dispatch. Show those pre-existing
+        # staged bytes rather than hiding them, clearly labelled as overlap.
+        compare_before = head_index
+        scope = "index_pre_existing"
+    if compare_before is None or compare_before.get("kind") not in {
+            "file", "symlink", "absent"}:
+        if changed:
+            entry["index_unavailable"] = before_error or "dispatch index unavailable"
+        return
+    if index_before is None and changed:
+        entry["index_unavailable"] = before_error or "dispatch index unavailable"
+        return
+    hunk = write_hunk(relative, scope, compare_before.get("data") or b"",
+                      index_after.get("data") or b"", "index/staged")
+    if hunk:
+        entry["index_hunks"].append(hunk)
+        entry["hunks"].append(hunk)
+        entry["additions"] = (entry.get("additions") or 0) + hunk["additions"]
+        entry["deletions"] = (entry.get("deletions") or 0) + hunk["deletions"]
+
+
+def _delta_chain_evidence(boundary, limitations):
+    """Check the previous attempt's completion boundary against this dispatch.
+
+    Missing or unreadable previous evidence is an explicit uncertainty, never a
+    silent clean assumption about changes between writer windows.
+    """
+    previous = boundary.get("previous_job_id")
+    evidence = {"previous_job_id": previous, "status": "not_applicable",
+                "limitations": []}
+    if not previous:
+        return evidence
+    try:
+        root = Path(boundary.get("dir", "")).parent.parent / str(previous) / "after"
+        previous_index = _safe_read(root / "index.json")
+    except (OSError, ValueError) as exc:
+        previous_index = None
+        evidence["error"] = str(exc)
+    if not isinstance(previous_index, dict):
+        evidence["status"] = "unavailable"
+        limitation = {"path": None,
+                      "reason": "previous writer boundary unavailable",
+                      "detail": ("The previous attempt's completion evidence could "
+                                 "not be read; changes between writer windows "
+                                 "cannot be ruled out.")}
+        evidence["limitations"].append(limitation)
+        limitations.append(limitation)
+        return evidence
+    missing = [name for name in ("index_sha256_at_completion",
+                                 "worktree_status_sha256_at_completion",
+                                 "final_snapshot_signature")
+               if not previous_index.get(name)]
+    mismatches = []
+    if previous_index.get("index_sha256_at_completion") not in (
+            None, boundary.get("index_sha256")):
+        mismatches.append({"evidence": "index",
+                           "previous_completion": previous_index.get(
+                               "index_sha256_at_completion"),
+                           "current_dispatch": boundary.get("index_sha256")})
+    if previous_index.get("worktree_status_sha256_at_completion") not in (
+            None, boundary.get("status_sha256")):
+        mismatches.append({"evidence": "worktree_status",
+                           "previous_completion": previous_index.get(
+                               "worktree_status_sha256_at_completion"),
+                           "current_dispatch": boundary.get("status_sha256")})
+    if (boundary.get("source_signature")
+            and previous_index.get("final_snapshot_signature")
+            and previous_index.get("final_snapshot_signature")
+            != boundary.get("source_signature")):
+        mismatches.append({"evidence": "worktree_content",
+                           "previous_completion": previous_index.get(
+                               "final_snapshot_signature"),
+                           "current_dispatch": boundary.get("source_signature")})
+    if missing or mismatches:
+        evidence.update({"status": ("incomplete" if missing else "unaccounted_changes"),
+                         "missing": missing, "mismatches": mismatches})
+        limitation = {"path": None,
+                      "reason": ("unaccounted changes between writer windows"
+                                 if mismatches else
+                                 "previous writer boundary incomplete"),
+                      "detail": ("The next dispatch boundary does not match the "
+                                 "previous attempt's recorded completion; changes "
+                                 "outside a writer window may be unattributed."
+                                 if mismatches else
+                                 "The previous attempt did not record enough "
+                                 "completion evidence to prove continuity."),
+                      "missing": missing, "mismatches": mismatches}
+        evidence["limitations"].append(limitation)
+        limitations.append(limitation)
+    else:
+        evidence["status"] = "continuous"
+    return evidence
 
 
 def batch_delta_index(state, batch_index=None):
@@ -10211,14 +10695,27 @@ def _projection_evidence_identity(package):
     }
 
 
+def _packet_path_problem(root: Path, relative):
+    """Reject an indexed/declared path with a link or escape in any component."""
+    rel = Path(str(relative))
+    if rel.is_absolute() or ".." in rel.parts:
+        return f"path escapes the projection: {relative}"
+    probe = root
+    for part in rel.parts:
+        probe = probe / part
+        if probe.is_symlink():
+            return f"path component is a symlink: {relative}"
+    return None
+
+
 def _validate_projection_packet(packet, physical_root=None):
     """Return a limitation string if the packet is not exactly reusable.
 
     Validates the manifest digest, its own identity digest, every indexed
     relative path, regular-file type, declared size and SHA-256.  Symlinks and
-    truncated/incomplete evidence are never accepted.  ``physical_root`` lets a
-    staged (not yet published) copy be validated against its final manifest
-    identity.
+    truncated/incomplete evidence are never accepted, and a link in *any* path
+    component is refused.  ``physical_root`` lets a staged (not yet published)
+    copy be validated against its final manifest identity.
     """
     if not isinstance(packet, dict):
         return "projection metadata missing"
@@ -10227,8 +10724,12 @@ def _validate_projection_packet(packet, physical_root=None):
     manifest_path = Path(packet.get("manifest", ""))
     if not root.is_dir() or root.is_symlink():
         return "projection root is missing or not a real directory"
-    if not manifest_path.is_file() or manifest_path.is_symlink():
+    if manifest_path.is_symlink():
+        return "projection manifest is a symlink"
+    if not manifest_path.is_file():
         return "projection manifest is missing or not a regular file"
+    if manifest_path.parent != root and physical_root is not None:
+        return "projection manifest is outside its declared staging root"
     if _sha256_file(manifest_path) != packet.get("manifest_sha256"):
         return "projection manifest digest changed"
     manifest = _safe_read(manifest_path)
@@ -10248,12 +10749,10 @@ def _validate_projection_packet(packet, physical_root=None):
     if not isinstance(files, dict):
         return "projection manifest has no indexed files"
     for relative, meta in files.items():
-        rel = Path(str(relative))
-        if rel.is_absolute() or ".." in rel.parts:
-            return f"indexed path escapes the projection: {relative}"
-        path = root / rel
-        if path.is_symlink():
-            return f"indexed path is a symlink: {relative}"
+        path_problem = _packet_path_problem(root, relative)
+        if path_problem:
+            return path_problem
+        path = root / str(relative)
         if not path.is_file():
             return f"indexed path is missing or not a regular file: {relative}"
         if not isinstance(meta, dict):
@@ -10265,11 +10764,129 @@ def _validate_projection_packet(packet, physical_root=None):
             return f"indexed path size is unreadable: {relative}"
         if _sha256_file(path) != meta.get("sha256"):
             return f"indexed path digest changed: {relative}"
+    if packet.get("binding_version"):
+        if packet.get("binding_version") != REVIEW_PACKET_BINDING_VERSION:
+            return "unsupported review packet binding version"
+        binding = packet.get("binding")
+        if not isinstance(binding, dict):
+            return "review packet binding is missing"
+        if binding.get("binding_version") != REVIEW_PACKET_BINDING_VERSION:
+            return "review packet binding version mismatch"
+        if binding.get("binding_sha256") != content_hash(
+                {key: value for key, value in binding.items()
+                 if key != "binding_sha256"}):
+            return "review packet binding digest mismatch"
+        if binding.get("manifest_sha256") != packet.get("manifest_sha256"):
+            return "review packet binding manifest mismatch"
+        if binding.get("projection_sha256") != packet.get("projection_sha256"):
+            return "review packet binding projection mismatch"
+        if content_hash(files) != binding.get("files_sha256"):
+            return "review packet binding file map mismatch"
     return None
 
 
+def review_packet_binding(projection):
+    """Canonical identity of one review packet for dispatch/return binding."""
+    projection = projection if isinstance(projection, dict) else {}
+    files = projection.get("files") or {}
+    binding = {
+        "binding_version": REVIEW_PACKET_BINDING_VERSION,
+        "root": str(projection.get("root")),
+        "manifest": str(projection.get("manifest")),
+        "manifest_sha256": projection.get("manifest_sha256"),
+        "projection_sha256": projection.get("projection_sha256"),
+        "verification_path": projection.get("verification_path"),
+        "verification_sha256": projection.get("verification_sha256"),
+        "evidence_version": projection.get("evidence_version"),
+        "candidate_hash": projection.get("candidate_hash"),
+        "files_sha256": content_hash(files),
+    }
+    binding["binding_sha256"] = content_hash(binding)
+    return binding
+
+
+def review_packet_problem(binding, *, project=None, expected_candidate=None):
+    """Validate a packet binding and its actual files; return a reason or None."""
+    if not isinstance(binding, dict):
+        return "review packet binding is missing"
+    if binding.get("binding_version") != REVIEW_PACKET_BINDING_VERSION:
+        return "review packet binding version mismatch"
+    core = {key: value for key, value in binding.items() if key != "binding_sha256"}
+    if content_hash(core) != binding.get("binding_sha256"):
+        return "review packet binding digest mismatch"
+    packet = {"root": binding.get("root"),
+              "manifest": binding.get("manifest"),
+              "manifest_sha256": binding.get("manifest_sha256"),
+              "projection_sha256": binding.get("projection_sha256"),
+              "binding_version": REVIEW_PACKET_BINDING_VERSION,
+              "binding": binding}
+    problem = _validate_projection_packet(packet)
+    if problem:
+        return problem
+    manifest = _safe_read(Path(str(binding.get("manifest"))))
+    if not isinstance(manifest, dict):
+        return "review packet manifest is unreadable"
+    if content_hash(manifest.get("files") or {}) != binding.get("files_sha256"):
+        return "review packet binding file map mismatch"
+    if binding.get("verification_path"):
+        verification_path = Path(str(binding.get("verification_path")))
+        # The record identity is bound even when the path is only available to
+        # the supervisor; if the file is present its bytes must still match.
+        if (verification_path.is_file() and binding.get("verification_sha256")
+                and _sha256_file(verification_path) != binding.get("verification_sha256")):
+            return "review packet verification record changed"
+    if expected_candidate is not None:
+        if binding.get("candidate_hash") not in (None, expected_candidate):
+            return "review packet does not describe the current candidate"
+    if project is not None:
+        if binding.get("candidate_hash") not in (
+                None, signature(source_snapshot(Path(project)))):
+            return "review packet candidate changed"
+    return None
+
+
+def packet_binding_matches(binding, projection):
+    """True when a producing binding is exactly the current packet identity."""
+    if not isinstance(binding, dict) or not isinstance(projection, dict):
+        return False
+    current = projection.get("binding") or review_packet_binding(projection)
+    return all(binding.get(key) == current.get(key)
+               for key in ("binding_version", "root", "manifest",
+                           "manifest_sha256", "projection_sha256",
+                           "verification_sha256", "files_sha256",
+                           "binding_sha256"))
+
+def _owned_projection_extras(path: Path, owner):
+    """Relative paths inside an owned packet not attributable to the supervisor."""
+    allowed = {"manifest.json", "STAGING.json", "OWNER.json", ".gitignore"}
+    files = owner.get("files") if isinstance(owner, dict) else None
+    if isinstance(files, dict):
+        allowed |= {str(Path(str(name)).as_posix()) for name in files}
+    extras = []
+    try:
+        candidates = list(path.rglob("*"))
+    except OSError:
+        return ["<unreadable>"]
+    for candidate in candidates:
+        relative = candidate.relative_to(path).as_posix()
+        if candidate.is_symlink():
+            extras.append(relative)
+            continue
+        if candidate.is_dir():
+            continue
+        if relative not in allowed:
+            extras.append(relative)
+    return sorted(extras)
+
+
 def _remove_owned_projection(path: Path, run_id):
-    """Remove a supervisor-owned staging/stale packet, never an arbitrary path."""
+    """Remove/quarantine a supervisor-owned staging or stale packet.
+
+    Never an arbitrary path: an ownership marker and run identity are required.
+    If the directory contains any file the supervisor did not author, it is
+    renamed aside instead of recursively deleted so user content survives a
+    retry/rebuild. Returns the preserved path (or ``None`` when removed).
+    """
     path = Path(path)
     if path.is_symlink() or (path.exists() and not path.is_dir()):
         raise OSError(f"Refusing to remove a non-directory or symlink: {path}")
@@ -10285,7 +10902,18 @@ def _remove_owned_projection(path: Path, run_id):
     if (owner.get("generated_by") != "abdullah-orchestrator"
             or (run_id and owner.get("run_id") not in (None, run_id))):
         raise OSError(f"{path} is not owned by this supervisor run")
+    extras = _owned_projection_extras(path, owner)
+    if extras:
+        preserved = path.with_name(path.name + ".preserved-" + uuid.uuid4().hex[:8])
+        try:
+            os.replace(path, preserved)
+        except OSError as exc:
+            raise OSError(
+                f"{path} contains unrecognized content ({extras[:5]}) and could not "
+                f"be preserved aside: {exc}") from exc
+        return preserved
     shutil.rmtree(path)
+    return None
 
 
 def read_review_projection(project, relative):
@@ -10387,7 +11015,13 @@ def prepare_review_projection(run_dir, state, cfg, project, batch, package):
             and existing.get("candidate_hash") == candidate_hash
             and existing.get("verification_path") == identity["verification_path"]
             and existing.get("verification_sha256") == identity["verification_sha256"]):
-        problem = _validate_projection_packet(existing)
+        # New-format packets must carry the producing binding; a state packet
+        # from an older candidate is rebuilt rather than reused without one.
+        problem = (None if existing.get("binding_version")
+                   == REVIEW_PACKET_BINDING_VERSION else
+                   "review packet has no dispatch binding")
+        if problem is None:
+            problem = _validate_projection_packet(existing)
         if problem is None:
             return existing, None
         # An interrupted/corrupt packet is never accepted or reused; it is
@@ -10524,6 +11158,7 @@ def prepare_review_projection(run_dir, state, cfg, project, batch, package):
                     "sha256": _sha256_file(path), "bytes": path.stat().st_size}
         manifest = {
             "version": 1, "generated_by": "abdullah-orchestrator",
+            "packet_binding_version": REVIEW_PACKET_BINDING_VERSION,
             "run_id": state.get("id"), "batch_index": state.get("batch_index", 0),
             "plan_version": state.get("plan_version"),
             "plan_revision": state.get("plan_revision", 0),
@@ -10556,6 +11191,10 @@ def prepare_review_projection(run_dir, state, cfg, project, batch, package):
             "evidence_version": identity["evidence_version"],
             "files": files, "limitations": limitations,
         }
+        binding = review_packet_binding(staged)
+        staged.update({"binding_version": REVIEW_PACKET_BINDING_VERSION,
+                       "binding": binding,
+                       "binding_sha256": binding["binding_sha256"]})
         # Verify the complete staged packet before publishing it.  A partial or
         # corrupt construction can therefore never become reviewer-visible, and
         # an interruption leaves only a retryable staging directory.
@@ -11224,8 +11863,9 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
         "repaired_text": repaired_text,
         "repair": repair,
     })
-    dispatch_evidence = ((_safe_read(jpath / "dispatch.json") or {})
-                         .get("dispatch_evidence") or {})
+    dispatch_record = _safe_read(jpath / "dispatch.json") or {}
+    dispatch_evidence = dispatch_record.get("dispatch_evidence") or {}
+    producing_packet = dispatch_record.get("review_packet")
     record = {
         "version": 1, "run_id": run_id, "job_id": job_id, "kind": kind,
         "role": job.get("role"), "applied_at": now(),
@@ -11248,6 +11888,7 @@ def recover_report(run_id, job_id, apply=False, repair_unescaped=False,
         # identity of a newer review packet.
         "review_projection_sha256": dispatch_evidence.get("projection_sha256"),
         "review_verification_sha256": dispatch_evidence.get("verification_sha256"),
+        "review_packet_binding": producing_packet,
         "authority_epoch": producing_epoch,
         "producing_job": {
             "id": job.get("id"), "kind": kind, "role": job.get("role"),
@@ -11363,6 +12004,14 @@ def cached_recovered_job_report(run_dir, state, kind):
         if (bound_verification is not None
                 and bound_verification != projection.get("verification_sha256")):
             return None
+        if (projection.get("binding_version") == REVIEW_PACKET_BINDING_VERSION
+                and record.get("review_projection_sha256") is not None):
+            bound_packet = record.get("review_packet_binding")
+            if not bound_packet or not packet_binding_matches(bound_packet, projection):
+                return None
+            problem = review_packet_problem(bound_packet)
+            if problem:
+                return None
         job_path = Path(job.get("path", ""))
         dispatch = _safe_read(job_path / "dispatch.json")
         if isinstance(dispatch, dict) and isinstance(dispatch.get("dispatch_evidence"), dict):
@@ -12502,6 +13151,20 @@ def advance(run_dir, state, cfg, deadline=None):
                         "inside its permitted read root. Resolve the projection path "
                         "problem or review manually; this is not a passing review."))
             return
+        # Revalidate the exact packet at admission, not only when it was built.
+        packet_problem = review_packet_problem(
+            projection.get("binding"), project=project,
+            expected_candidate=signature(current))
+        if packet_problem:
+            _block_review_verification(
+                state, run_dir, VerificationEvidenceRejected(
+                    "Review evidence packet failed its admission gate: "
+                    + packet_problem, code="review_packet_invalid",
+                    details={"root": projection.get("root")}),
+                advice=("Regenerate verification and the review packet; a packet "
+                        "that changed outside the producing dispatch cannot "
+                        "authorize an independent review."))
+            return
         state["review_projection"] = projection
         save(run_dir, state)
         requirements = user_requirements(state)
@@ -12541,10 +13204,18 @@ def advance(run_dir, state, cfg, deadline=None):
         fresh = False
         recovered = None
         if report is not None and job is not None:
-            if (job.get("review_projection_sha256") != projection["projection_sha256"]
-                    or (job.get("review_verification_sha256") is not None
-                        and job.get("review_verification_sha256")
-                        != projection.get("verification_sha256"))):
+            stale = (job.get("review_projection_sha256") != projection["projection_sha256"]
+                     or (job.get("review_verification_sha256") is not None
+                         and job.get("review_verification_sha256")
+                         != projection.get("verification_sha256")))
+            if (not stale
+                    and projection.get("binding_version") == REVIEW_PACKET_BINDING_VERSION
+                    and job.get("review_projection_sha256") is not None
+                    and not packet_binding_matches(job.get("review_packet_binding"),
+                                                   projection)):
+                # New-format reviews must carry the exact producing binding.
+                stale = True
+            if stale:
                 # A cached review produced against another packet/candidate must
                 # never be consumed for this one.
                 state["stale_cached_review"] = {

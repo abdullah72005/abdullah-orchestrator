@@ -200,13 +200,22 @@ real configuration normalization without inference.
 ### v1.2.0 release candidate (2026-11-18)
 
 Candidate base `7c050ee`; offline worktree with Python 3.10.12 on WSL2. No live
-model call, subscription usage, paid request, native terminal session or
-installed V2 binary was used for this candidate evidence.
+model call, subscription usage, paid request or native terminal session was
+measured. Published installation remains the `v1.0.0` tag; v1.2.0 is a local
+candidate identified by the revision in
+[release evidence](release-evidence/v1.2.0/README.md), not a published tag.
+
+The original candidate (`49f2b62`) evidence is preserved in the release-evidence
+directory. These rows describe the corrected candidate; the correction commits
+and exact command output are recorded alongside the logs.
 
 | Check | Result |
 |---|---|
-| Focused v1.2.0 modules | exit 0 — 300 tests, OK |
-| Full deterministic suite | exit 0 — **911 tests, OK, 7 skipped** in 875.2 s |
+| Focused v1.2.0 modules (original candidate `49f2b62`) | exit 0 — 300 tests, OK |
+| Full deterministic suite (original candidate `49f2b62`) | exit 0 — **911 tests, OK, 7 skipped** |
+| Focused correction gate (`26f515b` plus batch corrections) | exit 0 — 241 tests, OK |
+| Full deterministic suite (corrected candidate) | exit 0 — **940 tests, OK, 8 skipped** |
+| Installed OpenCode V2 compatibility module | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Compile | exit 0 |
 | `orchestrator.py version` | product `1.2.0`; supervisor `3.1.0`; schema `3`; contract `2` |
 | Config/risk policy | valid; mechanical 1 check/no review, ordinary 1 check/review, high 2 checks/review |
@@ -214,14 +223,22 @@ installed V2 binary was used for this candidate evidence.
 | Fresh-`HOME` install, twice | exit 0; links created once; config created then preserved; Codex/Claude registration idempotent |
 | MCP initialize/tools/state-only start | 9 tools; start `ok: true`, phase `plan`, no dispatch |
 
-The seven skips are the opt-in `test_opencode_v2_integration` module, which
-requires `ABDULLAH_OPENCODE_V2_BIN`. Detailed logs are in
-[release-evidence/v1.2.0](release-evidence/v1.2.0/README.md).
+The eight full-suite skips are the opt-in `test_opencode_v2_integration` module,
+which requires `ABDULLAH_OPENCODE_V2_BIN`; it is run separately above. Detailed
+logs are in [release-evidence/v1.2.0](release-evidence/v1.2.0/README.md).
+
+The installed V2 read test now generates its hunk through the actual supervisor
+delta path (`capture_batch_boundary` -> `finalize_batch_delta` ->
+`prepare_review_projection`) instead of a hand-written patch fixture. It proves
+only that the installed binary's filesystem endpoint returns the exact bytes of
+that supervisor-generated hunk under the checkout review projection. It does
+**not** attest a real Reviewer Read-tool invocation, model transport, agent
+permission enforcement or native terminal lifecycle.
 
 Not measured in this candidate: live Medium-vs-High planning quality/cost,
 token or wall-time savings, native terminal duration/Esc/reconnect behavior,
-authenticated Codex/Claude/OpenCode stages, and the installed V2 read-policy
-proof. Fake-CLI and fake-host fixtures establish supervisor behavior only.
+authenticated Codex/Claude/OpenCode stages, and real Reviewer tool calls.
+Fake-CLI and fake-host fixtures establish supervisor behavior only.
 
 ### Real end-to-end milestone (2026-11-16 → 2026-11-18)
 
