@@ -119,20 +119,27 @@ The installer deliberately never rewrites host settings. Verify with
 
 ## 4. Configure
 
-Edit `~/.config/abdullah-orchestrator/config.json`:
+The installer already copied `scripts/config.example.json` to
+`~/.config/abdullah-orchestrator/config.json`. Edit the model IDs there; this
+complete example is the minimum that passes the shipped validator:
 
 ```json
 {
+  "schema_version": 3,
   "architect": {
-    "codex": {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"}
+    "codex":  {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
+    "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
   },
   "workers": {
     "explorer":    {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "low",  "billing": "go"},
     "implementer": {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"},
     "reviewer":    {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
   },
-  "schema_version": 3,
-  "runtime": {"supervisor_version": "3.1.0"}
+  "fallback": {"enabled": false},
+  "limits": {"max_stage_seconds": 17000, "max_worker_seconds": 14400},
+  "permissions": {"allow_push": false, "allow_deploy": false, "allow_production": false},
+  "verification": {"require_checks": true, "require_docker_source_proof": true},
+  "runtime": {"supervisor_version": "3.1.0", "opencode_supported": [">=1.18 <2.0", ">=2.2 <3.0"]}
 }
 ```
 

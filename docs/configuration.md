@@ -45,6 +45,12 @@ worker to an API-billed or remote route.
 
 ## The configuration shape
 
+The complete, validator-clean starting point is
+[`scripts/config.example.json`](../scripts/config.example.json). The excerpt below
+shows the fields that matter most; it omits `permissions`, `verification`,
+`authorization` and `risk_policy`, which the shipped file includes. Later recipes
+show individual keys to merge into your config, not standalone files.
+
 ```json
 {
   "schema_version": 3,
@@ -77,8 +83,8 @@ worker to an API-billed or remote route.
 }
 ```
 
-The shipped example also contains `permissions`, `verification`, `runtime`,
-`authorization`, and `risk_policy` blocks; see the sections below.
+The shipped file is the authoritative complete example; use it directly, then
+edit only the values you need.
 
 ## Architect models
 

@@ -38,17 +38,35 @@ default worker route is OpenCode Go.
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    U["You"] --> C["Codex / Claude conversation<br/>visible coordinator"]
-    C -->|"stdio MCP · 9 tools"| A["Strong Architect<br/>plan · diagnose · accept"]
-    A --> E["Explorer · optional<br/>read-only"]
-    E --> I["Implementer<br/>one bounded writer"]
-    I --> V["Supervisor verification<br/>executes argv · binds evidence"]
-    V --> R["Independent Reviewer<br/>fresh context"]
-    R --> D{"Architect verdict"}
-    D -->|"changes required"| I
-    D -->|"approved"| Z["Complete<br/>durable evidence on disk"]
+```text
+        You
+         |
+         v
++--------------------------------------+
+| Codex / Claude conversation          |
+| visible coordinator  |  stdio MCP    |
++------------------+-------------------+
+                   |
+                   v
++--------------------------------------+
+| Python supervisor                    |
+| state | containment | evidence       |
++------------------+-------------------+
+                   |
+                   v
++--------------------------------------+
+| 1  Strong Architect .... plan        |
+| 2  Explorer (optional) . read-only   |
+| 3  Implementer ......... one writer  |
+| 4  Verification ........ argv checks |
+| 5  Reviewer ............ fresh eyes  |
+| 6  Architect ........... verdict     |
++------------------+-------------------+
+                   |
+      approved ----+---- changes required
+         |                       |
+         v                       +--> repeat 3-6, bounded
+      complete
 ```
 
 Every stage is one visible foreground call. The coordinator announces the worker
@@ -57,8 +75,9 @@ hidden inside a single "do everything" call.
 
 The supervisor, not a model, owns `state.json`, the journal, dispatch records,
 process containment and verification. Explorer is skipped unless the run's policy
-allows it. Human-only actions (`approve-plan`, `authorize-route`,
-`approve-fallback`, `retire`) are operator CLI commands — never MCP tools.
+allows it. The correction loop is bounded by configured limits. Human-only
+actions (`approve-plan`, `authorize-route`, `approve-fallback`, `retire`) are
+operator CLI commands — never MCP tools.
 
 **The split that matters:** the model decides, and the supervisor enforces.
 
@@ -169,12 +188,14 @@ Code setup, upgrades, rollback and uninstall — is in
 
 ## Configuration
 
-One file: `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`).
-The full reference is [docs/configuration.md](docs/configuration.md); every
-example there is validated by the shipped loader.
+One file: `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`), or
+start from `scripts/config.example.json`. The full reference is
+[docs/configuration.md](docs/configuration.md). This complete example passes the
+shipped validator:
 
 ```json
 {
+  "schema_version": 3,
   "architect": {
     "codex":  {"model": "gpt-6.1-sol", "effort": "high", "auth": "subscription"},
     "claude": {"model": "claude-opus-5-5", "effort": "high", "auth": "subscription"}
@@ -184,8 +205,10 @@ example there is validated by the shipped loader.
     "implementer": {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"},
     "reviewer":    {"provider": "opencode-go", "model": "opencode-go/deepseek-v4.1-flash", "variant": "high", "billing": "go"}
   },
+  "fallback": {"enabled": false},
   "limits": {"max_stage_seconds": 17000, "max_worker_seconds": 14400},
-  "schema_version": 3,
+  "permissions": {"allow_push": false, "allow_deploy": false, "allow_production": false},
+  "verification": {"require_checks": true, "require_docker_source_proof": true},
   "runtime": {"supervisor_version": "3.1.0", "opencode_supported": [">=1.18 <2.0", ">=2.2 <3.0"]}
 }
 ```
