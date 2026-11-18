@@ -12,9 +12,12 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
   documentation-only child. The full suite below ran from the r02 code tree.
   The follow-up evidence commit changes documentation, logs and test/evidence
   assertions only.
-- Batch 1 final corrections (r03, this candidate): code and tests at
+- Batch 1 final corrections (r03): code and tests at
   `52e52879cb708cdc97a03c3adc2b76cdcbdd4abb`; the evidence commit is its
   documentation-only child. The r03 suite ran from that exact code/test tree.
+- Batch 1 delta-binding correction (r04, this candidate): code and tests at
+  `c575199a8fd627812d52686bc318e964a91ffe86`; the evidence commit is its
+  documentation-only child. The r04 suite ran from that exact code/test tree.
 - Public product version: `1.2.0`
 - Internal identifiers: supervisor `3.1.0`, state/config schema `3`,
   report contract `2`, verification evidence `2`
@@ -75,6 +78,44 @@ above. The installed read test proves only that the binary's filesystem endpoint
 returns the exact bytes of a supervisor-generated projection hunk. It does not
 attest a real Reviewer Read-tool invocation, model transport, permission
 enforcement or native terminal behavior.
+
+## Batch 1 delta completion binding (r04 code `c575199`)
+
+The r04 correction closes the remaining delta-record binding gap:
+
+- A writer-delta record can no longer be reported complete without an attested
+  completion source identity. `_record_batch_delta(..., final_snapshot=None)`
+  persists one counted incomplete attempt with the reason
+  `writer completion not attested`, which reaches `batch_delta_index()`,
+  `delta/index.json` and the Reviewer-visible limitations.
+- Retained durable indexes are reused only when their job, attempt, batch/plan,
+  dispatch HEAD, dispatch signature, expected completion signature, completion
+  projection and every referenced hunk's size/digest agree. A mismatched or
+  tampered index is rebuilt from the preserved boundary and matching completion
+  when that evidence supports it; otherwise the incomplete-attempt record and
+  precise reason are retained.
+- Normal completion records the delta only after the existing containment gate
+  proves the writer stopped and no source violation blocks completion. A failed
+  or interrupted child re-samples the completion after the stop gate; if the
+  stop is unproven or the post-stop snapshot fails, no complete evidence is
+  produced. Job-id idempotency and already-recorded evidence are preserved.
+
+Probes exercised: missing completion, wrong completion against a valid retained
+index, tampered retained hunk, valid retained-index reuse with the actual hunk,
+guarded failed worker, unproven stop, and crash-recovered/repeated recovery.
+
+| Check | Command | Result |
+|---|---|---|
+| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_orchestrator test_v31_review_recovery test_v31_dispatch_safety` | exit 0 — **189 tests, OK** in 323.4 s (`focused-b01-r04.txt`) |
+| Full suite | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **973 tests, OK, 8 skipped** in 1251.4 s (`suite-b01-r04.txt`) |
+| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** in 32.1 s on `opencode v2.2.7` (`opencode-v2-b01-r04.txt`) |
+| Compile / version / diff | `python3 -m compileall -q scripts`, `orchestrator.py version`, `git diff --check 7c050ee..HEAD` | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` (`version-b01-r04.json`) |
+
+One initial full-suite attempt under load failed the pre-existing timing-sensitive
+`test_decision_child_is_clipped_to_the_remaining_stage_budget` on
+`failed_jobs`; it passed three standalone runs and the clean full rerun above
+produced the recorded 973-test result. No r04 code path is involved in that plan
+stage. The eight full-suite skips remain the opt-in OpenCode V2 module.
 
 ## Batch 1 final corrections (r03 code `52e5287`)
 

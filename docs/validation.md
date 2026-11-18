@@ -206,10 +206,12 @@ candidate identified by the revision in
 [release evidence](release-evidence/v1.2.0/README.md), not a published tag.
 
 The original candidate (`49f2b62`) evidence is preserved in the release-evidence
-directory, as are the r01 (`26f515b`) and r02 (`345ddb4`) correction logs. The
-r03 correction (`52e5287`, code and tests) closes the remaining Batch 1 recovery,
-snapshot-identity and staged-deletion findings; its evidence commit only adds
-documentation and logs. No live model call was made by any of these gates.
+directory, as are the r01 (`26f515b`), r02 (`345ddb4`) and r03 (`52e5287`)
+correction logs. The r04 correction (`c575199`, code and tests) binds each
+writer-delta record to an attested completion and rejects retained indexes whose
+dispatch/completion identity or hunk artifacts do not match; its evidence
+commit only adds documentation and logs. No live model call was made by any of
+these gates.
 
 | Check | Result |
 |---|---|
@@ -218,9 +220,11 @@ documentation and logs. No live model call was made by any of these gates.
 | Focused correction gate r01 (`26f515b`) | exit 0 — **241 tests, OK** |
 | Focused correction gate r02 (`345ddb4`) | exit 0 — **157 tests, OK** |
 | Focused correction gate r03 (`52e5287`) | exit 0 — **195 tests, OK** |
+| Focused correction gate r04 (`c575199`) | exit 0 — **189 tests, OK** |
 | Full deterministic suite (corrected candidate) | exit 0 — **953 tests, OK, 8 skipped** |
 | Full deterministic suite (r03 candidate) | exit 0 — **967 tests, OK, 8 skipped** |
-| Installed OpenCode V2 compatibility module (r03) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
+| Full deterministic suite (r04 candidate) | exit 0 — **973 tests, OK, 8 skipped** |
+| Installed OpenCode V2 compatibility module (r04) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Installed OpenCode V2 compatibility module (r02) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Compile | exit 0 |
 | `orchestrator.py version` | product `1.2.0`; supervisor `3.1.0`; schema `3`; contract `2` |
