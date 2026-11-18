@@ -2057,6 +2057,7 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
             self.project, self.rundir, job_id, boundary,
             final_snapshot=orc.source_snapshot(self.project), attempt=1)
         orc.save(self.rundir, state)
+        rolled_back = copy.deepcopy(state)
         self.assertTrue(orc.recover_finished_dispatch(self.rundir, state))
         records = [item for item in state["batch_deltas"]
                    if item.get("job_id") == job_id]
@@ -2067,7 +2068,15 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
         entry = next(item for item in record["paths"] if item["path"] == "app.py")
         self.assertTrue(entry["changed_in_window"])
         self.assertTrue(entry["hunks"])
-        # Replay must reuse the exact attempt, never append it again.
+        # A crash before the state save replays the same attempt via the same
+        # durable index; it must not add a second record.
+        orc.save(self.rundir, rolled_back)
+        self.assertTrue(orc.recover_finished_dispatch(self.rundir, rolled_back))
+        self.assertEqual(len([item for item in rolled_back["batch_deltas"]
+                              if item.get("job_id") == job_id]), 1)
+        self.assertEqual(rolled_back["batch_deltas"][0]["index_sha256"],
+                         prewritten["index_sha256"])
+        # An explicit replay of the recording entry point is also idempotent.
         orc._record_batch_delta(self.rundir, state, self.project, job_id,
                                 boundary, orc.source_snapshot(self.project))
         self.assertEqual(len([item for item in state["batch_deltas"]
@@ -2198,6 +2207,7 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
                 plan_version="v")
         self.assertIn("zzz_staged.py", boundary["omitted_paths"])
         (self.project / "aaa.py").write_text("writer changed\n")
+        (self.project / "zzz_staged.py").write_text("writer also touched\n")
         result = orc.finalize_batch_delta(
             self.project, self.rundir, "impl-cap", boundary,
             final_snapshot=orc.source_snapshot(self.project), attempt=1)
@@ -2205,8 +2215,7 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
                      if item["path"] == "zzz_staged.py")
         self.assertEqual(entry["index_comparison"], "unavailable")
         self.assertFalse(entry.get("index_changed_in_window"))
-        self.assertFalse(any(hunk["scope"].startswith("index")
-                             for hunk in entry.get("hunks") or []))
+        self.assertFalse(entry.get("hunks"))
         self.assertTrue(any(item.get("reason") == "dispatch index state not captured"
                             for item in result["limitations"]))
         state = self.saved(self.state(
@@ -2231,6 +2240,27 @@ class BatchCorrectionsR03Tests(ReleaseFixture):
             ["git", "-C", str(self.project), "show", ":zzz_staged.py"],
             capture_output=True, text=True, check=True).stdout
         self.assertEqual(staged, "pre-existing staged\n")
+
+    def test_unavailable_index_before_image_stays_explicit(self):
+        (self.project / "app.py").write_text("value = 2\n")
+        subprocess.run(["git", "add", "app.py"], cwd=self.project, check=True,
+                       capture_output=True)
+        (self.project / "app.py").write_text("value = 1\n")
+        boundary = orc.capture_batch_boundary(
+            self.project, self.rundir, "impl-index-lost", batch_index=0,
+            plan_version="v")
+        manifest = orc.read_json(Path(boundary["dir"]) / "manifest.json")
+        blob = manifest["entries"]["app.py"]["index"]["blob"]
+        Path(blob).unlink()
+        result = orc.finalize_batch_delta(
+            self.project, self.rundir, "impl-index-lost", boundary,
+            final_snapshot=orc.source_snapshot(self.project), attempt=1)
+        entry = next(item for item in result["paths"] if item["path"] == "app.py")
+        self.assertEqual(entry["index_unavailable"],
+                         "index_before_bytes_unavailable")
+        self.assertEqual(entry["index_hunks"], [])
+        self.assertFalse(any(hunk["scope"].startswith("index")
+                             for hunk in entry.get("hunks") or []))
 
     def test_unchanged_ignored_runtime_input_keeps_continuity(self):
         exclude = self.project / ".git" / "info" / "exclude"
