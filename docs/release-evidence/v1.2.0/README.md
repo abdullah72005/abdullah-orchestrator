@@ -18,10 +18,12 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
 - Batch 1 delta-binding correction (r04): code and tests at
   `c575199a8fd627812d52686bc318e964a91ffe86`; the evidence commit is its
   documentation-only child. The r04 suite ran from that exact code/test tree.
-- Batch 1 reconstruction-attestation correction (r05, this candidate): code and
-  tests at `4a00126143ed5ab6f9a1ad08afa66754d0f3aeed`; the evidence commit is
-  its documentation-only child. The r05 suite ran from that exact code/test
-  tree.
+- Batch 1 reconstruction-attestation correction (r05): code and tests at
+  `4a00126143ed5ab6f9a1ad08afa66754d0f3aeed`; the evidence commit is its
+  documentation-only child. The r05 suite ran from that exact code/test tree.
+- Batch 1 crash-safe delta publication (r06, this candidate): code and tests at
+  `58857664be23653c6fb45fa5412cb2998f3c72f2`; the evidence commit is its
+  documentation-only child. The r06 suite ran from that exact code/test tree.
 - Public product version: `1.2.0`
 - Internal identifiers: supervisor `3.1.0`, state/config schema `3`,
   report contract `2`, verification evidence `2`
@@ -82,6 +84,39 @@ above. The installed read test proves only that the binary's filesystem endpoint
 returns the exact bytes of a supervisor-generated projection hunk. It does not
 attest a real Reviewer Read-tool invocation, model transport, permission
 enforcement or native terminal behavior.
+
+## Batch 1 crash-safe delta publication (r06 code `5885766`)
+
+The r06 correction makes rebuilt delta publication crash-safe:
+
+- `finalize_batch_delta(..., stage=True)` writes a rebuilt index and its hunks
+  under a unique `after/staging-<id>/` tree. It never overwrites hunks
+  referenced by an already-published index.
+- `_record_batch_delta()` publishes the reusable `after/index.json` with one
+  atomic replace only after dispatch/completion identity, hunk identity,
+  before/after source attestation and artifact-set checks all pass. The durable
+  index carries a versioned `attestation` binding the dispatch signature,
+  completion signature, projection, source before/after and exact hunk set.
+- Reuse requires that attestation. Prior-format indexes without it are treated
+  as unproven, preserved aside as `index.prior-<id>.json`, and rebuilt from the
+  recorded stopped completion when possible; otherwise the counted incomplete
+  attempt and Reviewer limitation are retained. A drifted provisional index is
+  left under staging for audit and is invisible to the durable reuse path.
+- Interruptions after staging but before post-scan validation, after validation
+  but before publish, and after publish but before the state commit are covered.
+  The published-but-not-committed case reuses the same attested index checksum
+  without duplicating the record.
+
+| Check | Command | Result |
+|---|---|---|
+| r03–r06 regressions | `PYTHONPATH=scripts/tests python3 -m unittest -v ...BatchCorrectionsR03Tests ...R04Tests ...R05Tests ...R06Tests` | **Ran 27 tests in 57.305s, OK** |
+| Focused gate | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_workflow test_orchestrator test_v31_review_recovery test_v31_dispatch_safety` | exit 0 — **196 tests, OK** in 273.0 s (`focused-b01-r06.txt`) |
+| Full suite (single stabilized run) | `python3 -m unittest discover -s scripts/tests -v` | exit 0 — **980 tests, OK, 8 skipped** in 1030.1 s (`suite-b01-r06.txt`) |
+| Installed OpenCode V2 module | `ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" python3 -m unittest discover -s scripts/tests -p test_opencode_v2_integration.py -v` | exit 0 — **8 tests, OK** in 32.6 s on `opencode v2.2.7` (`opencode-v2-b01-r06.txt`) |
+| Isolated timing-sensitive test | `test_v31_stage_deadline...test_decision_child_is_clipped_to_the_remaining_stage_budget` | **Ran 1 test, OK** |
+| Compile / version / diff | `python3 -m compileall -q scripts`, `orchestrator.py version`, `git diff --check 7c050ee..HEAD` | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` (`version-b01-r06.json`) |
+
+The eight skips remain the opt-in OpenCode V2 module.
 
 ## Batch 1 reconstruction attestation (r05 code `4a00126`)
 
