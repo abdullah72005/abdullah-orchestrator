@@ -5810,7 +5810,7 @@ def source_snapshot(project: Path, include_generated=False, cfg=None, provenance
             "provenance_complete": manifest["complete"],
             "runtime_inputs": manifest,
             "environment": environment_provenance(cfg),
-            "configuration": configuration_provenance(),
+            "configuration": configuration_provenance(cfg),
             "toolchain": toolchain_identity(),
         })
     return result
@@ -15696,7 +15696,7 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
                                     metadata=selection.get("metadata", {}))
     # Keep the user's exact words.  Validation may reject whitespace-only text,
     # but the stored requirement is never trimmed or rewritten.
-    baseline = source_snapshot(project)
+    baseline = source_snapshot(project, cfg=cfg)
     handoff_path = approved_handoff
     authorized = bool(authorize_handoff)
     if bool(handoff_path) != authorized:

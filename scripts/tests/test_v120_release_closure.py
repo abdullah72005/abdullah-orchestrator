@@ -134,6 +134,23 @@ class ConfigPolicyTests(ReleaseFixture):
              "toolchain": {}, "runtime_inputs": {}})
         self.assertEqual(drift, [])
 
+    def test_stage_observation_binds_policy_not_a_later_file_read(self):
+        old_cfg = copy.deepcopy(self.cfg)
+        recorded = orc.source_snapshot(self.project, cfg=old_cfg)
+        changed = copy.deepcopy(self.cfg)
+        changed["limits"]["max_stage_seconds"] = 4599
+        orc.atomic_json(self.cfg_path, changed)
+        current = orc.source_snapshot(self.project, cfg=changed)
+        self.assertNotEqual(recorded["configuration"]["policy"]["sha256"],
+                            current["configuration"]["policy"]["sha256"])
+        self.assertIn("configuration",
+                      orc.provenance_drift(recorded, current))
+        # Passing the stage's parsed config records that policy, not the
+        # later file contents, so a mid-stage policy edit cannot be laundered.
+        self.assertEqual(
+            recorded["configuration"]["policy"]["sha256"],
+            orc.config_policy_fingerprint(old_cfg)["sha256"])
+
     def test_genuine_policy_change_still_blocks(self):
         state = self.policy_state()
         cfg = copy.deepcopy(self.cfg)
