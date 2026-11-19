@@ -29,7 +29,40 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
   report contract `2`, verification evidence `2`
 
 This directory records the deterministic evidence produced from the candidate
-root. It is a local candidate record, not a publication claim.
+root. It is a local candidate record, not a publication claim. Closure-era low
+findings and fixture-assumption notes are recorded separately in
+`closure-findings.md`.
+
+## Evidence epochs: historical baseline versus candidate
+
+Every result in this directory carries one of three labels. Labels do not alter
+the measured numbers, which are preserved exactly as recorded.
+
+- **HISTORICAL baseline evidence.** The 870-test full-suite baseline recorded in
+  `docs/validation.md` was produced on base
+  `7c050ee75d90efb22b96c5c7fafa35e7f04712f7` with Python 3.10.12 on the
+  baseline host; the 461–471 s figures there are per CI job on Python
+  3.10/3.12/3.13. Its counts, timings and skip distribution are historical
+  measurements of that base and those environments, not a result of this
+  candidate.
+- **HISTORICAL correction evidence.** The `49f2b62` initial-candidate table and
+  the `26f515b` correction table below remain as recorded for those revisions.
+- **Candidate evidence.** The r06 full suite on
+  `58857664be23653c6fb45fa5412cb2998f3c72f2` — **980 tests, OK, 8 skipped** in
+  1030.1 s (`suite-b01-r06.txt`) — together with its focused gate, installed
+  OpenCode V2 module and version/diff checks, is the candidate evidence *for
+  that revision*. The later release-closure revision
+  `b0d88f32d2182c2d35c72ab9cf69af66117257f6` supersedes it with the
+  1016-test closure run (`suite-closure.txt`) documented below; the r06 record
+  is preserved as history.
+
+Neither epoch proves the behaviour of a newer host, a different interpreter, a
+different OpenCode/Codex/Claude build, or live model/subscription behaviour.
+The earlier timing-sensitive
+`test_v31_stage_deadline ... test_decision_child_is_clipped_to_the_remaining_stage_budget`
+failure during a loaded r04-era full-suite attempt is **historical**, not a
+candidate result; its later isolated and full-suite passes are recorded in the
+r04–r06 sections below.
 
 ## Commands
 
@@ -310,6 +343,151 @@ and then make the single documented field change:
 Leave `effort: "high"` and `auth: "subscription"` unchanged. Do not auto-migrate
 installed config or rewrite saved routes; `scripts/config.example.json` already
 ships the new default for new installations.
+
+## Model defaults versus execution policy (1.2.0 closure)
+
+The raw config file path and SHA-256 are still retained for audit and for
+historical compatibility. Alongside them, a versioned semantic policy
+fingerprint covers supervisor execution, verification, safety and authorization
+policy.
+
+- Only named role-selection preferences are excluded from that fingerprint,
+  because their effective values are pinned per run.
+- Unknown or behaviour-bearing keys stay fail-closed: trust/permissions, command
+  policy, runtime-input discovery, risk policy, limits, routing/security policy
+  and fallback enablement/consent are all inside the fingerprint.
+- A preference-only or formatting-only config edit therefore no longer
+  invalidates run admission or the source-bound verification/recovery
+  provenance. A genuine runtime/authorization/verification policy change still
+  produces the established incompatibility and the explicit resolution path.
+- Runs created before the field existed adopt the new metadata only from exact
+  old evidence: an old raw-config digest that matches the saved run, or an
+  operator-supplied old config file whose SHA-256 matches it. If the old policy
+  cannot be proven, the existing explicit migration/reverification protection is
+  retained.
+- Routes are never rewritten. The complete selected primary and fallback
+  identities (model, effort, host fallback, billing) stay pinned per run, and a
+  change to another role's default or to the controlling host model cannot
+  alter an approved run's route or approval.
+
+## Authoritative model metadata and per-run selection
+
+Catalogue surfaces inspected for validation — observations, not entitlements or
+live-quality proof:
+
+- **Codex:** initialized `model/list` over
+  `app-server --listen stdio://` (experimental API) returned provider entries
+  with `supportedReasoningEfforts` (observed: Sol 6.1 and 6.2 with Medium and
+  High).
+- **OpenCode V1:** the `models --verbose` catalogue already used by `doctor`.
+- **OpenCode V2:** `api --standalone get /api/model` returned effective entries
+  with `providerID`, `id`, `enabled` and `variants` (observed enabled
+  `opencode-go/deepseek-v4.1-flash` with `low`, `high` and `max`).
+- **Claude:** help-based `--effort` contract validation only. There is no model
+  catalogue surface, so a Claude selection is not catalogue-confirmed.
+
+States stay distinct: confirmed support, confirmed unsupported, and
+unavailable/unverified. Missing metadata is never reported as support. A new or
+changed selection that the active adapter cannot attest requires the explicit
+`--allow-unverified-metadata` acknowledgement before work or consent is spent.
+
+Per-run overrides are role-keyed JSON; omitted safe fields are inherited, and a
+provider change requires a complete route including billing. `switch-role` is a
+human-only, read-only-preview-then-apply command: it takes a backup of run
+state first, journals the prior and new route, bumps the role generation,
+invalidates
+incompatible continuation, pending verdict/cache/recovery and fallback
+authorization for that role, preserves prior history and unaffected roles, and
+refuses use mid-stage. Routes and grants are pinned per run, so a preference
+change cannot reroute an already approved run, and switching alone never grants
+spending permission.
+
+### Operator launch pointers
+
+```bash
+# Read-only preview; no state changes.
+python3 scripts/orchestrator.py switch-role RUN --role ROLE --route route.json
+
+# Apply only with the exact confirmation printed by the preview.
+python3 scripts/orchestrator.py switch-role RUN --role ROLE --route route.json \
+  --apply --confirm switch-role:RUN:ROLE:SHA12
+
+# Adopt a pre-policy run's exact old config, backup-first.
+python3 scripts/orchestrator.py adopt-config-policy RUN --old-config PATH \
+  --acknowledge "..."
+```
+
+The authenticated Reviewer Read smoke (AOR120-A1) is prepared by
+`scripts/reviewer_smoke.py`:
+
+```bash
+# Read-only readiness: route preflight, installed dialect and normalized profile.
+python3 scripts/reviewer_smoke.py preflight --root <ROOT>
+
+# Operator action: exactly one real Reviewer dispatch on the pinned Go route.
+python3 scripts/reviewer_smoke.py launch --root <ROOT>
+
+# Recorded evidence, including the Read event/output and unchanged checkout.
+python3 scripts/reviewer_smoke.py inspect --root <ROOT>
+```
+
+Preparation makes no model call. Launch and its exact results are a separate
+operator action recorded in that root's `evidence.json`; this document does not
+claim them in advance.
+
+## Closure batch verification (19 November 2026)
+
+Local candidate code/test revision
+`b0d88f32d2182c2d35c72ab9cf69af66117257f6`. All commands ran from the candidate
+root with the hermetic test environment; no model was dispatched.
+
+```bash
+PYTHONPATH=scripts/tests python3 -m unittest -v \
+  test_v120_release_workflow test_interactive_recovery test_quota_changes \
+  test_v31_review_recovery test_v31_acceptance_integrity test_v31_stage_invariants \
+  test_v31_stage_deadline test_v31_dispatch_safety test_v31_worker_routes \
+  test_v31_campaign_integration test_v31_route_migration \
+  test_structured_output_schemas test_v31_claude_setup test_release_version \
+  test_v120_release_closure
+
+python3 -m unittest discover -s scripts/tests -v
+ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" \
+  python3 -m unittest discover -s scripts/tests \
+  -p 'test_opencode_v2_integration.py' -v
+python3 -m compileall -q scripts
+python3 scripts/orchestrator.py version
+```
+
+- Focused gates: **404 tests, OK** in 749.037 s (`test_v120_release_closure`
+  adds 32 closure tests).
+- Complete local suite: **1016 tests in 1244.145 s, 1008 passed, 8 opt-in
+  OpenCode V2 skips, exit 0** (`suite-closure.txt`). The eight skips are the
+  same module exercised separately next.
+- Installed OpenCode V2.2.7: **8 tests, OK** in 32.342 s
+  (`opencode-v2-closure.txt`).
+- `compileall`: clean. `version`: product `1.2.0`, supervisor `3.1.0`,
+  state/config schema `3`, report contract `2`, verification evidence `2`,
+  config policy `1`.
+- Environment-sensitive fixtures: the five named tests passed twice
+  independently (21.286 s and 21.277 s) and the complete
+  `test_v31_stage_deadline` module passed in 19.767 s after the test-only
+  start-marker gating; see `closure-findings.md`.
+- Archive identity (`archive-identity-b0d88f3.txt`): `git archive` of the exact
+  final revision has **254 files**, byte-for-byte and mode-for-mode identical to
+  `git ls-tree -r` (`mode mismatches 0`, `blob mismatches 0`), executable bits
+  only on `scripts/install_wsl.py` and `scripts/orchestrator.py`; archive
+  SHA-256 `41fe839aabd951060a71146b7bdcbdfee997b543914ef2e92b3f5809964e36ef`.
+  The historical `/mnt/c/Users/abdul/Downloads/abdullah-orchestrator-main (8).zip`
+  independently re-verified at SHA-256
+  `f808c36f90a9aea5b325b5d4829ed7e54d52b4aa28285d8da08812207c8cc222`, 281
+  entries, 252 files exactly equal to `git archive 626d8c6`.
+- Model metadata observation:
+  `model-metadata-observation.json` records confirmed catalogue support for the
+  installed Codex `0.169.1` and OpenCode `2.2.7` routes. This is metadata, not
+  entitlement, billing or live-quality proof.
+- Reviewer Read smoke: prepared, preflighted and **not launched**
+  (`reviewer-smoke-pointer.md`, `reviewer-smoke-preflight.json`). The one real
+  authenticated Reviewer dispatch remains an operator action.
 
 ## Explicit limitations
 

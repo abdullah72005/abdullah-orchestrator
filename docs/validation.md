@@ -21,8 +21,18 @@ python3 -m unittest discover -s scripts/tests
   `ABDULLAH_CHECKOUT_REGISTRY` values from a real run are replaced with
   temporary paths, so the suite cannot read or write live state.
 
-Coverage areas:
+**Validation policy.** The 870-test row above is historical baseline evidence
+for base `7c050ee` on Python 3.10.12 and CI 3.10/3.12/3.13; it is not a result
+of the current candidate. During development, run directly affected tests,
+negative cases and fast compile/config/link checks; expand to integration
+modules when state, recovery, billing, grants, verification authority or
+cross-module behavior changes. Run **one complete local suite** on the exact
+finalized code/test revision. Do not repeat the full suite for every edit, and
+do not treat CI as a replacement for that local gate. A documentation-only
+follow-up needs documentation/version checks plus proof that the tested
+code/test tree is byte-identical.
 
+Coverage areas:
 | Area | Representative tests |
 |---|---|
 | State machine and phases | plan → implement → verify → review → accept, corrections, amendments |

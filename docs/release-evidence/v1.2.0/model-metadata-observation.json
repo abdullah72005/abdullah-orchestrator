@@ -1,0 +1,103 @@
+{
+    "binaries": {
+        "claude": "2.1.247 (Claude Code)",
+        "codex": "codex-cli 0.169.1",
+        "opencode": "opencode v2.2.7"
+    },
+    "metadata": {
+        "architect": {
+            "detail": "initialized app-server model/list",
+            "effort_supported": true,
+            "model_listed": true,
+            "reason": null,
+            "source": "codex_app_server",
+            "state": "confirmed",
+            "variants": [
+                "high",
+                "low",
+                "max",
+                "medium",
+                "ultra",
+                "xhigh"
+            ],
+            "version": null
+        },
+        "explorer": {
+            "detail": "standalone /api/model",
+            "effort_supported": true,
+            "model_listed": true,
+            "reason": null,
+            "source": "opencode_v2_api",
+            "state": "confirmed",
+            "variants": [
+                "high",
+                "low",
+                "max"
+            ],
+            "version": "opencode v2.2.7"
+        },
+        "implementer": {
+            "detail": "standalone /api/model",
+            "effort_supported": true,
+            "model_listed": true,
+            "reason": null,
+            "source": "opencode_v2_api",
+            "state": "confirmed",
+            "variants": [
+                "high",
+                "low",
+                "max"
+            ],
+            "version": "opencode v2.2.7"
+        },
+        "reviewer": {
+            "detail": "standalone /api/model",
+            "effort_supported": true,
+            "model_listed": true,
+            "reason": null,
+            "source": "opencode_v2_api",
+            "state": "confirmed",
+            "variants": [
+                "high",
+                "low",
+                "max"
+            ],
+            "version": "opencode v2.2.7"
+        }
+    },
+    "notes": [
+        "Catalogue presence is not entitlement, billing or live-quality proof.",
+        "No inference request was made; probes use local CLI metadata surfaces."
+    ],
+    "observed_at": "2026-11-19T14:14:54+00:00",
+    "python": "3.10.12",
+    "routes": {
+        "architect": {
+            "billing": "subscription",
+            "effort": "high",
+            "model": "gpt-6.1-sol",
+            "provider": "codex"
+        },
+        "explorer": {
+            "billing": "go",
+            "effort": "low",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "provider": "opencode",
+            "worker_provider": "opencode-go"
+        },
+        "implementer": {
+            "billing": "go",
+            "effort": "high",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "provider": "opencode",
+            "worker_provider": "opencode-go"
+        },
+        "reviewer": {
+            "billing": "go",
+            "effort": "high",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "provider": "opencode",
+            "worker_provider": "opencode-go"
+        }
+    }
+}

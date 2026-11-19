@@ -15,11 +15,21 @@ cd abdullah-orchestrator
 python3 --version   # 3.10+
 ```
 
-Run the deterministic suite:
+Run focused checks while iterating. The complete deterministic suite is the
+final gate for a stabilized candidate, not a per-edit loop:
 
 ```bash
-python3 -m unittest discover -s scripts/tests
+# Directly affected modules (seconds to a few minutes).
+PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_closure
+
+# Complete local gate: run once on the exact finalized code/test revision.
+python3 -m unittest discover -s scripts/tests -v
 ```
+
+CI is exceptional: use it when a change needs another host or when the project
+contract requires it, and never as a substitute for the final local gate. A
+documentation-only follow-up needs documentation/version checks plus proof that
+the tested code/test tree is byte-identical.
 
 The suite is hermetic: it replaces `codex`, `claude`, and `opencode` with fakes
 and redirects `ABDULLAH_CONFIG`, `ABDULLAH_STATE_DIR`, and the checkout registry

@@ -4,9 +4,50 @@ All notable changes to Abdullah Orchestrator are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [Unreleased] — 2026-11-19
 
-Nothing yet.
+### v1.2.0 release closure
+
+Same public `1.2.0` version and internal identifiers (supervisor `3.1.0`,
+state/config schema `3`, report contract `2`, verification evidence `2`).
+Additive state fields keep older runs readable.
+
+### Added
+
+- Versioned semantic config-policy provenance. A preference-only or
+  formatting-only config edit no longer invalidates run admission or
+  source-bound verification provenance; behaviour-bearing and unknown keys stay
+  fail-closed. Pre-policy runs adopt metadata only from a matching old raw
+  digest or an operator-supplied old config whose SHA-256 matches.
+- Authoritative model metadata checks for Codex (`app-server` initialized
+  `model/list`), OpenCode V1 (`models --verbose`), OpenCode V2
+  (`api --standalone get /api/model`) and the Claude `--effort` contract.
+  Confirmed, unsupported and unavailable stay distinct; missing metadata is
+  never support.
+- Run-scoped role-keyed route overrides at start (CLI `--routes`, MCP `routes`),
+  with explicit billing on provider changes and metadata validation before any
+  state, lease or billable work.
+- Human-only `switch-role` with a read-only preview, exact-route confirmation,
+  backup-first state copy, role-generation bump, journaling and invalidation of
+  incompatible continuation, pending verdict/cache/recovery and fallback
+  consent.
+- `adopt-config-policy` backup-first operator adoption for pre-policy runs.
+- Per-role generation binding for cached/recovered reports, route grants and
+  fallback consent, including A→B→A switch protection.
+
+### Fixed
+
+- Preserve both the retained-index and rebuild rejection reasons in a writer
+  limitation when both fail.
+- Host fallback consent is bound to the exact pinned effective route and role
+  generation instead of re-reading the current global fallback model.
+
+### Changed
+
+- The ordinary planning trial no longer uses a Sol-version literal; it requires
+  catalogue-confirmed Medium and High support on the selected Codex model.
+- Contributor validation guidance now uses focused checks during development
+  and one complete local suite on the finalized candidate.
 
 ## [1.2.0] — 2026-11-18
 
