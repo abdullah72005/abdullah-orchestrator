@@ -114,7 +114,14 @@ billing  = architect.<host>.auth
   route-grant path instead.
 - Model IDs are passed through unchanged. Verify them against the installed CLI
   catalog rather than guessing.
-- `effort` is passed to the CLI as its reasoning-effort setting.
+- `effort` is passed to the CLI as its reasoning-effort setting. The persistent
+  Architect pin must be `high`: new configured defaults and run/switch
+  selections at another effort are refused before any state or billable work.
+  Medium is available only through the explicitly scoped
+  `ordinary_planning_trial` for an ordinary initial plan. A legacy run pinned
+  below High keeps its historical route, but the protected dispatch guard
+  refuses acceptance/diagnosis/integration; remediate it with a read-only
+  `switch-role` preview/apply to the same model at `high` (or create a new run).
 
 Example — move the Codex Architect to a different high-effort model:
 
@@ -368,7 +375,12 @@ global defaults. A provider change requires a complete route (model, provider,
 effort, billing) so consent is never inherited by accident.
 
 Role switching is human-only and works at a safe boundary (no active job/check,
-no uncertain state, no unreconciled retry or exploration):
+no uncertain state, no unreconciled retry or exploration), and only while the
+run's saved execution policy is compatible with the current configuration. A
+genuine policy change (`limits`, permissions, verification, unknown keys) is
+refused at preview and again under the apply lock; resolve it with
+`compatibility` and, when appropriate, `migrate-run` or
+`adopt-config-policy`. Preference-only changes do not block a switch.
 
 ```bash
 # 1. Read-only preview: proposed vs pinned route, metadata, downstream effects

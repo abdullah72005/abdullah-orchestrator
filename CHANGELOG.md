@@ -76,6 +76,32 @@ Additive state fields keep older runs readable.
 - Contributor validation guidance now uses focused checks during development
   and one complete local suite on the finalized candidate.
 
+### v1.2.0 release closure · correction 2
+
+- The Reviewer smoke now distinguishes an unobserved negative from a denied or
+  absent capability. Only an exact shell/edit probe denied in the producing
+  session, or an authoritative runtime inventory proving absence, counts; a
+  generic error, another session or an unrelated command stays unverified.
+  Static profile introspection is reported separately, and authenticated Read
+  success remains separately attestable. Read paths resolve against the
+  prepared repository to the exact hunk, not a foreign suffix.
+- Launch is bound to the prepared prompt digest and the exact isolated OpenCode
+  Go V2 subscription route: current pinned/effective route, policy identity,
+  dialect, shipped profile, installed profile, route preflight and prepared
+  evidence must all agree before inference. The completed job's dispatched
+  route must match. Inspection re-derives Read and negative evidence from the
+  digest-verified raw event stream, never from saved summaries alone.
+- Role switching now requires compatible saved/current execution policy at
+  preview and again under the apply lock, using one fresh config observation for
+  the under-lock proposal and route preflight. A stale policy refusal leaves
+  routes, generations, grants and evidence untouched. Preference-only changes
+  still permit a switch.
+- Every new persistent Architect route, including a configured default or an
+  early-stage switch, must use High and a catalogue-confirmed High-capable
+  model. Medium remains scoped to the explicit ordinary planning trial;
+  historical under-effort pins keep the fail-closed protected dispatch guard and
+  have a documented switch-to-High remediation.
+
 ## [1.2.0] — 2026-11-18
 
 **Local release candidate.** Discrete workflow and evidence improvements over

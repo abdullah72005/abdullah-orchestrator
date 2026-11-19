@@ -4334,19 +4334,21 @@ def require_human_operator(action, run_id, confirmation=None, *, expected=None):
             "confirmation_sha256": hashlib.sha256(expected.encode()).hexdigest()}
 
 
-def state_compatibility(state):
+def state_compatibility(state, observed=None):
     """Read-only compatibility classification; never mutates a run.
 
     Comparison uses the semantic policy identity when both sides have it.  A
     matching raw-config digest proves the policy for a pre-policy run and
-    permits the narrow metadata upgrade performed on the next save.
+    permits the narrow metadata upgrade performed on the next save.  ``observed``
+    may be a ``configuration_provenance`` result from the caller's validated
+    config observation, so policy and routes cannot disagree.
     """
     current = STATE_SCHEMA_VERSION
     version = state.get("schema_version")
     supervisor = state.get("supervisor_version")
     config_version = state.get("config_schema_version")
     config_sha = state.get("config_sha256")
-    observed = configuration_provenance()
+    observed = observed or configuration_provenance()
     current_config = observed.get("sha256")
     current_policy = (observed.get("policy") or {}).get("sha256")
     recorded_policy = _recorded_config_policy(state)
@@ -15484,6 +15486,21 @@ def architect_high_problem(verdict):
     return None
 
 
+def architect_selection_problem(route, verdict):
+    """A new persistent Architect route must be able to finish protected work.
+
+    Medium is deliberately scoped to the explicit ``ordinary_planning_trial``
+    for the initial plan; the persistent pin stays High so acceptance,
+    diagnosis and integration never stall on an under-effort route.
+    """
+    effort = str((route or {}).get("effort") or "").strip().lower()
+    if effort != "high":
+        return ("the persistent Architect route requires High (effort 'high') so "
+                "protected decisions remain dispatchable; use the explicit "
+                "ordinary_planning_trial for a Medium initial plan")
+    return architect_high_problem(verdict)
+
+
 def _catalogue_key(host, project, route, dialect):
     return (str(host or ""), os.path.realpath(str(project or "")),
             route.get("provider"),
@@ -15643,10 +15660,10 @@ def resolve_run_routes(cfg, host, project, overrides=None, *, allow_unverified=F
                 f"routes.{role} is not supported by authoritative metadata: "
                 + str(verdict.get("reason") or verdict.get("detail"))
                 + ". Choose a supported model/effort or a compatible CLI.")
-        if role == "architect" and role in changed:
-            high_problem = architect_high_problem(verdict)
-            if high_problem:
-                raise ValueError(f"routes.architect: {high_problem}")
+        if role == "architect":
+            problem = architect_selection_problem(route, verdict)
+            if problem:
+                raise ValueError(f"routes.architect: {problem}")
         if verdict["state"] == "unavailable" and role in changed:
             if not allow_unverified:
                 raise RuntimeError(
@@ -18125,9 +18142,9 @@ def _resolve_single_role_route(cfg, host, role, spec, project, *,
             f"routes.{role} is not supported by authoritative metadata: "
             + str(verdict.get("reason") or verdict.get("detail")))
     if role == "architect":
-        high_problem = architect_high_problem(verdict)
-        if high_problem:
-            raise ValueError(f"routes.architect: {high_problem}")
+        problem = architect_selection_problem(route, verdict)
+        if problem:
+            raise ValueError(f"routes.architect: {problem}")
     if verdict["state"] == "unavailable" and not allow_unverified:
         raise RuntimeError(
             f"routes.{role} cannot be attested from metadata ("
@@ -18160,8 +18177,27 @@ def _switch_preflight_problem(preflight):
     return f"{classification}: {detail}"
 
 
-def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
+def _require_switch_compatible(state, observed):
+    """Refuse a role switch while the saved run's policy is incompatible."""
+    compatibility = state_compatibility(state, observed)
+    if compatibility["status"] != "current":
+        raise RuntimeError(
+            "Role switching requires a run whose saved execution policy is "
+            f"compatible with the current configuration; this run is "
+            f"{compatibility['status']} "
+            f"(saved policy {compatibility.get('config_policy_sha256')}, current "
+            f"{compatibility.get('current_config_policy_sha256')}). Resolve it with "
+            "`orchestrator.py compatibility RUN_ID` and, when appropriate, the "
+            "backup-first `migrate-run`/`adopt-config-policy` path. Routes, grants "
+            "and evidence remain untouched")
+    return compatibility
+
+
+def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False,
+                     observed=None):
     _switch_guard(state)
+    compatibility = _require_switch_compatible(
+        state, observed or configuration_provenance(cfg))
     current = (state.get("model_routes") or {}).get(role)
     if not isinstance(current, dict):
         raise RuntimeError(f"Run has no pinned {role} route")
@@ -18203,6 +18239,7 @@ def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
             "authority_epoch": state.get("authority_epoch", 0),
             "batch_index": state.get("batch_index", 0),
             "verification": (state.get("verification") or {}).get("path"),
+            "config_policy_sha256": compatibility.get("config_policy_sha256"),
         },
         "previous_route": {key: current.get(key) for key in
                            ("provider", "worker_provider", "model", "effort", "billing")},
@@ -18238,6 +18275,7 @@ def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
             "expected_confirmation": confirmation,
             "preflight": preflight,
             "requires_grant": requires_grant,
+            "compatibility": compatibility,
             "phase": state.get("phase"), "status": state.get("status"),
             "note": ("Read-only preview. Apply with --apply and the exact "
                      "--confirm value; the route is backed up before mutation."),
@@ -18246,8 +18284,11 @@ def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
 
 def preview_role_switch(run_id, role, spec, *, allow_unverified=False):
     folder, state = load(run_id)
-    preview = _switch_proposal(state, config(), role, spec,
-                               allow_unverified=allow_unverified)
+    cfg = config()
+    observed = configuration_provenance(cfg)
+    preview = _switch_proposal(state, cfg, role, spec,
+                               allow_unverified=allow_unverified,
+                               observed=observed)
     preview["run_dir"] = str(folder)
     preview.pop("_route", None)
     preview.pop("_trial_effect", None)
@@ -18273,15 +18314,22 @@ def switch_role_run(run_id, role, spec, confirmation=None, *,
     spec = _route_spec_from_argument(spec)
     folder, state = load(run_id)
     cfg = config()
-    preview = _switch_proposal(state, cfg, role, spec,
-                               allow_unverified=allow_unverified)
+    preview = _switch_proposal(
+        state, cfg, role, spec, allow_unverified=allow_unverified,
+        observed=configuration_provenance(cfg))
     authorization = require_human_operator(
         "switch-role", run_id, confirmation,
         expected=preview["expected_confirmation"])
     with exclusive(folder):
         folder, state = load(run_id)
+        # Re-observe both policy and routes under the apply lock; this exact
+        # config observation feeds the proposal and its route preflight.
+        cfg = config()
+        observed = configuration_provenance(cfg)
+        _require_switch_compatible(state, observed)
         fresh = _switch_proposal(state, cfg, role, spec,
-                                 allow_unverified=allow_unverified)
+                                 allow_unverified=allow_unverified,
+                                 observed=observed)
         if confirmation != fresh["expected_confirmation"]:
             raise RuntimeError(
                 "Stale switch confirmation: the run, route or metadata changed "

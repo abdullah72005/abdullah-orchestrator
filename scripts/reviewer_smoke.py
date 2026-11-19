@@ -27,6 +27,7 @@ a failure; nothing is silently repaired or retried.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -48,9 +49,15 @@ WRITE_TOOLS = frozenset({"edit", "write", "patch", "multiedit", "apply_patch"})
 SHELL_TOOLS = frozenset({"shell", "bash", "exec", "run_command"})
 PROHIBITED_TOOLS = WRITE_TOOLS | SHELL_TOOLS | frozenset(
     {"task", "subagent", "webfetch", "websearch"})
-DENIED_MARKERS = ("permission denied", "permissiondenied", "not permitted",
-                  "not allowed", "disallowed", "denied", "unauthorized",
-                  "outside the allowed", "not authorized")
+DENIED_MARKERS = ("permission denied", "permissiondenied", "denied by policy",
+                  "policy denied", "policy_denied", "not permitted",
+                  "not allowed", "disallowed", "forbidden", "unauthorized",
+                  "outside the allowed", "not authorized", "blocked by permission")
+RUNTIME_INVENTORY_NOTE = (
+    "OpenCode v2.2.7 exposes normalized agents and permissions, not a tool "
+    "capability inventory. No event is therefore not proof that a capability "
+    "was absent; the negative stays unverified unless an exact probe was "
+    "explicitly denied in the producing session.")
 MAX_READ_EVENTS = 20
 
 
@@ -244,7 +251,8 @@ def prepare(root, keep=True):
     orc.save(folder, state)
 
     sentinel_value, sentinel_line = _new_sentinel()
-    write_probe_path = f"/tmp/abdullah-reviewer-write-probe-{uuid.uuid4().hex[:12]}.txt"
+    write_probe_path = str(
+        repo / f".reviewer-smoke-write-probe-{uuid.uuid4().hex[:12]}.txt")
     job_id = "smoke-writer-" + uuid.uuid4().hex[:8]
     (folder / "jobs" / job_id).mkdir(parents=True)
     boundary = orc.capture_batch_boundary(
@@ -310,8 +318,11 @@ def prepare(root, keep=True):
     launch = ("cd " + _shell_quote(ORCHESTRATOR_ROOT)
               + " && python3 scripts/reviewer_smoke.py launch --root "
               + _shell_quote(root))
+    profile = orc.opencode_profile("reviewer", "v2")
+    pinned_route = copy.deepcopy(
+        (state.get("model_routes") or {}).get("reviewer") or {})
     manifest = {
-        "version": 2, "root": str(root), "repo": str(repo),
+        "version": 3, "root": str(root), "repo": str(repo),
         "run_id": run_id, "run_dir": str(folder),
         "config": str(root / "config.json"),
         "state_dir": str(root / "state" / "runs"),
@@ -339,6 +350,14 @@ def prepare(root, keep=True):
         "contract_version": orc.REPORT_CONTRACT_VERSION,
         "prompt_path": str(prompt_path),
         "prompt_sha256": _sha256_file(prompt_path),
+        "pinned_route": pinned_route,
+        "route_sha256": orc.route_authorization_sha(pinned_route),
+        "routing_fingerprint": pinned_route.get("routing_fingerprint"),
+        "profile_sha256": orc.content_hash(profile),
+        "dialect": "v2",
+        "config_policy_sha256": (state.get("config_policy") or {}).get("sha256"),
+        "execution_channel":
+            "isolated_opencode_go_v2_subscription_readonly",
         "route": orc.route_report(state, "reviewer", stage="review"),
         "binaries": {"opencode": _command_version("opencode"),
                      "codex": _command_version("codex")},
@@ -390,6 +409,21 @@ def _event_path(state):
     for name in ("filePath", "file_path", "path", "target"):
         candidate = state.get(name)
         if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _event_command(state):
+    for key in ("input", "arguments", "parameters"):
+        value = state.get(key)
+        if isinstance(value, dict):
+            for name in ("command", "cmd", "script"):
+                candidate = value.get(name)
+                if isinstance(candidate, str):
+                    return candidate.strip()
+    for name in ("command", "cmd", "script"):
+        candidate = state.get(name)
+        if isinstance(candidate, str):
             return candidate.strip()
     return None
 
@@ -471,6 +505,7 @@ def _tool_events(raw):
                 "status": status,
                 "session_id": _event_session(item, part),
                 "path": _event_path(state),
+                "command": _event_command(state),
                 "output_sha256": _sha256_text(output),
                 "output_excerpt": (error_text or output)[:240],
                 "error_text": error_text[:240],
@@ -480,17 +515,23 @@ def _tool_events(raw):
     return events
 
 
-def _path_matches(value, manifest):
+def _resolve_against(value, base):
     if not isinstance(value, str) or not value.strip():
-        return False
-    text = value.strip().replace("\\", "/")
-    if text.startswith("./"):
-        text = text[2:]
-    hunk_relative = manifest["hunk_relpath"]
-    hunk_absolute = str(Path(manifest["hunk_path"]))
-    if text == hunk_absolute or text == hunk_relative:
-        return True
-    return text.endswith("/" + hunk_relative)
+        return None
+    candidate = Path(value.strip())
+    if not candidate.is_absolute():
+        candidate = Path(base) / candidate
+    try:
+        return Path(os.path.realpath(candidate))
+    except (OSError, ValueError):
+        return None
+
+
+def _path_matches(value, manifest):
+    """The exact prepared hunk, resolved against the prepared repository."""
+    resolved = _resolve_against(value, manifest["repo"])
+    hunk = Path(os.path.realpath(manifest["hunk_path"]))
+    return resolved is not None and resolved == hunk
 
 
 def _challenge_in_output(output, expected):
@@ -507,8 +548,42 @@ def _challenge_in_output(output, expected):
     return None
 
 
-def _analyse_events(raw, manifest, producing_session):
+def _probe_event_matches(item, spec, manifest):
+    if spec.get("tool") == "shell":
+        if item["tool"] not in SHELL_TOOLS:
+            return False
+        return ((item.get("command") or "").strip()
+                == str(spec.get("command") or "").strip())
+    if item["tool"] not in WRITE_TOOLS:
+        return False
+    resolved = _resolve_against(item.get("path"), manifest["repo"])
+    target = _resolve_against(spec.get("path"), manifest["repo"])
+    return resolved is not None and resolved == target
+
+
+def _runtime_inventory():
+    """Authoritative tool inventory, or an explicit unavailable record.
+
+    This OpenCode build exposes normalized agents/permissions only.  It has no
+    command that proves a tool is absent from the runtime, so "no event" must
+    not be promoted to "capability absent".
+    """
+    return {"available": False, "source": "opencode_v2_normalized_agents",
+            "tools": {}, "detail": RUNTIME_INVENTORY_NOTE}
+
+
+def _classify_attempt(item):
+    if item["status"] == "completed":
+        return "executed"
+    if item["status"] in {"error", "failed", "failure", "denied",
+                          "denied_by_policy", "blocked", "rejected"}:
+        return "denied" if _denied(item) else "generic_error"
+    return "incomplete"
+
+
+def _analyse_events(raw, manifest, producing_session, inventory=None):
     """Classify Read and negative-probe evidence from the raw stream."""
+    inventory = inventory or _runtime_inventory()
     events = _tool_events(raw)
     reads = [item for item in events if item["tool"] in READ_TOOLS]
     read_records = []
@@ -540,37 +615,67 @@ def _analyse_events(raw, manifest, producing_session):
     for name, spec in desired.items():
         tools = (SHELL_TOOLS if spec.get("tool") == "shell" else WRITE_TOOLS)
         relevant = [item for item in events if item["tool"] in tools]
-        outcomes = []
-        for item in relevant:
-            refused = (_denied(item) or item["status"] in
-                       {"error", "failed", "failure", "denied",
-                        "denied_by_policy", "blocked", "rejected"})
-            outcomes.append({"tool": item["tool"],
-                             "status": item["status"],
-                             "refused": refused,
-                             "denied_marker": _denied(item),
-                             "session_id": item["session_id"],
-                             "output_sha256": item["output_sha256"],
-                             "line_sha256": item["line_sha256"],
-                             "error_excerpt": item["error_text"][:160]
-                             if refused else ""})
-        if not relevant:
-            outcome = "absent"
-        elif all(item["refused"] for item in outcomes):
-            outcome = "denied"
-        else:
+        exact = [item for item in relevant
+                 if _probe_event_matches(item, spec, manifest)]
+        producing = [item for item in exact
+                     if item["session_id"] == producing_session]
+        other_session = [item for item in exact
+                         if item["session_id"] != producing_session]
+        attempts = []
+        for item in exact:
+            attempts.append({
+                "tool": item["tool"], "status": item["status"],
+                "session_id": item["session_id"],
+                "command": item.get("command"), "path": item.get("path"),
+                "classification": _classify_attempt(item),
+                "denied_marker": _denied(item),
+                "output_sha256": item["output_sha256"],
+                "line_sha256": item["line_sha256"],
+                "error_excerpt": item["error_text"][:160],
+            })
+        classifications = [_classify_attempt(item) for item in producing]
+        if "executed" in classifications:
+            observation = "executed"
             outcome = "executed"
-        capability[name] = {"outcome": outcome, "events": outcomes,
-                            "tool": spec.get("tool")}
+        elif classifications and all(value == "denied"
+                                     for value in classifications):
+            observation = "denied"
+            outcome = "denied"
+        elif "generic_error" in classifications:
+            observation = "generic_error"
+            outcome = "failed_unclassified"
+        elif "incomplete" in classifications:
+            observation = "incomplete"
+            outcome = "unverified"
+        elif other_session:
+            # A denial or failure in another session says nothing about the
+            # producing Reviewer's capability.
+            observation = "other_session_only"
+            outcome = "unverified"
+        else:
+            observation = "not_observed"
+            tools_inventory = inventory.get("tools") or {}
+            if inventory.get("available") and spec.get("tool") not in tools_inventory:
+                outcome = "absent"
+            else:
+                outcome = "unverified"
+        capability[name] = {
+            "probe": copy.deepcopy(spec),
+            "observation": observation,
+            "outcome": outcome,
+            "proven": outcome in {"denied", "absent"},
+            "producing_session": producing_session,
+            "attempts": attempts,
+            "other_session_attempts": len(other_session),
+            "unrelated_attempts": len(relevant) - len(exact),
+            "inventory": inventory,
+        }
 
     executed = []
     for item in events:
         if item["tool"] not in PROHIBITED_TOOLS:
             continue
-        refused = (_denied(item) or item["status"] in
-                   {"error", "failed", "failure", "denied",
-                    "denied_by_policy", "blocked", "rejected"})
-        if not refused:
+        if _classify_attempt(item) == "executed":
             executed.append({"tool": item["tool"], "status": item["status"],
                              "session_id": item["session_id"],
                              "line_sha256": item["line_sha256"]})
@@ -579,6 +684,7 @@ def _analyse_events(raw, manifest, producing_session):
         "read_events": read_records,
         "matched_read": matched,
         "producing_session": producing_session,
+        "inventory": inventory,
         "capability": capability,
         "prohibited_executed": executed,
     }
@@ -686,7 +792,168 @@ def _live_bindings(root, manifest):
             "projection_verified": verified_projection}
 
 
-def _assess(manifest, evidence, live):
+def _route_fields(route):
+    return {key: (route or {}).get(key) for key in
+            ("provider", "worker_provider", "model", "effort", "billing")}
+
+
+def _readiness(root, manifest, orc=None, cfg=None):
+    """The pre-dispatch authorization gate for the isolated smoke route.
+
+    It binds the prepared prompt, the exact pinned/effective Reviewer route,
+    the current execution-policy identity, the V2 Go subscription channel, and
+    the prepared evidence.  ``launch`` refuses before inference when this is not
+    ok; ``inspect`` recomputes it.  Static profile introspection is reported
+    here, separately from runtime tool observations.
+    """
+    orc = orc or _load_orchestrator(root)
+    cfg = cfg or orc.config()
+    policy_problems = []
+    route_problems = []
+    prompt_problems = []
+    problems = []
+    repo = Path(manifest["repo"])
+    folder = Path(manifest["run_dir"])
+    if manifest.get("version") != 3:
+        problems.append("the smoke manifest format is not the corrected version")
+    for name, actual, expected in (
+            ("config", getattr(orc, "CONFIG_PATH", None), manifest["config"]),
+            ("state", getattr(orc, "DEFAULT_STATE", None),
+             manifest["state_dir"])):
+        if actual is None or (Path(os.path.realpath(actual))
+                              != Path(os.path.realpath(expected))):
+            problems.append(f"the {name} path is not the isolated prepared path")
+    if Path(os.path.realpath(repo)) != Path(os.path.realpath(
+            Path(root) / "repo")):
+        problems.append("the prepared checkout is not the isolated fixture repo")
+    if manifest.get("execution_channel") != (
+            "isolated_opencode_go_v2_subscription_readonly"):
+        problems.append("the prepared execution channel is not the authorized "
+                        "isolated OpenCode Go V2 subscription route")
+    try:
+        state = orc.read_json(folder / "state.json")
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        state = {}
+        problems.append(f"the prepared run state is unreadable: {exc}")
+    observed = orc.configuration_provenance(cfg)
+    compatibility = orc.state_compatibility(state, observed=observed)
+    if compatibility["status"] != "current":
+        policy_problems.append(
+            "the saved/current execution policy is "
+            f"{compatibility['status']}, not current")
+    if (compatibility.get("config_policy_sha256")
+            != manifest.get("config_policy_sha256")):
+        policy_problems.append(
+            "the current execution-policy identity differs from preparation")
+    pinned = (state.get("model_routes") or {}).get("reviewer") or {}
+    if pinned != manifest.get("pinned_route"):
+        route_problems.append("the pinned Reviewer route differs from preparation")
+    if orc.route_authorization_sha(pinned) != manifest.get("route_sha256"):
+        route_problems.append("the pinned Reviewer route identity changed")
+    effective = orc.effective_route(state, "reviewer")
+    if effective.get("source") != "pinned":
+        route_problems.append(
+            "the effective Reviewer route source is "
+            f"{effective.get('source')!r}, not the pinned route")
+    if _route_fields(effective.get("effective")) != _route_fields(
+            manifest.get("pinned_route")):
+        route_problems.append("the effective Reviewer route differs from preparation")
+    for consent in ("fallback_authorization", "worker_fallback_authorization"):
+        item = state.get(consent)
+        if isinstance(item, dict) and item.get("role") == "reviewer":
+            route_problems.append(
+                f"an approved {consent.replace('_', ' ')} changed the Reviewer route")
+    retry = state.get("retry_session")
+    if isinstance(retry, dict) and retry.get("role") == "reviewer":
+        route_problems.append("a Reviewer retry session would change the dispatch")
+    fields = _route_fields(pinned)
+    if (fields.get("provider") != "opencode"
+            or fields.get("worker_provider") != "opencode-go"):
+        route_problems.append("the prepared route is not the OpenCode Go worker route")
+    if fields.get("billing") != "go":
+        route_problems.append("the prepared route is not the Go subscription route")
+    if str(fields.get("effort") or "").strip().lower() != "high":
+        route_problems.append("the prepared route is not the pinned High variant")
+    try:
+        dialect = orc._opencode_validated_dialect(cfg)
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        dialect = {"dialect": None, "error": exc.__class__.__name__}
+    if dialect.get("dialect") != "v2":
+        route_problems.append("the resolved OpenCode dialect is not V2")
+    profile = orc.opencode_profile("reviewer", "v2")
+    profile_sha = orc.content_hash(profile)
+    if profile_sha != manifest.get("profile_sha256"):
+        route_problems.append("the shipped Reviewer profile text changed")
+    try:
+        orc.validate_v2_effective_permissions("reviewer",
+                                              profile.get("permissions") or [])
+    except ValueError:
+        route_problems.append("the shipped Reviewer profile rules are invalid")
+    try:
+        installed = orc.probe_opencode_config(repo, "reviewer", "v2")
+    except (OSError, ValueError, RuntimeError,
+            subprocess.SubprocessError) as exc:
+        installed = f"error:{exc.__class__.__name__}"
+    if installed is not True:
+        route_problems.append(
+            "the installed OpenCode Reviewer profile does not match the shipped "
+            "read-only profile")
+    try:
+        preflight = orc.route_preflight("reviewer", pinned, cfg, repo, state,
+                                        run_dir=folder)
+    except (OSError, ValueError, RuntimeError,
+            subprocess.SubprocessError) as exc:
+        preflight = {"ok": False, "classification": "preflight_error",
+                     "reasons": [exc.__class__.__name__]}
+    if not preflight.get("ok"):
+        route_problems.append(
+            "route preflight is not ready: "
+            + "; ".join(str(item) for item in preflight.get("reasons") or []))
+    prompt_path = Path(manifest["prompt_path"])
+    prompt = ""
+    if not prompt_path.is_file():
+        prompt_problems.append("the prepared prompt is missing")
+    else:
+        prompt = prompt_path.read_text(encoding="utf-8")
+        if _sha256_file(prompt_path) != manifest.get("prompt_sha256"):
+            prompt_problems.append("the prepared prompt digest changed")
+        if '"contract_version": 2' not in prompt:
+            prompt_problems.append("the prepared prompt does not declare contract_version 2")
+        challenge = manifest.get("challenge") or {}
+        if (str(challenge.get("line") or "") in prompt
+                or str(challenge.get("value") or "") in prompt
+                or SENTINEL_NAME in prompt):
+            prompt_problems.append("the prepared prompt reveals the challenge")
+    live = _live_bindings(root, manifest)
+    problems.extend(policy_problems)
+    problems.extend(route_problems)
+    problems.extend(prompt_problems)
+    problems.extend(live["problems"])
+    return {
+        "ok": not problems, "problems": problems,
+        "policy_compatible": not policy_problems,
+        "route_bound": not route_problems,
+        "prompt_bound": not prompt_problems,
+        "compatibility": compatibility,
+        "pinned_route": pinned, "effective_route": effective,
+        "route_sha256": orc.route_authorization_sha(pinned),
+        "dialect": dialect,
+        "profile_sha256": profile_sha,
+        "installed_agent_introspection": installed,
+        "preflight": preflight,
+        "prompt_path": str(prompt_path),
+        "prompt_sha256": (_sha256_file(prompt_path)
+                          if prompt_path.is_file() else None),
+        "prompt_declares_contract_v2": ('"contract_version": 2' in prompt),
+        "prompt_reveals_challenge": bool(prompt_problems and any(
+            "reveals" in item for item in prompt_problems)),
+        "prepared_bindings": live,
+        "execution_channel": manifest.get("execution_channel"),
+        "route": orc.route_report(state, "reviewer", stage="review"),
+    }
+
+
+def _assess(manifest, evidence, live, readiness):
     """One result predicate shared by launch and inspect."""
     checks = {}
     reasons = []
@@ -696,9 +963,6 @@ def _assess(manifest, evidence, live):
     runtime = evidence.get("runtime") or {}
     matched = runtime.get("matched_read") or {}
     source = evidence.get("source") or {}
-    permissions = evidence.get("permissions") or {}
-    normalized = permissions.get("normalized_profile") or {}
-    installed = permissions.get("installed_agent_introspection")
 
     checks["report_ingested"] = bool(ingestion.get("ok"))
     checks["report_contract_v2"] = ingestion.get("contract_version") == 2
@@ -741,34 +1005,41 @@ def _assess(manifest, evidence, live):
 
     capability = runtime.get("capability") or {}
     for name in ("shell", "write"):
-        outcome = (capability.get(name) or {}).get("outcome")
-        checks[f"negative_{name}"] = outcome in {"absent", "denied"}
+        entry = capability.get(name) or {}
+        checks[f"negative_{name}"] = entry.get("proven") is True
         if not checks[f"negative_{name}"]:
-            reasons.append(f"the harmless {name} probe was not absent or "
-                           f"refused (observed {outcome or 'no event'})")
+            reasons.append(
+                f"the harmless {name} probe is not proven denied or absent "
+                f"(observation {entry.get('observation') or 'missing'}, "
+                f"outcome {entry.get('outcome') or 'missing'})")
+    checks["negative_evidence_verified"] = (
+        checks["negative_shell"] and checks["negative_write"])
     executed = runtime.get("prohibited_executed") or []
     checks["no_prohibited_execution"] = not executed
     if executed:
         reasons.append("a prohibited tool executed: "
                        + ", ".join(sorted({item['tool'] for item in executed})))
 
-    checks["normalized_read_allowed"] = normalized.get("read_hunk") == "allow"
-    checks["normalized_shell_denied"] = normalized.get("shell") != "allow"
-    checks["normalized_edit_denied"] = normalized.get("edit") != "allow"
-    checks["profile_valid"] = permissions.get("profile_valid") is True
-    checks["installed_profile_matches"] = installed is True
+    checks["readiness_ok"] = readiness.get("ok") is True
+    checks["route_bound"] = readiness.get("route_bound") is True
+    checks["prompt_bound"] = readiness.get("prompt_bound") is True
+    checks["policy_compatible"] = readiness.get("policy_compatible") is True
+    checks["job_route_matches"] = evidence.get("job_route_matches") is True
+    checks["evidence_version"] = evidence.get("version") == 3
+    checks["event_stream_recorded"] = bool(
+        runtime.get("events_log_sha256"))
     for key, reason in (
-            ("normalized_read_allowed",
-             "the shipped Reviewer profile does not allow the Read tool"),
-            ("normalized_shell_denied",
-             "the shipped Reviewer profile does not deny shell"),
-            ("normalized_edit_denied",
-             "the shipped Reviewer profile does not deny edit"),
-            ("profile_valid",
-             "the normalized Reviewer permission rules are invalid"),
-            ("installed_profile_matches",
-             "the installed OpenCode agent profile does not match the shipped "
-             "read-only Reviewer profile")):
+            ("readiness_ok", "the pre-dispatch readiness gate is not satisfied"),
+            ("route_bound", "the current pinned/effective Reviewer route does "
+                            "not match the prepared authorized route"),
+            ("prompt_bound", "the prepared prompt no longer matches its digest "
+                             "and contract-v2 shape"),
+            ("policy_compatible", "the saved/current execution policy is not "
+                                  "compatible with preparation"),
+            ("job_route_matches", "the completed job's dispatched route does "
+                                  "not match the prepared route"),
+            ("evidence_version", "the evidence format is not the corrected version"),
+            ("event_stream_recorded", "the raw event stream digest is missing")):
         if not checks[key]:
             reasons.append(reason)
 
@@ -812,25 +1083,25 @@ def preflight(root):
     root = Path(root).expanduser().resolve()
     manifest = _read_json(root / MANIFEST_NAME)
     orc = _load_orchestrator(root)
-    folder = Path(manifest["run_dir"])
-    repo = Path(manifest["repo"])
-    state = orc.read_json(folder / "state.json")
-    route = (state.get("model_routes") or {}).get("reviewer") or {}
-    cfg = orc.config()
-    result = orc.route_preflight("reviewer", route, cfg, repo, state,
-                                 run_dir=folder)
+    ready = _readiness(root, manifest, orc)
     profile = orc.opencode_profile("reviewer", "v2")
-    dialect = orc._opencode_validated_dialect(cfg)
-    live = _live_bindings(root, manifest)
-    prompt = Path(manifest["prompt_path"]).read_text(encoding="utf-8")
     payload = {
-        "ok": bool(result.get("ok")) and live["ok"] and manifest["version"] == 2,
-        "route": orc.route_report(state, "reviewer", stage="review"),
-        "preflight": result,
-        "dialect": dialect.get("dialect"),
-        "dialect_error": dialect.get("error"),
+        "ok": bool(ready["ok"]),
+        "problems": ready["problems"],
+        "compatibility": ready["compatibility"],
+        "route_bound": ready["route_bound"],
+        "prompt_bound": ready["prompt_bound"],
+        "policy_compatible": ready["policy_compatible"],
+        "pinned_route": ready["pinned_route"],
+        "effective_route": ready["effective_route"],
+        "route_sha256": ready["route_sha256"],
+        "route": ready["route"],
+        "preflight": ready["preflight"],
+        "dialect": (ready["dialect"] or {}).get("dialect"),
+        "dialect_error": (ready["dialect"] or {}).get("error"),
+        "profile_sha256": ready["profile_sha256"],
         "installed_agent_introspection":
-            orc.probe_opencode_config(repo, "reviewer", dialect.get("dialect")),
+            ready["installed_agent_introspection"],
         "effective_permissions": {
             "read": orc.v2_effective_permission(
                 profile["permissions"], "read", manifest["hunk_relpath"]),
@@ -839,25 +1110,21 @@ def preflight(root):
             "edit": orc.v2_effective_permission(
                 profile["permissions"], "edit", "probe.txt"),
         },
-        "prepared_bindings": live,
+        "prepared_bindings": ready["prepared_bindings"],
         "contract_version": manifest["contract_version"],
-        "prompt_declares_contract_v2": (
-            '"contract_version": 2' in prompt),
-        "prompt_reveals_challenge": (
-            manifest["challenge"]["line"] in prompt
-            or str(manifest["challenge"]["value"]) in prompt
-            or SENTINEL_NAME in prompt),
+        "prompt_sha256": ready["prompt_sha256"],
+        "prompt_declares_contract_v2": ready["prompt_declares_contract_v2"],
+        "prompt_reveals_challenge": ready["prompt_reveals_challenge"],
+        "execution_channel": ready["execution_channel"],
         "hunk_relpath": manifest["hunk_relpath"],
         "preflight_command": manifest["preflight_command"],
         "launch_command": manifest["launch_command"],
         "inspect_command": manifest["inspect_command"],
-        "note": ("Read-only readiness: route/preflight, installed dialect, "
-                 "normalized permissions, prepared digests and the contract-v2 "
-                 "prompt shape. No model child and no billable call. Runtime "
-                 "tool enforcement is only proven by the later launch."),
+        "note": ("Read-only readiness: authorized route/prompt/policy bindings, "
+                 "route preflight, installed dialect and normalized permissions. "
+                 "No model child and no billable call. Runtime tool enforcement "
+                 "is only observable after the operator launch."),
     }
-    if payload["prompt_reveals_challenge"]:
-        payload["ok"] = False
     print(json.dumps(payload, indent=2))
     return 0 if payload["ok"] else 1
 
@@ -869,16 +1136,16 @@ def launch(root):
     folder = Path(manifest["run_dir"])
     repo = Path(manifest["repo"])
     state = orc.read_json(folder / "state.json")
-    live = _live_bindings(root, manifest)
-    if not live["ok"]:
-        raise SystemExit("Prepared evidence drifted before launch: "
-                         + "; ".join(live["problems"]))
+    cfg = orc.config()
+    ready = _readiness(root, manifest, orc, cfg=cfg)
+    if not ready["ok"]:
+        raise SystemExit("Launch refused before inference: "
+                         + "; ".join(ready["problems"]))
+    live = ready["prepared_bindings"]
     projection = state.get("review_projection")
     if not isinstance(projection, dict):
         raise SystemExit("Prepared run lost its review projection")
     prompt = Path(manifest["prompt_path"]).read_text(encoding="utf-8")
-    if '"contract_version": 2' not in prompt:
-        raise SystemExit("The prepared prompt does not declare contract_version 2")
     before = orc.signature(orc.source_snapshot(repo))
     if before != manifest["candidate_signature"]:
         raise SystemExit("Checkout changed since preparation; re-run prepare")
@@ -888,23 +1155,31 @@ def launch(root):
     job = {}
     try:
         report, job = orc.call_model(
-            folder, state, orc.config(), "reviewer", "reviewer", prompt, repo,
+            folder, state, cfg, "reviewer", "reviewer", prompt, repo,
             dispatch_evidence=projection)
     except BaseException as exc:  # record the exact refusal, never hide it
         error = f"{exc.__class__.__name__}: {exc}"
         job = state.get("active_job") or {}
     elapsed = round(time.time() - started, 2)
     after = orc.signature(orc.source_snapshot(repo))
-    job_path = Path(job.get("path") or "")
+    job_path = (Path(job["path"]) if job.get("path")
+                else Path("/nonexistent-abdullah-smoke-job"))
     raw_path = job_path / "events.log"
     raw = (raw_path.read_text(encoding="utf-8", errors="replace")
            if raw_path.is_file() else "")
     producing_session = job.get("session_id")
-    runtime = _analyse_events(raw, manifest, producing_session)
+    inventory = _runtime_inventory()
+    runtime = _analyse_events(raw, manifest, producing_session, inventory)
     ingestion = _ingest(orc, raw, job_path, producing_session) if raw else {
         "ok": False, "error": "no OpenCode event stream was recorded",
         "code": "missing_output", "report": None, "normalization": [],
         "contract_version": None, "session_id": None, "diagnostics": {}}
+    dispatch_record = (orc.read_json(job_path / "dispatch.json")
+                       if (job_path / "dispatch.json").is_file() else {})
+    dispatched_route = dispatch_record.get("route") or {}
+    job_route_matches = (bool(dispatched_route)
+                         and _route_fields(dispatched_route)
+                         == _route_fields(manifest["pinned_route"]))
 
     # Prefer the supervisor's own ingested report when the independent pass
     # agrees with it; a disagreement fails closed in the predicate below.
@@ -948,9 +1223,23 @@ def launch(root):
         installed_profile = f"error:{exc.__class__.__name__}"
 
     evidence = {
-        "version": 2, "root": str(root), "run_id": manifest["run_id"],
+        "version": 3, "root": str(root), "run_id": manifest["run_id"],
         "orchestrator_revision": manifest["orchestrator_revision"],
         "manifest_file_sha256": _sha256_file(root / MANIFEST_NAME),
+        "readiness": {
+            "ok": ready["ok"], "problems": ready["problems"],
+            "compatibility": ready["compatibility"],
+            "route_bound": ready["route_bound"],
+            "prompt_bound": ready["prompt_bound"],
+            "policy_compatible": ready["policy_compatible"],
+            "route_sha256": ready["route_sha256"],
+            "prompt_sha256": ready["prompt_sha256"],
+            "profile_sha256": ready["profile_sha256"],
+            "dialect": (ready["dialect"] or {}).get("dialect"),
+            "installed_agent_introspection":
+                ready["installed_agent_introspection"],
+            "execution_channel": ready["execution_channel"],
+        },
         "route_configured": manifest["route"]["configured"],
         "route_effective": manifest["route"]["effective"],
         "route_source": manifest["route"]["route_source"],
@@ -958,6 +1247,9 @@ def launch(root):
         "model": manifest["route"]["model"],
         "effort": manifest["route"]["effort"],
         "billing": manifest["route"]["billing"],
+        "prepared_route": manifest["pinned_route"],
+        "dispatched_route": dispatched_route,
+        "job_route_matches": job_route_matches,
         "endpoint": (job.get("preflight") or {}).get("observed"),
         "elapsed_seconds": elapsed, "error": error,
         "job": {key: job.get(key) for key in
@@ -983,25 +1275,54 @@ def launch(root):
             "normalized_profile": normalized,
             "profile_valid": profile_valid, "profile_error": profile_error,
             "installed_agent_introspection": installed_profile,
-            "note": ("Normalized rule evaluation proves the shipped profile "
-                     "text denies shell/edit and allows read; the runtime "
-                     "capability outcomes above prove what the model runtime "
-                     "actually exposed or refused for this dispatch."),
+            "note": ("Static normalized-rule and installed-profile evidence only. "
+                     "It does not prove runtime enforcement; runtime capability "
+                     "outcomes are classified separately from the exact event "
+                     "stream and remain unverified without an exact producing-"
+                     "session policy denial or an authoritative inventory."),
         },
         "environment": manifest["binaries"],
         "recorded_at": orc.now(),
     }
-    evidence["assessment"] = _assess(manifest, evidence, live)
+    evidence["assessment"] = _assess(manifest, evidence, live, ready)
     _write_json(root / EVIDENCE_NAME, evidence)
     payload = {"ok": evidence["assessment"]["ok"],
                "checks": evidence["assessment"]["checks"],
                "reasons": evidence["assessment"]["reasons"],
                "read_verified": evidence["assessment"]["checks"].get(
                    "read_verified"),
+               "negative_evidence_verified": evidence["assessment"][
+                   "checks"].get("negative_evidence_verified"),
                "evidence": str(root / EVIDENCE_NAME),
                "summary_tail": str((report or {}).get("summary") or "")[-800:]}
     print(json.dumps(payload, indent=2))
     return 0 if payload["ok"] else 1
+
+
+def _rederive_event_evidence(root, manifest, evidence, orc):
+    """Re-derive runtime evidence from the exact recorded raw stream."""
+    problems = []
+    saved = evidence.get("runtime") or {}
+    raw_path = Path(str(saved.get("events_log") or ""))
+    expected = saved.get("events_log_sha256")
+    job = evidence.get("job") or {}
+    job_path = Path(str(job.get("path") or raw_path.parent))
+    if not raw_path.is_file():
+        return None, ["the recorded raw event stream is missing"]
+    actual = _sha256_file(raw_path)
+    if not expected or actual != expected:
+        return None, ["the recorded raw event stream changed; saved summaries "
+                      "cannot be used"]
+    raw = raw_path.read_text(encoding="utf-8", errors="replace")
+    producing = saved.get("producing_session") or job.get("session_id")
+    runtime = _analyse_events(raw, manifest, producing, _runtime_inventory())
+    ingestion = _ingest(orc, raw, job_path, producing)
+    return {
+        **evidence,
+        "runtime": {**runtime, "events_log": str(raw_path),
+                    "events_log_sha256": actual},
+        "report_ingestion": ingestion,
+    }, problems
 
 
 def inspect(root):
@@ -1019,22 +1340,37 @@ def inspect(root):
         return 2
     manifest = _read_json(root / MANIFEST_NAME)
     evidence = _read_json(evidence_path)
-    live = _live_bindings(root, manifest)
-    assessment = _assess(manifest, evidence, live)
+    orc = _load_orchestrator(root)
+    ready = _readiness(root, manifest, orc)
+    live = ready["prepared_bindings"]
+    derived, problems = _rederive_event_evidence(root, manifest, evidence, orc)
+    if problems:
+        assessment = {"ok": False, "checks": {"event_stream_verifiable": False},
+                      "reasons": problems}
+        evidence_view = evidence
+    else:
+        evidence_view = derived
+        assessment = _assess(manifest, derived, live, ready)
+        assessment["checks"]["event_stream_verifiable"] = True
+        assessment["ok"] = all(assessment["checks"].values())
     payload = {"ok": assessment["ok"], "checks": assessment["checks"],
                "reasons": assessment["reasons"],
                "manifest_file_sha256": _sha256_file(root / MANIFEST_NAME),
                "evidence_manifest_file_sha256":
                    evidence.get("manifest_file_sha256"),
-               "read": (evidence.get("runtime") or {}).get("matched_read"),
-               "capability": (evidence.get("runtime") or {}).get("capability"),
-               "prohibited_executed": (evidence.get("runtime") or {}).get(
+               "read": (evidence_view.get("runtime") or {}).get("matched_read"),
+               "capability": (evidence_view.get("runtime") or {}).get(
+                   "capability"),
+               "prohibited_executed": (evidence_view.get("runtime") or {}).get(
                    "prohibited_executed"),
-               "report": {"ingested": (evidence.get("report_ingestion") or {}
+               "readiness": {key: ready[key] for key in
+                             ("ok", "problems", "route_bound", "prompt_bound",
+                              "policy_compatible", "compatibility")},
+               "report": {"ingested": (evidence_view.get("report_ingestion") or {}
                                        ).get("ok"),
-                          "contract_version": (evidence.get("report_ingestion")
-                                               or {}).get("contract_version"),
-                          "status": ((evidence.get("report_ingestion") or {}
+                          "contract_version": (evidence_view.get(
+                              "report_ingestion") or {}).get("contract_version"),
+                          "status": ((evidence_view.get("report_ingestion") or {}
                                       ).get("report") or {}).get("status")},
                "live_bindings": live,
                "evidence": str(evidence_path)}

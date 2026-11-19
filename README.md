@@ -240,15 +240,21 @@ shipped validator:
 | Reviewer | `workers.reviewer` | Fresh independent context. |
 
 The shipped Codex Architect default is `gpt-6.2-sol` at `high` on subscription
-billing. Final acceptance always uses that High route. A run may explicitly opt
-into `ordinary_planning_trial` at creation to use Medium for the **initial plan
+billing. The persistent Architect pin must stay `high` so acceptance,
+diagnosis and integration remain dispatchable; a configured default or new
+selection at another effort is refused during admission or switch. Final
+acceptance always uses that High route. A run may explicitly opt into
+`ordinary_planning_trial` at creation to use Medium for the **initial plan
 only** on a task declared ordinary. The trial is validated against the exact
 resolved Architect route for that run — the same subscription model must have
 catalogue-confirmed Medium and High variants — and its pin records that route's
 provider, model, effort and billing. A high-risk plan from the trial is not
 admitted; replans, diagnosis, integration and acceptance stay High. An explicit
 Architect switch before the first plan marks a pending trial ineligible
-immediately; it never silently changes the trial's effort.
+immediately; it never silently changes the trial's effort. A legacy run pinned
+below High keeps its historical route and is blocked by the existing protected
+dispatch guard; remediate it with a `switch-role` preview/apply to High or a new
+run.
 
 Discover valid worker IDs before editing:
 

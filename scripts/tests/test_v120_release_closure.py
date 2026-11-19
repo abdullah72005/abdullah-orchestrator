@@ -501,6 +501,39 @@ class ModelMetadataTests(ReleaseFixture):
                     {"architect": {"model": "gpt-no-high", "effort": "medium",
                                    "billing": "subscription"}})
 
+    def test_configured_and_override_medium_architect_routes_are_refused(self):
+        self.metadata_bin()
+        medium = copy.deepcopy(self.cfg)
+        medium["architect"]["codex"]["effort"] = "medium"
+        with self.assertRaisesRegex(ValueError, "requires High"):
+            orc.resolve_run_routes(medium, "codex", self.project)
+        with self.assertRaisesRegex(ValueError, "requires High"):
+            orc.resolve_run_routes(
+                self.cfg, "codex", self.project,
+                {"architect": {"model": "gpt-6.2-sol", "effort": "medium",
+                               "billing": "subscription"}})
+        # The persistent pin stays High; Medium is the explicit trial's job.
+        resolved = orc.resolve_run_routes(
+            self.cfg, "codex", self.project,
+            {"architect": {"model": "gpt-6.2-sol", "effort": "high",
+                           "billing": "subscription"}})
+        self.assertEqual(resolved["routes"]["architect"]["effort"], "high")
+
+    def test_unavailable_metadata_still_requires_a_persistent_high_effort(self):
+        unavailable = {"state": "unavailable", "models": {}, "source": "x",
+                       "detail": "no adapter"}
+        medium = copy.deepcopy(self.cfg)
+        medium["architect"]["codex"]["effort"] = "medium"
+        with patch.object(orc, "model_catalogue", return_value=unavailable):
+            with self.assertRaisesRegex(ValueError, "requires High"):
+                orc.resolve_run_routes(medium, "codex", self.project,
+                                       allow_unverified=True)
+            resolved = orc.resolve_run_routes(
+                self.cfg, "codex", self.project, allow_unverified=True)
+        self.assertEqual(resolved["routes"]["architect"]["effort"], "high")
+        self.assertEqual(resolved["record"]["metadata_policy"],
+                         "explicitly_authorized_unverified")
+
     def test_opencode_v2_probe_reads_variants_and_enabled_state(self):
         self.metadata_bin()
         catalogue = orc._opencode_v2_catalogue(self.project)
@@ -1044,6 +1077,77 @@ class RoleSwitchTests(ReleaseFixture):
         self.assertEqual(result["invalidated"]["planning_trial"],
                          "ineligible_route_drift")
 
+    def test_switch_refuses_changed_execution_policy_before_and_under_lock(self):
+        self.allow_operator()
+        grant = {"id": "g", "role": "reviewer", "route_sha256": "0" * 64,
+                 "max_dispatches": 1, "used": 0, "role_generation": 0}
+        state = self.prepared(route_authorizations=[grant])
+        with self.switching():
+            preview = orc.preview_role_switch(
+                "test-v12000", "reviewer", self.route_spec())
+        changed = copy.deepcopy(self.cfg)
+        changed["limits"]["max_stage_seconds"] = 4321
+        orc.atomic_json(self.cfg_path, changed)
+        before = (self.rundir / "state.json").read_bytes()
+        with self.switching():
+            with self.assertRaisesRegex(RuntimeError, "compatible"):
+                orc.preview_role_switch("test-v12000", "reviewer",
+                                        self.route_spec())
+            with self.assertRaisesRegex(RuntimeError, "compatible"):
+                orc.switch_role_run("test-v12000", "reviewer",
+                                    self.route_spec(),
+                                    preview["expected_confirmation"])
+        after = orc.read_json(self.rundir / "state.json")
+        self.assertEqual((self.rundir / "state.json").read_bytes(), before)
+        self.assertEqual(after["model_routes"], state["model_routes"])
+        self.assertEqual(after["role_generations"]["reviewer"], 0)
+        self.assertEqual(after["route_authorizations"], [grant])
+        self.assertFalse(after["role_switches"])
+
+    def test_preference_only_change_after_preview_still_applies(self):
+        self.allow_operator()
+        state = self.prepared()
+        pinned = copy.deepcopy(state["model_routes"])
+        with self.switching():
+            preview = orc.preview_role_switch(
+                "test-v12000", "reviewer", self.route_spec())
+        changed = copy.deepcopy(self.cfg)
+        changed["workers"]["implementer"]["variant"] = "low"
+        changed["architect"]["codex"]["model"] = "gpt-any-9.9"
+        orc.atomic_json(self.cfg_path, changed)
+        with self.switching():
+            result = orc.switch_role_run(
+                "test-v12000", "reviewer", self.route_spec(),
+                preview["expected_confirmation"])
+        after = orc.read_json(self.rundir / "state.json")
+        self.assertTrue(result["applied"])
+        self.assertEqual(after["model_routes"]["reviewer"]["effort"], "max")
+        for role in ("architect", "explorer", "implementer"):
+            self.assertEqual(after["model_routes"][role], pinned[role])
+        self.assertEqual(after["role_generations"]["reviewer"], 1)
+
+    def test_architect_switch_to_medium_is_refused_before_protected_phases(self):
+        self.allow_operator()
+        self.prepared(phase="plan", plan=None)
+        with self.switching():
+            with self.assertRaisesRegex(ValueError, "requires High"):
+                orc.preview_role_switch(
+                    "test-v12000", "architect",
+                    {"model": "gpt-6.2-sol", "effort": "medium",
+                     "billing": "subscription"})
+            preview = orc.preview_role_switch(
+                "test-v12000", "architect",
+                {"model": "gpt-any-9.9", "effort": "high",
+                 "billing": "subscription"})
+            result = orc.switch_role_run(
+                "test-v12000", "architect",
+                {"model": "gpt-any-9.9", "effort": "high",
+                 "billing": "subscription"},
+                preview["expected_confirmation"])
+        self.assertTrue(result["applied"])
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(state["model_routes"]["architect"]["effort"], "high")
+
     def test_mid_stage_uncertain_and_terminal_runs_are_refused(self):
         cases = [
             ({"active_job": {"id": "job"}}, "mid-stage"),
@@ -1152,7 +1256,7 @@ class ReviewerSmokePrepareTests(ReleaseFixture):
             capture_output=True, text=True, timeout=300, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         manifest = json.loads((root / "smoke-manifest.json").read_text())
-        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["version"], 3)
         challenge = manifest["challenge"]["line"]
         value = str(manifest["challenge"]["value"])
         hunk = Path(manifest["hunk_path"]).read_text(encoding="utf-8")
@@ -1163,6 +1267,17 @@ class ReviewerSmokePrepareTests(ReleaseFixture):
         self.assertIn(manifest["hunk_relpath"], prompt)
         self.assertIn('"contract_version": 2', prompt)
         self.assertIn("echo abdullah-smoke-probe", prompt)
+        self.assertEqual(manifest["execution_channel"],
+                         "isolated_opencode_go_v2_subscription_readonly")
+        self.assertEqual(manifest["pinned_route"],
+                         json.loads((Path(manifest["run_dir"]) / "state.json")
+                                    .read_text())["model_routes"]["reviewer"])
+        self.assertEqual(manifest["route_sha256"],
+                         orc.route_authorization_sha(manifest["pinned_route"]))
+        self.assertEqual(manifest["profile_sha256"],
+                         orc.content_hash(orc.opencode_profile("reviewer", "v2")))
+        self.assertIn(str(root / "repo"),
+                      manifest["negative_probes"]["write"]["path"])
         projection = json.loads(Path(manifest["manifest_path"]).read_text())
         self.assertIn("delta/attempt-1/app.py-0001.patch",
                       projection["files"])
@@ -1182,6 +1297,9 @@ class ReviewerSmokePrepareTests(ReleaseFixture):
         self.assertTrue(payload["prepared_bindings"]["ok"])
         self.assertTrue(payload["prompt_declares_contract_v2"])
         self.assertFalse(payload["prompt_reveals_challenge"])
+        self.assertIn("pinned_route", payload)
+        self.assertEqual(payload["execution_channel"],
+                         "isolated_opencode_go_v2_subscription_readonly")
         self.assertFalse((root / "evidence.json").exists())
         inspect = subprocess.run(
             [sys.executable, str(self.script()), "inspect", "--root", str(root)],
@@ -1207,29 +1325,66 @@ sys.path.insert(0, str(Path(orc.HERE)))
 import reviewer_smoke as smoke  # noqa: E402 - after the scripts path is known
 
 
+SMOKE_REPO = "/tmp/opencode/abdullah-smoke-predicate-repo"
+SMOKE_HUNK_REL = ".git/review/delta/attempt-1/app.py-0001.patch"
+SMOKE_HUNK = SMOKE_REPO + "/" + SMOKE_HUNK_REL
+
+
 def smoke_manifest(line="MAGIC_SENTINEL = 123456"):
     return {
-        "version": 2,
+        "version": 3,
+        "repo": SMOKE_REPO,
         "challenge": {"name": "MAGIC_SENTINEL",
                       "value": int(line.rsplit(" ", 1)[-1]),
                       "line": line, "line_sha256": smoke._sha256_text(line)},
-        "hunk_relpath": ".git/review/delta/attempt-1/app.py-0001.patch",
-        "hunk_path": "/tmp/projection/delta/attempt-1/app.py-0001.patch",
+        "hunk_relpath": SMOKE_HUNK_REL,
+        "hunk_path": SMOKE_HUNK,
         "hunk_sha256": "hunk-sha",
         "candidate_signature": "candidate-sha",
         "manifest_sha256": "manifest-sha",
         "projection_sha256": "projection-sha",
         "binding_sha256": "binding-sha",
         "verification_sha256": "verification-sha",
+        "prompt_sha256": "prompt-sha",
+        "profile_sha256": "profile-sha",
+        "route_sha256": "route-sha",
+        "config_policy_sha256": "policy-sha",
+        "execution_channel": "isolated_opencode_go_v2_subscription_readonly",
+        "pinned_route": {"provider": "opencode",
+                         "worker_provider": "opencode-go",
+                         "model": "opencode-go/deepseek-v4.1-flash",
+                         "effort": "high", "billing": "go"},
         "negative_probes": {
             "shell": {"tool": "shell", "command": "echo abdullah-smoke-probe"},
-            "write": {"tool": "edit", "path": "/tmp/write-probe.txt"}},
+            "write": {"tool": "edit",
+                      "path": SMOKE_REPO + "/.reviewer-smoke-write-probe.txt"}},
     }
 
 
-def smoke_evidence(manifest, *, status="complete", read=None, shell="denied",
-                   write="absent", executed=None, unchanged=True,
-                   installed=True, ingested=True, error=None):
+def smoke_readiness(**overrides):
+    ready = {"ok": True, "problems": [], "route_bound": True,
+             "prompt_bound": True, "policy_compatible": True,
+             "compatibility": {"status": "current"},
+             "prepared_bindings": {"ok": True}}
+    ready.update(overrides)
+    return ready
+
+
+def negative_record(observation="denied", outcome=None):
+    outcome = outcome or ("denied" if observation == "denied" else
+                          "executed" if observation == "executed" else
+                          "unverified")
+    return {"probe": {"tool": "shell"}, "observation": observation,
+            "outcome": outcome, "proven": outcome in {"denied", "absent"},
+            "producing_session": "ses_producer", "attempts": [],
+            "other_session_attempts": 0, "unrelated_attempts": 0,
+            "inventory": smoke._runtime_inventory()}
+
+
+def smoke_evidence(manifest, *, status="complete", read=None,
+                   shell="denied", write="denied", executed=None,
+                   unchanged=True, ingested=True, error=None,
+                   job_route_matches=True):
     line = manifest["challenge"]["line"]
     path = manifest["hunk_relpath"]
     matched = read if read is not None else {
@@ -1243,17 +1398,20 @@ def smoke_evidence(manifest, *, status="complete", read=None, shell="denied",
               "blocker": "" if status == "complete" else "read refused",
               "findings": []}
     return {
+        "version": 3,
         "error": error,
+        "job_route_matches": job_route_matches,
         "report_ingestion": {
             "ok": ingested, "contract_version": 2 if ingested else None,
             "report": report if ingested else None,
             "error": None if ingested else "ReportIngestionError: refused"},
         "runtime": {
             "event_count": 3, "producing_session": "ses_producer",
+            "events_log_sha256": "raw-sha",
             "matched_read": matched,
             "read_events": [matched] if matched else [],
-            "capability": {"shell": {"outcome": shell},
-                           "write": {"outcome": write}},
+            "capability": {"shell": negative_record(shell),
+                           "write": negative_record(write)},
             "prohibited_executed": executed or []},
         "source": {"before": "candidate-sha", "after": "candidate-sha",
                    "unchanged": unchanged,
@@ -1266,7 +1424,7 @@ def smoke_evidence(manifest, *, status="complete", read=None, shell="denied",
             "normalized_profile": {"read_hunk": "allow", "shell": "deny",
                                    "edit": "deny"},
             "profile_valid": True,
-            "installed_agent_introspection": installed},
+            "installed_agent_introspection": True},
     }
 
 
@@ -1275,9 +1433,10 @@ class ReviewerSmokePredicateTests(ReleaseFixture):
 
     live = {"ok": True, "candidate_signature": "candidate-sha"}
 
-    def assess(self, evidence, live=None, manifest=None):
+    def assess(self, evidence, live=None, manifest=None, readiness=None):
         return smoke._assess(manifest or smoke_manifest(), evidence,
-                             live or self.live)
+                             live or self.live,
+                             readiness or smoke_readiness())
 
     def test_complete_evidence_verifies(self):
         manifest = smoke_manifest()
@@ -1362,11 +1521,35 @@ class ReviewerSmokePredicateTests(ReleaseFixture):
         self.assertFalse(result["checks"]["no_prohibited_execution"])
         self.assertFalse(result["ok"])
 
-    def test_installed_profile_mismatch_is_refused(self):
+    def test_unverified_negative_keeps_read_separate(self):
+        manifest = smoke_manifest()
+        evidence = smoke_evidence(manifest, shell="not_observed",
+                                  write="not_observed")
+        result = self.assess(evidence, manifest=manifest)
+        self.assertTrue(result["checks"]["read_verified"])
+        self.assertFalse(result["checks"]["negative_shell"])
+        self.assertFalse(result["checks"]["negative_evidence_verified"])
+        self.assertFalse(result["ok"])
+
+    def test_readiness_route_prompt_or_policy_drift_is_refused(self):
+        manifest = smoke_manifest()
+        evidence = smoke_evidence(manifest)
+        for overrides in ({"route_bound": False},
+                          {"prompt_bound": False},
+                          {"policy_compatible": False},
+                          {"ok": False, "problems": ["policy"]}):
+            with self.subTest(overrides=overrides):
+                result = self.assess(
+                    evidence, manifest=manifest,
+                    readiness=smoke_readiness(**overrides))
+                self.assertFalse(result["ok"])
+
+    def test_job_route_mismatch_is_refused(self):
         manifest = smoke_manifest()
         result = self.assess(
-            smoke_evidence(manifest, installed=False), manifest=manifest)
-        self.assertFalse(result["checks"]["installed_profile_matches"])
+            smoke_evidence(manifest, job_route_matches=False),
+            manifest=manifest)
+        self.assertFalse(result["checks"]["job_route_matches"])
         self.assertFalse(result["ok"])
 
     def test_simulated_stream_end_to_end_verifies(self):
@@ -1390,6 +1573,12 @@ class ReviewerSmokePredicateTests(ReleaseFixture):
                 "state": {"status": "error",
                           "error": "permission denied: shell is denied",
                           "input": {"command": "echo abdullah-smoke-probe"}}}},
+            {"type": "tool_use", "sessionID": "ses_producer", "part": {
+                "type": "tool", "tool": "edit", "sessionID": "ses_producer",
+                "state": {"status": "error",
+                          "error": "permission denied: edit is denied",
+                          "input": {"filePath": manifest["negative_probes"][
+                              "write"]["path"]}}}},
             {"type": "text", "sessionID": "ses_producer", "part": {
                 "text": json.dumps(report)}},
             {"type": "step_finish", "sessionID": "ses_producer", "part": {
@@ -1399,11 +1588,13 @@ class ReviewerSmokePredicateTests(ReleaseFixture):
         runtime = smoke._analyse_events(raw, manifest, "ses_producer")
         self.assertTrue(runtime["matched_read"])
         self.assertEqual(runtime["capability"]["shell"]["outcome"], "denied")
-        self.assertEqual(runtime["capability"]["write"]["outcome"], "absent")
+        self.assertEqual(runtime["capability"]["write"]["outcome"], "denied")
+        self.assertTrue(runtime["capability"]["shell"]["proven"])
         ingestion = smoke._ingest(orc, raw, self.root / "job", "ses_producer")
         self.assertTrue(ingestion["ok"], ingestion["error"])
         evidence = smoke_evidence(manifest)
-        evidence["runtime"] = {**runtime, "producing_session": "ses_producer"}
+        evidence["runtime"] = {**runtime, "producing_session": "ses_producer",
+                               "events_log_sha256": "raw-sha"}
         evidence["report_ingestion"] = ingestion
         result = self.assess(evidence, manifest=manifest)
         self.assertTrue(result["ok"], result["reasons"])
@@ -1421,6 +1612,92 @@ class ReviewerSmokePredicateTests(ReleaseFixture):
         raw = "\n".join(json.dumps(item) for item in events) + "\n"
         runtime = smoke._analyse_events(raw, manifest, "ses_producer")
         self.assertIsNone(runtime["matched_read"])
+
+    def test_foreign_hunk_suffix_is_not_the_prepared_hunk(self):
+        manifest = smoke_manifest()
+        foreign = "/tmp/foreign-checkout/" + manifest["hunk_relpath"]
+        self.assertFalse(smoke._path_matches(foreign, manifest))
+        self.assertTrue(smoke._path_matches(manifest["hunk_path"], manifest))
+        line = manifest["challenge"]["line"]
+        events = [
+            {"type": "tool_use", "sessionID": "ses_producer", "part": {
+                "type": "tool", "tool": "read", "sessionID": "ses_producer",
+                "state": {"status": "completed",
+                          "input": {"filePath": foreign},
+                          "output": f"00002| {line}\n"}}},
+        ]
+        raw = "\n".join(json.dumps(item) for item in events) + "\n"
+        runtime = smoke._analyse_events(raw, manifest, "ses_producer")
+        self.assertIsNone(runtime["matched_read"])
+
+    def test_generic_error_and_wrong_session_are_not_denials(self):
+        manifest = smoke_manifest()
+        base = {"type": "tool_use", "sessionID": "ses_producer", "part": {
+            "type": "tool", "tool": "shell", "sessionID": "ses_producer",
+            "state": {"status": "error", "error": "upstream failed",
+                      "input": {"command": "echo abdullah-smoke-probe"}}}}
+        raw = json.dumps(base) + "\n"
+        runtime = smoke._analyse_events(raw, manifest, "ses_producer")
+        record = runtime["capability"]["shell"]
+        self.assertEqual(record["observation"], "generic_error")
+        self.assertEqual(record["outcome"], "failed_unclassified")
+        self.assertFalse(record["proven"])
+        wrong = copy.deepcopy(base)
+        wrong["part"]["sessionID"] = "ses_other"
+        wrong["sessionID"] = "ses_other"
+        wrong["part"]["state"]["error"] = "permission denied"
+        runtime = smoke._analyse_events(json.dumps(wrong) + "\n",
+                                        manifest, "ses_producer")
+        record = runtime["capability"]["shell"]
+        self.assertEqual(record["observation"], "other_session_only")
+        self.assertEqual(record["outcome"], "unverified")
+        self.assertFalse(record["proven"])
+
+    def test_unrelated_command_is_not_the_probe(self):
+        manifest = smoke_manifest()
+        event = {"type": "tool_use", "sessionID": "ses_producer", "part": {
+            "type": "tool", "tool": "shell", "sessionID": "ses_producer",
+            "state": {"status": "error", "error": "permission denied",
+                      "input": {"command": "echo something-else"}}}}
+        runtime = smoke._analyse_events(json.dumps(event) + "\n",
+                                        manifest, "ses_producer")
+        record = runtime["capability"]["shell"]
+        self.assertEqual(record["observation"], "not_observed")
+        self.assertEqual(record["outcome"], "unverified")
+        self.assertEqual(record["unrelated_attempts"], 1)
+
+    def test_authoritative_inventory_can_prove_absence(self):
+        manifest = smoke_manifest()
+        inventory = {"available": True, "source": "test",
+                     "tools": {"read": True}, "detail": "inventory"}
+        runtime = smoke._analyse_events("", manifest, "ses_producer",
+                                        inventory)
+        self.assertEqual(runtime["capability"]["shell"]["outcome"], "absent")
+        self.assertTrue(runtime["capability"]["shell"]["proven"])
+
+    def test_inspect_requires_the_exact_raw_stream(self):
+        manifest = smoke_manifest()
+        root = self.root / "inspect-stream"
+        root.mkdir()
+        job = root / "job"
+        job.mkdir()
+        raw_path = job / "events.log"
+        raw_path.write_text('{"type":"text","part":{"text":"x"}}\n')
+        evidence = {
+            "version": 3, "job": {"path": str(job),
+                                  "session_id": "ses_producer"},
+            "runtime": {"events_log": str(raw_path),
+                        "events_log_sha256": smoke._sha256_file(raw_path),
+                        "producing_session": "ses_producer"}}
+        derived, problems = smoke._rederive_event_evidence(
+            root, manifest, evidence, orc)
+        self.assertEqual(problems, [])
+        self.assertIn("runtime", derived)
+        raw_path.write_text('{"type":"text","part":{"text":"changed"}}\n')
+        derived, problems = smoke._rederive_event_evidence(
+            root, manifest, evidence, orc)
+        self.assertIsNone(derived)
+        self.assertIn("changed", " ".join(problems))
 
 
 class WriterLimitationDiagnosticsTests(ReleaseFixture):
