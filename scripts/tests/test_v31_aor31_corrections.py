@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import test_orchestrator as baseline
-from test_v31_route_sources import FAKE_OPENCODE
+from test_v31_route_sources import FAKE_OPENCODE, StartGatedTimeout
 from test_v31_grant_ledger import FakeTTY
 orc = baseline.orc
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -80,6 +80,9 @@ class CorrectionTests(unittest.TestCase):
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         self.cfg = orc.config()
         os.environ["FAKE_OC_VERSION"] = version
+        # A rewritten config invalidates the previously adopted policy view;
+        # save() re-adopts the exact bytes this fixture just wrote.
+        self.state.pop("config_policy", None)
         self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
         orc.save(self.rundir, self.state)
         return cfg
@@ -487,23 +490,34 @@ class CorrectionTests(unittest.TestCase):
         route = self.route()
         self.state["model_routes"] = {"explorer": route}
         orc.save(self.rundir, self.state)
-        with patch.object(orc, "OPENCODE_INSPECTION_TIMEOUT", 0.4), \
+        # The clip begins only after the fake inspector has spawned the
+        # descendant and recorded its PID.  A bare 0.4s timeout can expire
+        # during Python startup on a loaded host, which would test cleanup of
+        # a tree that never existed.
+        with patch.object(orc, "OPENCODE_INSPECTION_TIMEOUT",
+                          StartGatedTimeout(child_pid, 0.4)), \
                 patch.object(orc, "_spawn_guarded",
                              wraps=orc._spawn_guarded) as spawn:
             with self.assertRaisesRegex(RuntimeError, "inspection|unprovable|preflight"):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project, route=route)
         assert_no_inference_dispatch(self, spawn)
-        deadline = time.monotonic() + 5
-        while child_pid.exists() is False and time.monotonic() < deadline:
-            time.sleep(0.02)
+        self.assertTrue(child_pid.exists(),
+                        "fake inspector never started its descendant tree "
+                        "before the inspection timeout")
         pids = [int((self.root / "inspector.pid").read_text()),
                 int(child_pid.read_text())]
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and any(self.alive(pid)
                                                   for pid in pids):
             time.sleep(0.05)
+        # self.alive() already treats zombies as terminated; a still-running
+        # descendant would remain in this list.
         self.assertEqual([pid for pid in pids if self.alive(pid)], [])
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertIsNone(state.get("active_check"),
+                          "proven inspection cleanup must not leave an "
+                          "unreconciled active check")
 
     def test_deadline_during_inspection_never_spawns(self):
         self.configure("2.2.7")

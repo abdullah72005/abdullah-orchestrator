@@ -282,11 +282,13 @@ class AcceptanceIntegrityTests(unittest.TestCase):
         self.assertEqual(self.state["phase"], "verify")
         self.assertIn("stale", self.state["invalidated_decisions"][-1]["reason"].lower())
 
-    def test_configuration_byte_drift_routes_to_verification(self):
+    def test_configuration_policy_drift_routes_to_verification(self):
         plan = make_plan(2)
         self.prepare(plan)
         config_path = Path(orc.CONFIG_PATH)
-        config_path.write_text(config_path.read_text() + "\n")
+        cfg = orc.read_json(config_path)
+        cfg["limits"]["max_stage_seconds"] = 4321
+        orc.atomic_json(config_path, cfg)
         with patch.object(orc, "strong_call") as strong:
             orc.advance(self.rundir, self.state, self.cfg)
         strong.assert_not_called()

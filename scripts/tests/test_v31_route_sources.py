@@ -14,6 +14,32 @@ import test_orchestrator as baseline
 orc = baseline.orc
 
 
+class StartGatedTimeout:
+    """Float-like timeout that starts counting only after a test marker exists.
+
+    A fixed inspection timeout races Python startup on a loaded host: the
+    timeout can fire before the fake inspector has spawned the descendant the
+    cleanup contract is about.  Blocking inside ``float()`` (which the bounded
+    inspector calls after spawning the child) proves the child is already
+    running before the clip can happen, without slowing the normal path.
+    """
+
+    def __init__(self, marker, seconds, wait=10.0):
+        self.marker = Path(marker)
+        self.seconds = float(seconds)
+        self.wait = float(wait)
+
+    def __float__(self):
+        deadline = time.monotonic() + self.wait
+        while time.monotonic() < deadline:
+            if self.marker.exists():
+                return self.seconds
+            time.sleep(0.01)
+        raise AssertionError(
+            f"start marker {self.marker} was not created within {self.wait:.1f}s; "
+            "refusing to clip a child that never provably started")
+
+
 FAKE_OPENCODE = r'''#!/usr/bin/env python3
 import json, os, pathlib, signal, sys, time
 args = sys.argv[1:]
@@ -164,6 +190,9 @@ class RouteSourceTests(unittest.TestCase):
         cfg.setdefault("authorization", {})["sensitive_cli_enabled"] = True
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         self.cfg = orc.config()
+        # A rewritten config invalidates the previously adopted policy view;
+        # save() re-adopts the exact bytes this fixture just wrote.
+        self.state.pop("config_policy", None)
         self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
         os.environ["FAKE_OC_VERSION"] = version
         orc.save(self.rundir, self.state)
@@ -303,7 +332,11 @@ class RouteSourceTests(unittest.TestCase):
         os.environ["FAKE_OC_MODE"] = "sleep"
         pid_file = self.root / "inspector.pid"
         os.environ["FAKE_OC_PID"] = str(pid_file)
-        with patch.object(orc, "OPENCODE_INSPECTION_TIMEOUT", 0.3):
+        # The 0.3s clip only starts once the fake inspector has recorded its
+        # own PID, so the bounded timeout is applied to a provably started
+        # child instead of racing interpreter startup.
+        with patch.object(orc, "OPENCODE_INSPECTION_TIMEOUT",
+                          StartGatedTimeout(pid_file, 0.3)):
             started = time.monotonic()
             observed = orc.opencode_provider_observation(
                 self.route(), project=self.project, cfg=self.cfg,
@@ -313,11 +346,25 @@ class RouteSourceTests(unittest.TestCase):
         self.assertEqual(observed["inspection"], "source_adapter")
         self.assertIn("inspector_failed", observed["inspection_reason"])
         self.assertIn("inspection is unavailable", observed["error"])
+        self.assertTrue(pid_file.exists(),
+                        "fake inspector never started before the clip")
         pid = int(pid_file.read_text())
+        # May already be reaped by the time containment returns; if it is
+        # still visible, remember its exact start time to reject PID reuse.
+        started_stat = orc.process_stat(pid)
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and orc.process_stat(pid):
+        stat = orc.process_stat(pid)
+        while time.monotonic() < deadline and stat and \
+                stat["state"] not in {"Z", "X", "x"}:
             time.sleep(0.05)
-        self.assertIsNone(orc.process_stat(pid))
+            stat = orc.process_stat(pid)
+        # A zombie is already terminated; only "reaped" (None) and a reused
+        # PID are also acceptable proofs that this exact child is gone.
+        reused = bool(stat and started_stat
+                      and stat["starttime"] != started_stat["starttime"])
+        self.assertTrue(stat is None or stat["state"] in {"Z", "X", "x"}
+                        or reused,
+                        f"inspector PID {pid} is still alive: {stat}")
 
     def test_material_source_edit_during_preparation_blocks_and_refunds(self):
         self.configure("1.18.35")

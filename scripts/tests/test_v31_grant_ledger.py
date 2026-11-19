@@ -50,6 +50,9 @@ class GrantLedgerTests(unittest.TestCase):
         cfg["workers"]["explorer"] = explorer
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         self.cfg = orc.config()
+        # A rewritten config invalidates the previously adopted policy view;
+        # save() re-adopts the exact bytes this fixture just wrote.
+        self.state.pop("config_policy", None)
         self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
         orc.save(self.rundir, self.state)
         return cfg

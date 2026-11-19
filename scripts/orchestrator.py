@@ -85,6 +85,21 @@ ROLE_POLICIES = {"plan": "architect", "decision": "architect", "diagnose": "arch
                  "implementer": "implementer", "reviewer": "independent reviewer"}
 SOURCE_PROVENANCE_VERSION = 3
 VERIFICATION_EVIDENCE_VERSION = 2
+# Additive effective-configuration provenance.  The raw file digest stays
+# recorded for audit and historical compatibility; execution/verification
+# authority compares this semantic policy fingerprint instead.  Only the
+# named role-selection preferences below are excluded, because their effective
+# values are pinned per run.  Every other key -- including unknown keys -- is
+# fail-closed policy.
+CONFIG_POLICY_VERSION = 1
+CONFIG_SELECTION_PREFERENCE_PATHS = tuple(
+    [("architect", host, key) for host in ("codex", "claude")
+     for key in ("model", "effort", "auth")]
+    + [("workers", role, key)
+       for role in ("explorer", "implementer", "reviewer")
+       for key in ("provider", "model", "variant", "billing", "fallback")]
+    + [("fallback", host, key) for host in ("codex", "claude")
+       for key in ("model", "effort")])
 # Public product release.  Independent of the internal supervisor/protocol
 # version, state schema and worker report contract so that a public tag never
 # invalidates pinned configuration or saved runs.
@@ -103,6 +118,13 @@ DECISION_BINDING_VERSION = 1
 # recovery increments it so pre-invalidation reports cannot be reused after
 # fresh checks of identical source.  Implementation eligibility is unaffected.
 AUTHORITY_EPOCH_KINDS = frozenset({"reviewer", "decision"})
+# A role switch increments this durable generation.  Unconsumed reports,
+# recovered sessions, fallback consents and route grants produced for an
+# earlier generation cannot silently continue, including A→B→A switches.
+JOB_KIND_ROLE = {"plan": "architect", "decision": "architect",
+                 "diagnose": "architect", "integration": "architect",
+                 "explorer": "explorer", "implementer": "implementer",
+                 "reviewer": "reviewer"}
 # Worker reports are bound to the plan revision they were produced for.  After a
 # material amendment invalidates the plan, an old implementation/exploration
 # report must not silently become the new batch's work merely because the batch
@@ -122,7 +144,7 @@ ARG_MAX_PER_STRING_PAGES = 32
 ARG_SPACE_HEADROOM = 0.85
 SENSITIVE_OPERATOR_COMMANDS = {"adopt", "retire", "checkout-recover",
                                "acknowledge-legacy-evidence", "migrate-run", "cancel",
-                               "restore-run"}
+                               "restore-run", "adopt-config-policy", "switch-role"}
 RUNTIME_INPUT_PATTERNS_CORE = (
     ".env", ".env.*", "*.env", "docker-compose*.yml", "docker-compose*.yaml",
     "compose*.yml", "compose*.yaml", "Dockerfile*", ".dockerignore",
@@ -350,9 +372,76 @@ def normalize_worker_spec(role, spec, *, allow_fallback=True, legacy_go=False):
     return route
 
 
-def config():
-    source = CONFIG_PATH if CONFIG_PATH.exists() else HERE / "config.example.json"
+def _config_source(path=None):
+    if path is not None:
+        return Path(path)
+    return CONFIG_PATH if CONFIG_PATH.exists() else HERE / "config.example.json"
+
+
+def _policy_view(cfg):
+    """Effective-policy view: drop only pinned per-run role selections.
+
+    Unknown keys are retained deliberately.  A new behavior-bearing key must
+    therefore invalidate execution/verification authority until explicitly
+    reviewed instead of silently escaping the compatibility surface.
+    """
+    view = copy.deepcopy(cfg)
+    for path in CONFIG_SELECTION_PREFERENCE_PATHS:
+        node = view
+        for key in path[:-1]:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+        else:
+            if isinstance(node, dict):
+                node.pop(path[-1], None)
+    return view
+
+
+def config_policy_fingerprint(cfg=None, *, raw_sha256=None):
+    """Deterministic semantic identity of execution/verification policy."""
+    if cfg is None:
+        cfg = observe_configuration()["cfg"]
+    return {"version": CONFIG_POLICY_VERSION,
+            "sha256": content_hash(_policy_view(cfg)),
+            "raw_sha256": raw_sha256,
+            "excluded": [".".join(item) for item in CONFIG_SELECTION_PREFERENCE_PATHS]}
+
+
+def observe_configuration(path=None):
+    """One coherent config observation: bytes, parsed value and provenance.
+
+    The parsed value is validated once; when the bytes on disk disagree with the
+    value a patched/legacy reader returned, the bytes are authoritative.  No
+    global override is installed.
+    """
+    source = _config_source(path)
     cfg = read_json(source)
+    _validated_config(cfg)
+    try:
+        data = source.read_bytes()
+    except OSError:
+        data = None
+    raw_sha = hashlib.sha256(data).hexdigest() if data is not None else None
+    if data is not None:
+        try:
+            on_disk = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            on_disk = None
+        if on_disk is not None and on_disk != cfg:
+            cfg = on_disk
+            _validated_config(cfg)
+    return {"cfg": cfg, "path": str(source),
+            "raw_sha256": raw_sha,
+            "policy": config_policy_fingerprint(cfg, raw_sha256=raw_sha)}
+
+
+def config():
+    return observe_configuration()["cfg"]
+
+
+def _validated_config(cfg):
     schema = cfg.get("schema_version")
     if isinstance(schema, int) and schema > CONFIG_SCHEMA_VERSION:
         raise ValueError(
@@ -418,6 +507,8 @@ def run_path(run_id):
 
 
 def save(path, state):
+    if not _recorded_config_policy(state):
+        _adopt_config_policy(state)
     _sync_grant_usage(state, Path(path))
     state["updated_at"] = now()
     atomic_json(path / "state.json", state)
@@ -2216,7 +2307,9 @@ def _opencode_contain_owned_inspection(record):
 
 
 def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None,
-                          ownership=None, purpose="routing inspection"):
+                          ownership=None, purpose="routing inspection",
+                          stdin_data=None, activity="routing inspection",
+                          stdin_fifo_payload=None, stop_when=None):
     """Contained, cancellable inspection with durable whole-execution ownership.
 
     The inspector is launched through the same guard, inherited markers and
@@ -2249,14 +2342,28 @@ def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None
     owned_state = _opencode_inspection_owner(ownership, record)
     proc = None
     lease_fd = None
+    fifo_write = None
+    fifo_path = None
     tracked = {}
     outcome = None
+    stopped_early = False
+    if stdin_fifo_payload is not None:
+        fifo_path = Path(tempfile.mkdtemp(prefix="abdullah-catalogue-")) / "stdin.fifo"
+        os.mkfifo(str(fifo_path), 0o600)
     try:
         try:
             with out_path.open("wb") as out_log, err_path.open("wb") as err_log:
                 proc, lease_fd = _spawn_guarded(
                     [str(item) for item in argv], cwd, child_env, out_log,
-                    launch_file=launch_file, error_stream=err_log)
+                    launch_file=launch_file, error_stream=err_log,
+                    stdin_data=stdin_data, stdin_fifo=fifo_path)
+                if stdin_fifo_payload is not None:
+                    fifo_write = os.open(
+                        str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+                    payload = (stdin_fifo_payload.encode("utf-8")
+                               if isinstance(stdin_fifo_payload, str)
+                               else stdin_fifo_payload)
+                    os.write(fifo_write, payload)
                 launch = _wait_launch(launch_file)
                 identity = ((launch or {}).get("guard")
                             if isinstance(launch, dict) else None) \
@@ -2272,20 +2379,22 @@ def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None
                 while True:
                     if proc.poll() is not None:
                         break
+                    if stop_when is not None and stop_when(out_path):
+                        record["stop_reason"] = "response_observed"
+                        stopped_early = True
+                        break
                     if cancel is not None and cancel():
                         outcome = InspectionCancelled(
-                            "Run pause/cancel requested during OpenCode routing "
-                            "inspection")
+                            "Run pause/cancel requested during " + activity)
                         break
                     if deadline is not None and time.monotonic() >= deadline:
                         outcome = InspectionDeadlineExpired(
-                            "Whole-stage deadline expired during OpenCode routing "
-                            "inspection")
+                            "Whole-stage deadline expired during " + activity)
                         break
                     elapsed = time.monotonic() - started
                     if elapsed >= limit:
                         outcome = TimeoutError(
-                            f"OpenCode config inspection exceeded {limit:.1f}s")
+                            f"{activity} exceeded {limit:.1f}s")
                         break
                     try:
                         _opencode_track_descendants(proc.pid, tracked)
@@ -2308,7 +2417,19 @@ def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None
                 except OSError:
                     pass
                 lease_fd = None
+        if fifo_write is not None:
+            try:
+                os.close(fifo_write)
+            except OSError:
+                pass
+            fifo_write = None
         if proc is not None:
+            if stopped_early:
+                # The expected response was observed; end the probe promptly.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
             try:
                 proc.wait(timeout=OPENCODE_INSPECTION_WAIT_SECONDS)
             except subprocess.TimeoutExpired:
@@ -2332,7 +2453,7 @@ def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None
             if owned_state:
                 _opencode_inspection_owner(ownership, record)
             raise InspectionContainmentError(
-                "OpenCode inspector process tree "
+                "Inspection process tree "
                 f"{record.get('pid')} could not be proven stopped"
                 + (f"; remaining {record['escaped_processes']}"
                    if record["escaped_processes"] else "")
@@ -2366,6 +2487,18 @@ def _opencode_run_bounded(argv, cwd, env, timeout, *, cancel=None, deadline=None
             if owned_state:
                 _opencode_release_inspection_owner(ownership, record)
         raise
+    finally:
+        if fifo_write is not None:
+            try:
+                os.close(fifo_write)
+            except OSError:
+                pass
+        if fifo_path is not None:
+            try:
+                fifo_path.unlink()
+                fifo_path.parent.rmdir()
+            except OSError:
+                pass
 
 
 def _opencode_routing_view(info):
@@ -3870,6 +4003,10 @@ def route_authorization_status(state, role, route, *, run_dir=None):
     for entry in reversed(state.get("route_authorizations", [])):
         if entry.get("role") != role or entry.get("route_sha256") != sha:
             continue
+        if entry.get("role_generation", 0) != _role_generation(state, role):
+            # A role switch invalidates grants issued for the earlier route
+            # generation, even if an A→B→A switch returns to identical bytes.
+            continue
         used = int(entry.get("used", 0))
         grant = (ledger or {}).get("grants", {}).get(entry.get("id"))
         if isinstance(grant, dict):
@@ -4104,7 +4241,8 @@ def reserve_route_grant(state, run_dir, role, route, *, reservation_id=None,
     reservation_id = reservation_id or uuid.uuid4().hex[:12]
     sha = route_authorization_sha(route)
     for entry in reversed(state.get("route_authorizations", [])):
-        if entry.get("role") == role and entry.get("route_sha256") == sha:
+        if (entry.get("role") == role and entry.get("route_sha256") == sha
+                and entry.get("role_generation", 0) == _role_generation(state, role)):
             used, grant = _reserve_in_ledger(
                 run_dir, entry, reservation_id, role, sha, cfg=cfg,
                 deadline=deadline, cancel=cancel)
@@ -4128,7 +4266,8 @@ def release_route_grant(state, run_dir, role, route, reason, *, reservation_id=N
     """Release only a reservation whose launch was proven never attempted."""
     sha = route_authorization_sha(route)
     for entry in reversed(state.get("route_authorizations", [])):
-        if entry.get("role") == role and entry.get("route_sha256") == sha:
+        if (entry.get("role") == role and entry.get("route_sha256") == sha
+                and entry.get("role_generation", 0) == _role_generation(state, role)):
             used, grant = _release_in_ledger(
                 run_dir, entry, reservation_id, reason, cfg=cfg,
                 deadline=deadline, cancel=cancel)
@@ -4162,10 +4301,10 @@ def _operator_action_allowed(action):
 
 
 HUMAN_ONLY_ACTIONS = {"approve-plan", "approve-fallback", "authorize-route",
-                      "approve-worker-fallback"}
+                      "approve-worker-fallback", "switch-role"}
 
 
-def require_human_operator(action, run_id, confirmation=None):
+def require_human_operator(action, run_id, confirmation=None, *, expected=None):
     """Require an interactive operator terminal for a human-only action.
 
     This is an operator-controlled boundary, not cryptographic proof. A model
@@ -4185,27 +4324,50 @@ def require_human_operator(action, run_id, confirmation=None):
         raise RuntimeError(
             f"{action} requires an interactive operator terminal (no TTY detected). "
             "MCP tools and non-interactive model shells cannot approve it.")
-    expected = f"{action}:{run_id}"
+    expected = expected or f"{action}:{run_id}"
     if confirmation != expected:
         raise RuntimeError(
             f"Confirmation mismatch. Re-run with --confirm {expected!r} from an "
-            "interactive terminal after reviewing the run.")
+            "interactive terminal after reviewing the preview.")
     return {"actor": _operator_actor(), "method": "interactive-tty-confirmation",
             "action": action, "run_id": run_id, "at": now(),
             "confirmation_sha256": hashlib.sha256(expected.encode()).hexdigest()}
 
 
 def state_compatibility(state):
-    """Read-only compatibility classification; never mutates a run."""
+    """Read-only compatibility classification; never mutates a run.
+
+    Comparison uses the semantic policy identity when both sides have it.  A
+    matching raw-config digest proves the policy for a pre-policy run and
+    permits the narrow metadata upgrade performed on the next save.
+    """
     current = STATE_SCHEMA_VERSION
     version = state.get("schema_version")
     supervisor = state.get("supervisor_version")
     config_version = state.get("config_schema_version")
     config_sha = state.get("config_sha256")
-    current_config = configuration_provenance().get("sha256")
+    observed = configuration_provenance()
+    current_config = observed.get("sha256")
+    current_policy = (observed.get("policy") or {}).get("sha256")
+    recorded_policy = _recorded_config_policy(state)
     supervisor_changed = supervisor != SUPERVISOR_VERSION
-    config_changed = (config_version != CONFIG_SCHEMA_VERSION
-                      or (config_sha is not None and config_sha != current_config))
+    policy_upgrade = None
+    if config_version != CONFIG_SCHEMA_VERSION:
+        config_changed = True
+    elif recorded_policy is not None:
+        config_changed = recorded_policy.get("sha256") != current_policy
+    elif config_sha is None:
+        config_changed = False
+    elif config_sha == current_config:
+        # Old metadata, exact same file: the policy is provable and the next
+        # save adopts it without touching any selected route.
+        config_changed = False
+        policy_upgrade = "matching_raw_digest"
+    else:
+        # Defaults/format may have changed, or the policy may have changed.
+        # Without the old bytes this cannot be proven: fail closed.
+        config_changed = True
+        policy_upgrade = "unproven_old_config"
     if (version is None or supervisor is None or config_version is None
             or config_sha is None):
         status = "legacy"
@@ -4226,10 +4388,23 @@ def state_compatibility(state):
             "config_schema_version": config_version,
             "supported_config_schema_version": CONFIG_SCHEMA_VERSION,
             "config_sha256": config_sha, "current_config_sha256": current_config,
+            "config_policy_version": (recorded_policy or {}).get("version"),
+            "config_policy_sha256": (recorded_policy or {}).get("sha256"),
+            "current_config_policy_sha256": current_policy,
+            "config_policy_upgrade": policy_upgrade,
+            "config_policy_upgrade_note": (
+                "Policy metadata will be adopted on the next save; selected "
+                "routes and evidence are unchanged."
+                if policy_upgrade == "matching_raw_digest" else
+                "The old configuration cannot be proven from the saved digest. "
+                "Use `adopt-config-policy --old-config <file>` with bytes whose "
+                "SHA-256 matches this run, or rewind/reverify downstream gates."
+                if policy_upgrade == "unproven_old_config" else None),
             "supervisor_changed": bool(supervisor_changed),
             "config_changed": bool(config_changed),
             "migration_required": status != "current",
             "writes": False}
+
 
 
 def assert_state_compatible(state):
@@ -4444,51 +4619,6 @@ def explorer_policy_for(state):
 
 PLANNING_TRIAL_EFFORT = "medium"
 
-
-def validate_planning_trial(cfg, host, enabled, *, declared_risk="ordinary"):
-    """Explicit, run-scoped Medium planning trial on the pinned Sol 6.2 route.
-
-    Only the initial plan may use Medium; acceptance, replans, diagnosis and
-    integration remain on the configured High route.
-    """
-    if not enabled:
-        return None
-    declared_risk = (declared_risk or "ordinary").strip().lower()
-    if declared_risk != "ordinary":
-        raise ValueError(
-            "The Medium planning trial is only for tasks declared ordinary before "
-            f"dispatch; got task risk {declared_risk!r}")
-    if host != "codex":
-        raise ValueError(
-            "The ordinary planning trial is pinned to the Codex Sol 6.2 High "
-            "subscription route; it is not available for host " + str(host))
-    try:
-        spec = cfg["architect"]["codex"]
-    except (KeyError, TypeError):
-        raise ValueError("architect.codex is not configured")
-    model = str(spec.get("model") or "")
-    if "sol" not in model.lower() or "6.2" not in model:
-        raise ValueError(
-            "The ordinary planning trial requires the pinned Codex Sol 6.2 route; "
-            f"configured model is {model!r}. Opting in cannot retarget another model.")
-    if str(spec.get("effort") or "").lower() != "high":
-        raise ValueError(
-            "The ordinary planning trial requires the pinned High architect effort; "
-            f"configured effort is {spec.get('effort')!r}")
-    if spec.get("auth") != "subscription":
-        raise ValueError(
-            "The ordinary planning trial requires subscription billing; configured "
-            f"auth is {spec.get('auth')!r}")
-    return {"enabled": True, "state": "pending", "effort": PLANNING_TRIAL_EFFORT,
-            "declared_task_risk": declared_risk,
-            "declared_at": now(),
-            "pinned_route": {"provider": "codex", "model": model,
-                             "effort": spec.get("effort"),
-                             "billing": spec.get("auth")},
-            "pinned_route_sha256": content_hash(
-                {"provider": "codex", "model": model,
-                 "effort": spec.get("effort"), "billing": spec.get("auth")}),
-            "scope": "initial_plan_only"}
 
 
 
@@ -4845,12 +4975,22 @@ def _guard_entry(argv):
 
 
 def _spawn_guarded(command, cwd, env, log_stream, launch_file=None,
-                   error_stream=None, stdin_data=None):
+                   error_stream=None, stdin_data=None, stdin_fifo=None):
     read_fd, write_fd = os.pipe()
     guard = [sys.executable, str(Path(__file__).resolve()), "_guard",
              "--lease-fd", str(read_fd)]
     stdin_fd = None
     stdin_path = None
+    fifo_fd = None
+    if stdin_data is not None and stdin_fifo is not None:
+        raise ValueError("stdin_data and stdin_fifo are mutually exclusive")
+    if stdin_fifo is not None:
+        # A FIFO read/write descriptor passed to the child stays open, so the
+        # child sees a live stdin instead of an immediate EOF.  The supervisor
+        # writes the request payload and controls when the stream ends.
+        fifo_fd = os.open(str(stdin_fifo), os.O_RDWR)
+        stdin_fd = fifo_fd
+        guard.extend(["--stdin-fd", str(stdin_fd)])
     if stdin_data is not None:
         # A seekable private file carries the complete UTF-8 payload; the child
         # reads it as stdin, so no prompt byte enters argv or the env block.
@@ -5330,14 +5470,91 @@ def toolchain_identity():
         _tool_fingerprint(sys.executable or "python3"), toolchain_fingerprint()))
 
 
-def configuration_provenance():
-    path = CONFIG_PATH if CONFIG_PATH.is_file() else HERE / "config.example.json"
+def configuration_provenance(cfg=None):
+    """Raw file identity plus the semantic policy fingerprint.
+
+    The raw digest remains for audit and historical compatibility; new
+    comparisons use ``policy.sha256``.  ``cfg`` must be the same observation the
+    caller used, so policy and selected routes cannot disagree.
+    """
+    path = _config_source()
     try:
         data = path.read_bytes()
     except OSError:
-        return {"path": str(path), "available": False, "sha256": None}
-    return {"path": str(path), "available": True,
-            "sha256": hashlib.sha256(data).hexdigest()}
+        return {"path": str(path), "available": False, "sha256": None,
+                "policy": None}
+    raw_sha = hashlib.sha256(data).hexdigest()
+    if cfg is None:
+        try:
+            cfg = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            cfg = None
+    policy = (config_policy_fingerprint(cfg, raw_sha256=raw_sha)
+              if isinstance(cfg, dict) else None)
+    return {"path": str(path), "available": True, "sha256": raw_sha,
+            "policy": policy}
+
+
+def _recorded_config_policy(state):
+    """A usable additive policy record, or None for pre-policy runs."""
+    policy = (state or {}).get("config_policy")
+    if not isinstance(policy, dict):
+        return None
+    if policy.get("version") != CONFIG_POLICY_VERSION:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", str(policy.get("sha256") or "")):
+        return None
+    return policy
+
+
+def _config_attestation(state):
+    """Exact old-config evidence recorded by an attested run, if any."""
+    if not isinstance(state, dict):
+        return None
+    policy = _recorded_config_policy(state)
+    raw_sha = state.get("config_sha256")
+    if not policy or not isinstance(raw_sha, str):
+        return None
+    return {"raw_sha256": raw_sha, "sha256": policy.get("sha256"),
+            "source": policy.get("source")}
+
+
+def _role_generation(state, role):
+    """Durable per-role route generation; legacy runs start at zero."""
+    if role is None:
+        return 0
+    generations = (state or {}).get("role_generations")
+    if not isinstance(generations, dict):
+        return 0
+    value = generations.get(role, 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _adopt_config_policy(state):
+    """Narrow, safe metadata upgrade from a matching raw config digest.
+
+    Only the *matching* old file proves the policy identity.  This never
+    rewrites routes or evidence, and never guesses values from the current
+    file when the digest differs.
+    """
+    if _recorded_config_policy(state):
+        return False
+    recorded_raw = state.get("config_sha256")
+    current = configuration_provenance()
+    if not isinstance(recorded_raw, str) or recorded_raw != current.get("sha256"):
+        return False
+    policy = current.get("policy")
+    if not policy:
+        return False
+    state["config_policy"] = {
+        **policy,
+        "source": "matching_raw_digest",
+        "adopted_at": now(),
+    }
+    return True
 
 
 def _command_policy_settings(cfg):
@@ -5636,10 +5853,51 @@ def _legacy_toolchain_view(identity):
     return view
 
 
-def provenance_drift(recorded, current):
+def _configuration_identity(view):
+    if not isinstance(view, dict):
+        return None
+    policy = view.get("policy")
+    if (isinstance(policy, dict)
+            and policy.get("version") == CONFIG_POLICY_VERSION
+            and isinstance(policy.get("sha256"), str)):
+        return ("policy", policy["sha256"])
+    return ("raw", view.get("sha256"))
+
+
+def _configuration_equivalent(recorded, current, attestation=None):
+    """Compare policy identity, keeping legacy/raw evidence meaningful.
+
+    A preference- or formatting-only config edit must not invalidate checks.
+    A policy, runtime-input, authorization or verification change still does.
+    """
+    left = _configuration_identity(recorded)
+    right = _configuration_identity(current)
+    if left is None or right is None:
+        return recorded == current
+    if left[0] == "policy" and right[0] == "policy":
+        return left[1] == right[1]
+    current_raw = (current or {}).get("sha256")
+    recorded_raw = (recorded or {}).get("sha256")
+    if left[0] == "raw" and left[1] and left[1] == current_raw:
+        return True
+    if isinstance(attestation, dict) and attestation.get("raw_sha256"):
+        # The run recorded these exact old bytes and adopted the policy derived
+        # from them.  That is proof, not inference from the current file.
+        if left[0] == "raw" and left[1] == attestation.get("raw_sha256"):
+            attested_policy = attestation.get("sha256")
+            if right[0] == "policy":
+                return attested_policy == right[1]
+        if (left[0] == "policy" and right[0] == "raw"
+                and current_raw == attestation.get("raw_sha256")):
+            return left[1] == attestation.get("sha256")
+    return False
+
+
+def provenance_drift(recorded, current, *, attestation=None):
     """Return the dimensions whose recorded provenance differs from current.
 
     Comparison is against freshly observed values, not merely recorded metadata.
+    ``attestation`` is the run's exact old-config proof for pre-policy evidence.
     """
     if not isinstance(recorded, dict) or not isinstance(current, dict):
         return ["provenance"]
@@ -5648,7 +5906,9 @@ def provenance_drift(recorded, current):
     diffs = []
     if recorded.get("environment") != current.get("environment"):
         diffs.append("environment")
-    if recorded.get("configuration") != current.get("configuration"):
+    if not _configuration_equivalent(
+            recorded.get("configuration"), current.get("configuration"),
+            attestation):
         diffs.append("configuration")
     recorded_toolchain = recorded.get("toolchain")
     current_toolchain = current.get("toolchain")
@@ -5895,7 +6155,8 @@ def make_decision_binding(state, project, references, *, plan_version=None):
                 "Legacy verification evidence cannot bind a new acceptance decision; "
                 "re-run verification")
         loaded = load_verification_evidence(reference, current,
-                                            plan_version=plan_version)
+                                            plan_version=plan_version,
+                                            run_state=state)
         refs.append({"path": str(Path(reference["path"]).resolve()),
                      "sha256": loaded["record_sha256"],
                      "candidate_hash": loaded["fingerprint"],
@@ -8779,11 +9040,16 @@ def _record_batch_delta(run_dir, state, project, job_id, boundary, final_snapsho
             reason = "writer completion not attested"
         elif rebuild_problem:
             reason = "writer delta reconstruction not attributable"
+        detail = (problem or rebuild_problem
+                  or "the writer attempt could not be attributed")
+        if retained_problem and retained_problem not in str(detail):
+            # Preserve the secondary diagnostic: when both retained reuse and
+            # reconstruction fail, the review packet must show both reasons.
+            detail = f"{detail} (retained-index: {retained_problem})"
         return _record_writer_limitation(
             run_dir, state, job_id, boundary,
             reason=reason,
-            detail=(problem or retained_problem or rebuild_problem
-                    or "the writer attempt could not be attributed"),
+            detail=detail,
             phase=phase, job=job)
     record = {
         "version": 1, "job_id": job_id, "attempt": attempt,
@@ -8848,12 +9114,25 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     route = copy.deepcopy(route or pinned or model_route(cfg, host, role, project=project))
     fallback = authorization_state.get("fallback_authorization") if authorization_state else None
     if fallback and fallback.get("role") == role:
-        selected = cfg["fallback"][host]
-        if not selected["model"]:
+        selected = ((authorization_state or {}).get("host_fallback_route")
+                    or (cfg.get("fallback") or {}).get(host) or {})
+        if not selected.get("model"):
             raise RuntimeError(f"No authorized {host} fallback model configured")
         route = {"provider": host, "model": selected["model"],
-                 "effort": selected["effort"], "billing": "subscription",
+                 "effort": selected.get("effort"), "billing": "subscription",
                  "fallback": True}
+        recorded_sha = fallback.get("route_sha256")
+        expected_sha = route_authorization_sha(route)
+        if recorded_sha and recorded_sha != expected_sha:
+            raise RuntimeError(
+                "Host fallback authorization does not match the exact pinned "
+                "effective route; re-approve the reviewed route")
+        current_generation = (authorization_state.get("role_generations") or {}).get(role, 0)
+        if fallback.get("role_generation") is not None and \
+                fallback.get("role_generation") != current_generation:
+            raise RuntimeError(
+                "Host fallback authorization belongs to an earlier role generation; "
+                "re-approve the reviewed route")
         # One approved dispatch only. Consent is consumed after preflight and
         # transport checks prove a launch is actually attempted.
     worker_fallback = (authorization_state.get("worker_fallback_authorization")
@@ -8864,6 +9143,12 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             and isinstance(configured_fallback, dict)):
         if (worker_fallback.get("route_sha256")
                 == route_authorization_sha(configured_fallback)):
+            current_generation = (authorization_state.get("role_generations") or {}).get(role, 0)
+            if (worker_fallback.get("role_generation") is not None
+                    and worker_fallback.get("role_generation") != current_generation):
+                raise RuntimeError(
+                    "Worker fallback authorization belongs to an earlier role "
+                    "generation; re-approve the exact reviewed route")
             route = copy.deepcopy(configured_fallback)
             fallback_selected = True
         else:
@@ -9085,6 +9370,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         review_packet = (dispatch_evidence.get("binding")
                          or review_packet_binding(dispatch_evidence))
     atomic_json(jpath / "dispatch.json", {"kind": kind, "role": role, "route": route,
+                                           "role_generation": _role_generation(state, role),
                                            "source": dispatch_snapshot,
                                            "decision_binding": decision_binding,
                                            "batch_boundary": boundary,
@@ -9327,6 +9613,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         save(grant_dir or run_dir, authorization_state)
     stdin_data = prompt if output_format in {"codex", "claude"} else None
     job = {"id": job_id, "kind": kind, "role": role, "route": route, "status": "dispatched",
+           "role_generation": _role_generation(state, role),
            "path": str(jpath), "created_at": now(), "pid": None,
            "preflight": preflight,
            "amendment_epoch": (state.get("amendment_epoch", 0) if state is not None else 0),
@@ -11946,7 +12233,8 @@ def validate_acceptance_references(state, project, references):
         load_verification_evidence(reference, current,
                                    plan_version=state.get("plan_version"),
                                    plan_revision=state.get("plan_revision", 0),
-                                   amendment_epoch=state.get("amendment_epoch", 0))
+                                   amendment_epoch=state.get("amendment_epoch", 0),
+                                   run_state=state)
     return current
 
 
@@ -11977,7 +12265,7 @@ def strong_call(run_dir, state, cfg, kind, extra=None, deadline=None, route=None
             references.append(reference)
         context["verification_evidence"] = verification_evidence_package(
             reference, context["snapshot"], run_id=state["id"],
-            plan_version=state.get("plan_version"))
+            plan_version=state.get("plan_version"), run_state=state)
         context["verification_evidence_root"] = str(Path(run_dir).resolve())
         context.setdefault("artifacts", {})["verification_record"] = \
             _run_artifact_reference(run_dir, reference.get("path"))
@@ -12075,6 +12363,10 @@ def cached_job_report(run_dir, state, kind):
         return None
     last = completed[-1]
     if last["kind"] != kind or last["id"] == state.get("last_consumed_job_id"):
+        return None
+    if (last.get("role_generation", 0)
+            != _role_generation(state, JOB_KIND_ROLE.get(kind))):
+        # The role switched after this unconsumed report was produced.
         return None
     if last.get("amendment_epoch", 0) != state.get("amendment_epoch", 0):
         return None
@@ -12233,6 +12525,13 @@ def _job_authority_epoch(state, job):
 
 def _recovery_authority_current(state, record, job):
     """Whether a recovered report still belongs to current authority."""
+    role = JOB_KIND_ROLE.get(record.get("kind"))
+    if role is not None:
+        generation = _role_generation(state, role)
+        if record.get("role_generation", 0) != generation:
+            return False
+        if job.get("role_generation", 0) != generation:
+            return False
     if record.get("kind") in WORKER_EPOCH_KINDS:
         # An implementation/exploration report produced for an earlier plan
         # revision must not become the new batch's work after an amendment.
@@ -12683,7 +12982,8 @@ def _bounded_log_text(path, *, success, limit=EVIDENCE_LOG_LIMIT,
 
 
 def load_verification_evidence(reference, current, *, plan_version=None,
-                               plan_revision=None, amendment_epoch=None):
+                               plan_revision=None, amendment_epoch=None,
+                               run_state=None):
     """Load and validate the source/provenance binding of a verification record.
 
     Returns the parsed record plus integrity metadata. Raises a classified
@@ -12779,7 +13079,8 @@ def load_verification_evidence(reference, current, *, plan_version=None,
         if not provenance_complete:
             reject("Versioned verification evidence has an incomplete runtime-input manifest",
                    "provenance_incomplete")
-        drift = provenance_drift(provenance, current)
+        drift = provenance_drift(provenance, current,
+                                 attestation=_config_attestation(run_state))
         if drift:
             reject(
                 "Verification provenance drifted since the check: "
@@ -12807,7 +13108,7 @@ def load_verification_evidence(reference, current, *, plan_version=None,
 
 def verification_evidence_package(reference, current, *, run_id=None,
                                   plan_version=None, plan_revision=None,
-                                  amendment_epoch=None,
+                                  amendment_epoch=None, run_state=None,
                                   log_limit=EVIDENCE_LOG_LIMIT,
                                   failure_log_limit=EVIDENCE_FAILURE_LOG_LIMIT):
     """Build a bounded, source-bound acceptance package from supervisor evidence.
@@ -12819,7 +13120,8 @@ def verification_evidence_package(reference, current, *, run_id=None,
     loaded = load_verification_evidence(reference, current,
                                         plan_version=plan_version,
                                         plan_revision=plan_revision,
-                                        amendment_epoch=amendment_epoch)
+                                        amendment_epoch=amendment_epoch,
+                                        run_state=run_state)
     path = Path(reference["path"])
     evidence = loaded["evidence"]
     record_sha = loaded["record_sha256"]
@@ -13067,11 +13369,13 @@ def verification_evidence_integrity(reference):
 
 
 def reviewer_verification_package(reference, current, run_id=None, plan_version=None,
-                                  plan_revision=None, amendment_epoch=None):
+                                  plan_revision=None, amendment_epoch=None,
+                                  run_state=None):
     return verification_evidence_package(reference, current, run_id=run_id,
                                          plan_version=plan_version,
                                          plan_revision=plan_revision,
-                                         amendment_epoch=amendment_epoch)
+                                         amendment_epoch=amendment_epoch,
+                                         run_state=run_state)
 
 
 def _review_plan_guard(state):
@@ -13409,7 +13713,8 @@ def review_verification_admission(run_dir, state, cfg, project, current):
             state.get("verification"), current, run_id=state.get("id"),
             plan_version=state.get("plan_version"),
             plan_revision=state.get("plan_revision", 0),
-            amendment_epoch=state.get("amendment_epoch", 0))
+            amendment_epoch=state.get("amendment_epoch", 0),
+            run_state=state)
         return batch, package
     except VerificationEvidenceRejected as exc:
         integrity = (verification_evidence_integrity(state.get("verification"))
@@ -14420,6 +14725,7 @@ def version_info():
         "report_contract_version": REPORT_CONTRACT_VERSION,
         "source_provenance_version": SOURCE_PROVENANCE_VERSION,
         "verification_evidence_version": VERIFICATION_EVIDENCE_VERSION,
+        "config_policy_version": CONFIG_POLICY_VERSION,
         "python": "%d.%d.%d" % sys.version_info[:3],
         "note": (
             "product_version is the public release. supervisor_version, "
@@ -14428,7 +14734,7 @@ def version_info():
     }
 
 
-def doctor(project: Path, host="codex"):
+def doctor(project: Path, host="codex", routes=None):
     validate_workflow()
     cfg = config()
     project = project.resolve()
@@ -14512,13 +14818,19 @@ def doctor(project: Path, host="codex"):
         except (OSError, subprocess.TimeoutExpired):
             checks["cli_compatible"][host] = False
     installed_version = checks["versions"].get("opencode")
+    selected_routes = routes if isinstance(routes, dict) else {}
     for role in ("explorer", "implementer", "reviewer"):
-        checks["route"][role] = model_route(
-            cfg, host, role, project=project, dialect=dialect,
-            version=installed_version)
-    checks["route"]["architect"] = model_route(
-        cfg, host, "architect", project=project, dialect=dialect,
-        version=installed_version)
+        checks["route"][role] = (copy.deepcopy(selected_routes[role])
+                                 if isinstance(selected_routes.get(role), dict)
+                                 else model_route(
+                                     cfg, host, role, project=project,
+                                     dialect=dialect, version=installed_version))
+    checks["route"]["architect"] = (
+        copy.deepcopy(selected_routes["architect"])
+        if isinstance(selected_routes.get("architect"), dict)
+        else model_route(cfg, host, "architect", project=project,
+                         dialect=dialect, version=installed_version))
+    checks["route_source"] = "run_selection" if selected_routes else "config"
     checks["host"] = host
     checks["billing_preflight"] = {}
     for role, route in checks["route"].items():
@@ -14632,6 +14944,26 @@ def doctor(project: Path, host="codex"):
             "executable": (observed.get("executable") or {}).get("version"),
         }
     checks["execution_verified"] = False
+    checks["model_metadata"] = {}
+    catalogues = {}
+    for role, route in checks["route"].items():
+        try:
+            key = _catalogue_key(route, dialect)
+            if key not in catalogues:
+                catalogues[key] = model_catalogue(
+                    host, role, route, project, dialect=dialect)
+            checks["model_metadata"][role] = validate_route_metadata(
+                route, host, role, project, dialect=dialect,
+                catalogue=catalogues[key])
+        except InspectionCancelled:
+            raise
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            checks["model_metadata"][role] = {
+                "state": "unavailable", "source": "doctor",
+                "detail": exc.__class__.__name__}
+    checks["model_metadata_note"] = (
+        "Confirmed/unsupported/unavailable are distinct. Missing catalogue "
+        "metadata is never reported as support, and no inference request is made.")
     checks["execution_verified_note"] = (
         "No provider route is execution-verified by Doctor; fake-CLI tests do not "
         "establish authenticated entitlement, provider-side retries or billing.")
@@ -14643,7 +14975,9 @@ def doctor(project: Path, host="codex"):
     checks["ready"] = checks["valid_repo"] and all(checks["commands"][c] for c in required) and (
         all(checks["cli_compatible"].values()) and len(checks["cli_compatible"]) >= 3) and all(checks["generated_commands"].values()) and all(checks["worker_profiles"].values()) and profiles_cli_ok and schemas_ok and (
         checks.get("route_models_listed") is True
-        and checks["variant_verified"] is not False) and not checks["api_billing_risk"]
+        and checks["variant_verified"] is not False
+        and all(item.get("state") != "unsupported"
+                for item in checks["model_metadata"].values())) and not checks["api_billing_risk"]
     checks["compatibility_note"] = (
         "ready proves local configuration, version-policy, argv, contract checks, strict "
         "structured-output schema compatibility and ordered V2 application-permission effects "
@@ -14653,23 +14987,689 @@ def doctor(project: Path, host="codex"):
     return checks
 
 
+MODEL_CATALOGUE_TIMEOUT = 20.0
+MODEL_CATALOGUE_MAX_PAGES = 5
+MODEL_CATALOGUE_CACHE_SECONDS = 30.0
+_MODEL_CATALOGUE_CACHE = {}
+
+
+def _executable_identity(name):
+    resolved = shutil.which(name)
+    if not resolved:
+        return (name, None)
+    try:
+        stat = os.stat(resolved)
+    except OSError:
+        return (name, os.path.realpath(resolved))
+    return (name, os.path.realpath(resolved), stat.st_size, stat.st_mtime_ns,
+            stat.st_ctime_ns)
+
+
+def _cached_catalogue(key, factory):
+    """Short-lived, per-executable metadata cache (never a policy override)."""
+    stamp = time.monotonic()
+    cached = _MODEL_CATALOGUE_CACHE.get(key)
+    if cached and stamp - cached[0] < MODEL_CATALOGUE_CACHE_SECONDS:
+        return copy.deepcopy(cached[1])
+    value = factory()
+    _MODEL_CATALOGUE_CACHE[key] = (stamp, copy.deepcopy(value))
+    return value
+MODEL_EFFORT_ALIASES = {
+    "minimal": "minimal", "low": "low", "medium": "medium",
+    "high": "high", "xhigh": "xhigh", "max": "max", "ultra": "ultra"}
+
+
+def _catalogue_unavailable(source, detail):
+    return {"state": "unavailable", "source": source, "models": {},
+            "detail": detail, "version": None}
+
+
+def _normalize_effort(value):
+    token = str(value or "").strip().lower()
+    return MODEL_EFFORT_ALIASES.get(token)
+
+
+def _variant_tokens(items):
+    tokens = []
+    for item in items or []:
+        if isinstance(item, dict):
+            tokens.append(item.get("id") or item.get("reasoningEffort")
+                          or item.get("effort") or item.get("name"))
+        else:
+            tokens.append(item)
+    return tokens
+
+
+def _catalogue_entry(provider, identifier, variants, extra=None):
+    ident = str(identifier or "").strip()
+    if not ident:
+        return None
+    prefix = str(provider or "").strip()
+    variants = sorted({_normalize_effort(item) or str(item).strip().lower()
+                       for item in _variant_tokens(variants) if str(item).strip()})
+    return {"id": f"{prefix}/{ident}" if prefix and "/" not in ident else ident,
+            "provider": prefix or None, "variants": variants,
+            **(extra or {})}
+
+
+def _catalogue_from_records(source, records, detail="", version=None):
+    models = {}
+    for entry in records:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        models[entry["id"]] = entry
+    if not models:
+        return _catalogue_unavailable(source, detail or "no model entries returned")
+    return {"state": "confirmed", "source": source, "models": models,
+            "detail": detail, "version": version}
+
+
+def _codex_model_catalogue(*, deadline=None, cancel=None):
+    """Bounded Codex app-server ``model/list`` metadata probe (no model turn)."""
+    resolved = shutil.which("codex")
+    if not resolved:
+        return _catalogue_unavailable("codex_app_server", "codex executable unavailable")
+    records = []
+    cursor = None
+    version = None
+    for _page in range(MODEL_CATALOGUE_MAX_PAGES):
+        params = {"limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        payload = "\n".join(json.dumps(message) for message in (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"clientInfo": {"name": "abdullah-orchestrator",
+                                       "version": PRODUCT_VERSION},
+                        "capabilities": {"experimentalApi": True}}},
+            {"jsonrpc": "2.0", "method": "initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": params},
+        )) + "\n"
+
+        def responded(path):
+            try:
+                return re.search(rb'"id"\s*:\s*2\b', path.read_bytes()) is not None
+            except OSError:
+                return False
+
+        try:
+            rc, out, err = _opencode_run_bounded(
+                [resolved, "app-server", "--listen", "stdio://"], str(HERE.parent),
+                scrubbed_env(), MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
+                deadline=deadline, purpose="model catalogue",
+                stdin_fifo_payload=payload, stop_when=responded,
+                activity="model catalogue probe")
+        except (InspectionCancelled, InspectionDeadlineExpired):
+            raise
+        except (OSError, ValueError, TimeoutError, RuntimeError,
+                subprocess.SubprocessError) as exc:
+            return _catalogue_unavailable(
+                "codex_app_server", f"probe failed: {exc.__class__.__name__}")
+        result = None
+        error = None
+        for line in (out or "").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("id") == 2:
+                result = event.get("result")
+                error = event.get("error")
+        if not isinstance(result, dict):
+            detail = ("probe returned an error: " + json.dumps(error)[:300]
+                      if error else
+                      f"no model/list result (exit {rc!r}; stderr suppressed)")
+            return _catalogue_unavailable("codex_app_server", detail)
+        version = version or result.get("version")
+        rows = result.get("data") or result.get("models") or []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            efforts = (row.get("supportedReasoningEfforts")
+                       or row.get("reasoningEfforts") or row.get("efforts") or [])
+            variants = []
+            for item in efforts if isinstance(efforts, list) else []:
+                if isinstance(item, dict):
+                    variants.append(item.get("reasoningEffort")
+                                    or item.get("effort") or item.get("id"))
+                else:
+                    variants.append(item)
+            records.append(_catalogue_entry(
+                row.get("provider") or row.get("providerId"),
+                row.get("id") or row.get("model") or row.get("slug"),
+                variants, {"hidden": row.get("hidden", False),
+                           "display_name": row.get("displayName")}))
+        cursor = result.get("nextCursor")
+        if not cursor:
+            break
+    return _catalogue_from_records(
+        "codex_app_server", [item for item in records if item],
+        detail="initialized app-server model/list", version=version)
+
+
+def _opencode_v2_catalogue(project, *, deadline=None, cancel=None):
+    """Bounded OpenCode V2 ``api --standalone get /api/model`` catalogue."""
+    identity = _opencode_binary_identity(deadline=deadline, cancel=cancel)
+    if not identity.get("available"):
+        return _catalogue_unavailable("opencode_v2_api", "OpenCode executable unavailable")
+    binary = identity["resolved"]
+    records = []
+    cursor = None
+    for _page in range(MODEL_CATALOGUE_MAX_PAGES):
+        endpoint = "/api/model"
+        if cursor:
+            endpoint += "?page=" + str(cursor)
+        try:
+            rc, out, err = _opencode_run_bounded(
+                [binary, "api", "--standalone", "get", endpoint], str(project),
+                scrubbed_env(), MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
+                deadline=deadline, purpose="model catalogue",
+                activity="model catalogue probe")
+        except (InspectionCancelled, InspectionDeadlineExpired):
+            raise
+        except (OSError, ValueError, TimeoutError, RuntimeError,
+                subprocess.SubprocessError) as exc:
+            return _catalogue_unavailable(
+                "opencode_v2_api", f"probe failed: {exc.__class__.__name__}")
+        if rc != 0:
+            return _catalogue_unavailable(
+                "opencode_v2_api",
+                f"probe exited {rc!r} (stderr suppressed)")
+        try:
+            document = json.loads(out or "")
+        except ValueError:
+            return _catalogue_unavailable(
+                "opencode_v2_api", "probe output was not JSON")
+        rows, cursor = _catalogue_rows(document)
+        for row in rows:
+            record = _opencode_v2_record(row)
+            if record:
+                records.append(record)
+        if not cursor:
+            break
+    return _catalogue_from_records(
+        "opencode_v2_api", records, detail="standalone /api/model",
+        version=(identity.get("version") or {}).get("text"))
+
+
+def _catalogue_rows(document):
+    """Return (rows, next_cursor) from common catalogue envelope shapes."""
+    rows = []
+    cursor = None
+    if isinstance(document, list):
+        return document, None
+    if not isinstance(document, dict):
+        return rows, None
+    for key in ("data", "models", "items", "result", "entries"):
+        value = document.get(key)
+        if isinstance(value, list):
+            rows = value
+            break
+        if isinstance(value, dict) and isinstance(value.get("items"), list):
+            rows = value["items"]
+            break
+    pagination = document.get("pagination") if isinstance(
+        document.get("pagination"), dict) else document
+    candidate = (pagination.get("next") or pagination.get("nextPage")
+                 or pagination.get("cursor"))
+    if document.get("hasMore") and not candidate:
+        current = pagination.get("page") or 1
+        candidate = int(current) + 1 if str(current).isdigit() else None
+    if candidate is not None and rows:
+        cursor = candidate
+    return rows, cursor
+
+
+def _opencode_v2_record(row):
+    if not isinstance(row, dict):
+        return None
+    provider = row.get("providerID") or row.get("provider")
+    variants = row.get("variants") or row.get("reasoningEfforts") or []
+    if isinstance(variants, dict):
+        variants = list(variants)
+    return _catalogue_entry(
+        provider,
+        row.get("modelID") or row.get("id") or row.get("model") or row.get("name"),
+        variants, {"enabled": row.get("enabled", True),
+                   "display_name": row.get("name")})
+
+
+def _opencode_v1_catalogue(project, *, deadline=None, cancel=None):
+    """OpenCode V1 ``models --verbose`` catalogue, including variants."""
+    identity = _opencode_binary_identity(deadline=deadline, cancel=cancel)
+    if not identity.get("available"):
+        return _catalogue_unavailable("opencode_v1_models", "OpenCode executable unavailable")
+    try:
+        rc, out, err = _opencode_run_bounded(
+            [identity["resolved"], "models", "--verbose"], str(project),
+            scrubbed_env(), MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
+            deadline=deadline, purpose="model catalogue",
+            activity="model catalogue probe")
+    except (InspectionCancelled, InspectionDeadlineExpired):
+        raise
+    except (OSError, ValueError, TimeoutError, RuntimeError,
+            subprocess.SubprocessError) as exc:
+        return _catalogue_unavailable(
+            "opencode_v1_models", f"probe failed: {exc.__class__.__name__}")
+    if rc != 0:
+        return _catalogue_unavailable(
+            "opencode_v1_models", f"probe exited {rc!r} (stderr suppressed)")
+    try:
+        inventory = parse_model_inventory(out)
+    except ValueError as exc:
+        return _catalogue_unavailable("opencode_v1_models", str(exc))
+    records = []
+    for name, value in inventory.items():
+        raw_variants = (value or {}).get("variants") or []
+        if isinstance(raw_variants, dict):
+            raw_variants = list(raw_variants)
+        provider, _, model_id = name.partition("/")
+        records.append(_catalogue_entry(provider, model_id, raw_variants))
+    return _catalogue_from_records(
+        "opencode_v1_models", [item for item in records if item],
+        detail="models --verbose")
+
+
+def _claude_model_catalogue(*, deadline=None, cancel=None):
+    """Claude CLI contract evidence; credentials are never inferred."""
+    resolved = shutil.which("claude")
+    if not resolved:
+        return _catalogue_unavailable("claude_cli_help", "claude executable unavailable")
+    try:
+        proc = subprocess.run([resolved, "--help"], capture_output=True, text=True,
+                              timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return _catalogue_unavailable("claude_cli_help", "help query failed")
+    text = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        return _catalogue_unavailable(
+            "claude_cli_help", f"help exited {proc.returncode!r}")
+    # The CLI help establishes the effort flag contract, not a model catalogue.
+    catalogue = _catalogue_unavailable(
+        "claude_cli_help", "Claude exposes no model/effort catalogue surface")
+    catalogue["effort_contract"] = "--effort" in text
+    variants = []
+    for line in text.splitlines():
+        if "--effort" not in line and "effort level" not in line.lower():
+            continue
+        match = re.search(r"\(([^()]*)\)", line)
+        if not match:
+            continue
+        variants = [token.strip().lower() for token in match.group(1).split(",")
+                    if token.strip()]
+        break
+    catalogue["effort_variants"] = variants
+    return catalogue
+
+
+def model_catalogue(host, role, route, project, *, deadline=None, cancel=None,
+                    dialect=None):
+    """Authoritative, bounded metadata for the requested provider."""
+    provider = route.get("provider")
+    if provider == "codex":
+        return _cached_catalogue(
+            ("codex",) + _executable_identity("codex"),
+            lambda: _codex_model_catalogue(deadline=deadline, cancel=cancel))
+    if provider == "claude":
+        return _cached_catalogue(
+            ("claude",) + _executable_identity("claude"),
+            lambda: _claude_model_catalogue(deadline=deadline, cancel=cancel))
+    if provider != "opencode":
+        return _catalogue_unavailable("unknown", f"no adapter for provider {provider!r}")
+    if dialect is None:
+        try:
+            dialect = _opencode_validated_dialect(
+                config(), deadline=deadline, cancel=cancel).get("dialect")
+        except (InspectionCancelled, InspectionDeadlineExpired):
+            raise
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            dialect = None
+    opened = ("opencode", dialect) + _executable_identity("opencode")
+    if dialect == "v2":
+        return _cached_catalogue(
+            opened + ("v2",),
+            lambda: _opencode_v2_catalogue(project, deadline=deadline,
+                                           cancel=cancel))
+    if dialect == "v1":
+        return _cached_catalogue(
+            opened + ("v1",),
+            lambda: _opencode_v1_catalogue(project, deadline=deadline,
+                                           cancel=cancel))
+    return _catalogue_unavailable(
+        "opencode", "the resolved OpenCode dialect could not be established")
+
+
+def _catalogue_lookup(catalogue, model):
+    """Resolve exact ids and the safe provider-stripped alias only."""
+    models = catalogue.get("models") or {}
+    if model in models:
+        return models[model]
+    if "/" in model:
+        provider, _, short = model.partition("/")
+        if short in models:
+            entry = models[short]
+            if not entry.get("provider") or entry.get("provider") == provider:
+                return entry
+    else:
+        matches = [entry for key, entry in models.items()
+                   if key.endswith("/" + model)]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def model_metadata_verdict(catalogue, model, effort):
+    """Classify support as confirmed, unsupported or unverified.
+
+    Missing metadata is never reported as support.
+    """
+    base = {"source": catalogue.get("source"), "detail": catalogue.get("detail"),
+            "version": catalogue.get("version")}
+    if catalogue.get("state") != "confirmed":
+        token = _normalize_effort(effort)
+        variants = catalogue.get("effort_variants") or []
+        effort_supported = None
+        if token and variants:
+            effort_supported = token in variants
+        if effort_supported is False:
+            return {**base, "state": "unsupported", "model_listed": None,
+                    "effort_supported": False,
+                    "effort_contract": catalogue.get("effort_contract"),
+                    "effort_variants": variants,
+                    "reason": f"effort {effort!r} is not in the CLI contract "
+                              f"{sorted(variants)}"}
+        return {**base, "state": "unavailable", "model_listed": None,
+                "effort_supported": effort_supported,
+                "effort_contract": catalogue.get("effort_contract"),
+                "effort_variants": variants}
+    entry = _catalogue_lookup(catalogue, model)
+    if entry is None:
+        return {**base, "state": "unsupported", "model_listed": False,
+                "effort_supported": None}
+    if entry.get("enabled") is False:
+        return {**base, "state": "unsupported", "model_listed": False,
+                "effort_supported": None, "reason": "model is disabled"}
+    token = _normalize_effort(effort)
+    variants = entry.get("variants") or []
+    if not token:
+        return {**base, "state": "confirmed", "model_listed": True,
+                "effort_supported": None, "variants": variants}
+    if not variants:
+        return {**base, "state": "unavailable", "model_listed": True,
+                "effort_supported": None, "variants": [],
+                "reason": "catalogue exposes no reasoning variants"}
+    supported = token in variants
+    return {**base, "state": "confirmed" if supported else "unsupported",
+            "model_listed": True, "effort_supported": supported,
+            "variants": variants,
+            "reason": None if supported else
+            f"effort {effort!r} is not in {sorted(variants)}"}
+
+
+def validate_route_metadata(route, host, role, project, *, deadline=None,
+                            cancel=None, dialect=None, catalogue=None):
+    if catalogue is None:
+        catalogue = model_catalogue(host, role, route, project, deadline=deadline,
+                                    cancel=cancel, dialect=dialect)
+    return model_metadata_verdict(catalogue, str(route.get("model") or ""),
+                                  route.get("effort"))
+
+
+def _catalogue_key(route, dialect):
+    return (route.get("provider"),
+            dialect if route.get("provider") == "opencode" else None)
+
+
+RUN_ROUTE_KEYS = {
+    "architect": {"provider", "model", "effort", "billing"},
+    "explorer": {"provider", "model", "effort", "variant", "billing"},
+    "implementer": {"provider", "model", "effort", "variant", "billing"},
+    "reviewer": {"provider", "model", "effort", "variant", "billing"},
+}
+
+
+def _route_override_error(role, detail):
+    return ValueError(f"routes.{role}: {detail}")
+
+
+def _merged_architect_route(cfg, host, override):
+    base = copy.deepcopy(model_route(cfg, host, "architect"))
+    unknown = set(override) - RUN_ROUTE_KEYS["architect"]
+    if unknown:
+        raise _route_override_error("architect", f"unknown keys {sorted(unknown)}")
+    provider = override.get("provider")
+    if provider is not None and provider != host:
+        raise _route_override_error(
+            "architect", "provider must match the explicit controlling host; a UI "
+            "model selection does not control subprocesses")
+    model = override.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            raise _route_override_error("architect", "model must be a nonempty string")
+        if "#" in model:
+            raise _route_override_error("architect", "put variants in effort, not model")
+        model = model.strip()
+    effort = override.get("effort", base.get("effort"))
+    billing = override.get("billing", base.get("billing"))
+    if not isinstance(effort, str) or not effort.strip():
+        raise _route_override_error("architect", "effort must be a nonempty string")
+    if billing not in EXPLICIT_BILLINGS:
+        raise _route_override_error(
+            "architect", f"billing must be one of {sorted(EXPLICIT_BILLINGS)}")
+    if model is not None and model != base.get("model") and "billing" not in override:
+        # A new model is a new billable route: do not inherit consent silently.
+        raise _route_override_error(
+            "architect", "a changed model requires explicit billing")
+    return {"provider": host, "model": model or base["model"],
+            "effort": effort.strip(), "billing": billing}
+
+
+def _merged_worker_route(cfg, role, override, project, *, dialect=None,
+                         version=None):
+    base = normalize_worker_spec(role, cfg["workers"][role], legacy_go=True)
+    unknown = set(override) - RUN_ROUTE_KEYS[role]
+    if "fallback" in override:
+        raise _route_override_error(
+            role, "a run override cannot introduce an unauthorized fallback")
+    unknown.discard("fallback")
+    if unknown:
+        raise _route_override_error(role, f"unknown keys {sorted(unknown)}")
+    model = override.get("model", base.get("model"))
+    if not isinstance(model, str) or not model.strip():
+        raise _route_override_error(role, "model must be a nonempty string")
+    model = model.strip()
+    provider, _, model_id = model.partition("/")
+    if not _ or not provider or not model_id:
+        provider = override.get("provider") or base.get("worker_provider")
+        model_id = model
+        model = f"{provider}/{model_id}"
+    declared = override.get("provider") or provider
+    if declared != provider:
+        raise _route_override_error(
+            role, f"provider {declared!r} does not match the model prefix {provider!r}")
+    effort = override.get("effort", override.get("variant", base.get("effort")))
+    if not isinstance(effort, str):
+        raise _route_override_error(role, "effort must be a string")
+    changed_provider = provider != base.get("worker_provider")
+    if changed_provider:
+        required = {"model", "provider", "effort", "billing"}
+        missing = sorted(required - set(override))
+        if missing:
+            raise _route_override_error(
+                role, "a provider change requires a complete route; missing "
+                + ", ".join(missing))
+    billing = override.get("billing", base.get("billing"))
+    if changed_provider and "billing" not in override:
+        raise _route_override_error(role, "a provider change requires explicit billing")
+    billing = validate_worker_billing(
+        f"routes.{role}", declared, billing, inferred=False)
+    route = {"provider": "opencode", "worker_provider": declared,
+             "model": model, "effort": effort.strip(), "billing": billing}
+    if isinstance(base.get("fallback_route"), dict):
+        route["fallback_route"] = copy.deepcopy(base["fallback_route"])
+    return route
+
+
+def resolve_run_routes(cfg, host, project, overrides=None, *, allow_unverified=False,
+                       deadline=None, cancel=None):
+    """Resolve and pin every role route before a run exists.
+
+    Overrides inherit only omitted safe fields; a provider change requires a
+    complete explicit route including billing.  New/changed selections are
+    validated against authoritative host/provider metadata.
+    """
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        raise ValueError("routes must be a role-keyed JSON object")
+    unknown_roles = set(overrides) - set(RUN_ROUTE_KEYS)
+    if unknown_roles:
+        raise ValueError(f"routes: unknown roles {sorted(unknown_roles)}")
+    routes = {}
+    changed = set()
+    for role in ("architect", "explorer", "implementer", "reviewer"):
+        override = overrides.get(role)
+        if override is None:
+            routes[role] = model_route(cfg, host, role, project=project)
+            continue
+        if not isinstance(override, dict):
+            raise ValueError(f"routes.{role} must be an object")
+        changed.add(role)
+        if role == "architect":
+            routes[role] = _merged_architect_route(cfg, host, override)
+        else:
+            routes[role] = _merged_worker_route(cfg, role, override, project)
+            routes[role]["routing_fingerprint"] = routing_fingerprint(
+                routes[role], cfg, project=project, role=role)
+    dialect = None
+    if any(route.get("provider") == "opencode" for route in routes.values()):
+        try:
+            dialect = _opencode_validated_dialect(
+                cfg, deadline=deadline, cancel=cancel).get("dialect")
+        except (InspectionCancelled, InspectionDeadlineExpired):
+            raise
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            dialect = None
+    metadata = {}
+    catalogues = {}
+    for role, route in routes.items():
+        key = _catalogue_key(route, dialect)
+        if key not in catalogues:
+            catalogues[key] = model_catalogue(
+                host, role, route, project, deadline=deadline, cancel=cancel,
+                dialect=dialect)
+        verdict = validate_route_metadata(
+            route, host, role, project, deadline=deadline, cancel=cancel,
+            dialect=dialect, catalogue=catalogues[key])
+        metadata[role] = verdict
+        if verdict["state"] == "unsupported":
+            raise ValueError(
+                f"routes.{role} is not supported by authoritative metadata: "
+                + str(verdict.get("reason") or verdict.get("detail"))
+                + ". Choose a supported model/effort or a compatible CLI.")
+        if verdict["state"] == "unavailable" and role in changed:
+            if not allow_unverified:
+                raise RuntimeError(
+                    f"routes.{role} cannot be attested from metadata ("
+                    + str(verdict.get("detail") or verdict.get("reason"))
+                    + "). Configure a supported adapter/CLI or explicitly "
+                    "authorize the exact requested route with "
+                    "--allow-unverified-metadata, then run an authorized probe.")
+    record = {
+        "source": "run_override" if changed else "config_default",
+        "recorded_at": now(),
+        "overrides": copy.deepcopy({role: overrides[role] for role in changed}),
+        "overrides_sha256": content_hash(
+            {role: overrides[role] for role in sorted(changed)}),
+        "metadata": metadata,
+        "metadata_policy": ("explicitly_authorized_unverified"
+                            if allow_unverified else "require_supported"),
+    }
+    fallback = (cfg.get("fallback") or {}).get(host) or {}
+    record["host_fallback_route"] = (
+        {"provider": host, "model": fallback.get("model"),
+         "effort": fallback.get("effort"), "billing": "subscription",
+         "source": "run_creation_pin"}
+        if fallback.get("model") else None)
+    return {"routes": routes, "record": record, "metadata": metadata,
+            "dialect": dialect}
+
+
+def validate_planning_trial(cfg, host, enabled, *, declared_risk="ordinary",
+                            metadata=None):
+    """Explicit, run-scoped Medium planning trial on the pinned architect route.
+
+    Only the initial plan may use Medium; acceptance, replans, diagnosis and
+    integration remain on the configured High route.  Support is established
+    from authoritative metadata, not a Sol-version literal.
+    """
+    if not enabled:
+        return None
+    declared_risk = (declared_risk or "ordinary").strip().lower()
+    if declared_risk != "ordinary":
+        raise ValueError(
+            "The Medium planning trial is only for tasks declared ordinary before "
+            f"dispatch; got task risk {declared_risk!r}")
+    if host != "codex":
+        raise ValueError(
+            "The ordinary planning trial is pinned to the Codex subscription "
+            "route; it is not available for host " + str(host))
+    try:
+        spec = cfg["architect"]["codex"]
+    except (KeyError, TypeError):
+        raise ValueError("architect.codex is not configured")
+    model = str(spec.get("model") or "")
+    if str(spec.get("effort") or "").lower() != "high":
+        raise ValueError(
+            "The ordinary planning trial requires the pinned High architect effort; "
+            f"configured effort is {spec.get('effort')!r}")
+    if spec.get("auth") != "subscription":
+        raise ValueError(
+            "The ordinary planning trial requires subscription billing; configured "
+            f"auth is {spec.get('auth')!r}")
+    verdict = (metadata or {}).get("architect") or {}
+    if verdict.get("state") != "confirmed":
+        raise ValueError(
+            "The ordinary planning trial requires confirmed catalogue metadata for "
+            f"{model!r}; metadata is {verdict.get('state') or 'unavailable'} "
+            f"({verdict.get('detail') or verdict.get('reason') or 'no adapter'}). "
+            "Refusing to treat missing metadata as support.")
+    variants = set(verdict.get("variants") or [])
+    missing = {"medium", "high"} - variants
+    if missing:
+        raise ValueError(
+            "The ordinary planning trial needs a model that supports both Medium "
+            f"and High decisions; {model!r} catalogue variants are {sorted(variants)} "
+            f"(missing {sorted(missing)})")
+    pinned = {"provider": "codex", "model": model,
+              "effort": spec.get("effort"), "billing": spec.get("auth")}
+    return {"enabled": True, "state": "pending", "effort": PLANNING_TRIAL_EFFORT,
+            "declared_task_risk": declared_risk,
+            "declared_at": now(),
+            "pinned_route": pinned,
+            "pinned_route_sha256": content_hash(pinned),
+            "metadata_source": verdict.get("source"),
+            "metadata_state": verdict.get("state"),
+            "scope": "initial_plan_only"}
+
+
 def create_run(*, project, goal=None, goal_file=None, host=None,
                plan_approval=False, require_explorer=False, approved_handoff=None,
                authorize_handoff=False, skip_doctor=False, interactive=False,
                allow_explorer=False, explorer_policy=None,
-               ordinary_planning_trial=False, planning_trial_risk="ordinary"):
+               ordinary_planning_trial=False, planning_trial_risk="ordinary",
+               routes=None, allow_unverified_metadata=False):
     """Create durable run state without dispatching a worker.
 
     ``host`` is the controlling interactive/strong host and must be supplied
     explicitly.  It is validated before any state, lease or job artifact is
-    written; there is no silent Codex default.
+    written; there is no silent Codex default.  ``routes`` is an optional
+    role-keyed override resolved and pinned before any state exists.
     """
     if not isinstance(host, str) or host not in {"codex", "claude"}:
         raise ValueError(
             "An explicit controlling host is required for a new run: codex or claude")
-    cfg = config()
-    trial = validate_planning_trial(cfg, host, ordinary_planning_trial,
-                                    declared_risk=planning_trial_risk)
+    observed = observe_configuration()
+    cfg = observed["cfg"]
     project = Path(project).expanduser().resolve()
     if not project.is_dir():
         raise ValueError(f"Project does not exist: {project}")
@@ -14688,6 +15688,12 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
         goal = Path(goal_file).expanduser().read_text(encoding="utf-8")
     if not isinstance(goal, str) or not goal.strip():
         raise ValueError("Goal is empty")
+    # Resolve every route before any state, lease or billable work is created.
+    selection = resolve_run_routes(
+        cfg, host, project, routes, allow_unverified=allow_unverified_metadata)
+    trial = validate_planning_trial(cfg, host, ordinary_planning_trial,
+                                    declared_risk=planning_trial_risk,
+                                    metadata=selection.get("metadata", {}))
     # Keep the user's exact words.  Validation may reject whitespace-only text,
     # but the stored requirement is never trimmed or rewritten.
     baseline = source_snapshot(project)
@@ -14703,7 +15709,7 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
     if plan and len(plan["batches"]) > cfg["limits"]["max_batches"]:
         raise ValueError("Handoff exceeds configured batch budget")
     if not skip_doctor:
-        healthy = doctor(project, host)
+        healthy = doctor(project, host, routes=selection["routes"])
         if not healthy["ready"]:
             raise RuntimeError("Doctor blocked start: " + json.dumps(healthy))
     identifier = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
@@ -14716,7 +15722,14 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
                  "schema_version": STATE_SCHEMA_VERSION,
                  "supervisor_version": SUPERVISOR_VERSION,
                  "config_schema_version": CONFIG_SCHEMA_VERSION,
-                 "config_sha256": configuration_provenance().get("sha256"),
+                 "config_sha256": observed["raw_sha256"],
+                 "config_policy": {**observed["policy"], "source": "run_creation",
+                                   "adopted_at": now()},
+                 "route_selection": selection["record"],
+                 "host_fallback_route": selection["record"].get("host_fallback_route"),
+                 "role_generations": {role: 0 for role in
+                                      ("architect", "explorer", "implementer", "reviewer")},
+                 "role_switches": [],
                  "explorer_policy": policy,
                  "ordinary_planning_trial": trial,
                  "planning_trial_history": [],
@@ -14742,8 +15755,7 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
                            "reported_cache_write_tokens": None, "sources": [],
                            "reported_provider_cost": None,
                            "cost_status": "unavailable"},
-                 "model_routes": {r: model_route(cfg, host, r, project=project) for r in
-                                  ("architect", "explorer", "implementer", "reviewer")}}
+                 "model_routes": selection["routes"]}
         if handoff is not None:
             state["plan"] = plan
             state["plan_version"] = content_hash(plan)
@@ -14787,6 +15799,18 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
         raise
 
 
+def _load_routes_argument(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, dict):
+        return value
+    text = str(value)
+    candidate = Path(text).expanduser()
+    if not text.lstrip().startswith("{") and candidate.is_file():
+        text = candidate.read_text(encoding="utf-8")
+    return json.loads(text)
+
+
 def begin(args):
     identifier, folder, state = create_run(
         project=args.project, goal_file=args.goal_file, host=args.host,
@@ -14798,6 +15822,9 @@ def begin(args):
         planning_trial_risk=getattr(args, "planning_trial_risk", "ordinary"),
         approved_handoff=getattr(args, "approved_handoff", None),
         authorize_handoff=getattr(args, "authorize_handoff", False),
+        routes=_load_routes_argument(getattr(args, "routes", None)),
+        allow_unverified_metadata=bool(
+            getattr(args, "allow_unverified_metadata", False)),
         skip_doctor=bool(args.skip_doctor), interactive=False)
     print(json.dumps({"run": identifier, "status": "running",
                       "project": state["project"], "run_dir": str(folder)}))
@@ -14815,6 +15842,76 @@ def detach(run_id):
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                              start_new_session=True, cwd=folder)
     print(json.dumps({"supervisor_pid": p.pid, "log": str(logfile)}))
+
+
+def adopt_config_policy_run(run_id, old_config, acknowledge=None, backup_dir=None):
+    """Backup-first adoption of a pre-policy run's old config evidence.
+
+    The supplied file must hash to the digest the run saved.  Its bytes, not the
+    current defaults, derive the policy identity.  Routes, evidence and grants
+    are untouched; an actual policy difference still fails closed downstream.
+    """
+    _operator_action_allowed("adopt-config-policy")
+    acknowledge = (acknowledge or "").strip()
+    if not acknowledge:
+        raise ValueError(
+            "adopt-config-policy requires --acknowledge describing the retained "
+            "backup of the old configuration")
+    folder, state = load(run_id)
+    path = Path(old_config).expanduser()
+    if not path.is_file():
+        raise ValueError(f"Old configuration file not found: {path}")
+    data = path.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    recorded = state.get("config_sha256")
+    if not isinstance(recorded, str) or not recorded:
+        raise RuntimeError("Run has no saved raw configuration digest")
+    if sha != recorded:
+        raise RuntimeError(
+            "Old configuration SHA-256 does not match the run's saved digest; "
+            "refusing to infer policy from a different file")
+    cfg = json.loads(data.decode("utf-8"))
+    _validated_config(cfg)
+    policy = config_policy_fingerprint(cfg, raw_sha256=sha)
+    current = (configuration_provenance().get("policy") or {})
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
+    with exclusive(folder):
+        folder, state = load(run_id)
+        if state.get("config_sha256") != sha:
+            raise RuntimeError(
+                "Run configuration digest changed while adopting; re-run the command")
+        if _recorded_config_policy(state):
+            raise RuntimeError(
+                "Run already has additive config-policy metadata; no adoption needed")
+        if state.get("active_job") or state.get("active_check"):
+            raise RuntimeError(
+                "Reconcile active work before adopting configuration metadata")
+        backup = Path(backup_dir).expanduser() if backup_dir else (
+            folder / "backups" / f"{stamp}-config-policy-{uuid.uuid4().hex[:6]}")
+        backup.mkdir(parents=True, exist_ok=False)
+        (backup / "state.json").write_bytes((folder / "state.json").read_bytes())
+        state["config_policy"] = {
+            **policy, "source": "operator_old_config",
+            "old_config_path": str(path.resolve()),
+            "adopted_at": now(), "acknowledge": acknowledge,
+            "backup": str(backup),
+        }
+        state.setdefault("config_policy_history", []).append(
+            copy.deepcopy(state["config_policy"]))
+        save(folder, state)
+        journal_event(folder, state, "config_policy_adopted",
+                      raw_sha256=sha, policy_sha256=policy["sha256"],
+                      matches_current=(policy["sha256"]
+                                       == current.get("sha256")),
+                      old_config_path=str(path.resolve()))
+    return {"ok": True, "run_id": run_id, "config_sha256": sha,
+            "config_policy_sha256": policy["sha256"],
+            "current_policy_sha256": current.get("sha256"),
+            "equivalent_to_current": policy["sha256"] == current.get("sha256"),
+            "backup": str(backup), "run_dir": str(folder),
+            "note": ("Policy metadata adopted from the exact old bytes. A genuine "
+                     "policy difference still requires explicit migration or "
+                     "reverification; routes and grants are unchanged.")}
 
 
 def compatibility_run(run_id):
@@ -15230,11 +16327,21 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
         expected = STAGES.get(state["phase"], {}).get("role")
         if role != expected:
             raise RuntimeError(f"Stage {state['phase']} needs role {expected}; got {role}")
-        settings = config()["fallback"][state["host"]]
-        if not settings["model"]:
+        settings = (state.get("host_fallback_route")
+                    or (config()["fallback"][state["host"]]))
+        if not settings.get("model"):
             raise RuntimeError("Fallback model must be explicitly configured")
         ensure_checkout_lease(state, adopt_legacy=True)
-        state["fallback_authorization"] = {"role": role, "approved_at": now(), "limit": "one dispatch"}
+        generation = (state.get("role_generations") or {}).get(role, 0)
+        state["fallback_authorization"] = {
+            "role": role, "approved_at": now(), "limit": "one dispatch",
+            "route_sha256": route_authorization_sha(
+                {"provider": state["host"], "model": settings["model"],
+                 "effort": settings.get("effort"), "billing": "subscription"}),
+            "role_generation": generation,
+            "route": {"provider": state["host"], "model": settings["model"],
+                      "effort": settings.get("effort"),
+                      "billing": "subscription"}}
         state["status"] = "running"
         state["pause_reason"] = None
         save(folder, state)
@@ -15565,20 +16672,26 @@ def effective_route(state, role):
     effective = copy.deepcopy(configured) if configured else None
     if configured is None:
         return {"configured": None, "effective": None, "source": "supervisor"}
+    generation = (state.get("role_generations") or {}).get(role, 0)
     source = "pinned"
     fallback = state.get("fallback_authorization") or {}
-    if fallback.get("role") == role:
-        try:
-            selected = config()["fallback"][state.get("host") or "codex"]
-        except (ValueError, KeyError, TypeError, OSError):
-            selected = {}
+    if (fallback.get("role") == role
+            and fallback.get("role_generation") in (None, generation)):
+        selected = state.get("host_fallback_route") or {}
+        if not selected.get("model"):
+            try:
+                selected = config()["fallback"][state.get("host") or "codex"]
+            except (ValueError, KeyError, TypeError, OSError):
+                selected = {}
         if selected.get("model"):
             effective = {"provider": state.get("host"), "model": selected["model"],
                          "effort": selected.get("effort"),
                          "billing": "subscription"}
             source = "approved_fallback"
     worker_fallback = state.get("worker_fallback_authorization") or {}
-    if worker_fallback.get("role") == role and isinstance(configured.get("fallback_route"), dict):
+    if (worker_fallback.get("role") == role
+            and worker_fallback.get("role_generation") in (None, generation)
+            and isinstance(configured.get("fallback_route"), dict)):
         effective = copy.deepcopy(configured["fallback_route"])
         source = "approved_worker_fallback"
     trial = state.get("ordinary_planning_trial") or {}
@@ -15591,6 +16704,7 @@ def effective_route(state, role):
         (configured.get(key) != (effective or {}).get(key))
         for key in ("provider", "model", "effort", "billing"))
     return {"configured": configured, "effective": effective, "source": source,
+            "role_generation": generation,
             "differs_from_configured": changed}
 
 
@@ -16014,7 +17128,8 @@ def start_run(*, project, goal=None, goal_file=None, host=None,
               plan_approval=False, require_explorer=False, approved_handoff=None,
               authorize_handoff=False, skip_doctor=False, interactive=True,
               allow_explorer=False, explorer_policy=None,
-              ordinary_planning_trial=False, planning_trial_risk="ordinary"):
+              ordinary_planning_trial=False, planning_trial_risk="ordinary",
+              routes=None, allow_unverified_metadata=False):
     identifier, folder, state = create_run(
         project=project, goal=goal, goal_file=goal_file, host=host,
         plan_approval=plan_approval, require_explorer=require_explorer,
@@ -16022,9 +17137,11 @@ def start_run(*, project, goal=None, goal_file=None, host=None,
         ordinary_planning_trial=ordinary_planning_trial,
         planning_trial_risk=planning_trial_risk,
         approved_handoff=approved_handoff, authorize_handoff=authorize_handoff,
-        skip_doctor=skip_doctor, interactive=interactive)
+        skip_doctor=skip_doctor, interactive=interactive,
+        routes=routes, allow_unverified_metadata=allow_unverified_metadata)
     return {"ok": True, "run_id": identifier, "status": state["status"],
             "phase": state["phase"], "project": state["project"],
+            "route_selection": state.get("route_selection"),
             "ordinary_planning_trial": state.get("ordinary_planning_trial"),
             "run_dir": str(folder), "next_action": "orchestrator_stage",
             "next": next_stage_preview(state)}
@@ -16071,13 +17188,26 @@ def route_report(state, role=_ROUTE_UNSET, *, stage=None):
                 "differs_from_configured": False, "stage": stage}
     resolved = effective_route(state, role)
     route = resolved.get("effective") or {}
+    selection = state.get("route_selection") or {}
+    current_default = None
+    try:
+        current_default = model_route(config(), state.get("host"), role,
+                                       project=Path(state["project"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        current_default = None
     return {"role": role, "host": state.get("host"),
+            "controlling_host": state.get("host"),
             "provider": route.get("provider"),
             "worker_provider": route.get("worker_provider"),
             "model": route.get("model"), "effort": route.get("effort"),
             "billing": route.get("billing"),
             "routing_fingerprint": route.get("routing_fingerprint"),
             "configured": resolved.get("configured"),
+            "pinned": resolved.get("configured"),
+            "current_default": current_default,
+            "selection_source": selection.get("source"),
+            "selection_metadata": (selection.get("metadata") or {}).get(role),
+            "role_generation": resolved.get("role_generation"),
             "effective": route,
             "route_source": resolved.get("source"),
             "differs_from_configured": resolved.get("differs_from_configured"),
@@ -16786,6 +17916,7 @@ def authorize_route_run(run_id, role, max_dispatches=1, attestation=None,
             "used": 0,
             "attestation": attestation or None,
             "run_id": run_id,
+            "role_generation": _role_generation(state, role),
             "selected_route": "fallback" if fallback else "primary",
             "primary_route_sha256": route_authorization_sha(primary),
             "actor": authorization["actor"],
@@ -16825,6 +17956,7 @@ def approve_worker_fallback_run(run_id, role, confirmation=None):
             raise RuntimeError(binding_error)
         state["worker_fallback_authorization"] = {
             "role": role, "route_sha256": route_authorization_sha(fallback),
+            "role_generation": _role_generation(state, role),
             "approved_at": now(), "limit": "one dispatch",
             "authorization": authorization,
             "fallback_route": {key: fallback.get(key) for key in
@@ -16838,6 +17970,267 @@ def approve_worker_fallback_run(run_id, role, confirmation=None):
     return {"ok": True, "run_id": run_id, "role": role,
             "worker_fallback_authorization": state["worker_fallback_authorization"],
             "human_authorization": authorization}
+
+
+SWITCH_ROLE_DOWNSTREAM = {
+    "architect": ("Preserve the approved plan and deterministic checks; any pending "
+                  "protected verdict or diagnosis is re-dispatched on the newly "
+                  "selected High route."),
+    "reviewer": ("Invalidate the current unaccepted review and its dependent pending "
+                 "verdict; repeat independent review on the same qualifying evidence "
+                 "when it still matches."),
+    "implementer": ("Preserve already applied work, accepted batches and historical "
+                    "reports; clear only the old retry continuation for this role."),
+    "explorer": ("Preserve already applied work and reports; a pending exploration "
+                 "must be rechecked on the newly selected route."),
+}
+
+
+def _switch_guard(state):
+    """Refuse a switch at an unsafe or mid-stage boundary."""
+    if state.get("status") in FINAL_STATES:
+        raise RuntimeError("A completed/cancelled run has no live route to switch")
+    if state.get("status") == "uncertain":
+        raise RuntimeError(
+            "Run is uncertain; interrupt or reconcile the exact attempt before "
+            "switching (`orchestrator.py interrupt|reconcile <run>`)")
+    if state.get("active_job") or state.get("active_check"):
+        raise RuntimeError(
+            "An active job/check exists; let the stage finish or interrupt it and "
+            "reconcile before switching. No role switch is allowed mid-stage")
+    exploration = state.get("exploration")
+    if isinstance(exploration, dict) and exploration.get("status") in {
+            "running", "dispatched", "uncertain"}:
+        raise RuntimeError(
+            "A tracked exploration is still active; reconcile it "
+            "(`orchestrator.py reconcile-explorer <run>`) first")
+    conflict = checkout_conflict(state)
+    if conflict:
+        raise RuntimeError(
+            "Checkout lease conflict blocks a role switch: "
+            + str(conflict.get("kind")) + " — " + str(conflict.get("resolution")))
+    retry = state.get("retry_session")
+    if isinstance(retry, dict) and not retry.get("reconciled"):
+        raise RuntimeError(
+            "An unreconciled retry session exists; reconcile it before switching")
+
+
+def _resolve_single_role_route(cfg, host, role, spec, project, *, allow_unverified):
+    if not isinstance(spec, dict):
+        raise ValueError(f"routes.{role} must be an object")
+    if role == "architect":
+        route = _merged_architect_route(cfg, host, spec)
+    elif role in RUN_ROUTE_KEYS:
+        route = _merged_worker_route(cfg, role, spec, project)
+        route["routing_fingerprint"] = routing_fingerprint(
+            route, cfg, project=project, role=role)
+    else:
+        raise ValueError(f"Unknown role {role!r}")
+    verdict = validate_route_metadata(route, host, role, project)
+    if verdict["state"] == "unsupported":
+        raise ValueError(
+            f"routes.{role} is not supported by authoritative metadata: "
+            + str(verdict.get("reason") or verdict.get("detail")))
+    if verdict["state"] == "unavailable" and not allow_unverified:
+        raise RuntimeError(
+            f"routes.{role} cannot be attested from metadata ("
+            + str(verdict.get("detail") or verdict.get("reason"))
+            + "). Use a compatible CLI or explicitly authorize the exact probe "
+            "with --allow-unverified-metadata.")
+    return route, verdict
+
+
+def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
+    _switch_guard(state)
+    current = (state.get("model_routes") or {}).get(role)
+    if not isinstance(current, dict):
+        raise RuntimeError(f"Run has no pinned {role} route")
+    proposed, verdict = _resolve_single_role_route(
+        cfg, state.get("host"), role, spec, Path(state["project"]),
+        allow_unverified=allow_unverified)
+    if (role == "architect" and state.get("phase") in {"accept", "diagnose", "integrate"}
+            and str(proposed.get("effort") or "").lower() != "high"):
+        raise ValueError(
+            f"A protected Architect {state.get('phase')} requires High; the proposed "
+            f"route uses effort {proposed.get('effort')!r}")
+    generation = _role_generation(state, role) + 1
+    route_sha = route_authorization_sha(proposed)
+    trial = state.get("ordinary_planning_trial") or {}
+    trial_effect = None
+    if role == "architect" and trial.get("enabled") and trial.get("state") == "pending":
+        new_pin = content_hash({key: proposed.get(key) for key in
+                                ("provider", "model", "effort", "billing")})
+        if trial.get("pinned_route_sha256") not in (None, new_pin):
+            trial_effect = ("pending Medium planning trial will be marked "
+                            "ineligible_route_drift with operator-visible reasons; "
+                            "the pinned High route is preserved and effort is not changed")
+    proposal = {
+        "run_id": state.get("id"),
+        "role": role,
+        "generation": generation,
+        "state_identity": {
+            "phase": state.get("phase"), "status": state.get("status"),
+            "plan_version": state.get("plan_version"),
+            "plan_revision": state.get("plan_revision", 0),
+            "amendment_epoch": state.get("amendment_epoch", 0),
+            "authority_epoch": state.get("authority_epoch", 0),
+            "batch_index": state.get("batch_index", 0),
+            "verification": (state.get("verification") or {}).get("path"),
+        },
+        "previous_route": {key: current.get(key) for key in
+                           ("provider", "worker_provider", "model", "effort", "billing")},
+        "proposed_route": {key: proposed.get(key) for key in
+                           ("provider", "worker_provider", "model", "effort", "billing")},
+        "billing": proposed.get("billing"),
+        "route_sha256": route_sha,
+        "metadata": verdict,
+        "trial_effect": trial_effect,
+        "downstream": SWITCH_ROLE_DOWNSTREAM.get(role),
+    }
+    proposal_sha = content_hash(proposal)
+    confirmation = f"switch-role:{state.get('id')}:{role}:{proposal_sha[:12]}"
+    try:
+        preflight = route_preflight(role, proposed, cfg, Path(state["project"]),
+                                    state)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        preflight = {"ok": False, "reasons": [exc.__class__.__name__],
+                     "warning": "read-only preflight unavailable"}
+    return {"version": 1, "ok": True, "applied": False,
+            **proposal,
+            "proposal_sha256": proposal_sha,
+            "expected_confirmation": confirmation,
+            "preflight": preflight,
+            "phase": state.get("phase"), "status": state.get("status"),
+            "note": ("Read-only preview. Apply with --apply and the exact "
+                     "--confirm value; the route is backed up before mutation."),
+            "_route": proposed}
+
+
+def preview_role_switch(run_id, role, spec, *, allow_unverified=False):
+    folder, state = load(run_id)
+    preview = _switch_proposal(state, config(), role, spec,
+                               allow_unverified=allow_unverified)
+    preview["run_dir"] = str(folder)
+    preview.pop("_route", None)
+    return preview
+
+
+def _route_spec_from_argument(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("A JSON route object or path to a JSON file is required")
+    text = value.strip()
+    if text.startswith("{"):
+        return json.loads(text)
+    return json.loads(Path(text).expanduser().read_text(encoding="utf-8"))
+
+
+def switch_role_run(run_id, role, spec, confirmation=None, *,
+                    allow_unverified=False, backup_dir=None):
+    """Human-only, backup-first single-role route switch at a safe boundary."""
+    if role not in RUN_ROUTE_KEYS:
+        raise ValueError("Unknown role")
+    spec = _route_spec_from_argument(spec)
+    folder, state = load(run_id)
+    preview = _switch_proposal(state, config(), role, spec,
+                               allow_unverified=allow_unverified)
+    authorization = require_human_operator(
+        "switch-role", run_id, confirmation,
+        expected=preview["expected_confirmation"])
+    with exclusive(folder):
+        folder, state = load(run_id)
+        fresh = _switch_proposal(state, config(), role, spec,
+                                 allow_unverified=allow_unverified)
+        if confirmation != fresh["expected_confirmation"]:
+            raise RuntimeError(
+                "Stale switch confirmation: the run, route or metadata changed "
+                "after the preview. Re-run the read-only preview.")
+        _switch_guard(state)
+        proposed = fresh["_route"]
+        generation = fresh["generation"]
+        route_sha = fresh["route_sha256"]
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
+        backup = Path(backup_dir).expanduser() if backup_dir else (
+            folder / "backups" / f"{stamp}-switch-{role}-{uuid.uuid4().hex[:6]}")
+        backup.mkdir(parents=True, exist_ok=False)
+        (backup / "state.json").write_bytes(
+            (folder / "state.json").read_bytes())
+        (backup / "switch.json").write_text(
+            json.dumps({k: v for k, v in fresh.items() if k != "_route"},
+                       indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        invalidated = {"grants": 0, "retry_session": False,
+                       "fallback_consent": False, "review": False,
+                       "pending_verdict": False, "authority_epoch": False}
+        prior_generation = _role_generation(state, role)
+        state.setdefault("model_routes", {})[role] = proposed
+        state.setdefault("role_generations", {})[role] = generation
+        for consent in ("fallback_authorization", "worker_fallback_authorization"):
+            item = state.get(consent)
+            if isinstance(item, dict) and item.get("role") == role:
+                state[consent] = None
+                invalidated["fallback_consent"] = True
+        retry = state.get("retry_session")
+        if isinstance(retry, dict) and retry.get("role") == role:
+            state["retry_session"] = None
+            invalidated["retry_session"] = True
+        invalidated["grants"] = sum(
+            1 for entry in state.get("route_authorizations", [])
+            if entry.get("role") == role
+            and entry.get("role_generation", 0) == prior_generation)
+        if role == "architect":
+            # Preserve plan, checks and accepted history. Pending protected
+            # outputs must be produced by the new High route.
+            state["final_verdict"] = None
+            state["pending_decision_binding"] = None
+            state["diagnosis_verdict"] = None
+            state["authority_epoch"] = _authority_epoch_value(
+                state.get("authority_epoch", 0)) + 1
+            invalidated["pending_verdict"] = True
+            invalidated["authority_epoch"] = True
+        elif role == "reviewer":
+            if state.get("review"):
+                state["review"] = None
+                invalidated["review"] = True
+            state["final_verdict"] = None
+            state["pending_decision_binding"] = None
+            state["authority_epoch"] = _authority_epoch_value(
+                state.get("authority_epoch", 0)) + 1
+            invalidated["pending_verdict"] = True
+            invalidated["authority_epoch"] = True
+            if state.get("phase") in {"review", "accept"}:
+                state["phase"] = "review"
+        elif role == "explorer":
+            if state.get("required_exploration_job"):
+                state.pop("required_exploration_job", None)
+                state["exploration"] = None
+        record = {
+            "role": role, "at": now(),
+            "prior_generation": prior_generation, "new_generation": generation,
+            "prior_route": fresh["previous_route"],
+            "new_route": fresh["proposed_route"],
+            "route_sha256": route_sha,
+            "proposal_sha256": fresh["proposal_sha256"],
+            "metadata": fresh["metadata"], "backup": str(backup),
+            "invalidated": invalidated,
+            "human_authorization": authorization,
+            "downstream": fresh["downstream"],
+        }
+        state.setdefault("role_switches", []).append(record)
+        state["pause_reason"] = (
+            f"{role.title()} route switched to "
+            f"{proposed.get('model')} · {proposed.get('effort')}. "
+            "Review the journal and resume; changes remain local until then.")
+        if state.get("status") == "running":
+            state["status"] = "paused"
+        save(folder, state)
+        journal_event(folder, state, "role_switched", switch=record)
+    result = {k: v for k, v in fresh.items() if k != "_route"}
+    result.update({"applied": True, "backup": str(backup),
+                   "invalidated": invalidated, "record": record,
+                   "run_dir": str(folder), "status": state.get("status"),
+                   "next_action": "review the journal, then resume the run"})
+    return result
 
 
 def approve_fallback_run(run_id, role, confirmation=None):
@@ -16909,6 +18302,25 @@ MCP_TOOLS = [
                                                      "Medium effort for the initial plan only. "
                                                      "Final acceptance remains High.")},
          "planning_trial_risk": {"type": "string", "enum": ["ordinary"], "default": "ordinary"},
+         "routes": {"type": "object", "additionalProperties": False,
+                    "description": ("Optional run-scoped role route overrides. A "
+                                    "provider change requires a complete route "
+                                    "including billing."),
+                    "properties": {role: {
+                        "type": "object", "additionalProperties": False,
+                        "properties": {
+                            "provider": {"type": "string"},
+                            "model": {"type": "string"},
+                            "effort": {"type": "string"},
+                            "variant": {"type": "string"},
+                            "billing": {"type": "string",
+                                        "enum": sorted(EXPLICIT_BILLINGS)}},
+                        "required": []}
+                        for role in ("architect", "explorer", "implementer", "reviewer")}},
+         "allow_unverified_metadata": {"type": "boolean", "default": False,
+                                       "description": ("Explicitly authorize a "
+                                                       "new/changed route whose catalogue "
+                                                       "cannot attest model/effort")},
          "approved_handoff": {"type": "string",
                               "description": "Absolute JSON handoff path, only with explicit user approval"},
          "authorize_handoff": {"type": "boolean", "default": False},
@@ -16981,7 +18393,10 @@ def _mcp_tool_call(name, arguments):
                          ordinary_planning_trial=bool(arguments.get(
                              "ordinary_planning_trial", False)),
                          planning_trial_risk=arguments.get(
-                             "planning_trial_risk", "ordinary"))
+                             "planning_trial_risk", "ordinary"),
+                         routes=arguments.get("routes"),
+                         allow_unverified_metadata=bool(arguments.get(
+                             "allow_unverified_metadata", False)))
     if name == "orchestrator_stage":
         return stage_run(arguments["run_id"])
     if name == "orchestrator_status":
@@ -17168,6 +18583,11 @@ def main(argv=None):
                    help="Explicitly declare an ordinary task and use Medium for the initial plan only (final acceptance stays High)")
     s.add_argument("--planning-trial-risk", default="ordinary",
                    help="Declared task risk for the Medium planning trial (only 'ordinary' is eligible)")
+    s.add_argument("--routes",
+                   help="Role-keyed JSON route overrides (inline object or JSON file path)")
+    s.add_argument("--allow-unverified-metadata", action="store_true",
+                   help="Explicitly authorize a new/changed route whose provider "
+                        "catalogue cannot attest the requested model/effort")
     s.add_argument("--skip-doctor", action="store_true", help="Tests/offline development only")
     for name in ("status", "resume", "pause", "cancel", "approve-plan",
                  "approve-fallback", "reconcile", "serve"):
@@ -17258,6 +18678,28 @@ def main(argv=None):
     mg.add_argument("run_id")
     mg.add_argument("--backup-dir")
     mg.add_argument("--routes", help="Explicit JSON route mapping when recorded routes are insufficient")
+    sw = subs.add_parser("switch-role",
+                         help="Human-only preview/apply of one role's route at a safe boundary")
+    sw.add_argument("run_id")
+    sw.add_argument("--role", required=True,
+                    choices=("architect", "explorer", "implementer", "reviewer"))
+    sw.add_argument("--route", required=True,
+                    help="Proposed route as a JSON object or a path to a JSON file")
+    sw.add_argument("--apply", action="store_true",
+                    help="Apply the previewed switch; omitted means read-only preview")
+    sw.add_argument("--allow-unverified-metadata", action="store_true",
+                    help="Explicitly authorize a route the catalogue cannot attest")
+    sw.add_argument("--backup-dir")
+    sw.add_argument("--confirm",
+                    help="Exact preview confirmation, e.g. switch-role:<run>:<role>:<sha12>")
+    ac = subs.add_parser("adopt-config-policy",
+                         help="Backup-first adoption of a pre-policy run's exact old config")
+    ac.add_argument("run_id")
+    ac.add_argument("--old-config", required=True,
+                    help="Old config file whose SHA-256 matches the run's saved digest")
+    ac.add_argument("--acknowledge", required=True,
+                    help="Describe the retained backup before mutating metadata")
+    ac.add_argument("--backup-dir")
     rs = subs.add_parser("restore-run", help="Restore a migrated run from its exact backup")
     rs.add_argument("run_id")
     rs.add_argument("--backup", required=True)
@@ -17363,6 +18805,21 @@ def main(argv=None):
                 route_map = json.loads(Path(opts.routes).expanduser().read_text(encoding="utf-8"))
             print(json.dumps(migrate_run(opts.run_id, opts.backup_dir, route_map),
                              ensure_ascii=False, indent=2))
+        elif opts.command == "adopt-config-policy":
+            print(json.dumps(adopt_config_policy_run(
+                opts.run_id, opts.old_config, opts.acknowledge, opts.backup_dir),
+                ensure_ascii=False, indent=2))
+        elif opts.command == "switch-role":
+            if opts.apply:
+                result = switch_role_run(
+                    opts.run_id, opts.role, opts.route, opts.confirm,
+                    allow_unverified=bool(opts.allow_unverified_metadata),
+                    backup_dir=opts.backup_dir)
+            else:
+                result = preview_role_switch(
+                    opts.run_id, opts.role, opts.route,
+                    allow_unverified=bool(opts.allow_unverified_metadata))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         elif opts.command == "restore-run":
             print(json.dumps(restore_run(opts.run_id, opts.backup, opts.acknowledge),
                              ensure_ascii=False, indent=2))

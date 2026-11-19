@@ -475,7 +475,9 @@ class ReviewRecoveryTests(unittest.TestCase):
         config_path = Path(orc.CONFIG_PATH)
         original = config_path.read_text()
         self.addCleanup(config_path.write_text, original)
-        config_path.write_text(original + "\n")
+        cfg = orc.read_json(config_path)
+        cfg["limits"]["max_stage_seconds"] = 4321
+        orc.atomic_json(config_path, cfg)
         with patch.object(orc, "call_model",
                           side_effect=AssertionError("unexpected model")) as model:
             with self.assertRaisesRegex(RuntimeError, "config_changed"):

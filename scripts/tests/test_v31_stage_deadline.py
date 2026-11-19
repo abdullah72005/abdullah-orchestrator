@@ -6,11 +6,57 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
 import test_orchestrator as baseline
 orc = baseline.orc
+
+
+class MarkerGatedBudget:
+    """Test-only deadline value that clips only after a start marker exists.
+
+    Under load, preflight work can consume the whole stage budget before the
+    decision child is spawned, turning this test into the pre-spawn timeout
+    branch.  Returning this object from ``remaining_budget`` lets the spawn
+    happen; its first comparison waits (bounded) for the fake decision's
+    marker and then applies the genuine remaining stage budget, or a minimal
+    positive clip if the deadline already elapsed while starting up.
+    """
+
+    def __init__(self, marker, deadline, configured, wait=10.0, expired=0.05):
+        self.marker = Path(marker)
+        self.deadline = deadline
+        self.configured = float(configured)
+        self.wait = float(wait)
+        self.expired = float(expired)
+
+    def _clip(self):
+        until = time.monotonic() + self.wait
+        while time.monotonic() < until:
+            if self.marker.exists():
+                remaining = (self.deadline - time.monotonic()
+                             if self.deadline is not None else self.configured)
+                if remaining <= 0.05:
+                    # The stage deadline elapsed during startup.  A
+                    # prerequisite child gets a small positive window to
+                    # finish; the child under test gets an immediate clip.
+                    return self.expired
+                return min(self.configured, remaining)
+            time.sleep(0.01)
+        raise AssertionError(
+            f"decision start marker {self.marker} was not created within "
+            f"{self.wait:.1f}s; refusing to clip a child that never started")
+
+    def __lt__(self, elapsed):
+        return elapsed > self._clip()
+
+    def __float__(self):
+        return self._clip()
+
+    def __repr__(self):
+        return f"MarkerGatedBudget({self.marker})"
 
 
 SLEEPING_CODEX = r'''#!/usr/bin/env python3
@@ -32,9 +78,15 @@ class StageDeadlineTests(unittest.TestCase):
         cfg = orc.read_json(orc.CONFIG_PATH)
         cfg.setdefault("limits", {})["max_stage_seconds"] = seconds
         cfg["limits"]["max_check_seconds"] = 60
-        cfg["limits"]["max_architect_seconds"] = 60
+        # Distinct from the check limit so a test can gate only the decision
+        # child's remaining-budget call.
+        cfg["limits"]["max_architect_seconds"] = 61
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         self.cfg = orc.config()
+        # The setup already adopted a policy record for the original config.
+        # Drop it with the raw digest so save() re-adopts the policy of the
+        # config this test just wrote instead of retaining the stale one.
+        self.state.pop("config_policy", None)
         self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
         orc.save(self.rundir, self.state)
 
@@ -77,21 +129,51 @@ class StageDeadlineTests(unittest.TestCase):
         self.assertIsNone(after.get("verification"))
 
     def test_already_started_check_is_terminated_at_clipped_deadline(self):
-        self.configure_stage(1.5)
+        # Each check writes a start marker before running.  The test-only
+        # budget wrapper holds the clip until that marker exists, so a loaded
+        # host cannot consume the stage budget during interpreter startup and
+        # turn this into the pre-spawn branch.  The long check's marker plus
+        # its 30s sleep proves it was running when the clipped deadline ended
+        # it.  The first-check window is only a startup floor; the long check
+        # still receives the genuine remaining stage budget.
+        self.configure_stage(3.0)
+        first_marker = self.root / "first-check-started"
+        long_marker = self.root / "long-check-started"
+        first_check = (
+            "import pathlib,time; "
+            f"pathlib.Path({str(first_marker)!r}).write_text('started'); "
+            "time.sleep(0.2)")
+        long_check = (
+            "import pathlib,time; "
+            f"pathlib.Path({str(long_marker)!r}).write_text('started'); "
+            "time.sleep(30)")
         plan = {"contract_version": 2, "status": "complete", "summary": "plan",
                 "invariants": ["Keep behavior"],
                 "batches": [{"title": "one", "goal": "g", "acceptance": ["a"],
-                             "checks": [[sys.executable, "-c",
-                                         "import time; time.sleep(0.3)"],
-                                        [sys.executable, "-c",
-                                         "import time; time.sleep(30)"]],
+                             "checks": [[sys.executable, "-c", first_check],
+                                        [sys.executable, "-c", long_check]],
                              "risk": "ordinary"}],
                 "blocker": ""}
         self.state.update(phase="verify", plan=plan,
                           plan_version=orc.content_hash(plan), batch_index=0,
                           single_batch_fast_path=False)
         orc.save(self.rundir, self.state)
-        result = orc.stage_run("test-run00")
+        real_remaining = orc.remaining_budget
+        check_limit = float(self.cfg["limits"]["max_check_seconds"])
+        calls = {"checks": 0}
+
+        def gated_remaining(configured, deadline):
+            if float(configured) != check_limit:
+                return real_remaining(configured, deadline)
+            calls["checks"] += 1
+            if calls["checks"] == 1:
+                return MarkerGatedBudget(first_marker, deadline, configured,
+                                         expired=5.0)
+            return MarkerGatedBudget(long_marker, deadline, configured)
+
+        with patch.object(orc, "remaining_budget",
+                          side_effect=gated_remaining):
+            result = orc.stage_run("test-run00")
         self.assertFalse(result["ok"])
         self.assertEqual(result["stage"], "verify")
         self.assertTrue(result["pause_reason"])
@@ -100,13 +182,18 @@ class StageDeadlineTests(unittest.TestCase):
         self.assertEqual(state["phase"], "verify")
         self.assertIsNone(state.get("verification"))
         self.assertFalse(state.get("accepted_batches"))
-        # The first check completed; the second was clipped and terminated.
+        # The first check completed; the second started and was clipped.
         logs = sorted((self.rundir / "jobs").glob("check-*.log"))
         self.assertGreaterEqual(len(logs), 1)
         evidence = (state.get("check_progress") or {}).get("evidence") or {}
         commands = evidence.get("commands") or []
         self.assertTrue(commands)
         self.assertEqual(commands[0]["returncode"], 0)
+        self.assertTrue(first_marker.exists(),
+                        "the first check never started")
+        self.assertTrue(long_marker.exists(),
+                        "the long check never started before its clipped "
+                        "timeout; the test would only prove a pre-spawn branch")
         # A timed-out stage must not advance to review or acceptance and must
         # not dispatch a Reviewer/worker on the next stage attempt.
         again = orc.stage_run("test-run00")
@@ -117,6 +204,20 @@ class StageDeadlineTests(unittest.TestCase):
         self.assertIsNone(after.get("verification"))
         self.assertFalse(any(job.get("role") in {"reviewer", "implementer"}
                              for job in after.get("completed_jobs", [])))
+        # The timeout leaves the exact check record for reconciliation.  It is
+        # refused until the recorded tree is proven stopped, then cleared.
+        active = after.get("active_check")
+        self.assertIsNotNone(active, after)
+        # While the check record exists, the next stage remains paused and
+        # directs the operator to reconcile instead of starting new work.
+        self.assertIn("reconcile", again["error"].lower())
+        inspection = orc.inspect_execution(
+            active, run_id=after["id"], include_run=True)
+        self.assertTrue(inspection["stopped"], inspection["reasons"])
+        orc.modify_locked(self.rundir, after, after["id"], "reconcile")
+        reconciled = orc.read_json(self.rundir / "state.json")
+        self.assertIsNone(reconciled.get("active_check"))
+        self.assertEqual(reconciled["phase"], "verify")
 
     def test_decision_child_is_clipped_to_the_remaining_stage_budget(self):
         self.configure_stage(0.7)
@@ -146,14 +247,23 @@ class StageDeadlineTests(unittest.TestCase):
         self.assertEqual(orc.remaining_budget(5, None), 5)
 
     def test_each_child_fits_but_checks_plus_decision_do_not(self):
-        # One final check (0.8s) fits the 2.0s stage; the fake decision (1.5s)
-        # also fits alone.  Together they exceed the genuine acceptance budget.
-        self.configure_stage(2.0)
+        # A 20s stage fits the 2s check and the 19s decision individually.
+        # Together they exceed the acceptance budget.  The wide margin keeps
+        # host load and decision preflight from consuming the whole budget
+        # before the decision is spawned; its start marker then proves it was
+        # already running when the remaining budget clipped it.
+        self.configure_stage(20.0)
+        decision_marker = self.root / "decision-started"
+        check_marker = self.root / "final-check-started"
+        final_check = (
+            "import pathlib,time; "
+            f"pathlib.Path({str(check_marker)!r}).write_text('started'); "
+            "time.sleep(2.0)")
         bin_dir = self.root / "acceptance-deadline-bin"
         bin_dir.mkdir()
         script = bin_dir / "codex"
         script.write_text(r'''#!/usr/bin/env python3
-import json, pathlib, sys, time
+import json, os, pathlib, sys, time
 args = sys.argv[1:]
 if '--version' in args:
     print('0.167.0')
@@ -162,7 +272,8 @@ if '--output-last-message' in args:
     output = pathlib.Path(args[args.index('--output-last-message') + 1])
     kind = output.parent.name.split('-')[0]
     if kind == 'decision':
-        time.sleep(1.5)
+        pathlib.Path(os.environ['FAKE_DECISION_MARKER']).write_text(str(os.getpid()))
+        time.sleep(19.0)
     report = {'contract_version': 2, 'verdict': 'approved', 'reason': 'inspected',
               'inspected': ['app.py'], 'correction': '',
               'dismissed_findings': []}
@@ -174,8 +285,7 @@ sys.exit(3)
         plan = {"contract_version": 2, "status": "complete", "summary": "plan",
                 "invariants": ["Keep behavior"],
                 "batches": [{"title": "one", "goal": "g", "acceptance": ["a"],
-                             "checks": [[sys.executable, "-c",
-                                         "import time; time.sleep(0.8)"]],
+                             "checks": [[sys.executable, "-c", final_check]],
                              "risk": "ordinary"}],
                 "blocker": ""}
         self.state.update(phase="verify", plan=plan,
@@ -183,7 +293,8 @@ sys.exit(3)
                           single_batch_fast_path=True)
         orc.save(self.rundir, self.state)
         with patch.dict(os.environ, {"PATH": str(bin_dir) + ":" + os.environ["PATH"],
-                                     "OPENAI_API_KEY": ""}):
+                                     "OPENAI_API_KEY": "",
+                                     "FAKE_DECISION_MARKER": str(decision_marker)}):
             evidence = orc.run_checks(self.rundir, self.state, self.cfg,
                                       self.project, plan["batches"][0])
             self.assertTrue(evidence["passed"], evidence)
@@ -192,9 +303,32 @@ sys.exit(3)
                 "findings": [], "files": [], "tests": [], "evidence": ["app.py:1"],
                 "unknowns": [], "blocker": ""}, check_progress=None)
             orc.save(self.rundir, self.state)
-            result = orc.stage_run("test-run00")
+            real_remaining = orc.remaining_budget
+
+            architect_limit = float(self.cfg["limits"]["max_architect_seconds"])
+            check_limit = float(self.cfg["limits"]["max_check_seconds"])
+
+            def gated_remaining(configured, deadline):
+                if float(configured) == check_limit:
+                    # Prerequisite final check: let it start and finish even
+                    # if load consumed the stage budget first, so the decision
+                    # budget test is reached deterministically.
+                    return MarkerGatedBudget(check_marker, deadline, configured,
+                                             expired=8.0)
+                if float(configured) != architect_limit:
+                    return real_remaining(configured, deadline)
+                # The decision clip still uses the genuine remaining stage
+                # budget, but is applied only after its marker exists.
+                return MarkerGatedBudget(decision_marker, deadline, configured)
+
+            with patch.object(orc, "remaining_budget",
+                              side_effect=gated_remaining):
+                result = orc.stage_run("test-run00")
         self.assertFalse(result["ok"], result)
         self.assertEqual(result["stage"], "accept")
+        self.assertTrue(decision_marker.exists(),
+                        "the decision child never started before the clipped "
+                        "budget; the test would only prove a pre-spawn branch")
         state = orc.read_json(self.rundir / "state.json")
         self.assertNotEqual(state["status"], "complete")
         self.assertEqual(state["phase"], "accept")

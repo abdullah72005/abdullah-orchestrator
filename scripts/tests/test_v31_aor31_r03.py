@@ -398,15 +398,31 @@ class InspectionOwnershipTests(R03Base):
         try:
             with patch.object(orc, "_opencode_track_descendants",
                               side_effect=scan_then_release):
+                # The fake parent only exits after spawning the detached
+                # child, so the bounded containment starts after the child
+                # exists.  Keep the bound generous enough that host load
+                # cannot clip the parent before that marker is written.
                 rc, out, _ = orc._opencode_run_bounded(
                     [sys.executable, str(parent), str(release), str(pidfile)],
-                    self.root, {"PATH": os.environ["PATH"]}, 3)
+                    self.root, {"PATH": os.environ["PATH"]}, 10)
             self.assertEqual(rc, 0)
             self.assertEqual(out.strip(), "[]")
+            self.assertTrue(pidfile.exists(),
+                            "fake inspector exited without proving the "
+                            "post-snapshot child had started")
             pid = int(pidfile.read_text())
+            started_stat = orc.process_stat(pid)
             self.assertTrue(_wait_dead(self, pid),
                             "post-snapshot detached child survived")
-            self.assertIsNone(orc.process_stat(pid))
+            stat = orc.process_stat(pid)
+            # A zombie is already terminated; a reaped PID (None) or a reused
+            # PID also proves this exact child is gone.
+            reused = bool(stat and started_stat
+                          and stat["starttime"] != started_stat["starttime"])
+            self.assertTrue(stat is None or stat["state"] in {"Z", "X", "x"}
+                            or reused,
+                            f"post-snapshot detached child {pid} is still "
+                            f"alive: {stat}")
         finally:
             if pid is None and pidfile.exists():
                 pid = int(pidfile.read_text())

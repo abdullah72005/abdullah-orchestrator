@@ -330,6 +330,9 @@ class CallModelGrantWaitTests(unittest.TestCase):
             "variant": "low", "billing": "api"}
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         self.cfg = orc.config()
+        # A rewritten config invalidates the previously adopted policy view;
+        # save() re-adopts the exact bytes this fixture just wrote.
+        self.state.pop("config_policy", None)
         self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
         route = orc.model_route(self.cfg, "codex", "explorer",
                                 project=self.project)

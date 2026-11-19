@@ -78,6 +78,9 @@ class WorkerRouteTests(unittest.TestCase):
             cfg["architect"] = architect
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         self.cfg = orc.config()
+        # A rewritten config invalidates the previously adopted policy view;
+        # save() re-adopts the exact bytes this fixture just wrote.
+        self.state.pop("config_policy", None)
         self.state["config_sha256"] = orc.configuration_provenance().get("sha256")
         orc.save(self.rundir, self.state)
         return cfg
@@ -332,6 +335,10 @@ class WorkerRouteTests(unittest.TestCase):
         self.assertEqual(before["status"], "current")
         cfg = orc.read_json(orc.CONFIG_PATH)
         cfg["workers"]["implementer"]["variant"] = "low"
+        orc.atomic_json(orc.CONFIG_PATH, cfg)
+        # A role-selection preference is pinned per run and must not block it.
+        self.assertEqual(orc.state_compatibility(self.state)["status"], "current")
+        cfg["limits"]["max_stage_seconds"] = 77
         orc.atomic_json(orc.CONFIG_PATH, cfg)
         after = orc.state_compatibility(self.state)
         self.assertEqual(after["status"], "config_changed")

@@ -44,6 +44,12 @@ FAKE_CLI = textwrap.dedent(
     """)
 
 
+TRIAL_METADATA = {"architect": {
+    "state": "confirmed", "source": "test", "detail": "fixture",
+    "version": "test", "models": {},
+    "variants": ["low", "medium", "high"]}}
+
+
 def fake_bin(root: Path, names=("codex", "claude", "opencode")):
     directory = root / "fake-bin"
     directory.mkdir(exist_ok=True)
@@ -768,19 +774,30 @@ class QuotaRoutingTests(ReleaseFixture):
 
     def test_trial_validation_rejects_unknown_risk_and_wrong_host(self):
         cfg = self.cfg
-        self.assertIsNotNone(orc.validate_planning_trial(cfg, "codex", True))
+        self.assertIsNotNone(orc.validate_planning_trial(
+            cfg, "codex", True, metadata=TRIAL_METADATA))
         with self.assertRaisesRegex(ValueError, "ordinary"):
-            orc.validate_planning_trial(cfg, "codex", True, declared_risk="high")
+            orc.validate_planning_trial(cfg, "codex", True,
+                                        declared_risk="high",
+                                        metadata=TRIAL_METADATA)
         with self.assertRaisesRegex(ValueError, "Codex"):
-            orc.validate_planning_trial(cfg, "claude", True)
-        legacy = json.loads(json.dumps(cfg))
-        legacy["architect"]["codex"]["model"] = "gpt-6.1-sol"
-        with self.assertRaisesRegex(ValueError, "6.2"):
-            orc.validate_planning_trial(legacy, "codex", True)
+            orc.validate_planning_trial(cfg, "claude", True,
+                                        metadata=TRIAL_METADATA)
+        # No Sol-version literal gate: any catalogue-confirmed model works.
+        other = json.loads(json.dumps(cfg))
+        other["architect"]["codex"]["model"] = "gpt-6.1-sol"
+        self.assertIsNotNone(orc.validate_planning_trial(
+            other, "codex", True, metadata=TRIAL_METADATA))
+        high_only = json.loads(json.dumps(TRIAL_METADATA))
+        high_only["architect"]["variants"] = ["high"]
+        with self.assertRaisesRegex(ValueError, "missing"):
+            orc.validate_planning_trial(other, "codex", True,
+                                        metadata=high_only)
 
     def test_initial_plan_uses_medium_and_acceptance_stays_high(self):
         plan = self.plan(risk="ordinary")
-        trial = orc.validate_planning_trial(self.cfg, "codex", True)
+        trial = orc.validate_planning_trial(
+            self.cfg, "codex", True, metadata=TRIAL_METADATA)
         state = self.saved(self.state(phase="plan", plan=None,
                                       ordinary_planning_trial=trial))
         calls = []
@@ -818,7 +835,8 @@ class QuotaRoutingTests(ReleaseFixture):
         self.assertIsNone(accept_calls[-1][1])
 
     def test_high_risk_trial_plan_is_not_admitted(self):
-        trial = orc.validate_planning_trial(self.cfg, "codex", True)
+        trial = orc.validate_planning_trial(
+            self.cfg, "codex", True, metadata=TRIAL_METADATA)
         state = self.saved(self.state(phase="plan", plan=None,
                                       ordinary_planning_trial=trial))
         with patch.object(orc, "strong_call",
@@ -1172,7 +1190,8 @@ class CorrectionCycleF120Tests(ReleaseFixture):
 
     # -- F4 ---------------------------------------------------------------
     def test_medium_plan_stage_reports_attempted_trial_route_and_outcome(self):
-        trial = orc.validate_planning_trial(self.cfg, "codex", True)
+        trial = orc.validate_planning_trial(
+            self.cfg, "codex", True, metadata=TRIAL_METADATA)
         state = self.saved(self.state(phase="plan", plan=None,
                                       ordinary_planning_trial=trial))
         with patch.object(orc, "strong_call", return_value=self.plan()):
