@@ -236,16 +236,19 @@ shipped validator:
 | Architect (Codex) | `architect.codex.model` / `.effort` | Passed through; confirm it exists in your Codex catalog. |
 | Architect (Claude) | `architect.claude.model` / `.effort` | Same, for the Claude host. |
 | Explorer | `workers.explorer` | Optional read-only investigation. |
+| Implementer | `workers.implementer` | The only writer. |
+| Reviewer | `workers.reviewer` | Fresh independent context. |
 
 The shipped Codex Architect default is `gpt-6.2-sol` at `high` on subscription
 billing. Final acceptance always uses that High route. A run may explicitly opt
 into `ordinary_planning_trial` at creation to use Medium for the **initial plan
-only** on a task declared ordinary; a high-risk plan from that trial is not
-admitted, and replans, diagnosis, integration and acceptance stay High. The
-trial is validated against the pinned Codex Sol 6.2 subscription route and never
-mutates the Architect route.
-| Implementer | `workers.implementer` | The only writer. |
-| Reviewer | `workers.reviewer` | Fresh independent context. |
+only** on a task declared ordinary. The trial is validated against the exact
+resolved Architect route for that run — the same subscription model must have
+catalogue-confirmed Medium and High variants — and its pin records that route's
+provider, model, effort and billing. A high-risk plan from the trial is not
+admitted; replans, diagnosis, integration and acceptance stay High. An explicit
+Architect switch before the first plan marks a pending trial ineligible
+immediately; it never silently changes the trial's effort.
 
 Discover valid worker IDs before editing:
 
@@ -260,8 +263,12 @@ Rules the supervisor enforces:
 - `billing: "go"` is valid only for the unchanged `opencode-go` route.
 - Any other provider/billing needs an explicit human grant in the run's
   operator terminal: `orchestrator.py authorize-route <RUN> --role <role> ...`.
-- Configuration changes mid-run mark the run `config_changed` and block stages;
-  start a new run or migrate deliberately.
+- A run pins its resolved routes. Changing role defaults mid-run does not
+  reroute it; use a per-run `routes` override at creation or a human
+  `switch-role` preview/apply. Behaviour-bearing policy changes (limits,
+  permissions, verification, unknown keys) still mark the run `config_changed`
+  and block stages until resolved. See
+  [docs/configuration.md](docs/configuration.md#changing-configuration-during-a-run).
 - New runs must state their host (`codex` or `claude`); there is no implicit
   default.
 

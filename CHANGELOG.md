@@ -42,6 +42,33 @@ Additive state fields keep older runs readable.
 - Host fallback consent is bound to the exact pinned effective route and role
   generation instead of re-reading the current global fallback model.
 
+### v1.2.0 release closure · correction 1
+
+- The authenticated Reviewer smoke now asks for the real contract-v2 report and
+  proves its claim from one predicate used by both launch and inspect: a
+  completed, path-matched Read from the producing session carrying the hidden
+  challenge line, supervisor OpenCode ingestion, unchanged candidate and intact
+  prepared bindings. Missing, failed, unrelated or wrong-session Reads, blocked
+  reports, drift and executed write/shell capabilities fail closed; harmless
+  negative capability probes distinguish runtime refusal from normalized rules.
+  The fixture is built through the attested writer-delta publication path.
+- A nonempty effort/variant is matched against canonical and exact
+  provider-defined catalogue names, so a typo is `unsupported` before run
+  creation or switch, including with `--allow-unverified-metadata`. Model
+  catalogue probes run in the target project, are cached per host/project, and
+  an unfinished page budget yields `unavailable`, never authoritative rejection.
+  New Architect selections lacking catalogue-confirmed High are refused at
+  admission or switch.
+- The ordinary planning trial validates Medium and High on the exact resolved
+  run route and pins that route's provider/model/effort/billing. An explicit
+  Architect switch marks a pending trial `ineligible_route_drift` in the preview
+  and saved state immediately.
+- Role switches inherit omitted fields from the pinned run route, refuse a
+  currently incompatible preflight while distinguishing a separately required
+  grant, and preserve mechanical-batch supervisor acceptance and phase when
+  independent review is exempt. Ordinary/high batches still rerun the dependent
+  review and decision on preserved deterministic verification.
+
 ### Changed
 
 - The ordinary planning trial no longer uses a Sol-version literal; it requires

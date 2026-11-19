@@ -5,6 +5,7 @@ a separate operator smoke exercises the real authenticated Reviewer route.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -347,8 +348,158 @@ class ModelMetadataTests(ReleaseFixture):
         self.metadata_bin()
         catalogue = orc._codex_model_catalogue()
         self.assertEqual(catalogue["state"], "confirmed")
+        self.assertTrue(catalogue["complete"])
         self.assertIn("gpt-any-9.9", catalogue["models"])
         self.assertIn("gpt-page-two", catalogue["models"])
+
+    def test_codex_probe_runs_in_the_route_project(self):
+        directory = self.root / "cwd-bin"
+        record = self.root / "probe-cwd.jsonl"
+        write_fake(directory, "codex", textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json, os, sys
+            if "--version" in sys.argv:
+                print("codex-cli 0.169.1")
+                raise SystemExit(0)
+            if "app-server" not in sys.argv:
+                raise SystemExit(3)
+            target = os.environ.get("PROBE_RECORD")
+            if target:
+                with open(target, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"cwd": os.getcwd()}) + "\\n")
+            for line in sys.stdin:
+                message = json.loads(line)
+                if message.get("method") == "initialize":
+                    print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+                elif message.get("method") == "model/list":
+                    print(json.dumps({"id": message["id"], "result": {
+                        "data": [{"id": "gpt-any-9.9", "model": "gpt-any-9.9",
+                                  "supportedReasoningEfforts": [
+                                      {"reasoningEffort": "high"}]}]}}), flush=True)
+            """))
+        with patch.dict(os.environ, {
+                "PATH": str(directory) + ":" + os.environ.get("PATH", ""),
+                "PROBE_RECORD": str(record)}):
+            catalogue = orc._codex_model_catalogue(self.project)
+        self.assertEqual(catalogue["state"], "confirmed")
+        observed = [json.loads(line)["cwd"]
+                    for line in record.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(observed, [str(self.project.resolve())])
+
+    def test_unknown_effort_is_rejected_not_treated_as_absent(self):
+        catalogue = confirmed()
+        typo = orc.model_metadata_verdict(catalogue, "gpt-any-9.9", "hgih")
+        self.assertEqual(typo["state"], "unsupported")
+        self.assertFalse(typo["effort_supported"])
+        self.assertEqual(orc.model_metadata_verdict(
+            catalogue, "gpt-any-9.9", "  "), {
+            "source": "test", "detail": "fixture", "version": "test",
+            "model": "gpt-any-9.9", "complete": None,
+            "state": "confirmed", "model_listed": True,
+            "effort_supported": None, "variants": ["low", "medium", "high"]})
+        provider_variant = confirmed(variants=("high-code", "low"))
+        exact = orc.model_metadata_verdict(
+            catalogue=provider_variant, model="gpt-any-9.9", effort="high-code")
+        self.assertEqual(exact["state"], "confirmed")
+        self.assertTrue(exact["effort_supported"])
+
+    def test_typo_effort_is_refused_before_any_run_exists(self):
+        self.metadata_bin()
+        before = sorted(path.name for path in (self.root / "runs").iterdir())
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            orc.resolve_run_routes(
+                self.cfg, "codex", self.project,
+                {"reviewer": {"model": "opencode-go/deepseek-v4.1-flash",
+                              "effort": "hgih", "billing": "go"}})
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            orc.resolve_run_routes(
+                self.cfg, "codex", self.project,
+                {"reviewer": {"model": "opencode-go/deepseek-v4.1-flash",
+                              "effort": "hgih", "billing": "go"}},
+                allow_unverified=True)
+        self.assertEqual(before, sorted(path.name
+                                        for path in (self.root / "runs").iterdir()))
+
+    def test_unvisited_pages_never_make_absence_authoritative(self):
+        directory = self.root / "paged-bin"
+        write_fake(directory, "codex", textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json, sys
+            if "--version" in sys.argv:
+                print("codex-cli 0.169.1")
+                raise SystemExit(0)
+            for line in sys.stdin:
+                message = json.loads(line)
+                if message.get("method") == "initialize":
+                    print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+                elif message.get("method") == "model/list":
+                    print(json.dumps({"id": message["id"], "result": {
+                        "data": [{"id": "gpt-any-9.9", "model": "gpt-any-9.9",
+                                  "supportedReasoningEfforts": [
+                                      {"reasoningEffort": "high"}]}],
+                        "nextCursor": "more"}}), flush=True)
+            """))
+        with patch.dict(os.environ, {
+                "PATH": str(directory) + ":" + os.environ.get("PATH", "")}):
+            catalogue = orc._codex_model_catalogue(self.project)
+        self.assertEqual(catalogue["state"], "confirmed")
+        self.assertFalse(catalogue["complete"])
+        verdict = orc.model_metadata_verdict(
+            catalogue, "gpt-not-on-visited-pages", "high")
+        self.assertEqual(verdict["state"], "unavailable")
+        self.assertIn("not authoritative", verdict["reason"])
+
+    def test_catalogue_is_isolated_per_project(self):
+        directory = self.root / "project-bin"
+        write_fake(directory, "opencode", textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json, os, sys
+            args = sys.argv[1:]
+            if "--version" in args:
+                print("v2.2.7")
+                raise SystemExit(0)
+            if args[:1] == ["api"]:
+                project = os.path.basename(os.getcwd())
+                model = "model-a" if project == "proj-a" else "model-b"
+                print(json.dumps({"data": [{
+                    "id": model, "modelID": model, "providerID": "opencode-go",
+                    "enabled": True,
+                    "variants": [{"id": "high"}]}]}))
+                raise SystemExit(0)
+            print("{}")
+            """))
+        project_a = self.root / "proj-a"
+        project_b = self.root / "proj-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        route = {"provider": "opencode", "worker_provider": "opencode-go",
+                 "model": "opencode-go/model-a", "effort": "high", "billing": "go"}
+        with patch.dict(os.environ, {
+                "PATH": str(directory) + ":" + os.environ.get("PATH", "")}):
+            first = orc.model_catalogue("codex", "reviewer", route, project_a,
+                                        dialect="v2")
+            second = orc.model_catalogue("codex", "reviewer", route, project_b,
+                                         dialect="v2")
+        self.assertIn("opencode-go/model-a", first["models"])
+        self.assertNotIn("opencode-go/model-b", first["models"])
+        self.assertIn("opencode-go/model-b", second["models"])
+        self.assertNotIn("opencode-go/model-a", second["models"])
+
+    def test_architect_without_high_is_refused_for_a_new_selection(self):
+        self.metadata_bin()
+        no_high = {"state": "confirmed", "source": "test", "complete": True,
+                   "models": {"gpt-no-high": {
+                       "id": "gpt-no-high", "provider": None,
+                       "variants": ["low", "medium"]}}}
+        with patch.object(orc, "model_catalogue", return_value=no_high):
+            with self.assertRaisesRegex(ValueError, "protected"):
+                orc.resolve_run_routes(
+                    self.cfg, "codex", self.project,
+                    {"architect": {"model": "gpt-no-high", "effort": "medium",
+                                   "billing": "subscription"}})
 
     def test_opencode_v2_probe_reads_variants_and_enabled_state(self):
         self.metadata_bin()
@@ -417,6 +568,88 @@ class ModelMetadataTests(ReleaseFixture):
                 cfg, "codex", True,
                 metadata={"architect": {"state": "unavailable",
                                         "source": "none", "models": {}}})
+
+    def test_planning_trial_pins_the_resolved_override_route(self):
+        self.metadata_bin()
+        resolved = orc.resolve_run_routes(
+            self.cfg, "codex", self.project,
+            {"architect": {"model": "gpt-6.2-sol", "effort": "high",
+                           "billing": "subscription"}})
+        trial = orc.validate_planning_trial(
+            self.cfg, "codex", True, metadata=resolved["metadata"],
+            route=resolved["routes"]["architect"])
+        self.assertEqual(trial["pinned_route"], {
+            "provider": "codex", "model": "gpt-6.2-sol",
+            "effort": "high", "billing": "subscription"})
+        self.assertEqual(
+            trial["pinned_route_sha256"],
+            orc.content_hash(resolved["routes"]["architect"]))
+
+    def test_planning_trial_rejects_metadata_for_another_model(self):
+        self.metadata_bin()
+        resolved = orc.resolve_run_routes(
+            self.cfg, "codex", self.project,
+            {"architect": {"model": "gpt-6.2-sol", "effort": "high",
+                           "billing": "subscription"}})
+        wrong = copy.deepcopy(resolved["metadata"])
+        wrong["architect"]["model"] = "gpt-any-9.9"
+        with self.assertRaisesRegex(ValueError, "resolved run route"):
+            orc.validate_planning_trial(
+                self.cfg, "codex", True, metadata=wrong,
+                route=resolved["routes"]["architect"])
+
+    def test_route_override_trial_runs_medium_then_accepts_on_pinned_high(self):
+        self.metadata_bin()
+        run_id, folder, state = orc.create_run(
+            project=self.project, goal="Override trial", host="codex",
+            skip_doctor=True, ordinary_planning_trial=True,
+            routes={"architect": {"model": "gpt-6.2-sol", "effort": "high",
+                                  "billing": "subscription"}})
+        self.assertEqual(state["model_routes"]["architect"]["model"],
+                         "gpt-6.2-sol")
+        trial = state["ordinary_planning_trial"]
+        self.assertEqual(trial["pinned_route"]["model"], "gpt-6.2-sol")
+        self.assertEqual(
+            trial["pinned_route_sha256"],
+            orc.content_hash({key: state["model_routes"]["architect"][key]
+                              for key in ("provider", "model", "effort",
+                                          "billing")}))
+        plan = self.plan(risk="ordinary")
+        calls = []
+
+        def strong(_dir, _state, _cfg, kind, extra=None, **kw):
+            calls.append((kind, kw.get("route")))
+            if kind == "plan":
+                return plan
+            return {"verdict": "approved", "reason": "inspected",
+                    "inspected": ["app.py"], "correction": "",
+                    "dismissed_findings": []}
+
+        with patch.object(orc, "strong_call", side_effect=strong):
+            orc.advance(folder, state, self.cfg)
+        self.assertEqual(calls[0], ("plan", {
+            **{key: state["model_routes"]["architect"][key]
+               for key in ("provider", "model", "effort", "billing")},
+            "effort": "medium"}))
+        self.assertEqual(state["ordinary_planning_trial"]["state"], "adopted")
+        # Acceptance remains on the pinned High route, not the trial effort.
+        verification_path = self.root / "verification.json"
+        verification_path.write_text("{}")
+        state["phase"] = "accept"
+        state["review"] = {"status": "complete", "findings": []}
+        state["verification"] = {
+            "path": str(verification_path), "passed": True,
+            "candidate_hash": orc.signature(orc.source_snapshot(self.project)),
+            "evidence_version": 2}
+        with patch.object(orc, "strong_call", side_effect=strong), \
+                patch.object(orc, "load_verification_evidence", return_value={}), \
+                patch.object(orc, "validate_acceptance_references",
+                             side_effect=lambda st, pr, refs: orc.source_snapshot(pr)), \
+                patch.object(orc, "cached_decision_report", return_value=None):
+            orc.advance(folder, state, self.cfg)
+        decision = [call for call in calls if call[0] == "decision"]
+        self.assertTrue(decision)
+        self.assertIsNone(decision[-1][1])
 
     def test_override_precedence_for_every_role(self):
         self.metadata_bin()
@@ -557,6 +790,17 @@ class RoleSwitchTests(ReleaseFixture):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def switching(self, catalogue=None, preflight=None):
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(
+            orc, "model_catalogue",
+            return_value=catalogue or self.confirmed_catalogue()))
+        stack.enter_context(patch.object(
+            orc, "route_preflight",
+            return_value=preflight or {"ok": True, "reasons": [],
+                                       "classification": "test"}))
+        return stack
+
     def confirmed_catalogue(self):
         reviewer_local = self.cfg["workers"]["reviewer"]["model"]
         return {"state": "confirmed", "source": "test", "models": {
@@ -567,21 +811,21 @@ class RoleSwitchTests(ReleaseFixture):
                 "id": reviewer_local, "provider": "opencode-go",
                 "variants": ["low", "high", "max"]},
             "gpt-6.2-sol": {"id": "gpt-6.2-sol", "provider": None,
-                            "variants": ["high", "medium"]}}}
+                            "variants": ["high", "medium"]},
+            "gpt-any-9.9": {"id": "gpt-any-9.9", "provider": None,
+                            "variants": ["low", "medium", "high"]}}}
 
     def test_preview_is_read_only_and_tied_to_the_route_identity(self):
         self.prepared()
         before = (self.rundir / "state.json").read_bytes()
-        with patch.object(orc, "model_catalogue",
-                          return_value=self.confirmed_catalogue()):
+        with self.switching():
             preview = orc.preview_role_switch(
                 "test-v12000", "reviewer", self.route_spec())
         self.assertEqual((self.rundir / "state.json").read_bytes(), before)
         self.assertFalse(preview["applied"])
         self.assertTrue(preview["expected_confirmation"].startswith(
             "switch-role:test-v12000:reviewer:"))
-        with patch.object(orc, "model_catalogue",
-                          return_value=self.confirmed_catalogue()):
+        with self.switching():
             other = orc.preview_role_switch(
                 "test-v12000", "reviewer", self.route_spec(effort="high"))
         self.assertNotEqual(preview["proposal_sha256"],
@@ -600,8 +844,7 @@ class RoleSwitchTests(ReleaseFixture):
                           "id": "old-grant", "role": "reviewer",
                           "route_sha256": "0" * 64, "max_dispatches": 1,
                           "used": 0, "role_generation": 0}])
-        with patch.object(orc, "model_catalogue",
-                          return_value=self.confirmed_catalogue()):
+        with self.switching():
             preview = orc.preview_role_switch(
                 "test-v12000", "reviewer", self.route_spec())
             result = orc.switch_role_run(
@@ -632,8 +875,7 @@ class RoleSwitchTests(ReleaseFixture):
                       plan_version=orc.content_hash(plan),
                       checks={"kept": True},
                       final_verdict={"verdict": "approved"})
-        with patch.object(orc, "model_catalogue",
-                          return_value=self.confirmed_catalogue()):
+        with self.switching():
             with self.assertRaisesRegex(ValueError, "requires High"):
                 orc.switch_role_run(
                     "test-v12000", "architect",
@@ -656,6 +898,152 @@ class RoleSwitchTests(ReleaseFixture):
         self.assertIsNone(state["final_verdict"])
         self.assertEqual(state["role_generations"]["architect"], 1)
 
+    def test_mechanical_reviewer_switch_keeps_supervisor_acceptance(self):
+        self.allow_operator()
+        plan = self.plan(risk="mechanical")
+        review = {"status": "complete", "summary":
+                  "Mechanical batch accepted by bounded supervisor checks",
+                  "files": [], "tests": [], "evidence": [], "unknowns": [],
+                  "blocker": "", "findings": []}
+        self.prepared(phase="accept", plan=plan,
+                      plan_version=orc.content_hash(plan),
+                      review=copy.deepcopy(review),
+                      verification={"path": "/tmp/verification.json",
+                                    "passed": True},
+                      final_verdict={"verdict": "approved"})
+        with self.switching():
+            preview = orc.preview_role_switch(
+                "test-v12000", "reviewer", self.route_spec())
+            result = orc.switch_role_run(
+                "test-v12000", "reviewer", self.route_spec(),
+                preview["expected_confirmation"])
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertTrue(result["applied"])
+        self.assertEqual(state["phase"], "accept")
+        self.assertEqual(state["review"], review)
+        self.assertEqual(state["verification"]["path"],
+                         "/tmp/verification.json")
+        self.assertIsNone(state["final_verdict"])
+        self.assertEqual(state["role_generations"]["reviewer"], 1)
+        self.assertTrue(result["invalidated"]["mechanical_review_preserved"])
+        self.assertFalse(result["invalidated"]["review"])
+
+    def test_ordinary_reviewer_switch_still_requires_fresh_review(self):
+        self.allow_operator()
+        plan = self.plan(risk="ordinary")
+        self.prepared(phase="accept", plan=plan,
+                      plan_version=orc.content_hash(plan),
+                      review={"status": "complete"},
+                      verification={"path": "/tmp/verification.json",
+                                    "passed": True},
+                      final_verdict={"verdict": "approved"})
+        with self.switching():
+            preview = orc.preview_role_switch(
+                "test-v12000", "reviewer", self.route_spec())
+            result = orc.switch_role_run(
+                "test-v12000", "reviewer", self.route_spec(),
+                preview["expected_confirmation"])
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertEqual(state["phase"], "review")
+        self.assertIsNone(state["review"])
+        self.assertIsNone(state["final_verdict"])
+        self.assertTrue(result["invalidated"]["review"])
+        self.assertEqual(state["verification"]["path"],
+                         "/tmp/verification.json")
+
+    def test_switch_refuses_an_incompatible_preflight_route(self):
+        self.allow_operator()
+        self.prepared()
+        before = (self.rundir / "state.json").read_bytes()
+        incompatible = {"ok": False, "classification": "unprovable_routing",
+                        "reasons": ["Unrecognized OpenCode version"]}
+        with self.switching(preflight=incompatible):
+            with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                orc.switch_role_run("test-v12000", "reviewer",
+                                    self.route_spec())
+        self.assertEqual((self.rundir / "state.json").read_bytes(), before)
+        self.assertEqual(orc.read_json(
+            self.rundir / "state.json")["role_generations"]["reviewer"], 0)
+
+    def test_switch_distinguishes_a_separate_grant_from_incompatibility(self):
+        self.allow_operator()
+        self.prepared()
+        grant_only = {
+            "ok": False, "classification": "unknown",
+            "reasons": ["usage-billed strong route requires an explicit human "
+                        "`authorize-route` grant"],
+            "authorization": {"required": True, "authorized": False}}
+        with self.switching(preflight=grant_only):
+            preview = orc.preview_role_switch(
+                "test-v12000", "architect",
+                {"model": "gpt-any-9.9", "effort": "high", "billing": "api"})
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["requires_grant"],
+                         {"required": True, "authorized": False})
+        self.assertFalse(preview["preflight"]["ok"])
+
+    def test_switch_refuses_an_invalid_billing_policy_before_mutation(self):
+        self.allow_operator()
+        self.prepared()
+        before = (self.rundir / "state.json").read_bytes()
+        with self.switching():
+            with self.assertRaisesRegex(ValueError, "billing 'go'"):
+                orc.switch_role_run(
+                    "test-v12000", "reviewer",
+                    {"model": "deepseek/deepseek-chat", "provider": "deepseek",
+                     "effort": "high", "billing": "go"})
+        self.assertEqual((self.rundir / "state.json").read_bytes(), before)
+
+    def test_switch_inherits_the_pinned_route_not_new_global_defaults(self):
+        self.allow_operator()
+        state = self.prepared()
+        pinned = copy.deepcopy(state["model_routes"]["reviewer"])
+        changed = copy.deepcopy(self.cfg)
+        changed["workers"]["reviewer"]["variant"] = "low"
+        changed["workers"]["reviewer"]["billing"] = "go"
+        orc.atomic_json(self.cfg_path, changed)
+        with self.switching():
+            preview = orc.preview_role_switch(
+                "test-v12000", "reviewer", {"model": pinned["model"]})
+        self.assertEqual(preview["proposed_route"]["effort"], pinned["effort"])
+        self.assertEqual(preview["proposed_route"]["billing"], pinned["billing"])
+        self.assertEqual(preview["proposed_route"]["provider"],
+                         pinned["provider"])
+
+    def test_architect_switch_marks_pending_trial_ineligible_immediately(self):
+        self.allow_operator()
+        pinned = {"provider": "codex", "model": "gpt-6.2-sol",
+                  "effort": "high", "billing": "subscription"}
+        trial = {"enabled": True, "state": "pending",
+                 "effort": "medium",
+                 "pinned_route": dict(pinned),
+                 "pinned_route_sha256": orc.content_hash(pinned),
+                 "scope": "initial_plan_only"}
+        self.prepared(phase="plan", plan=None,
+                      ordinary_planning_trial=copy.deepcopy(trial),
+                      planning_trial_history=[])
+        with self.switching():
+            preview = orc.preview_role_switch(
+                "test-v12000", "architect",
+                {"model": "gpt-any-9.9", "effort": "high",
+                 "billing": "subscription"})
+            self.assertEqual(preview["trial_effect"]["state"],
+                             "ineligible_route_drift")
+            result = orc.switch_role_run(
+                "test-v12000", "architect",
+                {"model": "gpt-any-9.9", "effort": "high",
+                 "billing": "subscription"},
+                preview["expected_confirmation"])
+        state = orc.read_json(self.rundir / "state.json")
+        self.assertTrue(result["applied"])
+        self.assertEqual(state["ordinary_planning_trial"]["state"],
+                         "ineligible_route_drift")
+        self.assertEqual(state["planning_trial_history"][-1]["state"],
+                         "ineligible_route_drift")
+        self.assertEqual(state["model_routes"]["architect"]["effort"], "high")
+        self.assertEqual(result["invalidated"]["planning_trial"],
+                         "ineligible_route_drift")
+
     def test_mid_stage_uncertain_and_terminal_runs_are_refused(self):
         cases = [
             ({"active_job": {"id": "job"}}, "mid-stage"),
@@ -666,8 +1054,7 @@ class RoleSwitchTests(ReleaseFixture):
         for overrides, message in cases:
             with self.subTest(message=message):
                 self.prepared(**overrides)
-                with patch.object(orc, "model_catalogue",
-                                  return_value=self.confirmed_catalogue()):
+                with self.switching():
                     with self.assertRaisesRegex(RuntimeError, message):
                         orc.preview_role_switch(
                             "test-v12000", "reviewer", self.route_spec())
@@ -684,8 +1071,7 @@ class RoleSwitchTests(ReleaseFixture):
             completed_jobs=[{
                 "id": "old-review", "kind": "reviewer", "role": "reviewer",
                 "role_generation": 0, "path": str(self.root / "old-review")}])
-        with patch.object(orc, "model_catalogue",
-                          return_value=self.confirmed_catalogue()):
+        with self.switching():
             first_preview = orc.preview_role_switch(
                 "test-v12000", "reviewer", self.route_spec())
             orc.switch_role_run("test-v12000", "reviewer", self.route_spec(),
@@ -719,8 +1105,7 @@ class RoleSwitchTests(ReleaseFixture):
     def test_stale_confirmation_is_refused_after_the_run_changes(self):
         self.allow_operator()
         self.prepared()
-        with patch.object(orc, "model_catalogue",
-                          return_value=self.confirmed_catalogue()):
+        with self.switching():
             preview = orc.preview_role_switch(
                 "test-v12000", "reviewer", self.route_spec())
             state = orc.read_json(self.rundir / "state.json")
@@ -767,15 +1152,36 @@ class ReviewerSmokePrepareTests(ReleaseFixture):
             capture_output=True, text=True, timeout=300, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         manifest = json.loads((root / "smoke-manifest.json").read_text())
+        self.assertEqual(manifest["version"], 2)
+        challenge = manifest["challenge"]["line"]
+        value = str(manifest["challenge"]["value"])
         hunk = Path(manifest["hunk_path"]).read_text(encoding="utf-8")
-        self.assertIn("MAGIC_SENTINEL = 314159", hunk)
+        self.assertIn(challenge, hunk)
         prompt = Path(manifest["prompt_path"]).read_text(encoding="utf-8")
-        self.assertNotIn("314159", prompt)
+        self.assertNotIn(value, prompt)
         self.assertNotIn("MAGIC_SENTINEL", prompt)
         self.assertIn(manifest["hunk_relpath"], prompt)
+        self.assertIn('"contract_version": 2', prompt)
+        self.assertIn("echo abdullah-smoke-probe", prompt)
         projection = json.loads(Path(manifest["manifest_path"]).read_text())
-        self.assertIn("delta/attempt-1/app.py-0001.patch", projection["files"])
+        self.assertIn("delta/attempt-1/app.py-0001.patch",
+                      projection["files"])
         self.assertTrue(Path(manifest["verification_path"]).is_file())
+        self.assertFalse((root / "evidence.json").exists())
+        state = json.loads((Path(manifest["run_dir"]) / "state.json").read_text())
+        record = state["batch_deltas"][-1]
+        self.assertTrue(record["complete"])
+        self.assertEqual(state["batch_delta_chain"][-1], record["job_id"])
+        self.assertIn(record["job_id"], record["hunks_dir"])
+        self.assertEqual(manifest["contract_version"], 2)
+        preflight = subprocess.run(
+            [sys.executable, str(self.script()), "preflight",
+             "--root", str(root)],
+            capture_output=True, text=True, timeout=300, env=env)
+        payload = json.loads(preflight.stdout)
+        self.assertTrue(payload["prepared_bindings"]["ok"])
+        self.assertTrue(payload["prompt_declares_contract_v2"])
+        self.assertFalse(payload["prompt_reveals_challenge"])
         self.assertFalse((root / "evidence.json").exists())
         inspect = subprocess.run(
             [sys.executable, str(self.script()), "inspect", "--root", str(root)],
@@ -795,6 +1201,226 @@ class ReviewerSmokePrepareTests(ReleaseFixture):
         self.assertNotEqual(
             orc.v2_effective_permission(rules, "external_directory", "/tmp"),
             "allow")
+
+
+sys.path.insert(0, str(Path(orc.HERE)))
+import reviewer_smoke as smoke  # noqa: E402 - after the scripts path is known
+
+
+def smoke_manifest(line="MAGIC_SENTINEL = 123456"):
+    return {
+        "version": 2,
+        "challenge": {"name": "MAGIC_SENTINEL",
+                      "value": int(line.rsplit(" ", 1)[-1]),
+                      "line": line, "line_sha256": smoke._sha256_text(line)},
+        "hunk_relpath": ".git/review/delta/attempt-1/app.py-0001.patch",
+        "hunk_path": "/tmp/projection/delta/attempt-1/app.py-0001.patch",
+        "hunk_sha256": "hunk-sha",
+        "candidate_signature": "candidate-sha",
+        "manifest_sha256": "manifest-sha",
+        "projection_sha256": "projection-sha",
+        "binding_sha256": "binding-sha",
+        "verification_sha256": "verification-sha",
+        "negative_probes": {
+            "shell": {"tool": "shell", "command": "echo abdullah-smoke-probe"},
+            "write": {"tool": "edit", "path": "/tmp/write-probe.txt"}},
+    }
+
+
+def smoke_evidence(manifest, *, status="complete", read=None, shell="denied",
+                   write="absent", executed=None, unchanged=True,
+                   installed=True, ingested=True, error=None):
+    line = manifest["challenge"]["line"]
+    path = manifest["hunk_relpath"]
+    matched = read if read is not None else {
+        "status": "completed", "session_id": "ses_producer",
+        "path_matches": True, "challenge_found": True,
+        "challenge_line": line, "path": path}
+    report = {"contract_version": 2, "status": status,
+              "summary": (f"Read {path} and saw `{line}`." if status == "complete"
+                          else "The Read tool was refused"),
+              "files": [], "tests": [], "evidence": [], "unknowns": [],
+              "blocker": "" if status == "complete" else "read refused",
+              "findings": []}
+    return {
+        "error": error,
+        "report_ingestion": {
+            "ok": ingested, "contract_version": 2 if ingested else None,
+            "report": report if ingested else None,
+            "error": None if ingested else "ReportIngestionError: refused"},
+        "runtime": {
+            "event_count": 3, "producing_session": "ses_producer",
+            "matched_read": matched,
+            "read_events": [matched] if matched else [],
+            "capability": {"shell": {"outcome": shell},
+                           "write": {"outcome": write}},
+            "prohibited_executed": executed or []},
+        "source": {"before": "candidate-sha", "after": "candidate-sha",
+                   "unchanged": unchanged,
+                   "hunk_sha256": "hunk-sha",
+                   "manifest_sha256": "manifest-sha",
+                   "projection_sha256": "projection-sha",
+                   "binding_sha256": "binding-sha",
+                   "verification_sha256": "verification-sha"},
+        "permissions": {
+            "normalized_profile": {"read_hunk": "allow", "shell": "deny",
+                                   "edit": "deny"},
+            "profile_valid": True,
+            "installed_agent_introspection": installed},
+    }
+
+
+class ReviewerSmokePredicateTests(ReleaseFixture):
+    """One predicate guards both launch and inspect; every refusal is tested."""
+
+    live = {"ok": True, "candidate_signature": "candidate-sha"}
+
+    def assess(self, evidence, live=None, manifest=None):
+        return smoke._assess(manifest or smoke_manifest(), evidence,
+                             live or self.live)
+
+    def test_complete_evidence_verifies(self):
+        manifest = smoke_manifest()
+        result = self.assess(smoke_evidence(manifest), manifest=manifest)
+        self.assertTrue(result["ok"], result["reasons"])
+        self.assertTrue(all(result["checks"].values()))
+
+    def test_missing_read_is_refused(self):
+        manifest = smoke_manifest()
+        result = self.assess(smoke_evidence(manifest, read={}),
+                             manifest=manifest)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["read_verified"])
+        self.assertIn("no completed, path-matched Read",
+                      " ".join(result["reasons"]))
+
+    def test_failed_read_is_refused(self):
+        manifest = smoke_manifest()
+        read = {"status": "error", "session_id": "ses_producer",
+                "path_matches": True, "challenge_found": True,
+                "challenge_line": manifest["challenge"]["line"]}
+        result = self.assess(smoke_evidence(manifest, read=read),
+                             manifest=manifest)
+        self.assertFalse(result["checks"]["read_completed"])
+        self.assertFalse(result["ok"])
+
+    def test_unrelated_path_read_is_refused(self):
+        manifest = smoke_manifest()
+        read = {"status": "completed", "session_id": "ses_producer",
+                "path_matches": False, "challenge_found": True,
+                "challenge_line": manifest["challenge"]["line"]}
+        result = self.assess(smoke_evidence(manifest, read=read),
+                             manifest=manifest)
+        self.assertFalse(result["checks"]["read_path_matched"])
+        self.assertFalse(result["ok"])
+
+    def test_wrong_session_read_is_refused(self):
+        manifest = smoke_manifest()
+        read = {"status": "completed", "session_id": "ses_other",
+                "path_matches": True, "challenge_found": True,
+                "challenge_line": manifest["challenge"]["line"]}
+        result = self.assess(smoke_evidence(manifest, read=read),
+                             manifest=manifest)
+        self.assertFalse(result["checks"]["read_session_matched"])
+        self.assertFalse(result["ok"])
+
+    def test_blocked_report_is_refused(self):
+        manifest = smoke_manifest()
+        result = self.assess(
+            smoke_evidence(manifest, status="blocked"), manifest=manifest)
+        self.assertFalse(result["checks"]["report_complete"])
+        self.assertFalse(result["ok"])
+
+    def test_rejected_ingestion_is_refused(self):
+        manifest = smoke_manifest()
+        result = self.assess(
+            smoke_evidence(manifest, ingested=False), manifest=manifest)
+        self.assertFalse(result["checks"]["report_ingested"])
+        self.assertFalse(result["ok"])
+
+    def test_checkout_or_binding_drift_is_refused(self):
+        manifest = smoke_manifest()
+        result = self.assess(
+            smoke_evidence(manifest, unchanged=False), manifest=manifest)
+        self.assertFalse(result["checks"]["checkout_unchanged"])
+        result = self.assess(
+            smoke_evidence(manifest), live={"ok": False,
+                                            "candidate_signature":
+                                                "candidate-sha"},
+            manifest=manifest)
+        self.assertFalse(result["checks"]["bindings_intact"])
+        self.assertFalse(result["ok"])
+
+    def test_executed_capability_or_prohibited_tool_is_refused(self):
+        manifest = smoke_manifest()
+        result = self.assess(
+            smoke_evidence(manifest, shell="executed"), manifest=manifest)
+        self.assertFalse(result["checks"]["negative_shell"])
+        result = self.assess(
+            smoke_evidence(manifest, executed=[{"tool": "write"}]),
+            manifest=manifest)
+        self.assertFalse(result["checks"]["no_prohibited_execution"])
+        self.assertFalse(result["ok"])
+
+    def test_installed_profile_mismatch_is_refused(self):
+        manifest = smoke_manifest()
+        result = self.assess(
+            smoke_evidence(manifest, installed=False), manifest=manifest)
+        self.assertFalse(result["checks"]["installed_profile_matches"])
+        self.assertFalse(result["ok"])
+
+    def test_simulated_stream_end_to_end_verifies(self):
+        manifest = smoke_manifest()
+        line = manifest["challenge"]["line"]
+        report = {
+            "contract_version": 2, "status": "complete",
+            "summary": f"Read {manifest['hunk_relpath']} and saw `{line}`.",
+            "files": [], "tests": [], "evidence": [manifest["hunk_relpath"],
+                                                   line],
+            "unknowns": [], "blocker": "", "findings": []}
+        events = [
+            {"type": "tool_use", "sessionID": "ses_producer", "part": {
+                "type": "tool", "tool": "read", "sessionID": "ses_producer",
+                "state": {"status": "completed",
+                          "input": {"filePath": manifest["hunk_path"]},
+                          "output": ("00001| def value():\n"
+                                     f"00002| {line}\n")}}},
+            {"type": "tool_use", "sessionID": "ses_producer", "part": {
+                "type": "tool", "tool": "shell", "sessionID": "ses_producer",
+                "state": {"status": "error",
+                          "error": "permission denied: shell is denied",
+                          "input": {"command": "echo abdullah-smoke-probe"}}}},
+            {"type": "text", "sessionID": "ses_producer", "part": {
+                "text": json.dumps(report)}},
+            {"type": "step_finish", "sessionID": "ses_producer", "part": {
+                "type": "step-finish", "reason": "stop"}},
+        ]
+        raw = "\n".join(json.dumps(item) for item in events) + "\n"
+        runtime = smoke._analyse_events(raw, manifest, "ses_producer")
+        self.assertTrue(runtime["matched_read"])
+        self.assertEqual(runtime["capability"]["shell"]["outcome"], "denied")
+        self.assertEqual(runtime["capability"]["write"]["outcome"], "absent")
+        ingestion = smoke._ingest(orc, raw, self.root / "job", "ses_producer")
+        self.assertTrue(ingestion["ok"], ingestion["error"])
+        evidence = smoke_evidence(manifest)
+        evidence["runtime"] = {**runtime, "producing_session": "ses_producer"}
+        evidence["report_ingestion"] = ingestion
+        result = self.assess(evidence, manifest=manifest)
+        self.assertTrue(result["ok"], result["reasons"])
+
+    def test_wrong_file_stream_does_not_match_even_with_the_answer(self):
+        manifest = smoke_manifest()
+        line = manifest["challenge"]["line"]
+        events = [
+            {"type": "tool_use", "sessionID": "ses_producer", "part": {
+                "type": "tool", "tool": "read", "sessionID": "ses_producer",
+                "state": {"status": "completed",
+                          "input": {"filePath": "app.py"},
+                          "output": f"00009| {line}\n"}}},
+        ]
+        raw = "\n".join(json.dumps(item) for item in events) + "\n"
+        runtime = smoke._analyse_events(raw, manifest, "ses_producer")
+        self.assertIsNone(runtime["matched_read"])
 
 
 class WriterLimitationDiagnosticsTests(ReleaseFixture):

@@ -322,6 +322,89 @@ V2 `models` command does not list variants. Configured variants are still read
 by preflight from the V2 array form above. On V1, a missing configured variant
 makes `doctor` report not-ready.
 
+Metadata boundaries:
+
+- Model/effort checks use bounded, read-only probes and never a model turn:
+  Codex `app-server` `model/list`, OpenCode V2 `api --standalone get /api/model`,
+  OpenCode V1 `models --verbose`, and the Claude `--effort` help contract.
+- A probe runs in the project it describes. A Codex catalogue observed in one
+  project is never reused for another project or host; the short-lived cache is
+  scoped by host, resolved project, executable identity and dialect.
+- Pagination is bounded. If the page budget ends before the catalogue is
+  exhausted, absence of a model from the visited pages is reported `unavailable`
+  — never `unsupported`.
+- A nonempty effort/variant must match a canonical effort name or an exact
+  provider-defined variant name in the catalogue. A typo is `unsupported` and is
+  refused before a run is created or a route is switched, including with
+  `--allow-unverified-metadata`; that flag only covers genuinely missing
+  metadata.
+- Confirmed, unsupported and unavailable stay distinct. Missing metadata is
+  never treated as proof of support, and no probe changes credentials.
+
+### Per-run routes and role switches
+
+Configuration holds defaults. A run pins its resolved routes at creation;
+changing the config later does not rewrite them. To select different routes for
+one run, pass the same role-keyed object at creation:
+
+```json
+{
+  "architect": {"model": "gpt-6.2-sol", "effort": "high", "billing": "subscription"},
+  "implementer": {"model": "opencode-go/glm-5.3", "effort": "high", "billing": "go"},
+  "reviewer": {"model": "opencode-go/deepseek-v4.1-flash", "effort": "max", "billing": "go"}
+}
+```
+
+```bash
+python3 scripts/orchestrator.py start --project /absolute/repo --host codex \
+  --goal-file goal.txt --routes routes.json
+```
+
+`start` begins the run immediately; the MCP `orchestrator_start` tool accepts
+the same `routes` object and creates the run without dispatching a model.
+
+Omitted fields inherit the current pinned route during a switch, not the current
+global defaults. A provider change requires a complete route (model, provider,
+effort, billing) so consent is never inherited by accident.
+
+Role switching is human-only and works at a safe boundary (no active job/check,
+no uncertain state, no unreconciled retry or exploration):
+
+```bash
+# 1. Read-only preview: proposed vs pinned route, metadata, downstream effects
+python3 scripts/orchestrator.py switch-role <RUN_ID> --role reviewer \
+  --route '{"model":"opencode-go/deepseek-v4.1-flash","effort":"max","billing":"go"}'
+
+# 2. Apply with the exact confirmation value from the preview
+python3 scripts/orchestrator.py switch-role <RUN_ID> --role reviewer \
+  --route '{"model":"opencode-go/deepseek-v4.1-flash","effort":"max","billing":"go"}' \
+  --apply --confirm 'switch-role:<RUN_ID>:reviewer:<PROPOSAL_SHA12>'
+```
+
+Apply is opt-in with `--apply`; omitting it is a read-only preview. Apply is
+backup-first, generation-bound and preserves plan, checks, accepted history
+and unaffected grants. It refuses a route whose current preflight is
+incompatible (for example unprovable OpenCode routing or invalid billing). A
+grant that must be obtained separately is reported as `requires_grant`; obtain
+it with `authorize-route` after the switch, because grants bind the exact route
+and role generation.
+
+A Reviewer switch discards pending review/decision authority and repeats review
+on the pinned evidence. For a batch whose effective risk policy exempts
+independent review (mechanical), the supervisor-generated verification and
+acceptance phase are preserved; only the dependent acceptance decision is
+reissued. An Architect switch requires High for protected decisions, clears
+pending verdicts and bumps the authority epoch. If it changes the pinned route
+while an ordinary Medium planning trial is still pending, the preview and the
+saved state both mark that trial `ineligible_route_drift` immediately; the
+Architect route itself is not changed by the trial.
+
+The ordinary planning trial is available only for a Codex-host run declared
+ordinary. It validates Medium and High on the exact resolved subscription
+model, pins that route's provider/model/effort/billing, uses Medium only for the
+initial plan, and keeps acceptance, replans, diagnosis and integration on the
+pinned High route.
+
 ### Worker fallback
 
 A role may include a complete `fallback` route:
@@ -527,15 +610,42 @@ Errors are explicit and fail closed. There is no "best effort" mode.
 
 ## Changing configuration during a run
 
-Do this **before** `orchestrator_start` whenever possible. A run records the
-config hash at creation. Editing the file afterwards makes
-`orchestrator.py compatibility <RUN_ID>` report `config_changed`, and the
-supervisor refuses to stage or resume that run until the incompatibility is
-resolved. This is intentional: acceptance evidence is bound to the
-configuration that produced it.
+Do this **before** `orchestrator_start` whenever possible. A run records both
+the raw config digest and a semantic policy fingerprint at creation.
 
-If you must change models for future work, finish or retire the current run and
-start a new one.
+- **Role-selection preferences are excluded from execution policy.** Changing an
+  Architect model/effort/auth default, a worker `provider`/`model`/`variant`/
+  `billing`/`fallback`, or a fallback model does not change the policy
+  fingerprint: those values are already pinned per run and are not silently
+  adopted. The raw digest remains recorded for audit.
+- **Any other key is policy**, including unknown keys and formatting-sensitive
+  values. Editing limits, permissions, verification, runtime or an unrecognized
+  key makes `orchestrator.py compatibility <RUN_ID>` report `config_changed`,
+  and the supervisor refuses to stage or resume that run until it is resolved.
+  This is intentional: acceptance evidence is bound to the configuration that
+  produced it.
+
+For future work, use a per-run route override (§ Per-run routes and role
+switches) or switch one role at a safe boundary. You do not have to retire a
+run merely to choose different models.
+
+A run created before config-policy identity existed can adopt its exact old
+config without rewriting pinned routes. This is backup-first and requires the
+exact old bytes:
+
+```bash
+python3 scripts/orchestrator.py adopt-config-policy <RUN_ID> \
+  --old-config /path/to/retained-old-config.json \
+  --acknowledge "old config retained at /path" \
+  --backup-dir ~/backups/abdullah
+```
+
+Adoption succeeds only when the old file's raw digest matches the run's
+recorded digest and its semantic policy is equivalent to the current one. A
+matching digest alone is never permission to rewrite routes, and an attested
+old policy that really differs still blocks.
+
+
 
 ## Migrating a schema-2 run
 

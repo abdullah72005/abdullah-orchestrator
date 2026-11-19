@@ -14948,7 +14948,7 @@ def doctor(project: Path, host="codex", routes=None):
     catalogues = {}
     for role, route in checks["route"].items():
         try:
-            key = _catalogue_key(route, dialect)
+            key = _catalogue_key(host, project, route, dialect)
             if key not in catalogues:
                 catalogues[key] = model_catalogue(
                     host, role, route, project, dialect=dialect)
@@ -15006,7 +15006,12 @@ def _executable_identity(name):
 
 
 def _cached_catalogue(key, factory):
-    """Short-lived, per-executable metadata cache (never a policy override)."""
+    """Short-lived metadata cache scoped to one execution context.
+
+    The key must include the effective host/project/routing context: a
+    catalogue observed in project A is not evidence about project B, even for
+    the same executable and dialect.
+    """
     stamp = time.monotonic()
     cached = _MODEL_CATALOGUE_CACHE.get(key)
     if cached and stamp - cached[0] < MODEL_CATALOGUE_CACHE_SECONDS:
@@ -15020,8 +15025,10 @@ MODEL_EFFORT_ALIASES = {
 
 
 def _catalogue_unavailable(source, detail):
+    # ``complete: False`` means absence of a model in this result is not
+    # authoritative evidence that the host does not support it.
     return {"state": "unavailable", "source": source, "models": {},
-            "detail": detail, "version": None}
+            "detail": detail, "version": None, "complete": False}
 
 
 def _normalize_effort(value):
@@ -15052,7 +15059,8 @@ def _catalogue_entry(provider, identifier, variants, extra=None):
             **(extra or {})}
 
 
-def _catalogue_from_records(source, records, detail="", version=None):
+def _catalogue_from_records(source, records, detail="", version=None,
+                            *, complete=True):
     models = {}
     for entry in records:
         if not isinstance(entry, dict) or not entry.get("id"):
@@ -15061,17 +15069,24 @@ def _catalogue_from_records(source, records, detail="", version=None):
     if not models:
         return _catalogue_unavailable(source, detail or "no model entries returned")
     return {"state": "confirmed", "source": source, "models": models,
-            "detail": detail, "version": version}
+            "detail": detail, "version": version, "complete": bool(complete)}
 
 
-def _codex_model_catalogue(*, deadline=None, cancel=None):
-    """Bounded Codex app-server ``model/list`` metadata probe (no model turn)."""
+def _codex_model_catalogue(project=None, *, deadline=None, cancel=None):
+    """Bounded Codex app-server ``model/list`` metadata probe (no model turn).
+
+    The probe runs in the project the route will execute in, so a per-project
+    Codex configuration cannot be silently reported as another project's
+    catalogue.
+    """
     resolved = shutil.which("codex")
     if not resolved:
         return _catalogue_unavailable("codex_app_server", "codex executable unavailable")
+    workdir = str(Path(project).resolve()) if project is not None else str(HERE.parent)
     records = []
     cursor = None
     version = None
+    truncated = False
     for _page in range(MODEL_CATALOGUE_MAX_PAGES):
         params = {"limit": 1000}
         if cursor:
@@ -15093,7 +15108,7 @@ def _codex_model_catalogue(*, deadline=None, cancel=None):
 
         try:
             rc, out, err = _opencode_run_bounded(
-                [resolved, "app-server", "--listen", "stdio://"], str(HERE.parent),
+                [resolved, "app-server", "--listen", "stdio://"], workdir,
                 scrubbed_env(), MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
                 deadline=deadline, purpose="model catalogue",
                 stdin_fifo_payload=payload, stop_when=responded,
@@ -15141,9 +15156,14 @@ def _codex_model_catalogue(*, deadline=None, cancel=None):
         cursor = result.get("nextCursor")
         if not cursor:
             break
+    if cursor:
+        # The page budget ended with more pages unvisited: absence from this
+        # partial catalogue is not authoritative rejection evidence.
+        truncated = True
     return _catalogue_from_records(
         "codex_app_server", [item for item in records if item],
-        detail="initialized app-server model/list", version=version)
+        detail="initialized app-server model/list", version=version,
+        complete=not truncated)
 
 
 def _opencode_v2_catalogue(project, *, deadline=None, cancel=None):
@@ -15154,6 +15174,7 @@ def _opencode_v2_catalogue(project, *, deadline=None, cancel=None):
     binary = identity["resolved"]
     records = []
     cursor = None
+    truncated = False
     for _page in range(MODEL_CATALOGUE_MAX_PAGES):
         endpoint = "/api/model"
         if cursor:
@@ -15186,9 +15207,12 @@ def _opencode_v2_catalogue(project, *, deadline=None, cancel=None):
                 records.append(record)
         if not cursor:
             break
+    if cursor:
+        truncated = True
     return _catalogue_from_records(
         "opencode_v2_api", records, detail="standalone /api/model",
-        version=(identity.get("version") or {}).get("text"))
+        version=(identity.get("version") or {}).get("text"),
+        complete=not truncated)
 
 
 def _catalogue_rows(document):
@@ -15303,15 +15327,21 @@ def _claude_model_catalogue(*, deadline=None, cancel=None):
 
 def model_catalogue(host, role, route, project, *, deadline=None, cancel=None,
                     dialect=None):
-    """Authoritative, bounded metadata for the requested provider."""
+    """Authoritative, bounded metadata for the requested provider.
+
+    The cache key always includes the effective host and resolved project: a
+    catalogue observed while routing project A is never reused for project B.
+    """
     provider = route.get("provider")
+    context = (str(host or ""), os.path.realpath(str(project or "")))
     if provider == "codex":
         return _cached_catalogue(
-            ("codex",) + _executable_identity("codex"),
-            lambda: _codex_model_catalogue(deadline=deadline, cancel=cancel))
+            ("codex",) + context + _executable_identity("codex"),
+            lambda: _codex_model_catalogue(project, deadline=deadline,
+                                           cancel=cancel))
     if provider == "claude":
         return _cached_catalogue(
-            ("claude",) + _executable_identity("claude"),
+            ("claude",) + context + _executable_identity("claude"),
             lambda: _claude_model_catalogue(deadline=deadline, cancel=cancel))
     if provider != "opencode":
         return _catalogue_unavailable("unknown", f"no adapter for provider {provider!r}")
@@ -15323,7 +15353,7 @@ def model_catalogue(host, role, route, project, *, deadline=None, cancel=None,
             raise
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             dialect = None
-    opened = ("opencode", dialect) + _executable_identity("opencode")
+    opened = ("opencode", dialect) + context + _executable_identity("opencode")
     if dialect == "v2":
         return _cached_catalogue(
             opened + ("v2",),
@@ -15357,16 +15387,31 @@ def _catalogue_lookup(catalogue, model):
     return None
 
 
+def _effort_token(value):
+    """Canonical effort name or the exact provider-defined variant token."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    return MODEL_EFFORT_ALIASES.get(raw) or raw
+
+
 def model_metadata_verdict(catalogue, model, effort):
     """Classify support as confirmed, unsupported or unverified.
 
-    Missing metadata is never reported as support.
+    A nonempty effort is matched against the canonical names and the exact
+    provider-defined variant names the actual host catalogue reports.  Missing
+    metadata is never reported as support, an unknown string is never treated
+    as an absent effort, and absence from an incomplete (paginated) catalogue
+    is never reported as authoritative rejection.
     """
     base = {"source": catalogue.get("source"), "detail": catalogue.get("detail"),
-            "version": catalogue.get("version")}
+            "version": catalogue.get("version"), "model": model,
+            "complete": catalogue.get("complete")}
     if catalogue.get("state") != "confirmed":
-        token = _normalize_effort(effort)
-        variants = catalogue.get("effort_variants") or []
+        token = _effort_token(effort)
+        variants = [str(item).strip().lower()
+                    for item in (catalogue.get("effort_variants") or [])
+                    if str(item).strip()]
         effort_supported = None
         if token and variants:
             effort_supported = token in variants
@@ -15383,13 +15428,19 @@ def model_metadata_verdict(catalogue, model, effort):
                 "effort_variants": variants}
     entry = _catalogue_lookup(catalogue, model)
     if entry is None:
+        if not catalogue.get("complete", True):
+            return {**base, "state": "unavailable", "model_listed": None,
+                    "effort_supported": None,
+                    "reason": ("the bounded model catalogue ended before every "
+                               "page was visited; absence is not authoritative")}
         return {**base, "state": "unsupported", "model_listed": False,
                 "effort_supported": None}
     if entry.get("enabled") is False:
         return {**base, "state": "unsupported", "model_listed": False,
                 "effort_supported": None, "reason": "model is disabled"}
-    token = _normalize_effort(effort)
-    variants = entry.get("variants") or []
+    token = _effort_token(effort)
+    variants = [str(item).strip().lower() for item in (entry.get("variants") or [])
+                if str(item).strip()]
     if not token:
         return {**base, "state": "confirmed", "model_listed": True,
                 "effort_supported": None, "variants": variants}
@@ -15414,8 +15465,28 @@ def validate_route_metadata(route, host, role, project, *, deadline=None,
                                   route.get("effort"))
 
 
-def _catalogue_key(route, dialect):
-    return (route.get("provider"),
+def architect_high_problem(verdict):
+    """Reject a new Architect selection whose catalogue lacks High.
+
+    Protected decisions (acceptance, diagnosis, integration) are always High.
+    A model known not to support High must not be admitted for a new run or
+    switch only to stall later at a protected decision.  Unknown metadata stays
+    on the existing explicit unverified path.
+    """
+    if not isinstance(verdict, dict) or verdict.get("state") != "confirmed":
+        return None
+    variants = [str(item).strip().lower()
+                for item in (verdict.get("variants") or []) if str(item).strip()]
+    if variants and "high" not in variants:
+        return (f"the catalogue for {verdict.get('model') or 'the selected model'} "
+                f"supports {sorted(variants)} but not 'high', which every protected "
+                "Architect decision requires")
+    return None
+
+
+def _catalogue_key(host, project, route, dialect):
+    return (str(host or ""), os.path.realpath(str(project or "")),
+            route.get("provider"),
             dialect if route.get("provider") == "opencode" else None)
 
 
@@ -15431,8 +15502,13 @@ def _route_override_error(role, detail):
     return ValueError(f"routes.{role}: {detail}")
 
 
-def _merged_architect_route(cfg, host, override):
-    base = copy.deepcopy(model_route(cfg, host, "architect"))
+def _merged_architect_route(cfg, host, override, base_route=None):
+    base = (copy.deepcopy(base_route) if isinstance(base_route, dict)
+            else copy.deepcopy(model_route(cfg, host, "architect")))
+    if base.get("provider") not in (None, host):
+        raise _route_override_error(
+            "architect", f"the pinned route provider {base.get('provider')!r} "
+            f"does not match the controlling host {host!r}")
     unknown = set(override) - RUN_ROUTE_KEYS["architect"]
     if unknown:
         raise _route_override_error("architect", f"unknown keys {sorted(unknown)}")
@@ -15464,8 +15540,9 @@ def _merged_architect_route(cfg, host, override):
 
 
 def _merged_worker_route(cfg, role, override, project, *, dialect=None,
-                         version=None):
-    base = normalize_worker_spec(role, cfg["workers"][role], legacy_go=True)
+                         version=None, base_route=None):
+    base = (copy.deepcopy(base_route) if isinstance(base_route, dict)
+            else normalize_worker_spec(role, cfg["workers"][role], legacy_go=True))
     unknown = set(override) - RUN_ROUTE_KEYS[role]
     if "fallback" in override:
         raise _route_override_error(
@@ -15552,7 +15629,7 @@ def resolve_run_routes(cfg, host, project, overrides=None, *, allow_unverified=F
     metadata = {}
     catalogues = {}
     for role, route in routes.items():
-        key = _catalogue_key(route, dialect)
+        key = _catalogue_key(host, project, route, dialect)
         if key not in catalogues:
             catalogues[key] = model_catalogue(
                 host, role, route, project, deadline=deadline, cancel=cancel,
@@ -15566,6 +15643,10 @@ def resolve_run_routes(cfg, host, project, overrides=None, *, allow_unverified=F
                 f"routes.{role} is not supported by authoritative metadata: "
                 + str(verdict.get("reason") or verdict.get("detail"))
                 + ". Choose a supported model/effort or a compatible CLI.")
+        if role == "architect" and role in changed:
+            high_problem = architect_high_problem(verdict)
+            if high_problem:
+                raise ValueError(f"routes.architect: {high_problem}")
         if verdict["state"] == "unavailable" and role in changed:
             if not allow_unverified:
                 raise RuntimeError(
@@ -15595,12 +15676,13 @@ def resolve_run_routes(cfg, host, project, overrides=None, *, allow_unverified=F
 
 
 def validate_planning_trial(cfg, host, enabled, *, declared_risk="ordinary",
-                            metadata=None):
+                            metadata=None, route=None):
     """Explicit, run-scoped Medium planning trial on the pinned architect route.
 
     Only the initial plan may use Medium; acceptance, replans, diagnosis and
-    integration remain on the configured High route.  Support is established
-    from authoritative metadata, not a Sol-version literal.
+    integration remain on the pinned High route.  Support is established from
+    authoritative metadata for both Medium and High on the exact resolved run
+    route, not from a global default or a Sol-version literal.
     """
     if not enabled:
         return None
@@ -15613,19 +15695,21 @@ def validate_planning_trial(cfg, host, enabled, *, declared_risk="ordinary",
         raise ValueError(
             "The ordinary planning trial is pinned to the Codex subscription "
             "route; it is not available for host " + str(host))
-    try:
-        spec = cfg["architect"]["codex"]
-    except (KeyError, TypeError):
-        raise ValueError("architect.codex is not configured")
-    model = str(spec.get("model") or "")
-    if str(spec.get("effort") or "").lower() != "high":
+    route = (copy.deepcopy(route) if isinstance(route, dict)
+             else model_route(cfg, host, "architect"))
+    if route.get("provider") != "codex":
+        raise ValueError(
+            "The ordinary planning trial requires the resolved Codex route; "
+            f"selected provider is {route.get('provider')!r}")
+    model = str(route.get("model") or "")
+    if str(route.get("effort") or "").lower() != "high":
         raise ValueError(
             "The ordinary planning trial requires the pinned High architect effort; "
-            f"configured effort is {spec.get('effort')!r}")
-    if spec.get("auth") != "subscription":
+            f"resolved effort is {route.get('effort')!r}")
+    if route.get("billing") != "subscription":
         raise ValueError(
-            "The ordinary planning trial requires subscription billing; configured "
-            f"auth is {spec.get('auth')!r}")
+            "The ordinary planning trial requires subscription billing; resolved "
+            f"billing is {route.get('billing')!r}")
     verdict = (metadata or {}).get("architect") or {}
     if verdict.get("state") != "confirmed":
         raise ValueError(
@@ -15633,15 +15717,21 @@ def validate_planning_trial(cfg, host, enabled, *, declared_risk="ordinary",
             f"{model!r}; metadata is {verdict.get('state') or 'unavailable'} "
             f"({verdict.get('detail') or verdict.get('reason') or 'no adapter'}). "
             "Refusing to treat missing metadata as support.")
-    variants = set(verdict.get("variants") or [])
+    recorded_model = verdict.get("model")
+    if recorded_model and recorded_model != model:
+        raise ValueError(
+            "The ordinary planning trial metadata describes "
+            f"{recorded_model!r}, not the resolved run route {model!r}")
+    variants = {str(item).strip().lower()
+                for item in (verdict.get("variants") or []) if str(item).strip()}
     missing = {"medium", "high"} - variants
     if missing:
         raise ValueError(
             "The ordinary planning trial needs a model that supports both Medium "
             f"and High decisions; {model!r} catalogue variants are {sorted(variants)} "
             f"(missing {sorted(missing)})")
-    pinned = {"provider": "codex", "model": model,
-              "effort": spec.get("effort"), "billing": spec.get("auth")}
+    pinned = {"provider": route.get("provider"), "model": model,
+              "effort": route.get("effort"), "billing": route.get("billing")}
     return {"enabled": True, "state": "pending", "effort": PLANNING_TRIAL_EFFORT,
             "declared_task_risk": declared_risk,
             "declared_at": now(),
@@ -15693,7 +15783,8 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
         cfg, host, project, routes, allow_unverified=allow_unverified_metadata)
     trial = validate_planning_trial(cfg, host, ordinary_planning_trial,
                                     declared_risk=planning_trial_risk,
-                                    metadata=selection.get("metadata", {}))
+                                    metadata=selection.get("metadata", {}),
+                                    route=selection["routes"].get("architect"))
     # Keep the user's exact words.  Validation may reject whitespace-only text,
     # but the stored requirement is never trimmed or rewritten.
     baseline = source_snapshot(project, cfg=cfg)
@@ -18015,13 +18106,15 @@ def _switch_guard(state):
             "An unreconciled retry session exists; reconcile it before switching")
 
 
-def _resolve_single_role_route(cfg, host, role, spec, project, *, allow_unverified):
+def _resolve_single_role_route(cfg, host, role, spec, project, *,
+                               allow_unverified, base_route=None):
     if not isinstance(spec, dict):
         raise ValueError(f"routes.{role} must be an object")
     if role == "architect":
-        route = _merged_architect_route(cfg, host, spec)
+        route = _merged_architect_route(cfg, host, spec, base_route=base_route)
     elif role in RUN_ROUTE_KEYS:
-        route = _merged_worker_route(cfg, role, spec, project)
+        route = _merged_worker_route(cfg, role, spec, project,
+                                     base_route=base_route)
         route["routing_fingerprint"] = routing_fingerprint(
             route, cfg, project=project, role=role)
     else:
@@ -18031,6 +18124,10 @@ def _resolve_single_role_route(cfg, host, role, spec, project, *, allow_unverifi
         raise ValueError(
             f"routes.{role} is not supported by authoritative metadata: "
             + str(verdict.get("reason") or verdict.get("detail")))
+    if role == "architect":
+        high_problem = architect_high_problem(verdict)
+        if high_problem:
+            raise ValueError(f"routes.architect: {high_problem}")
     if verdict["state"] == "unavailable" and not allow_unverified:
         raise RuntimeError(
             f"routes.{role} cannot be attested from metadata ("
@@ -18040,14 +18137,39 @@ def _resolve_single_role_route(cfg, host, role, spec, project, *, allow_unverifi
     return route, verdict
 
 
+def _switch_preflight_problem(preflight):
+    """None for a usable route, or the incompatible-policy reason.
+
+    A grant that must be obtained separately is not an incompatible route; it
+    is reported as ``requires_grant`` so preview/apply can distinguish it.
+    """
+    if not isinstance(preflight, dict):
+        return "read-only route preflight was unavailable"
+    if preflight.get("ok"):
+        return None
+    reasons = [str(item) for item in (preflight.get("reasons") or [])
+               if str(item).strip()]
+    authorization = preflight.get("authorization")
+    if (isinstance(authorization, dict) and authorization.get("required")
+            and not authorization.get("authorized")):
+        others = [item for item in reasons if "grant" not in item.lower()]
+        if not others:
+            return None
+    classification = str(preflight.get("classification") or "unknown")
+    detail = "; ".join(reasons) or "no reason recorded"
+    return f"{classification}: {detail}"
+
+
 def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
     _switch_guard(state)
     current = (state.get("model_routes") or {}).get(role)
     if not isinstance(current, dict):
         raise RuntimeError(f"Run has no pinned {role} route")
+    # Omitted switch fields inherit the exact pinned run route, never whatever
+    # the global configuration happens to say now.
     proposed, verdict = _resolve_single_role_route(
         cfg, state.get("host"), role, spec, Path(state["project"]),
-        allow_unverified=allow_unverified)
+        allow_unverified=allow_unverified, base_route=current)
     if (role == "architect" and state.get("phase") in {"accept", "diagnose", "integrate"}
             and str(proposed.get("effort") or "").lower() != "high"):
         raise ValueError(
@@ -18061,9 +18183,14 @@ def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
         new_pin = content_hash({key: proposed.get(key) for key in
                                 ("provider", "model", "effort", "billing")})
         if trial.get("pinned_route_sha256") not in (None, new_pin):
-            trial_effect = ("pending Medium planning trial will be marked "
-                            "ineligible_route_drift with operator-visible reasons; "
-                            "the pinned High route is preserved and effort is not changed")
+            trial_effect = {
+                "state": "ineligible_route_drift",
+                "reason": ("the pending Medium planning trial is bound to the "
+                           "run's pinned route; the proposed Architect route "
+                           "differs, so the trial will not run"),
+                "pinned_route_sha256": trial.get("pinned_route_sha256"),
+                "proposed_route_sha256": new_pin,
+            }
     proposal = {
         "run_id": state.get("id"),
         "role": role,
@@ -18094,16 +18221,27 @@ def _switch_proposal(state, cfg, role, spec, *, allow_unverified=False):
                                     state)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         preflight = {"ok": False, "reasons": [exc.__class__.__name__],
+                     "classification": "preflight_error",
                      "warning": "read-only preflight unavailable"}
+    problem = _switch_preflight_problem(preflight)
+    if problem:
+        raise RuntimeError(
+            "The proposed route is incompatible with the current execution "
+            f"policy: {problem}. Resolve it before previewing or applying a switch")
+    authorization = preflight.get("authorization")
+    requires_grant = (authorization if isinstance(authorization, dict)
+                      and authorization.get("required")
+                      and not authorization.get("authorized") else None)
     return {"version": 1, "ok": True, "applied": False,
             **proposal,
             "proposal_sha256": proposal_sha,
             "expected_confirmation": confirmation,
             "preflight": preflight,
+            "requires_grant": requires_grant,
             "phase": state.get("phase"), "status": state.get("status"),
             "note": ("Read-only preview. Apply with --apply and the exact "
                      "--confirm value; the route is backed up before mutation."),
-            "_route": proposed}
+            "_route": proposed, "_trial_effect": trial_effect}
 
 
 def preview_role_switch(run_id, role, spec, *, allow_unverified=False):
@@ -18112,6 +18250,7 @@ def preview_role_switch(run_id, role, spec, *, allow_unverified=False):
                                allow_unverified=allow_unverified)
     preview["run_dir"] = str(folder)
     preview.pop("_route", None)
+    preview.pop("_trial_effect", None)
     return preview
 
 
@@ -18133,14 +18272,15 @@ def switch_role_run(run_id, role, spec, confirmation=None, *,
         raise ValueError("Unknown role")
     spec = _route_spec_from_argument(spec)
     folder, state = load(run_id)
-    preview = _switch_proposal(state, config(), role, spec,
+    cfg = config()
+    preview = _switch_proposal(state, cfg, role, spec,
                                allow_unverified=allow_unverified)
     authorization = require_human_operator(
         "switch-role", run_id, confirmation,
         expected=preview["expected_confirmation"])
     with exclusive(folder):
         folder, state = load(run_id)
-        fresh = _switch_proposal(state, config(), role, spec,
+        fresh = _switch_proposal(state, cfg, role, spec,
                                  allow_unverified=allow_unverified)
         if confirmation != fresh["expected_confirmation"]:
             raise RuntimeError(
@@ -18157,7 +18297,8 @@ def switch_role_run(run_id, role, spec, confirmation=None, *,
         (backup / "state.json").write_bytes(
             (folder / "state.json").read_bytes())
         (backup / "switch.json").write_text(
-            json.dumps({k: v for k, v in fresh.items() if k != "_route"},
+            json.dumps({k: v for k, v in fresh.items()
+                        if k not in {"_route", "_trial_effect"}},
                        indent=2, sort_keys=True) + "\n", encoding="utf-8")
         invalidated = {"grants": 0, "retry_session": False,
                        "fallback_consent": False, "review": False,
@@ -18188,10 +18329,38 @@ def switch_role_run(run_id, role, spec, confirmation=None, *,
                 state.get("authority_epoch", 0)) + 1
             invalidated["pending_verdict"] = True
             invalidated["authority_epoch"] = True
+            effect = fresh.get("_trial_effect")
+            trial_state = state.get("ordinary_planning_trial") or {}
+            if (isinstance(effect, dict)
+                    and trial_state.get("enabled")
+                    and trial_state.get("state") == "pending"):
+                state["ordinary_planning_trial"] = {
+                    **trial_state,
+                    "state": effect["state"],
+                    "decision_reason": effect["reason"],
+                    "decided_at": now(),
+                    "pinned_route_sha256": effect["pinned_route_sha256"],
+                    "proposed_route_sha256": effect["proposed_route_sha256"],
+                }
+                state.setdefault("planning_trial_history", []).append(
+                    copy.deepcopy(state["ordinary_planning_trial"]))
+                invalidated["planning_trial"] = effect["state"]
+                journal_event(folder, state, "planning_trial_ineligible",
+                              reason="architect_route_switched",
+                              effect=effect)
         elif role == "reviewer":
-            if state.get("review"):
+            batch = current_batch(state)
+            policy = risk_policy((batch or {}).get("risk"), cfg)
+            review_exempt = not policy["independent_review"]
+            if state.get("review") and not review_exempt:
                 state["review"] = None
                 invalidated["review"] = True
+            elif state.get("review") and review_exempt:
+                # Deterministic supervisor evidence for a mechanical batch stays
+                # valid across a Reviewer route switch; only the dependent
+                # acceptance decision must be reissued.
+                invalidated["review"] = False
+                invalidated["mechanical_review_preserved"] = True
             state["final_verdict"] = None
             state["pending_decision_binding"] = None
             state["authority_epoch"] = _authority_epoch_value(
@@ -18199,7 +18368,7 @@ def switch_role_run(run_id, role, spec, confirmation=None, *,
             invalidated["pending_verdict"] = True
             invalidated["authority_epoch"] = True
             if state.get("phase") in {"review", "accept"}:
-                state["phase"] = "review"
+                state["phase"] = "accept" if review_exempt else "review"
         elif role == "explorer":
             if state.get("required_exploration_job"):
                 state.pop("required_exploration_job", None)
@@ -18225,7 +18394,8 @@ def switch_role_run(run_id, role, spec, confirmation=None, *,
             state["status"] = "paused"
         save(folder, state)
         journal_event(folder, state, "role_switched", switch=record)
-    result = {k: v for k, v in fresh.items() if k != "_route"}
+    result = {k: v for k, v in fresh.items()
+              if k not in {"_route", "_trial_effect"}}
     result.update({"applied": True, "backup": str(backup),
                    "invalidated": invalidated, "record": record,
                    "run_dir": str(folder), "status": state.get("status"),
