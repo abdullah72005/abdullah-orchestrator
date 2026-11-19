@@ -7,6 +7,10 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
 - Corrected candidate (Batch 1 review):
   `26f515b60801582cdc9d6c4261628d7874d3d7bb` (implementation, tests and
   changelog).
+- Revision correction 1 (this candidate): code and tests at
+  `ebd55c888aa886c098213e9acc1a2f0e6e01db5b`, based on the clean closure
+  revision `140c8c0c615756066fa83b3a0840f894ea541f20`; the evidence commit is
+  its documentation-only child (see "Correction 1 verification" below).
 - Batch 1 follow-up corrections (r02): code and tests at
   `345ddb43b62226e03d995f02bba8d46d2f385dab`; the evidence commit is its
   documentation-only child. The full suite below ran from the r02 code tree.
@@ -390,6 +394,10 @@ States stay distinct: confirmed support, confirmed unsupported, and
 unavailable/unverified. Missing metadata is never reported as support. A new or
 changed selection that the active adapter cannot attest requires the explicit
 `--allow-unverified-metadata` acknowledgement before work or consent is spent.
+Correction 1 narrows this further: nonempty efforts must match a canonical or
+exact provider-defined catalogue variant, probes run and cache per host/project,
+an unfinished page budget yields `unavailable`, and a new Architect route
+without catalogue-confirmed High is refused before admission or switch.
 
 Per-run overrides are role-keyed JSON; omitted safe fields are inherited, and a
 provider change requires a complete route including billing. `switch-role` is a
@@ -491,6 +499,66 @@ python3 scripts/orchestrator.py version
   (``reviewer-smoke-pointer.md`, `reviewer-smoke-preflight.json`; root
   `/tmp/opencode/abdullah-reviewer-smoke-c04f640`). The one real
   authenticated Reviewer dispatch remains an operator action.
+
+## Correction 1 verification (19 November 2026)
+
+Base: clean `140c8c0c615756066fa83b3a0840f894ea541f20`. Correction-1 code and
+test revision: `ebd55c888aa886c098213e9acc1a2f0e6e01db5b`; the evidence commit is
+its documentation-only child. All commands ran from the candidate root with the
+hermetic test environment; no model was dispatched and no shared configuration
+was changed. Per the correction brief, the complete local regression is
+deliberately **not** run here; one stabilized final run remains scheduled after
+independent review and live-smoke feedback.
+
+```bash
+PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_closure
+PYTHONPATH=scripts/tests python3 -m unittest -v \
+  test_v120_release_workflow test_orchestrator test_quota_changes \
+  test_release_version test_v31_worker_routes test_v31_route_sources \
+  test_v31_routing_observation
+ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" \
+  PYTHONPATH=scripts/tests python3 -m unittest -v \
+  test_opencode_v2_integration test_p1_03_permission_overlap
+python3 -m compileall -q scripts
+python3 scripts/orchestrator.py version
+git diff --check 140c8c0..HEAD
+```
+
+| Check | Command | Result |
+|---|---|---|
+| Closure regressions | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_closure` | exit 0 — **65 tests, OK** in 125.516 s (`focused-closure-r01.txt`) |
+| Affected integration (routes, preview/apply, billing, verification, acceptance, trial) | the combined module command above | exit 0 — **231 tests, OK** in 391.202 s (`focused-routes-r01.txt`) |
+| Installed OpenCode V2.2.7 + permission overlap | the combined module command above | exit 0 — **31 tests, OK** in 29.755 s (`opencode-v2-r01.txt`) |
+| Compile / version / diff | the commands above | exit 0; `1.2.0` / `3.1.0` / schema `3` / contract `2` / config policy `1` (`version-r01.txt`) |
+| Archive identity | `git archive` vs `git ls-tree -r` | **263 files**, exact set/bytes/modes, `mode mismatches 0`, `blob mismatches 0`, SHA-256 `7116a0944bfebc97fd80ae0b69969d118d7a2d8160af0ae5f872efc7e428c93d` (`archive-identity-ebd55c8.txt`) |
+| Historical ZIP | re-verified against `626d8c6` | 252 files exact, SHA-256 `f808c36f90a9aea5b325b5d4829ed7e54d52b4aa28285d8da08812207c8cc222` |
+
+Correction scope proven by these checks:
+
+- The smoke prompt requests the real contract-v2 Reviewer object, and one
+  predicate is shared by `launch` and `inspect`. Success requires a completed,
+  path-matched Read from the producing session carrying the hidden challenge
+  line, supervisor OpenCode ingestion, an unchanged candidate, intact prepared
+  bindings, and absent/denied shell and edit capabilities. Negative fixtures
+  cover no event, wrong file/session, failed Read, blocked report, rejected
+  ingestion, checkout/binding drift, executed capability and installed-profile
+  mismatch; a successful simulated stream is validated end to end.
+- Effort/variant typo handling, per-project catalogue isolation, bounded-page
+  absence, and Architect High eligibility are covered offline.
+- The planning trial is validated and pinned against the exact resolved run
+  route, including the real first-stage Medium plan and High acceptance.
+- Reviewer switches preserve mechanical supervisor acceptance and phase;
+  ordinary/high batches still rerun review and decision on preserved
+  verification. Switches inherit the pinned route, refuse incompatible
+  preflight, distinguish a separately required grant, and mark a pending trial
+  ineligible in preview and state together.
+
+The previous fixture `/tmp/opencode/abdullah-reviewer-smoke-c04f640` is
+superseded. The new fixture `/tmp/opencode/abdullah-reviewer-smoke-ebd55c8`
+(run `20261119T182217-87d9122d`) was prepared and preflighted without a model
+call; see `reviewer-smoke-pointer.md` and
+`reviewer-smoke-preflight-r01.json`. The one authenticated Reviewer dispatch
+remains an operator action.
 
 ## Explicit limitations
 

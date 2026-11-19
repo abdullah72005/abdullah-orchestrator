@@ -1,0 +1,37 @@
+test_captured_variant_config_normalizes_to_the_recorded_document (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_disjoint_legacy_native_providers_match_real_normalizer (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_doctor_introspection_matches_binary (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_generated_profiles_are_accepted_with_effective_denials (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_installed_binary_fs_read_returns_supervisor_generated_hunk (test_opencode_v2_integration.OpenCodeV2Binary)
+Precise boundary: the installed V2 binary's filesystem read path. ... ok
+test_parent_config_above_git_root_is_freshly_observed (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_run_help_supports_generated_flags (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_version_is_tested_v2_line (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_deny_only_hardening_is_accepted (test_p1_03_permission_overlap.CompatibilityTests) ... ok
+test_generated_profiles_are_accepted (test_p1_03_permission_overlap.CompatibilityTests) ... ok
+test_known_opencode_v227_profiles_are_accepted (test_p1_03_permission_overlap.CompatibilityTests) ... ok
+test_doctor_accepts_only_safe_normalized_output (test_p1_03_permission_overlap.DoctorProbeTests) ... ok
+test_doctor_rejects_ambiguous_or_malformed_payloads (test_p1_03_permission_overlap.DoctorProbeTests) ... ok
+test_doctor_rejects_later_ask_and_broad_allow (test_p1_03_permission_overlap.DoctorProbeTests) ... ok
+test_doctor_rejects_malformed_or_missing_normalized_permissions (test_p1_03_permission_overlap.DoctorProbeTests) ... ok
+test_doctor_rejects_oversized_pattern_without_crashing (test_p1_03_permission_overlap.DoctorProbeTests) ... ok
+test_doctor_rejects_wrong_policy_identity (test_p1_03_permission_overlap.DoctorProbeTests) ... ok
+test_dangerous_shell_overlap_is_rejected_without_sample_commands (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_later_ask_overriding_mandatory_deny_is_rejected (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_later_broad_allow_overriding_earlier_deny_is_rejected (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_malformed_or_missing_permissions_are_rejected (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_nested_secret_at_previously_unenumerated_path_is_rejected (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_overlap_prover_models_opencode_optional_trailing_space (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_overlap_prover_only_declares_provable_disjointness (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_read_private_star_overlaps_env (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_read_secret_directory_star_overlaps_env (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_read_src_star_overlaps_nested_secret_file (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_reordered_or_contradictory_sequence_is_rejected (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_repo_controlled_oversized_pattern_fails_closed (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_unrecognized_action_names_are_rejected (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+test_wildcard_overlap_edge_cases_are_fail_closed (test_p1_03_permission_overlap.OverlapRejectionTests) ... ok
+
+----------------------------------------------------------------------
+Ran 31 tests in 29.755s
+
+OK

@@ -80,6 +80,30 @@ is reported about a run.
   invocation, permission enforcement or publish attestation is made from the
   installed test. Accepted, documented, not fixed.
 
+## Correction 1 findings (C4–C12)
+
+Correction 1 was raised by the Architect against `140c8c0`. All items below are
+fixed and covered by the 65-test closure module; the historical C1–C3 and their
+evidence remain unchanged.
+
+| ID | Observation | Disposition |
+|---|---|---|
+| C4 | Smoke prompt omitted `contract_version`, so the real contract-v2 ingestion would reject it | **Fixed.** The prompt requests the exact contract-v2 reviewer shape; `launch` re-runs the recorded stream through the supervisor's real `extract_cli_report` → `normalize_report` → `validate_report` path |
+| C5 | Smoke success could come from a loose answer match with no proving Read, and the sentinel also exists in fixture source | **Fixed.** One predicate for launch and inspect requires a completed, path-matched Read from the producing session carrying the exact challenge line, plus the contract-v2 complete report. Missing/failed/unrelated/wrong-session Reads, blocked output, drift, prohibited execution and installed-profile mismatch fail |
+| C6 | A nonempty unrecognized effort was treated like absent effort on a confirmed catalogue | **Fixed.** Nonempty efforts match canonical or exact provider-defined variant names; a typo is `unsupported` before run creation or switch, including with `--allow-unverified-metadata` |
+| C7 | The 30 s catalogue cache reused project A's OpenCode metadata for project B; Codex probed from the supervisor repo | **Fixed.** Cache keys include host and resolved project; Codex `app-server` probes run in the target project. Two-project isolation is tested |
+| C8 | A page-budget-limited probe could label absence as authoritative rejection | **Fixed.** Catalogues carry `complete`; model absence from an unfinished catalogue is `unavailable` with an explicit reason |
+| C9 | A new Architect selection lacking High could be admitted and stall later | **Fixed.** Confirmed catalogues missing `high` are refused at admission or switch, while missing metadata keeps the explicit unverified path and the dispatch High guard |
+| C10 | The planning trial built its pin from the global Codex default, not the resolved run override | **Fixed.** Medium and High are validated on the exact resolved subscription route and the pin records that route's provider/model/effort/billing; real first-stage Medium and acceptance High are tested |
+| C11 | A Reviewer switch in `accept` on a mechanical batch cleared supervisor evidence and changed the phase | **Fixed.** Effective risk policy preserves the mechanical acceptance phase and supervisor review; only the dependent decision is reissued. Ordinary/high batches still clear review/verdict on preserved verification |
+| C12 | Omitted switch fields inherited changed global defaults; incompatible preflight was not refused; a pending trial's preview and state disagreed | **Fixed.** Switches inherit the pinned run route, refuse a currently incompatible preflight, report a separately required grant as `requires_grant`, and mark a pending trial `ineligible_route_drift` in preview and state together |
+
+Smoke fixtures: the new fixture at
+`/tmp/opencode/abdullah-reviewer-smoke-ebd55c8` is prepared through
+`_record_batch_delta` (attested publication) and preflighted without a model
+call. The old `/tmp/opencode/abdullah-reviewer-smoke-c04f640` fixture is
+superseded.
+
 ## Environment-sensitive fixture assumptions
 
 - Architect reran the five named tests on base `626d8c6` under WSL2 Python
