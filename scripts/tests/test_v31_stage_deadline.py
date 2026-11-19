@@ -60,11 +60,12 @@ class MarkerGatedBudget:
 
 
 SLEEPING_CODEX = r'''#!/usr/bin/env python3
-import sys, time
+import os, pathlib, sys, time
 if '--version' in sys.argv:
     print('0.167.0')
     sys.exit(0)
 if '--output-last-message' in sys.argv:
+    pathlib.Path(os.environ['FAKE_DECISION_MARKER']).write_text(str(os.getpid()))
     time.sleep(10)
 sys.exit(0)
 '''
@@ -220,22 +221,62 @@ class StageDeadlineTests(unittest.TestCase):
         self.assertEqual(reconciled["phase"], "verify")
 
     def test_decision_child_is_clipped_to_the_remaining_stage_budget(self):
+        # The fake decision child records a start marker before sleeping.  The
+        # test-only budget wrapper refuses to clip until that marker exists, so
+        # host load cannot consume the 0.7s stage budget during route preflight
+        # and turn this into the safe pre-launch expiry (no failed job).  The
+        # marker plus the timeout error proves the spawned child was stopped by
+        # the remaining whole-stage budget rather than never having started.
         self.configure_stage(0.7)
+        decision_marker = self.root / "decision-started"
         bin_dir = self.root / "deadline-bin"
         bin_dir.mkdir()
         script = bin_dir / "codex"
         script.write_text(SLEEPING_CODEX)
         script.chmod(0o755)
+        real_remaining = orc.remaining_budget
+        architect_limit = float(self.cfg["limits"]["max_architect_seconds"])
+
+        def gated_remaining(configured, deadline):
+            if float(configured) != architect_limit:
+                return real_remaining(configured, deadline)
+            # The genuine remaining stage budget is applied only after the
+            # decision child is running; a minimal positive clip covers the
+            # case where preflight already consumed the budget.
+            return MarkerGatedBudget(decision_marker, deadline, configured)
+
         with patch.dict(os.environ, {"PATH": str(bin_dir) + ":" + os.environ["PATH"],
-                                     "OPENAI_API_KEY": ""}):
-            result = orc.stage_run("test-run00")
+                                     "OPENAI_API_KEY": "",
+                                     "FAKE_DECISION_MARKER": str(decision_marker)}):
+            with patch.object(orc, "remaining_budget",
+                              side_effect=gated_remaining):
+                result = orc.stage_run("test-run00")
         self.assertFalse(result["ok"])
         self.assertEqual(result["stage"], "plan")
+        self.assertTrue(decision_marker.exists(),
+                        "the decision child never started before its clipped "
+                        "budget; the test would only prove a pre-launch branch")
         state = orc.read_json(self.rundir / "state.json")
         self.assertIn(state["status"], {"uncertain", "blocked"})
         self.assertEqual(state["phase"], "plan")
-        self.assertTrue(state["failed_jobs"])
         self.assertFalse(state["completed_jobs"])
+        self.assertTrue(state["failed_jobs"])
+        failed = state["failed_jobs"][0]
+        self.assertEqual(failed["kind"], "plan")
+        self.assertEqual(failed["role"], "architect")
+        self.assertIn("ran beyond configured", failed["error"])
+        if state.get("active_job"):
+            # A clipped child whose containment was not yet proven leaves the
+            # exact uncertain ownership for the reconciliation contract.
+            self.assertEqual(state["active_job"]["status"], "uncertain")
+            self.assertEqual(state["status"], "uncertain")
+            inspection = orc.inspect_execution(
+                state["active_job"], run_id=state["id"], include_run=True)
+            self.assertTrue(inspection["stopped"], inspection["reasons"])
+            orc.modify_locked(self.rundir, state, state["id"], "reconcile")
+            reconciled = orc.read_json(self.rundir / "state.json")
+            self.assertIsNone(reconciled.get("active_job"))
+            self.assertEqual(reconciled["phase"], "plan")
 
     def test_worker_timeout_uses_the_remaining_stage_budget(self):
         self.cfg["limits"]["max_stage_seconds"] = 0.2
