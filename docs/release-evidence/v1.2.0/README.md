@@ -636,9 +636,30 @@ The high-risk trial rejection message still names Sol 6.2 even when the run
 pins another eligible model. Resuming uses the pinned High route. The message
 is a wording issue and is deferred to preserve the reviewed code tree.
 
-The authenticated smoke and the complete local suite on the stabilized
-candidate remain pending. The earlier 1,017-test run covered `c04f640`, before
-the two correction rounds.
+The earlier 1,017-test run covered `c04f640`, before the two correction rounds.
+
+## Final local regression (20 November 2026)
+
+The first full run at `6b48683` reported 1,048 passes, one failure and eight
+skips. The planning deadline fixture assumed that a child would start before
+its 0.7-second whole-stage deadline. An injected preflight delay reproduced
+the assertion with a safe pre-launch refusal. The fixture now records the
+child's start and exercises clipping after launch. The separate pre-launch
+expiry test still covers the refusal branch. The Architect verified the
+corrected test both normally and with the injected delay.
+
+`python3 -m unittest discover -s scripts/tests -v` at
+`314843e06fb87976dfed292b284d07b85471722b` exited 0 after 1,325.100 seconds.
+It discovered 1,057 tests, with 1,049 passes and eight opt-in OpenCode V2
+skips. The installed-binary cases had passed separately during the independent
+review. [Final local regression log](suite-closure-final.txt)
+
+The executable code is unchanged from `b72a772`. The archive of tested
+revision `314843e` matched all 275 tracked files by Git blob and executable
+mode. Its tar SHA-256 is
+`c42efeffaf629168f91705f8c68708f902c29047eb90946903923887857c3dd5`.
+The authenticated Reviewer smoke remains pending in the prepared fixture.
+[Reviewer smoke instructions](reviewer-smoke-pointer.md)
 
 ## Explicit limitations
 
