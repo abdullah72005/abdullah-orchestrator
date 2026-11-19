@@ -1,0 +1,24 @@
+$ /usr/bin/python3 -m compileall -q scripts
+
+exit 0
+$ /usr/bin/python3 scripts/orchestrator.py version
+{
+  "product": "abdullah-orchestrator",
+  "product_version": "1.2.0",
+  "supervisor_version": "3.1.0",
+  "state_schema_version": 3,
+  "config_schema_version": 3,
+  "report_contract_version": 2,
+  "source_provenance_version": 3,
+  "verification_evidence_version": 2,
+  "config_policy_version": 1,
+  "python": "3.10.12",
+  "note": "product_version is the public release. supervisor_version, state/config schema and report contract versions are independent; a public release never resets or reinterprets them."
+}
+exit 0
+$ git diff --check 1f5ad78..HEAD
+
+exit 0
+doc link files checked 55
+broken links 0
+doc_link_exit 0

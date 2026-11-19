@@ -104,6 +104,30 @@ Smoke fixtures: the new fixture at
 call. The old `/tmp/opencode/abdullah-reviewer-smoke-c04f640` fixture is
 superseded.
 
+## Correction 2 findings (C13–C21)
+
+Correction 2 was raised by the Architect against `1f5ad78`. All items are fixed
+and covered by the 77-test closure module; C1–C12 and their evidence remain
+unchanged.
+
+| ID | Observation | Disposition |
+|---|---|---|
+| C13 | Smoke treated "no shell/edit event" as `absent` and any error as denial, including a generic error for an unrelated command in another session | **Fixed.** Outcomes are `denied` only for an exact probe in the producing session with explicit policy markers, `executed`, `generic_error`, `incomplete`, `other_session_only`, `not_observed`, or inventory `absent`. Only denied/absent prove the negative; the rest stay unverified |
+| C14 | No authoritative tool inventory was reported | **Fixed/clarified.** OpenCode v2.2.7 exposes normalized agents/permissions only; the inventory is recorded unavailable and a missing event is explicitly unverified, not absent |
+| C15 | Static profile introspection was conflated with runtime enforcement | **Fixed.** Readiness reports the shipped/installed profile separately; runtime capability evidence is classified from events only, and `read_verified` is reported separately from `negative_evidence_verified` |
+| C16 | Any absolute path ending in the relative hunk path matched a foreign checkout | **Fixed.** Paths resolve against the prepared repository and compare to the exact real hunk path |
+| C17 | Launch did not bind the prepared prompt digest or the exact authorized Reviewer route | **Fixed.** Readiness checks prompt digest/contract shape, pinned and effective route, no fallback consent/retry, Go/V2/High channel, shipped/installed profile, route preflight and prepared evidence before inference |
+| C18 | Launch evidence described the frozen manifest route rather than the dispatched route | **Fixed.** The completed job's `dispatch.json` route must match the prepared route |
+| C19 | Inspect trusted saved summaries rather than the original stream | **Fixed.** Inspect verifies the raw stream SHA-256 and re-derives Read/negative evidence and report ingestion from it, failing if missing or changed |
+| C20 | Role switching ignored saved/current execution-policy compatibility | **Fixed.** Preview and apply (under lock, one fresh observation) require `current` policy; refusal leaves routes, generations, grants and evidence untouched. Preference-only changes still permit a switch |
+| C21 | Architect admission checked High capability only for explicit overrides and allowed a persistent Medium pin | **Fixed.** Every new persistent Architect route, including a configured default and early-stage switch, must use High; Medium remains the explicit ordinary trial, historical under-effort pins keep the protected dispatch guard, and remediation is documented |
+
+Smoke fixtures: the new pending fixture is
+`/tmp/opencode/abdullah-reviewer-smoke-b72a772` (run
+`20261119T193923-901988fd`), prepared through the attested publication path and
+preflighted without a model call. The `c04f640` and `ebd55c8` fixtures are
+superseded.
+
 ## Environment-sensitive fixture assumptions
 
 - Architect reran the five named tests on base `626d8c6` under WSL2 Python

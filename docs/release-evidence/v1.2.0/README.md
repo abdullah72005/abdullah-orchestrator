@@ -11,6 +11,10 @@ Prepared 18 November 2026 for the local v1.2.0 release candidate.
   `ebd55c888aa886c098213e9acc1a2f0e6e01db5b`, based on the clean closure
   revision `140c8c0c615756066fa83b3a0840f894ea541f20`; the evidence commit is
   its documentation-only child (see "Correction 1 verification" below).
+- Revision correction 2: code and tests at
+  `b72a772ec7446d63f9d616daf9aecbd0a3788baf`, based on `1f5ad78`; the evidence
+  commit is its documentation-only child (see "Correction 2 verification"
+  below).
 - Batch 1 follow-up corrections (r02): code and tests at
   `345ddb43b62226e03d995f02bba8d46d2f385dab`; the evidence commit is its
   documentation-only child. The full suite below ran from the r02 code tree.
@@ -558,6 +562,63 @@ superseded. The new fixture `/tmp/opencode/abdullah-reviewer-smoke-ebd55c8`
 (run `20261119T182217-87d9122d`) was prepared and preflighted without a model
 call; see `reviewer-smoke-pointer.md` and
 `reviewer-smoke-preflight-r01.json`. The one authenticated Reviewer dispatch
+remains an operator action.
+
+## Correction 2 verification (19 November 2026)
+
+Base: clean `1f5ad782a71f634a18a790a64374ae908ce464c8`. Correction-2 code and
+test revision: `b72a772ec7446d63f9d616daf9aecbd0a3788baf`; the evidence commit is
+its documentation-only child. All commands ran from the candidate root with the
+hermetic test environment; no model was dispatched and no shared configuration
+was changed. The complete local regression remains reserved for the stabilized
+final code/test revision.
+
+| Check | Command | Result |
+|---|---|---|
+| Closure regressions | `PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_closure` | exit 0 — **77 tests, OK** in 151.083 s (`focused-closure-r02.txt`) |
+| Affected integration (switching, admission, trial, verification, acceptance) | combined modules listed below | exit 0 — **286 tests, OK** in 421.627 s (`focused-routes-r02.txt`) |
+| Installed OpenCode V2.2.7 + permission overlap | combined modules listed below | exit 0 — **31 tests, OK** in 28.499 s (`opencode-v2-r02.txt`) |
+| Compile / version / diff / doc links | `compileall`, `orchestrator.py version`, `git diff --check 1f5ad78..HEAD`, relative-link scan | exit 0; 55 files checked, 0 broken links (`version-r02.txt`) |
+| Archive identity | `git archive` vs `git ls-tree -r` | **269 files**, exact set/bytes/modes, 0 mismatches, SHA-256 `3d0137e34d27c5082a4d899111c4b97f54dee2eed0fbe905fc1b768aad27a7a0` (`archive-identity-b72a772.txt`) |
+| Historical ZIP | re-verified against `626d8c6` | 252 files exact, SHA-256 `f808c36f90a9aea5b325b5d4829ed7e54d52b4aa28285d8da08812207c8cc222` |
+
+```bash
+PYTHONPATH=scripts/tests python3 -m unittest -v test_v120_release_closure
+PYTHONPATH=scripts/tests python3 -m unittest -v \
+  test_v120_release_workflow test_orchestrator test_quota_changes \
+  test_release_version test_v31_worker_routes test_v31_route_sources \
+  test_v31_routing_observation test_v31_route_migration \
+  test_v31_dispatch_safety test_v31_acceptance_integrity
+ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" \
+  PYTHONPATH=scripts/tests python3 -m unittest -v \
+  test_opencode_v2_integration test_p1_03_permission_overlap
+```
+
+Correction scope proven by these checks:
+
+- Smoke negative evidence distinguishes `not_observed`/`other_session_only`/
+  `generic_error` from an exact producing-session policy `denied` or an
+  authoritative inventory `absent`; an unverified negative keeps the combined
+  result false while `read_verified` stays separately attestable.
+- Read paths resolve against the prepared repository to the exact hunk, so a
+  foreign checkout with the same relative suffix is rejected.
+- Launch refuses before inference on prompt, route, consent, fallback, policy,
+  dialect, profile, preflight or prepared-evidence drift; the completed
+  dispatched route must match. Inspect re-derives evidence from the
+  digest-verified raw stream and fails when it is missing or changed.
+- Role switches require compatible execution policy at preview and again under
+  the apply lock with one fresh observation; a refusal leaves routes,
+  generations, grants and evidence untouched. Preference-only changes still
+  switch, and other roles' pinned routes stay unchanged.
+- New persistent Architect routes, including configured defaults and
+  early-stage switches, must use High; Medium remains the explicit ordinary
+  planning trial, and historical under-effort pins keep the fail-closed
+  protected dispatch guard with a documented switch-to-High remediation.
+
+The pending fixture `/tmp/opencode/abdullah-reviewer-smoke-b72a772`
+(run `20261119T193923-901988fd`) was prepared and preflighted without a model
+call; see `reviewer-smoke-pointer.md` and
+`reviewer-smoke-preflight-r02.json`. The one authenticated Reviewer dispatch
 remains an operator action.
 
 ## Explicit limitations
