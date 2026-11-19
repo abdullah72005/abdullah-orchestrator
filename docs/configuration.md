@@ -479,9 +479,10 @@ every branch, and the observer expands references in the same child environment
 the spawn receives, so an added/stripped credential is detected rather than
 assumed. Preflight then rejects dispatch until the operator reviews/migrates the
 run.
-Editing the config after creation still makes the run `config_changed`; it never
-silently reroutes. Explicit `migrate-run` initializes current routing pins and
-records their source, for old schema-2 routes whose fingerprint was null.
+Editing execution policy after creation makes the run `config_changed`.
+Role-selection defaults can change while existing runs keep their pinned routes.
+Explicit `migrate-run` initializes current routing pins and records their source
+for old schema-2 routes whose fingerprint was null.
 Arbitrary plugins/gateways that cannot be inspected remain an explicit
 limitation, not a universal proof.
 
@@ -527,8 +528,8 @@ race the supervisor at the boundary.
 `planning_trial_risk: "ordinary"` (CLI: `--planning-trial-risk`). This is an
 explicit declaration made **before** dispatch, not an automatic downgrade:
 
-- it validates the pinned Codex Architect route is Sol 6.2 at `high` with
-  `subscription` billing and refuses another host or model;
+- it requires a pinned Codex Architect route at `high` with `subscription`
+  billing and catalogue confirmation that its model supports Medium and High;
 - only the initial plan uses Medium effort; the Architect route itself is not
   mutated and saved runs keep the route they pinned;
 - a plan containing high-risk batches is not admitted — resume for a fresh High
@@ -652,12 +653,11 @@ python3 scripts/orchestrator.py adopt-config-policy <RUN_ID> \
   --backup-dir ~/backups/abdullah
 ```
 
-Adoption succeeds only when the old file's raw digest matches the run's
-recorded digest and its semantic policy is equivalent to the current one. A
-matching digest alone is never permission to rewrite routes, and an attested
-old policy that really differs still blocks.
-
-
+Adoption requires the old file's raw digest to match the run's recorded
+digest. It records the old policy and preserves the pinned routes. If the old
+policy differs from the current one, the result reports
+`equivalent_to_current: false` and execution remains blocked until the policy
+incompatibility is resolved.
 
 ## Migrating a schema-2 run
 

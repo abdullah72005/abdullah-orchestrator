@@ -60,8 +60,8 @@ the measured numbers, which are preserved exactly as recorded.
   1030.1 s (`suite-b01-r06.txt`) — together with its focused gate, installed
   OpenCode V2 module and version/diff checks, is the candidate evidence *for
   that revision*. The later release-closure revision
-  `b0d88f32d2182c2d35c72ab9cf69af66117257f6` supersedes it with the
-  1016-test closure run (`suite-closure.txt`) documented below; the r06 record
+  `c04f6405f48c5c6422a13662646bdb1f3bca2a08` supersedes it with the
+  1017-test closure run (`suite-closure.txt`) documented below; the r06 record
   is preserved as history.
 
 Neither epoch proves the behaviour of a newer host, a different interpreter, a
@@ -620,6 +620,25 @@ The pending fixture `/tmp/opencode/abdullah-reviewer-smoke-b72a772`
 call; see `reviewer-smoke-pointer.md` and
 `reviewer-smoke-preflight-r02.json`. The one authenticated Reviewer dispatch
 remains an operator action.
+
+## Independent closure review
+
+The independent Reviewer inspected the integrated closure at
+`1a0f23930b0c6ff8765cf8f52b7825eb0c76fc8b`, with executable code and tests at
+`b72a772ec7446d63f9d616daf9aecbd0a3788baf`. The review closed both correction
+rounds and found no material defects. The Reviewer independently reran the 77
+closure tests, 286 integration tests, 31 installed OpenCode and permission
+checks, and five timing fixtures. All four groups passed.
+
+This documentation follow-up corrects the trial eligibility, config
+compatibility, provider switching, policy adoption and historical suite count.
+The high-risk trial rejection message still names Sol 6.2 even when the run
+pins another eligible model. Resuming uses the pinned High route. The message
+is a wording issue and is deferred to preserve the reviewed code tree.
+
+The authenticated smoke and the complete local suite on the stabilized
+candidate remain pending. The earlier 1,017-test run covered `c04f640`, before
+the two correction rounds.
 
 ## Explicit limitations
 

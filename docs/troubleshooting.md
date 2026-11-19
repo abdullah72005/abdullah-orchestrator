@@ -121,9 +121,12 @@ use the audited `reconcile <RUN> --launch-missing --evidence '...'` form.
 
 ### `config_changed`
 
-The configuration was edited after the run was pinned. Either restore the pinned
-config (recommended for an in-flight run) or finish this run and start a new one.
-Worker providers cannot be switched mid-run.
+The current execution policy differs from the run's recorded policy, or a
+legacy run needs its original config to establish that identity. Restore the
+matching policy or resolve the incompatibility using the documented adoption
+or migration path. Once the run is compatible and no stage is active, an
+operator can preview and apply a worker provider change with `switch-role`.
+[Configuration changes and role switching](configuration.md#changing-configuration-during-a-run)
 
 ### Stage is blocked with `verification_rejection`
 
