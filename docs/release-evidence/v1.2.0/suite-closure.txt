@@ -596,6 +596,7 @@ test_legacy_unknown_old_config_digest_fails_closed (test_v120_release_closure.Co
 test_old_run_keeps_pinned_routes_and_evidence_after_new_default (test_v120_release_closure.ConfigPolicyTests) ... ok
 test_operator_adoption_requires_exact_old_bytes_and_is_backup_first (test_v120_release_closure.ConfigPolicyTests) ... ok
 test_preference_only_change_keeps_semantic_policy_and_run_current (test_v120_release_closure.ConfigPolicyTests) ... ok
+test_stage_observation_binds_policy_not_a_later_file_read (test_v120_release_closure.ConfigPolicyTests) ... ok
 test_unknown_key_is_fail_closed (test_v120_release_closure.ConfigPolicyTests) ... ok
 test_attestation_cannot_launder_a_different_policy (test_v120_release_closure.LegacyEvidenceAdmissionTests) ... ok
 test_attested_old_bytes_permit_equivalent_policy (test_v120_release_closure.LegacyEvidenceAdmissionTests) ... ok
@@ -1019,7 +1020,7 @@ test_subscription_grant_is_consumed_even_when_the_attempt_fails (test_v31_worker
 test_unapproved_api_route_fails_before_spawn (test_v31_worker_routes.WorkerRouteTests) ... ok
 
 ----------------------------------------------------------------------
-Ran 1016 tests in 1244.145s
+Ran 1017 tests in 1252.675s
 
 OK (skipped=8)
 Reconciled. Check candidate source and resume when safe.
@@ -1038,6 +1039,6 @@ Reconciled. Check candidate source and resume when safe.
 Reconciled. Check candidate source and resume when safe.
 Reconciled. Check candidate source and resume when safe.
 
-real	20m44.327s
-user	7m35.418s
-sys	2m3.747s
+real	20m52.854s
+user	7m33.402s
+sys	2m3.990s

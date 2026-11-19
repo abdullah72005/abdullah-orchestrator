@@ -1,14 +1,14 @@
 # AOR120-A1 — authenticated Reviewer Read smoke (operator launch)
 
-Prepared 19 November 2026 from candidate revision
-`b0d88f32d2182c2d35c72ab9cf69af66117257f6`. Preparation made **no model call**.
+Prepared 19 November 2026 from the final candidate code/test revision
+`c04f6405f48c5c6422a13662646bdb1f3bca2a08`. Preparation made **no model call**.
 The single real Reviewer dispatch is the operator action below; nothing in this
 file claims its result in advance.
 
 ## Prepared root
 
-- Root: `/tmp/opencode/abdullah-reviewer-smoke-b0d88f3`
-- Run: `20261119T151052-af70fb81`
+- Root: `/tmp/opencode/abdullah-reviewer-smoke-c04f640`
+- Run: `20261119T153949-a80cff8d`
 - Isolated config: `<root>/config.json`; isolated state `<root>/state/runs`;
   isolated checkout registry `<root>/registry`. Real stored OpenCode Go
   subscription access is used; no API-billed alternate credential is selected.
@@ -19,24 +19,24 @@ file claims its result in advance.
 
 | Item | Value |
 |---|---|
-| Candidate signature | `31d8c5136feed071bbb9d97d1d6a57ff846adab4dd5279805cf7b60d2cf37b04` |
-| Verification record SHA-256 | `259f4294a4f80f6939f644d14d013e6c2aa212ae6b3327e436f4feb3be613ab5` |
-| Projection SHA-256 | `ef720f402e16c00d2bebdaa6ef63c3a914caeb79ed4552731091c12d554b194f` |
-| Packet binding SHA-256 | `41f9d989f570f8c81c68c6c5933ecbb07e5ab11c3b01c76d249b449ca588f305` |
-| Manifest SHA-256 | `7c1a9dd38486b51dd3c1b6190dbbe4b6f5c19c2e13d3fc180958ecf6b838064c` |
+| Candidate signature | `64503e9a5bebe0f3ebcf6f649ec8fd24dcdb15cc8941f23995d6344958a46611` |
+| Verification record SHA-256 | `40ed49c36ecee5a1fdaac460227557153efbf526901ab3df89f0361ac90d48d3` |
+| Projection SHA-256 | `139e42750ab7afe11cce1307fb30b2c443d7ee3d52109b85e6bfa2aa5d34b9f9` |
+| Packet binding SHA-256 | `bb272161620efa1c935fc3a1953deafe43bff83001ff14093762a7ba6a933acb` |
+| Manifest SHA-256 | `2fca1e879bfa52c66a89f97e6f7d184793e078967cbe96eaf70f7a56461b0b78` |
 | Challenge hunk SHA-256 | `e270bca742e32cc54b41d3a96c2aafe806673e8b0e9ec2ff6b495f91528099d5` |
-| Prompt SHA-256 | `ebe6f85b33f9a332b637c4f253ae0d64f6876c3a1e3274dfc3f154939114139f` |
+| Prompt SHA-256 | `4557f4c5c367833b63c448dac318f91e277f8817277a01f1d6772dec049dff12` |
 
 The hunk contains the added `MAGIC_SENTINEL = 314159`. The prompt names the
 hunk path but deliberately contains neither the line nor the value.
 
 ## Route and readiness
 
-Preflight (read-only, `/tmp/opencode/smoke-preflight.json`, copied beside this
-file) returned `ok: true`, classification `go_subscription`, dialect `v2`,
-installed-agent introspection `true` on OpenCode `v2.2.7`, with normalized
-permissions `read: allow`, `shell: deny`, `edit: deny`. Codex is `0.169.1`.
-Entitlement is attested by configuration only; no inference request was made.
+Preflight (read-only, `reviewer-smoke-preflight.json` beside this file) returned
+`ok: true`, classification `go_subscription`, dialect `v2`, installed-agent
+introspection `true` on OpenCode `v2.2.7`, with normalized permissions
+`read: allow`, `shell: deny`, `edit: deny`. Codex is `0.169.1`. Entitlement is
+attested by configuration only; no inference request was made.
 
 Pinned Reviewer route: `opencode-go/deepseek-v4.1-flash`, effort `high`,
 billing `go`, `route_source: pinned`.
@@ -44,13 +44,13 @@ billing `go`, `route_source: pinned`.
 ## Exact terminal launch pointer
 
 ```bash
-cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke.py launch --root /tmp/opencode/abdullah-reviewer-smoke-b0d88f3
+cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke.py launch --root /tmp/opencode/abdullah-reviewer-smoke-c04f640
 ```
 
 Then inspect the recorded evidence:
 
 ```bash
-cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke.py inspect --root /tmp/opencode/abdullah-reviewer-smoke-b0d88f3
+cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke.py inspect --root /tmp/opencode/abdullah-reviewer-smoke-c04f640
 ```
 
 ## What the launch records

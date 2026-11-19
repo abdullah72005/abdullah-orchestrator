@@ -9,13 +9,13 @@
         "model": "opencode-go/deepseek-v4.1-flash",
         "effort": "high",
         "billing": "go",
-        "routing_fingerprint": "9121828687289017b9adf2fe42200b1d5496da7f56cf41e696831f171b5cb462",
+        "routing_fingerprint": "af53179c9c9d1b6087d9738d5abbc00e8b055fc41c5f836e9551c62952e81290",
         "configured": {
             "billing": "go",
             "effort": "high",
             "model": "opencode-go/deepseek-v4.1-flash",
             "provider": "opencode",
-            "routing_fingerprint": "9121828687289017b9adf2fe42200b1d5496da7f56cf41e696831f171b5cb462",
+            "routing_fingerprint": "af53179c9c9d1b6087d9738d5abbc00e8b055fc41c5f836e9551c62952e81290",
             "worker_provider": "opencode-go"
         },
         "pinned": {
@@ -23,7 +23,7 @@
             "effort": "high",
             "model": "opencode-go/deepseek-v4.1-flash",
             "provider": "opencode",
-            "routing_fingerprint": "9121828687289017b9adf2fe42200b1d5496da7f56cf41e696831f171b5cb462",
+            "routing_fingerprint": "af53179c9c9d1b6087d9738d5abbc00e8b055fc41c5f836e9551c62952e81290",
             "worker_provider": "opencode-go"
         },
         "current_default": {
@@ -32,7 +32,7 @@
             "model": "opencode-go/deepseek-v4.1-flash",
             "effort": "high",
             "billing": "go",
-            "routing_fingerprint": "9121828687289017b9adf2fe42200b1d5496da7f56cf41e696831f171b5cb462"
+            "routing_fingerprint": "af53179c9c9d1b6087d9738d5abbc00e8b055fc41c5f836e9551c62952e81290"
         },
         "selection_source": "config_default",
         "selection_metadata": {
@@ -55,7 +55,7 @@
             "effort": "high",
             "model": "opencode-go/deepseek-v4.1-flash",
             "provider": "opencode",
-            "routing_fingerprint": "9121828687289017b9adf2fe42200b1d5496da7f56cf41e696831f171b5cb462",
+            "routing_fingerprint": "af53179c9c9d1b6087d9738d5abbc00e8b055fc41c5f836e9551c62952e81290",
             "worker_provider": "opencode-go"
         },
         "route_source": "pinned",
@@ -75,7 +75,7 @@
         "warnings": [
             "OpenCode Go entitlement is attested by configuration only; no inference request was made."
         ],
-        "route_sha256": "65ac8ed5df5f16aa71c5dbcdef28ae371f4311796c509c424d211c1f8ca81463",
+        "route_sha256": "d6f4078f31445bb3120c49720bf6512020dfd45cbc545a15df23fda2dc706377",
         "observed": {
             "provider": "opencode-go",
             "config": [
@@ -223,7 +223,7 @@
                 },
                 {
                     "kind": "project",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/opencode.json",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/opencode.json",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -234,7 +234,7 @@
                 },
                 {
                     "kind": "project",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/opencode.jsonc",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/opencode.jsonc",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -245,7 +245,7 @@
                 },
                 {
                     "kind": "project",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/repo/opencode.json",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/repo/opencode.json",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -256,7 +256,7 @@
                 },
                 {
                     "kind": "project",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/repo/opencode.jsonc",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/repo/opencode.jsonc",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -333,7 +333,7 @@
                 },
                 {
                     "kind": "project_directory",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/.opencode/opencode.json",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/.opencode/opencode.json",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -344,7 +344,7 @@
                 },
                 {
                     "kind": "project_directory",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/.opencode/opencode.jsonc",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/.opencode/opencode.jsonc",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -355,7 +355,7 @@
                 },
                 {
                     "kind": "project_directory",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/repo/.opencode/opencode.json",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/repo/.opencode/opencode.json",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -366,7 +366,7 @@
                 },
                 {
                     "kind": "project_directory",
-                    "path": "/tmp/opencode/abdullah-reviewer-smoke-b0d88f3/repo/.opencode/opencode.jsonc",
+                    "path": "/tmp/opencode/abdullah-reviewer-smoke-c04f640/repo/.opencode/opencode.jsonc",
                     "required": false,
                     "present": false,
                     "sha256": null,
@@ -424,11 +424,11 @@
                 }
             ],
             "unresolved_routing": [],
-            "routing_material_sha256": "72d26be8b846bc05be0522d2055f563bdc051a334e4f3e11905c57731baf1cce"
+            "routing_material_sha256": "b832e66b21dfeb9733fc4370c028366c1e1d7c1449caacab111b5b4053f07956"
         },
-        "checked_at": "2026-11-19T15:11:02+00:00",
-        "route_material_sha256": "72d26be8b846bc05be0522d2055f563bdc051a334e4f3e11905c57731baf1cce",
-        "current_routing_fingerprint": "9121828687289017b9adf2fe42200b1d5496da7f56cf41e696831f171b5cb462"
+        "checked_at": "2026-11-19T15:39:53+00:00",
+        "route_material_sha256": "b832e66b21dfeb9733fc4370c028366c1e1d7c1449caacab111b5b4053f07956",
+        "current_routing_fingerprint": "af53179c9c9d1b6087d9738d5abbc00e8b055fc41c5f836e9551c62952e81290"
     },
     "dialect": "v2",
     "dialect_error": null,
@@ -438,6 +438,6 @@
         "shell": "deny",
         "edit": "deny"
     },
-    "launch_command": "cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke.py launch --root /tmp/opencode/abdullah-reviewer-smoke-b0d88f3",
+    "launch_command": "cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke.py launch --root /tmp/opencode/abdullah-reviewer-smoke-c04f640",
     "note": "Read-only readiness: route/preflight, installed dialect and normalized permissions. No model child and no billable call."
 }

@@ -100,10 +100,11 @@ is reported about a run.
   explicit pre-spawn branch where a pre-spawn timeout is the case under test.
   Where cleanup is the requirement, the child/descendant is established as
   started before the timeout or cancel is triggered.
-- Verification of that hardening on candidate code revision `b0d88f3`: the five
-  named tests passed twice independently (21.286 s and 21.277 s), and the
-  complete `test_v31_stage_deadline` module passed in 19.767 s. The full
-  1016-test closure suite also passed; see `README.md` and `suite-closure.txt`.
+- Verification of that hardening on code revision `b0d88f3` (unchanged in the
+  final revision): the five named tests passed twice independently (21.286 s
+  and 21.277 s), and the complete `test_v31_stage_deadline` module passed in
+  19.767 s. The final 1017-test closure suite on `c04f640` covers the same test
+  files; see `README.md` and `suite-closure.txt`.
 - No live exact identity (PID/PGID/session) is accepted without cleanup proof;
   terminated/zombie and reaped states stay distinct, and PID reuse is rejected
   by comparing the recorded start time.

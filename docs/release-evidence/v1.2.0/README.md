@@ -438,7 +438,7 @@ claim them in advance.
 ## Closure batch verification (19 November 2026)
 
 Local candidate code/test revision
-`b0d88f32d2182c2d35c72ab9cf69af66117257f6`. All commands ran from the candidate
+`c04f6405f48c5c6422a13662646bdb1f3bca2a08`. All commands ran from the candidate
 root with the hermetic test environment; no model was dispatched.
 
 ```bash
@@ -460,10 +460,10 @@ python3 scripts/orchestrator.py version
 
 - Focused gates: **404 tests, OK** in 749.037 s (`test_v120_release_closure`
   adds 32 closure tests).
-- Complete local suite: **1016 tests in 1244.145 s, 1008 passed, 8 opt-in
+- Complete local suite: **1017 tests in 1252.675 s, 1009 passed, 8 opt-in
   OpenCode V2 skips, exit 0** (`suite-closure.txt`). The eight skips are the
   same module exercised separately next.
-- Installed OpenCode V2.2.7: **8 tests, OK** in 32.342 s
+- Installed OpenCode V2.2.7: **8 tests, OK** in 30.181 s
   (`opencode-v2-closure.txt`).
 - `compileall`: clean. `version`: product `1.2.0`, supervisor `3.1.0`,
   state/config schema `3`, report contract `2`, verification evidence `2`,
@@ -472,11 +472,13 @@ python3 scripts/orchestrator.py version
   independently (21.286 s and 21.277 s) and the complete
   `test_v31_stage_deadline` module passed in 19.767 s after the test-only
   start-marker gating; see `closure-findings.md`.
-- Archive identity (`archive-identity-b0d88f3.txt`): `git archive` of the exact
-  final revision has **254 files**, byte-for-byte and mode-for-mode identical to
+- Archive identity (`archive-identity-c04f640.txt`): `git archive` of the exact
+  final revision has **262 files**, byte-for-byte and mode-for-mode identical to
   `git ls-tree -r` (`mode mismatches 0`, `blob mismatches 0`), executable bits
   only on `scripts/install_wsl.py` and `scripts/orchestrator.py`; archive
-  SHA-256 `41fe839aabd951060a71146b7bdcbdfee997b543914ef2e92b3f5809964e36ef`.
+  SHA-256 `af0a7de5aba6cf818a2b6a7ed9658e4278319b110e15e789a7b105090982b702`.
+  `archive-identity-b0d88f3.txt` is retained as the intermediate revision
+  (254 files, SHA-256 `41fe839aabd951060a71146b7bdcbdfee997b543914ef2e92b3f5809964e36ef`).
   The historical `/mnt/c/Users/abdul/Downloads/abdullah-orchestrator-main (8).zip`
   independently re-verified at SHA-256
   `f808c36f90a9aea5b325b5d4829ed7e54d52b4aa28285d8da08812207c8cc222`, 281
@@ -486,7 +488,8 @@ python3 scripts/orchestrator.py version
   installed Codex `0.169.1` and OpenCode `2.2.7` routes. This is metadata, not
   entitlement, billing or live-quality proof.
 - Reviewer Read smoke: prepared, preflighted and **not launched**
-  (`reviewer-smoke-pointer.md`, `reviewer-smoke-preflight.json`). The one real
+  (``reviewer-smoke-pointer.md`, `reviewer-smoke-preflight.json`; root
+  `/tmp/opencode/abdullah-reviewer-smoke-c04f640`). The one real
   authenticated Reviewer dispatch remains an operator action.
 
 ## Explicit limitations
