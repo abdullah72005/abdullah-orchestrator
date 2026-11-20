@@ -1,5 +1,10 @@
 # AOR120-A1 — authenticated Reviewer Read smoke (operator launch)
 
+The launch instructions below are historical. That run reproduced the inherited
+`PWD` failure. The corrected authenticated run and the remaining
+same-session permission limit are recorded in the
+[checkout-binding release evidence](README.md#opencode-checkout-binding-and-authenticated-reviewer-evidence).
+
 Prepared 19 November 2026 from correction-2 code/test revision
 `b72a772ec7446d63f9d616daf9aecbd0a3788baf`. Preparation and the read-only
 preflight made **no model call**. The single real Reviewer dispatch is the

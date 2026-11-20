@@ -1,0 +1,18 @@
+local request 1 /v1/chat/completions
+advertised tools []
+127.0.0.1 - - [20/Nov/2026 13:17:37] "POST /v1/chat/completions HTTP/1.1" 200 -
+local request 2 /v1/chat/completions
+advertised tools ['glob', 'grep', 'read', 'skill']
+127.0.0.1 - - [20/Nov/2026 13:17:37] "POST /v1/chat/completions HTTP/1.1" 200 -
+local request 3 /v1/chat/completions
+advertised tools ['glob', 'grep', 'read', 'skill']
+127.0.0.1 - - [20/Nov/2026 13:17:38] "POST /v1/chat/completions HTTP/1.1" 200 -
+exit 0
+tool_use shell {'command': 'echo fixture-shell-probe', 'description': 'Harmless fixture probe'} error No tool named "shell" is currently available. Please use a tool from the available tool list.
+tool_use write {'path': '/tmp/opencode/review-read-loopback-matf3g0i/repo/fixture-write-probe.txt', 'content': 'fixture'} error No tool named "write" is currently available. Please use a tool from the available tool list.
+tool_use edit {'path': '/tmp/opencode/review-read-loopback-matf3g0i/repo/probe.patch', 'oldString': 'controlled fixture', 'newString': 'unexpected write'} error No tool named "edit" is currently available. Please use a tool from the available tool list.
+tool_use read {'path': '.git/abdullah-review/probe.patch'} completed None Read file .git/abdullah-review/probe.patch, lines 1-1
+1: controlled fixture
+stderr
+write probe exists False
+existing fixture unchanged True

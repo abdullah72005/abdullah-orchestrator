@@ -638,7 +638,7 @@ is a wording issue and is deferred to preserve the reviewed code tree.
 
 The earlier 1,017-test run covered `c04f640`, before the two correction rounds.
 
-## Final local regression (20 November 2026)
+## Deadline fixture regression (20 November 2026)
 
 The first full run at `6b48683` reported 1,048 passes, one failure and eight
 skips. The planning deadline fixture assumed that a child would start before
@@ -658,14 +658,45 @@ The executable code is unchanged from `b72a772`. The archive of tested
 revision `314843e` matched all 275 tracked files by Git blob and executable
 mode. Its tar SHA-256 is
 `c42efeffaf629168f91705f8c68708f902c29047eb90946903923887857c3dd5`.
-The authenticated Reviewer smoke remains pending in the prepared fixture.
-[Reviewer smoke instructions](reviewer-smoke-pointer.md)
+The checkout-binding correction below supersedes this tested revision.
+
+## OpenCode checkout binding and authenticated Reviewer evidence
+
+The first authenticated Reviewer run failed at a checkout-relative Read
+despite an intact review packet. OpenCode 2.2.7 used inherited `PWD` as its
+working directory. Revision `f59a2cdd9c2411bf501ba6ceda5866fd1ce40c00` binds
+`PWD` to the resolved checkout for OpenCode inspection and launch. The
+installed-binary regression exercised a real Read against a scripted loopback
+provider and confirmed that stale `PWD` could no longer redirect the read.
+
+The operator's second authenticated run used `opencode-go/deepseek-v4.1-flash`
+at High on the prepared Go route. The completed Read matched the exact hunk,
+challenge, and producing session. The source and packet digests remained
+intact. The session logged no shell or edit call, and the CLI's sanitized
+session export provided no request tool inventory. Accordingly the combined
+smoke remained unverified for same-session permissions. [Redacted authenticated evidence](authenticated-reviewer-f59a2cd.json)
+
+In a separate run with the same installed binary and shipped Reviewer profile,
+the credential-free loopback provider observed only `glob`, `grep`, `read`,
+and `skill` in the advertised tool list. OpenCode rejected the scripted shell,
+write, and edit calls as unavailable, created no file, and left the existing
+fixture intact. This demonstrates runtime permission behavior in the isolated
+profile. [Loopback runtime log](reviewer-negative-loopback-f59a2cd.txt)
+
+The completed local `python3 -m unittest discover -s scripts/tests -v` run at
+`f59a2cd` exited 0 after 1,683.494 seconds. It discovered 1,065 tests, with 1,055
+passes and 10 opt-in skips. All ten installed OpenCode V2 cases passed separately
+at that revision. The interrupted attempt was incomplete and was excluded from
+the result. The tested archive matched all 277 tracked files by blob and
+executable mode, with tar SHA-256
+`974268223550d0700419d74f9390a32cafdb82f92300cd161354c3bd38f8de80`.
+[Final checkout-binding regression log](suite-closure-final-f59a2cd.txt)
 
 ## Explicit limitations
 
-- No live model calls, subscription usage, token savings, wall-clock quota
-  comparison, native terminal duration/Esc/reconnect behavior or real host
-  acceptance were measured in this offline candidate.
+- The authenticated Reviewer smoke recorded one Go Reviewer dispatch per fixture.
+  Native terminal duration/Esc/reconnect behavior, comparative token savings,
+  and wall-clock quota were outside those observations.
 - Native OpenCode V2 read-policy proof depends on an installed isolated binary;
   the deterministic test mirrors the effective policy but is not a substitute
   for that installed-binary check.

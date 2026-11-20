@@ -1,0 +1,38 @@
+{
+  "auth_negative_observations": {
+    "shell": "not_observed",
+    "write": "not_observed"
+  },
+  "authenticated_negative_verified": false,
+  "authenticated_read_verified": true,
+  "billing": "go",
+  "binding_sha256": "30d39c0e21fb4626e06d29966402a5c6ec378e75b09872febfe6bc529ca64e3d",
+  "candidate_sha256": "ad8026f6149068b81b879f47d6633b6df262f27b8e2f334e5e8454daedc76712",
+  "combined_ok": false,
+  "effective_profile": {
+    "edit": "deny",
+    "external_directory": "deny",
+    "read_hunk": "allow",
+    "shell": "deny"
+  },
+  "effort": "high",
+  "events_sha256": "5c966a7ddf575f703651afc84c97adf980bf9c27bcef358c0d6ba3c1e520f02c",
+  "evidence_file_sha256": "d06de26c1340c78b0c9d296f33672d0a4934b936a445f0b6f70821a0bf425370",
+  "model": "opencode-go/deepseek-v4.1-flash",
+  "no_prohibited_execution_observed": true,
+  "orchestrator_revision": "f59a2cdd9c2411bf501ba6ceda5866fd1ce40c00",
+  "projection_manifest_sha256": "5e1de07059a3563ffa75b0e1502e091fe5155424d2d564d576d465d2a572fff2",
+  "projection_sha256": "5e7bfed489294a9740501c87198ad4db220bc321c3558893bcfc8d813da08b7a",
+  "read": {
+    "challenge_output_sha256": "33eca589805c3cb8c493e40920cd64667dcd30dc9e72e8b0a232eaf9cd101575",
+    "line_sha256": "c6327a2a944a9ab7475130f02fbb44a44e2dbdfb2164f86aef68c09cbfd86dba",
+    "output_sha256": "8d62ae332e3faca66ef2ee9df588ca69bd6e9427ee0aac7076994b51311993ec",
+    "path": ".git/abdullah-review/20261120T110811-bcfbde28-b0-ad8026f61490-627fb82fd11d/delta/attempt-1/app.py-0001.patch",
+    "status": "completed",
+    "tool": "read"
+  },
+  "run_id": "20261120T110811-bcfbde28",
+  "session_id": "ses_e07557812ffe2zJCE8SVx1kA2v",
+  "smoke_manifest_file_sha256": "3caa755b1ac77375690ae5ee7e3c3e8c54e41d7b0eb9228be58e6b77ce1ba24d",
+  "source_unchanged": true
+}
