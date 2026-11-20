@@ -1158,6 +1158,21 @@ def scrubbed_env():
     return env
 
 
+def _opencode_checkout_env(env, project):
+    """Copy ``env`` with ``PWD`` bound to the resolved checkout.
+
+    The installed OpenCode binary prefers an inherited ``PWD`` over the
+    spawned process's cwd and changes directory to it before reading
+    project-scoped configuration or resolving relative tool paths.  Every
+    project-scoped OpenCode entry point therefore carries the resolved
+    project in ``PWD`` so observation and dispatch cannot drift to the
+    supervisor's ambient directory.  The caller's mapping is never mutated.
+    """
+    child_env = dict(env or {})
+    child_env["PWD"] = str(Path(project).expanduser().resolve())
+    return child_env
+
+
 # ---------------------------------------------------------------------------
 # Shared route/billing preflight (Doctor and every dispatch use this)
 # ---------------------------------------------------------------------------
@@ -3010,6 +3025,10 @@ def _opencode_prepared_context(role, dialect, project=None, *, child_env=None,
     child_env = scrubbed_env() if child_env is None else child_env
     project_path = (Path(project).expanduser().resolve()
                     if project is not None else Path.cwd().resolve())
+    # Bind the inherited PWD to the resolved checkout before any observation
+    # runs. Installations that prefer PWD over cwd would otherwise inspect the
+    # supervisor's ambient directory instead of the approved project.
+    child_env = _opencode_checkout_env(child_env, project_path)
     base = {"error": None, "records": [], "documents": [], "sources": [],
             "inline": {}, "config": {}, "files": [], "inspection": None,
             "executable": None, "child_env": child_env, "project": project_path,
@@ -3189,6 +3208,9 @@ def _opencode_launch_context(role, dialect, project, *, allow_free=False,
     if context.get("cancelled") or context.get("expired"):
         return {"context": context, "env": None}
     env = dict(context.get("child_env") or scrubbed_env())
+    # Re-bind at the launch boundary so a prepared context from another caller
+    # can never launch the CLI against a different checkout than it observed.
+    env = _opencode_checkout_env(env, context.get("project") or project)
     for key in ("LEAN_CTX_READ_ONLY_ROOTS", "__LEAN_CTX_NO_DAEMON"):
         env.pop(key, None)
     if not allow_free:
@@ -7618,7 +7640,7 @@ def validate_worker_profile(role, dialect="v2"):
     return validate_v2_effective_permissions(role, profile.get("permissions"))
 
 
-def opencode_env(role, dialect, allow_free=False):
+def opencode_env(role, dialect, allow_free=False, project=None):
     env = scrubbed_env()
     # Run-scoped read-only evidence access belongs to the Architect only; a
     # worker launched by the Architect (e.g. via `explore`) must not inherit it.
@@ -7628,6 +7650,8 @@ def opencode_env(role, dialect, allow_free=False):
         # Free-model discovery is disabled by default.  Only an explicitly
         # authorized free route policy may remove this guard.
         env["OPENCODE_DISABLE_FREE_MODELS"] = "1"
+    if project is not None:
+        env = _opencode_checkout_env(env, project)
     # The inline block is generated from the same boundary the preflight
     # observation/fingerprint use, so an approved provider is not discarded.
     inline, meta = opencode_child_inline(role, dialect)
@@ -9527,6 +9551,10 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         evidence_root=run_dir if role == "architect" else None,
         prepared=launch)
     env = dict(env)
+    if not strong:
+        # The guarded child's cwd is the checkout; bind PWD to the same
+        # resolved project so the CLI cannot chdir back to an ambient parent.
+        env = _opencode_checkout_env(env, project)
     if state is not None:
         env["ABDULLAH_RUN_ID"] = str(state.get("id") or state.get("run_id") or "")
         env["ABDULLAH_JOB_ID"] = job_id
@@ -9575,6 +9603,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             continuation, evidence_root=run_dir if role == "architect" else None,
             prepared=launch)
         env = dict(env)
+        if not strong:
+            env = _opencode_checkout_env(env, project)
         if state is not None:
             env["ABDULLAH_RUN_ID"] = str(state.get("id") or state.get("run_id") or "")
             env["ABDULLAH_JOB_ID"] = job_id
@@ -14666,8 +14696,8 @@ def probe_opencode_config(project, role, dialect):
             # V2.2 exposes normalized agents, including effective permissions.
             response = subprocess.run(
                 ["opencode", "debug", "agents", "--standalone"], cwd=project,
-                env=opencode_env(role, dialect), capture_output=True,
-                text=True, timeout=60, check=False)
+                env=opencode_env(role, dialect, project=project),
+                capture_output=True, text=True, timeout=60, check=False)
             if response.returncode:
                 return None
             agents = json.loads(response.stdout)
@@ -14696,7 +14726,8 @@ def probe_opencode_config(project, role, dialect):
         if dialect != "v1":
             return None
         response = subprocess.run(["opencode", "debug", "agent", f"abdullah-{role}"], cwd=project,
-                                  env=opencode_env(role, dialect), capture_output=True,
+                                  env=opencode_env(role, dialect, project=project),
+                                  capture_output=True,
                                   text=True, timeout=20, check=False)
         if response.returncode:
             return False
@@ -14865,11 +14896,15 @@ def doctor(project: Path, host="codex", routes=None):
     if checks["commands"]["opencode"]:
         try:
             if dialect == "v2":
-                inv = subprocess.run(["opencode", "models"], cwd=project,
-                                     capture_output=True, text=True, timeout=20, check=False)
+                inv = subprocess.run(
+                    ["opencode", "models"], cwd=project,
+                    env=_opencode_checkout_env(scrubbed_env(), project),
+                    capture_output=True, text=True, timeout=20, check=False)
             else:
-                inv = subprocess.run(["opencode", "models", "--verbose"], cwd=project,
-                                     capture_output=True, text=True, timeout=20, check=False)
+                inv = subprocess.run(
+                    ["opencode", "models", "--verbose"], cwd=project,
+                    env=_opencode_checkout_env(scrubbed_env(), project),
+                    capture_output=True, text=True, timeout=20, check=False)
             checks["model_inventory"] = "listed" if inv.returncode == 0 else "failed"
             worker_routes = {role: checks["route"][role]
                              for role in ("explorer", "implementer", "reviewer")}
@@ -15184,7 +15219,8 @@ def _opencode_v2_catalogue(project, *, deadline=None, cancel=None):
         try:
             rc, out, err = _opencode_run_bounded(
                 [binary, "api", "--standalone", "get", endpoint], str(project),
-                scrubbed_env(), MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
+                _opencode_checkout_env(scrubbed_env(), project),
+                MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
                 deadline=deadline, purpose="model catalogue",
                 activity="model catalogue probe")
         except (InspectionCancelled, InspectionDeadlineExpired):
@@ -15267,7 +15303,8 @@ def _opencode_v1_catalogue(project, *, deadline=None, cancel=None):
     try:
         rc, out, err = _opencode_run_bounded(
             [identity["resolved"], "models", "--verbose"], str(project),
-            scrubbed_env(), MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
+            _opencode_checkout_env(scrubbed_env(), project),
+            MODEL_CATALOGUE_TIMEOUT, cancel=cancel,
             deadline=deadline, purpose="model catalogue",
             activity="model catalogue probe")
     except (InspectionCancelled, InspectionDeadlineExpired):

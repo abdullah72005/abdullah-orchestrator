@@ -4,11 +4,14 @@ Set ABDULLAH_OPENCODE_V2_BIN to an isolated V2.2.x binary to run these.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -179,6 +182,178 @@ class OpenCodeV2Binary(unittest.TestCase):
             for role in ("explorer", "implementer", "reviewer"):
                 with self.subTest(role=role):
                     self.assertIs(orc.probe_opencode_config(self.project, role, "v2"), True)
+
+    def _isolated_binary_env(self, home, *, pwd):
+        return {
+            "PATH": str(Path(self.bin).parent) + os.pathsep + os.environ["PATH"],
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "XDG_STATE_HOME": str(home / "state"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_FREE_MODELS": "1",
+            "PWD": str(pwd),
+        }
+
+    def test_stale_ambient_pwd_does_not_redirect_config_observation(self):
+        """Preflight must observe the intended checkout, not a stale sibling."""
+        root = Path(self.tmp.name)
+        home = root / "stale-config-home"
+        home.mkdir()
+        repo = root / "intended-checkout"
+        repo.mkdir()
+        stale_repo = root / "stale-checkout"
+        stale_repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "init", "-q", str(stale_repo)], check=True)
+        intended_url = "https://intended.invalid/v1"
+        stale_url = "https://stale.invalid/v1"
+        (repo / "opencode.json").write_text(json.dumps({
+            "providers": {"opencode-go": {
+                "settings": {"baseURL": intended_url},
+                "models": {"go-model": {}}}}}))
+        (stale_repo / "opencode.json").write_text(json.dumps({
+            "providers": {"opencode-go": {
+                "settings": {"baseURL": stale_url},
+                "models": {"go-model": {}}}}}))
+        route = {"provider": "opencode", "worker_provider": "opencode-go",
+                 "model": "opencode-go/go-model", "effort": "low",
+                 "billing": "go"}
+        env = self._isolated_binary_env(home, pwd=stale_repo)
+        inspection_env = {}
+        real_bounded = orc._opencode_run_bounded
+
+        def capture_bounded(argv, cwd, child_env, timeout, **kwargs):
+            if "debug" in argv and "config" in argv:
+                inspection_env.update(child_env)
+            return real_bounded(argv, cwd, child_env, timeout, **kwargs)
+
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(orc, "_opencode_run_bounded",
+                             side_effect=capture_bounded):
+            observed = orc.opencode_provider_observation(
+                route, project=repo, cfg=self.cfg, role="reviewer")
+        self.assertEqual(inspection_env.get("PWD"), str(repo.resolve()))
+        self.assertEqual(observed["inspection"], "normalized", observed.get("error"))
+        self.assertFalse(observed.get("inspection_disagreement"), observed)
+        self.assertEqual(
+            observed["endpoint_sha256"],
+            hashlib.sha256(intended_url.encode()).hexdigest())
+
+    def test_reviewer_read_binds_to_the_checkout_under_stale_ambient_pwd(self):
+        """The real Read tool resolves relative paths from the intended checkout."""
+        root = Path(self.tmp.name)
+        home = root / "read-binding-home"
+        home.mkdir()
+        repo = root / "read-binding-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        relative = ".git/abdullah-review/probe.patch"
+        intended = repo / relative
+        intended.parent.mkdir(parents=True)
+        intended.write_text("controlled fixture\n")
+        (repo / "app.py").write_text("value = 1\n")
+        # A decoy at the same relative path under the stale ambient PWD makes a
+        # wrong checkout observable in the returned Read output, not just a miss.
+        decoy = root / relative
+        decoy.parent.mkdir(parents=True)
+        decoy.write_text("stale decoy\n")
+
+        state = {"requests": 0}
+        read_paths = [relative, "app.py", str(repo / relative)]
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                document = json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"])))
+                state["requests"] += 1
+                base = {"id": "chatcmpl-abdullah-pwd", "object":
+                        "chat.completion.chunk", "created": 1,
+                        "model": "probe"}
+                if document.get("tools") and not state.get("sent_reads"):
+                    state["sent_reads"] = True
+                    calls = [
+                        {"index": i, "id": f"call_fixture_{i}",
+                         "type": "function",
+                         "function": {"name": "read",
+                                      "arguments": json.dumps({"path": path})}}
+                        for i, path in enumerate(read_paths)]
+                    delta = {"role": "assistant", "tool_calls": calls}
+                    reason = "tool_calls"
+                else:
+                    delta = {"role": "assistant",
+                             "content": "offline read fixture complete"}
+                    reason = "stop"
+                chunks = [
+                    {**base, "choices": [{"index": 0, "delta": delta,
+                                          "finish_reason": None}]},
+                    {**base, "choices": [{"index": 0, "delta": {},
+                                          "finish_reason": reason}]},
+                ]
+                body = ("".join("data: " + json.dumps(chunk) + "\n\n"
+                                for chunk in chunks)
+                        + "data: [DONE]\n\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        env = self._isolated_binary_env(home, pwd=root)
+        env.update({
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "NO_PROXY": "127.0.0.1,localhost"})
+        with patch.dict(os.environ, env, clear=True):
+            launch = orc._opencode_launch_context(
+                "reviewer", "v2", repo, allow_free=True)
+        self.assertIsNotNone(launch["env"], launch["context"].get("error"))
+        self.assertEqual(launch["env"]["PWD"], str(repo.resolve()))
+        run_env = dict(launch["env"])
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            endpoint = f"http://127.0.0.1:{server.server_port}/v1"
+            run_env["OPENCODE_CONFIG_CONTENT"] = json.dumps({
+                "providers": {"local": {
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "settings": {"baseURL": endpoint, "apiKey": "fixture"},
+                    "models": {"probe": {}}}},
+                "agents": {"abdullah-reviewer":
+                           orc.opencode_profile("reviewer", "v2")}})
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            response = subprocess.run(
+                [self.bin, "run", "--standalone", "--auto",
+                 "--agent", "abdullah-reviewer", "--model", "local/probe",
+                 "--format", "json", "Run the controlled fixture."],
+                cwd=repo, env=run_env, text=True, capture_output=True,
+                timeout=90)
+            server.shutdown()
+        self.assertEqual(response.returncode, 0, response.stderr[-2000:])
+        reads = []
+        for line in response.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            part = event.get("part") or {}
+            if event.get("type") == "tool_use" and part.get("tool") == "read":
+                reads.append(part.get("state") or {})
+        self.assertTrue(reads, response.stdout[-2000:])
+        by_path = {str((item.get("input") or {}).get("path")): item
+                   for item in reads}
+        for path in read_paths:
+            self.assertIn(path, by_path, reads)
+            self.assertEqual(by_path[path].get("status"), "completed",
+                             by_path[path])
+        self.assertIn("controlled fixture",
+                      by_path[relative].get("output") or "")
+        self.assertNotIn("stale decoy", by_path[relative].get("output") or "")
+        self.assertIn("controlled fixture",
+                      by_path[str(repo / relative)].get("output") or "")
 
     def test_installed_binary_fs_read_returns_supervisor_generated_hunk(self):
         """Precise boundary: the installed V2 binary's filesystem read path.
