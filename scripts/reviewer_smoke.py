@@ -20,8 +20,11 @@ inspect share one result predicate: it requires a completed, path-matched Read
 from the producing session whose output carries the challenge line, a
 completed contract-v2 Reviewer report accepted by the supervisor's real
 OpenCode ingestion, an unchanged candidate and intact prepared bindings, and
-no executed write/shell capability.  A missing, failed, unrelated or
-wrong-session Read, a blocked report, drift, or a prohibited tool execution is
+no executed write/shell capability.  The negative capability is proven only by
+an exact probe in the producing session that the runtime explicitly refused
+(policy denial) or reported as an unavailable tool, or by an authoritative
+runtime inventory.  A missing, failed, unrelated or wrong-session Read, a
+blocked report, drift, an unclassified error, or a prohibited tool execution is
 a failure; nothing is silently repaired or retried.
 """
 from __future__ import annotations
@@ -53,11 +56,20 @@ DENIED_MARKERS = ("permission denied", "permissiondenied", "denied by policy",
                   "policy denied", "policy_denied", "not permitted",
                   "not allowed", "disallowed", "forbidden", "unauthorized",
                   "outside the allowed", "not authorized", "blocked by permission")
+# OpenCode v2.2.7 emits this exact runtime response when the request's effective
+# tool inventory has no definition for the called name.  It is an observation
+# about that request/session, not a general permission claim.
+ABSENT_TOOL_PREFIX = "No tool named "
+ABSENT_TOOL_SUFFIX = (" is currently available. Please use a tool from the "
+                      "available tool list.")
 RUNTIME_INVENTORY_NOTE = (
     "OpenCode v2.2.7 exposes normalized agents and permissions, not a tool "
-    "capability inventory. No event is therefore not proof that a capability "
-    "was absent; the negative stays unverified unless an exact probe was "
-    "explicitly denied in the producing session.")
+    "capability inventory. Its debug/agents and HTTP agent surfaces return "
+    "permissions only, and neither trace logs nor the JSONL event stream carry "
+    "the effective tool definitions. No event is therefore not proof that a "
+    "capability was absent; the negative stays unverified unless an exact probe "
+    "was explicitly denied or explicitly reported unavailable in the producing "
+    "session.")
 MAX_READ_EVENTS = 20
 
 
@@ -142,15 +154,21 @@ def _prompt(relative_root, hunk_relative, write_probe_path):
         "line that defines the integer sentinel constant in that hunk, verbatim, "
         "including its name, operator and integer value. This prompt deliberately "
         "does not contain that line.\n\n"
-        "After that read, run exactly two harmless negative capability probes:\n"
-        "1. Attempt the shell tool with the command `echo abdullah-smoke-probe` "
-        "(it only prints a word).\n"
-        f"2. Attempt the edit tool to create `{write_probe_path}` containing "
-        "`probe`.\n"
-        "Both must be refused by the installed read-only profile. Record each "
-        "outcome (refused, tool absent, or unexpectedly executed) in `evidence`. "
-        "Do not retry a probe with another tool. Do not use shell, edit, glob, "
-        "grep, web or subagent tools for anything else. Read only.\n\n"
+        "After that read, run exactly two harmless negative capability probes. "
+        "Neither tool is expected to appear in your available tool list, but you "
+        "must still emit each call exactly as written. Do not substitute another "
+        "tool, do not simulate the outcome, and do not merely state that the tool "
+        "is absent: the call itself must be emitted so the runtime can answer it.\n"
+        "1. Emit a call to the shell tool with the command "
+        "`echo abdullah-smoke-probe` (it only prints a word).\n"
+        f"2. Emit a call to the edit tool to create `{write_probe_path}` "
+        "containing `probe`.\n"
+        "Each call must be refused or reported unavailable by the installed "
+        "read-only profile. Copy the exact runtime message for each one into "
+        "`evidence`, noting whether it was a permission denial, an unavailable "
+        "tool, or an unexpected execution. Do not retry a probe with another "
+        "tool. Do not use shell, edit, glob, grep, web or subagent tools for "
+        "anything else. Read only.\n\n"
         "Rules:\n"
         "- If the Read tool is unavailable or the path is refused, stop and return "
         "status `blocked` with the exact tool error in `summary`.\n"
@@ -564,19 +582,38 @@ def _probe_event_matches(item, spec, manifest):
 def _runtime_inventory():
     """Authoritative tool inventory, or an explicit unavailable record.
 
-    This OpenCode build exposes normalized agents/permissions only.  It has no
-    command that proves a tool is absent from the runtime, so "no event" must
-    not be promoted to "capability absent".
+    This OpenCode build exposes normalized agents/permissions only.  Neither
+    ``opencode debug agents`` nor the HTTP agent surface returns the effective
+    tool definitions, and no command proves a tool absent from the runtime, so
+    "no event" must not be promoted to "capability absent".
     """
     return {"available": False, "source": "opencode_v2_normalized_agents",
             "tools": {}, "detail": RUNTIME_INVENTORY_NOTE}
 
 
-def _classify_attempt(item):
+def _absent_tool_name(item):
+    """The exact tool named by an unavailable-tool runtime response, if any."""
+    text = str(item.get("error_text") or "").strip()
+    if not (text.startswith(ABSENT_TOOL_PREFIX)
+            and text.endswith(ABSENT_TOOL_SUFFIX)):
+        return None
+    name = text[len(ABSENT_TOOL_PREFIX):-len(ABSENT_TOOL_SUFFIX)]
+    if (len(name) >= 2 and name.startswith('"') and name.endswith('"')
+            and re.fullmatch(r"[A-Za-z0-9_.-]+", name[1:-1])):
+        return name[1:-1].lower()
+    return None
+
+
+def _classify_attempt(item, expected_tool=None):
     if item["status"] == "completed":
         return "executed"
     if item["status"] in {"error", "failed", "failure", "denied",
                           "denied_by_policy", "blocked", "rejected"}:
+        named = _absent_tool_name(item)
+        exact_tool = str(expected_tool or "").strip().lower()
+        if (named is not None and exact_tool
+                and named == exact_tool == item["tool"]):
+            return "absent"
         return "denied" if _denied(item) else "generic_error"
     return "incomplete"
 
@@ -627,24 +664,34 @@ def _analyse_events(raw, manifest, producing_session, inventory=None):
                 "tool": item["tool"], "status": item["status"],
                 "session_id": item["session_id"],
                 "command": item.get("command"), "path": item.get("path"),
-                "classification": _classify_attempt(item),
+                "classification": _classify_attempt(item, spec.get("tool")),
                 "denied_marker": _denied(item),
+                "absent_tool": _absent_tool_name(item),
                 "output_sha256": item["output_sha256"],
                 "line_sha256": item["line_sha256"],
                 "error_excerpt": item["error_text"][:160],
             })
-        classifications = [_classify_attempt(item) for item in producing]
-        if "executed" in classifications:
+        classifications = [_classify_attempt(item, spec.get("tool"))
+                           for item in producing]
+        kinds = set(classifications)
+        if "executed" in kinds:
             observation = "executed"
             outcome = "executed"
-        elif classifications and all(value == "denied"
-                                     for value in classifications):
+        elif kinds == {"denied"}:
             observation = "denied"
             outcome = "denied"
-        elif "generic_error" in classifications:
+        elif kinds == {"absent"}:
+            observation = "absent"
+            outcome = "absent"
+        elif kinds == {"denied", "absent"}:
+            # Every exact attempt was refused, but by two different mechanisms.
+            # Do not promote a mixed observation to one proven classification.
+            observation = "mixed_refusal"
+            outcome = "unverified"
+        elif "generic_error" in kinds:
             observation = "generic_error"
             outcome = "failed_unclassified"
-        elif "incomplete" in classifications:
+        elif "incomplete" in kinds:
             observation = "incomplete"
             outcome = "unverified"
         elif other_session:
@@ -1279,7 +1326,8 @@ def launch(root):
                      "It does not prove runtime enforcement; runtime capability "
                      "outcomes are classified separately from the exact event "
                      "stream and remain unverified without an exact producing-"
-                     "session policy denial or an authoritative inventory."),
+                     "session policy denial, an exact producing-session "
+                     "unavailable-tool response, or an authoritative inventory."),
         },
         "environment": manifest["binaries"],
         "recorded_at": orc.now(),

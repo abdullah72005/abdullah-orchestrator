@@ -1373,6 +1373,7 @@ def smoke_readiness(**overrides):
 def negative_record(observation="denied", outcome=None):
     outcome = outcome or ("denied" if observation == "denied" else
                           "executed" if observation == "executed" else
+                          "absent" if observation == "absent" else
                           "unverified")
     return {"probe": {"tool": "shell"}, "observation": observation,
             "outcome": outcome, "proven": outcome in {"denied", "absent"},
@@ -1674,6 +1675,121 @@ class ReviewerSmokePredicateTests(ReleaseFixture):
                                         inventory)
         self.assertEqual(runtime["capability"]["shell"]["outcome"], "absent")
         self.assertTrue(runtime["capability"]["shell"]["proven"])
+
+    @staticmethod
+    def probe_event(tool, *, command=None, path=None, session="ses_producer",
+                    status="error", message=None, output=None):
+        state = {"status": status,
+                 "input": ({"command": command} if command is not None
+                           else {"filePath": path})}
+        if status == "completed":
+            state["output"] = output if output is not None else "done"
+        else:
+            state["error"] = message if message is not None else (
+                f'No tool named "{tool}" is currently available. '
+                'Please use a tool from the available tool list.')
+        return {"type": "tool_use", "sessionID": session, "part": {
+            "type": "tool", "tool": tool, "sessionID": session,
+            "state": state}}
+
+    def test_exact_runtime_absence_proves_the_exact_tool(self):
+        manifest = smoke_manifest()
+        probes = manifest["negative_probes"]
+        events = [
+            self.probe_event("shell", command="echo abdullah-smoke-probe"),
+            self.probe_event("edit", path=probes["write"]["path"]),
+        ]
+        raw = "\n".join(json.dumps(item) for item in events) + "\n"
+        runtime = smoke._analyse_events(raw, manifest, "ses_producer")
+        for name, tool in (("shell", "shell"), ("write", "edit")):
+            record = runtime["capability"][name]
+            self.assertEqual(record["observation"], "absent")
+            self.assertEqual(record["outcome"], "absent")
+            self.assertTrue(record["proven"])
+            self.assertEqual(record["attempts"][0]["classification"], "absent")
+            self.assertEqual(record["attempts"][0]["absent_tool"], tool)
+            self.assertEqual(record["attempts"][0]["session_id"],
+                             "ses_producer")
+
+    def test_absence_is_not_promoted_without_exact_tool_attempt_and_session(self):
+        manifest = smoke_manifest()
+        command = "echo abdullah-smoke-probe"
+        path = manifest["negative_probes"]["write"]["path"]
+        exact = ('No tool named "shell" is currently available. Please use a '
+                 'tool from the available tool list.')
+        cases = {
+            "different write-family tool than the prepared edit probe":
+                (self.probe_event("write", path=path,
+                                  message=exact.replace('"shell"', '"write"')),
+                 "write"),
+            "runtime names a different tool than the event":
+                (self.probe_event("shell", command=command,
+                                  message='No tool named "write" is currently '
+                                          'available. Please use a tool from '
+                                          'the available tool list.'),
+                 "shell"),
+            "attempt in another session":
+                (self.probe_event("shell", command=command,
+                                  session="ses_other"),
+                 "shell"),
+            "changed runtime wording":
+                (self.probe_event("shell", command=command,
+                                  message='No tool named "shell" is currently '
+                                          'available now.'),
+                 "shell"),
+            "absence text in a completed output":
+                (self.probe_event("shell", command=command, status="completed",
+                                  output=exact),
+                 "shell"),
+        }
+        for label, (event, capability) in cases.items():
+            with self.subTest(label=label):
+                runtime = smoke._analyse_events(json.dumps(event) + "\n",
+                                                manifest, "ses_producer")
+                record = runtime["capability"][capability]
+                self.assertFalse(record["proven"])
+                self.assertNotEqual(record["outcome"], "absent")
+
+    def test_absence_message_on_an_unrelated_command_is_not_the_probe(self):
+        manifest = smoke_manifest()
+        event = self.probe_event("shell", command="echo something-else")
+        runtime = smoke._analyse_events(json.dumps(event) + "\n",
+                                        manifest, "ses_producer")
+        record = runtime["capability"]["shell"]
+        self.assertEqual(record["observation"], "not_observed")
+        self.assertEqual(record["outcome"], "unverified")
+        self.assertEqual(record["unrelated_attempts"], 1)
+
+    def test_saved_absence_is_rederived_from_the_raw_stream(self):
+        manifest = smoke_manifest()
+        root = self.root / "inspect-absence"
+        job = root / "job"
+        job.mkdir(parents=True)
+        line = manifest["challenge"]["line"]
+        read = {"type": "tool_use", "sessionID": "ses_producer", "part": {
+            "type": "tool", "tool": "read", "sessionID": "ses_producer",
+            "state": {"status": "completed",
+                      "input": {"filePath": manifest["hunk_path"]},
+                      "output": f"00002| {line}\n"}}}
+        raw_path = job / "events.log"
+        raw_path.write_text(json.dumps(read) + "\n")
+        evidence = smoke_evidence(manifest, shell="absent", write="absent")
+        evidence["job"] = {"path": str(job), "session_id": "ses_producer"}
+        evidence["runtime"] = {**evidence["runtime"],
+                               "events_log": str(raw_path),
+                               "events_log_sha256":
+                                   smoke._sha256_file(raw_path),
+                               "producing_session": "ses_producer"}
+        derived, problems = smoke._rederive_event_evidence(
+            root, manifest, evidence, orc)
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            derived["runtime"]["capability"]["shell"]["outcome"], "unverified")
+        assessment = smoke._assess(
+            manifest, derived, self.live, smoke_readiness())
+        self.assertFalse(assessment["ok"])
+        self.assertFalse(assessment["checks"]["negative_shell"])
+        self.assertFalse(assessment["checks"]["negative_write"])
 
     def test_inspect_requires_the_exact_raw_stream(self):
         manifest = smoke_manifest()
