@@ -102,6 +102,20 @@ Additive state fields keep older runs readable.
   historical under-effort pins keep the fail-closed protected dispatch guard and
   have a documented switch-to-High remediation.
 
+### v1.2.0 release closure · same-session permission evidence
+
+- The Reviewer smoke now classifies OpenCode's exact unavailable-tool response
+  as per-session absence evidence only when the event tool, the tool named by
+  the runtime, the exact prepared probe input and the producing session all
+  match. The probe prompt requires emitting both calls even when the tools are
+  absent from the model's list. Generic errors, mixed refusals and other
+  sessions stay unverified, and inspection re-derives the classification from
+  the digest-verified raw stream.
+- Runtime inspection confirmed OpenCode v2.2.7 exposes no tool inventory through
+  `debug agents`, the HTTP agent surface, trace logs or the JSONL event stream.
+  A model that declines to call a tool it cannot see therefore leaves the
+  negative unverified rather than inferred from silence.
+
 ## [1.2.0] — 2026-11-18
 
 **Local release candidate.** Discrete workflow and evidence improvements over
