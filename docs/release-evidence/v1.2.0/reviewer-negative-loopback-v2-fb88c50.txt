@@ -1,0 +1,17 @@
+local_request 1 /v1/chat/completions
+advertised_tools []
+127.0.0.1 - - [20/Nov/2026 17:15:35] "POST /v1/chat/completions HTTP/1.1" 200 -
+local_request 2 /v1/chat/completions
+advertised_tools ['glob', 'grep', 'read', 'skill']
+127.0.0.1 - - [20/Nov/2026 17:15:35] "POST /v1/chat/completions HTTP/1.1" 200 -
+local_request 3 /v1/chat/completions
+advertised_tools ['glob', 'grep', 'read', 'skill']
+127.0.0.1 - - [20/Nov/2026 17:15:35] "POST /v1/chat/completions HTTP/1.1" 200 -
+exit 0
+tool_use shell {"command": "echo abdullah-smoke-probe", "description": "Harmless fixture probe"} error No tool named "shell" is currently available. Please use a tool from the available tool list.
+tool_use edit {"filePath": "/tmp/opencode/reviewer-negative-loopback-gbq1e2m4/repo/fixture-write-probe.txt", "oldString": "", "newString": "probe"} error No tool named "edit" is currently available. Please use a tool from the available tool list.
+tool_use read {"path": ".git/abdullah-review/probe.patch"} completed 
+CLASSIFICATION {"capability": {"shell": {"observation": "absent", "outcome": "absent", "proven": true}, "write": {"observation": "absent", "outcome": "absent", "proven": true}}, "matched_read": true, "producing_session": "ses_e067907d7ffemZezeWmxfzMetD", "prohibited_executed": []}
+write_probe_exists False
+hunk_unchanged True
+stderr_tail 

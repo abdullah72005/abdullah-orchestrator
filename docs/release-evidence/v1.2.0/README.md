@@ -597,7 +597,8 @@ ABDULLAH_OPENCODE_V2_BIN="$(command -v opencode)" \
 Correction scope proven by these checks:
 
 - Smoke negative evidence distinguishes `not_observed`/`other_session_only`/
-  `generic_error` from an exact producing-session policy `denied` or an
+  `generic_error` from an exact producing-session policy `denied`, an exact
+  producing-session runtime unavailable-tool response `absent`, or an
   authoritative inventory `absent`; an unverified negative keeps the combined
   result false while `read_verified` stays separately attestable.
 - Read paths resolve against the prepared repository to the exact hunk, so a
@@ -692,11 +693,54 @@ executable mode, with tar SHA-256
 `974268223550d0700419d74f9390a32cafdb82f92300cd161354c3bd38f8de80`.
 [Final checkout-binding regression log](suite-closure-final-f59a2cd.txt)
 
+### Same-session permission evidence (20 November 2026)
+
+The `f59a2cd` authenticated session proved the Read but logged no shell/edit
+call; its negative permission result remains unverified and is not promoted.
+Runtime inspection at `fb88c50` confirmed that OpenCode v2.2.7 exposes no tool
+inventory: `opencode debug agents` and the HTTP agent surface return normalized
+permissions only, and neither trace logs nor the JSONL stream carry the request's
+tool definitions. Capturing the provider-bound request would require the Go
+credential or TLS interception, so that route is rejected.
+
+The runtime does answer an unknown call with one exact per-session message:
+`No tool named "<tool>" is currently available. Please use a tool from the
+available tool list.` The smoke now classifies that response as `absent` only
+when the event tool, the tool named by the runtime, the exact prepared probe
+input, and the producing session all match. Every other error stays
+`generic_error`/`unverified`; mixed denials and absences stay unverified; and
+`inspect` re-derives the classification from the digest-verified raw stream.
+The prompt now requires the model to emit both probes even though the tools are
+absent from its list.
+
+An isolated credential-free loopback exercised the shipped Reviewer profile:
+Read completed, the advertised list contained only `glob`, `grep`, `read`, and
+`skill`, shell/edit were rejected as unavailable, the classifier proved both
+negatives, no file was created, and the fixture stayed intact.
+[Loopback log](reviewer-negative-loopback-v2-fb88c50.txt)
+
+A fresh authenticated fixture is prepared but **not launched**:
+`/tmp/opencode/abdullah-reviewer-smoke-fb88c50` (run
+`20261120T151504-dc79fb44`, code revision
+`fb88c50bf0c09ff1a8814d2a56336aebe4ff3ba2`, prepared manifest SHA-256
+`f9f36e8c8b9eb4e01865a8f227afa080b7d3d3668457ab8716eaef7f759dcdeb`). Preflight
+returned `ok: true` with intact bindings and the pinned Go High route; see
+[the operator pointer](reviewer-same-session-pointer.md) and
+[preflight output](reviewer-smoke-preflight-fb88c50.json). The single
+authenticated dispatch and its same-session absent/denied classifications remain
+an operator action. If the model declines to emit calls to tools it cannot see,
+the combined verdict stays conditional and the limitation is recorded rather
+than promoted.
+
 ## Explicit limitations
 
 - The authenticated Reviewer smoke recorded one Go Reviewer dispatch per fixture.
   Native terminal duration/Esc/reconnect behavior, comparative token savings,
   and wall-clock quota were outside those observations.
+- Same-session capability proof depends on the authenticated model emitting the
+  exact probe calls. OpenCode v2.2.7 exposes no runtime tool inventory, so a
+  model that declines to call a tool it cannot see leaves the negative
+  unverified; the harness does not infer absence from silence.
 - Native OpenCode V2 read-policy proof depends on an installed isolated binary;
   the deterministic test mirrors the effective policy but is not a substitute
   for that installed-binary check.
