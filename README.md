@@ -339,6 +339,47 @@ running ──verified interrupt──► paused ──resume──► running
 Operations reference: [references/operation.md](references/operation.md).
 Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
 
+## Live worker progress
+
+Every stage records one durable attempt with its route, task, expected output,
+clock and supervisor identity. Reading progress is additive and read-only: it
+takes no write lock, never repairs or advances a run, and never changes the stage
+outcome.
+
+- `orchestrator_status` now carries `stage_progress`: attempt identity, current
+  stage, effective role/model/effort, batch, sanitized task and expected output,
+  elapsed seconds (live monotonic time while the recorded owner is proven alive,
+  recorded duration after completion), latest observed activity, outcome and next
+  action. Legacy journals without attempt identity stay readable.
+- When the MCP client supplies a `progressToken`, the `orchestrator_stage` call
+  also emits advisory `notifications/progress` updates about once per second for
+  the attempt that call admitted. They carry a bounded human-readable message, a
+  strictly increasing `progress` value and no `total`. Tokenless and refused
+  calls emit nothing; cancellation and teardown stop them immediately.
+- The terminal observer is read-only and follows a run across stages:
+
+```bash
+python3 scripts/orchestrator.py status --run <RUN_ID> --follow
+```
+
+While waiting it shows the next stage's role, route, task and expected output.
+During a stage it ticks elapsed time and the latest activity; on return it shows
+the outcome, measured elapsed time and next action. It keeps following until the
+run reaches a final state, and `Ctrl-C` only closes the viewer. Redirected output
+uses a plain-text mode instead of in-place redraws.
+
+What each client actually does while a stage runs (verified in this batch):
+
+| Surface | Observed behaviour |
+|---|---|
+| Claude Code CLI `2.1.247` | Renders native MCP progress in the TUI. A real 38.6 s stage showed the role, route, batch, activity and ticking seconds, then `Called orchestrator` and `Crunched for 39s`. |
+| Codex CLI `0.169.1` | Supplies an integer progress token and receives the notifications, but its terminal prints only `mcp: … started` / `(completed)`. The adjacent `status --follow` pane ticked elapsed time, activity, measured duration and next action during the same 36.4 s stage. |
+| Codex desktop (Windows + WSL agent) | In-app Stop and live worker detail remain unverified; use `status --follow` in the integrated WSL terminal. |
+| Claude desktop | No suitable desktop session was available in this batch; use an adjacent terminal observer. |
+
+Native notifications never replace the guarded foreground stage: a progress
+failure cannot advance, cancel or delay it.
+
 ## What changed in 1.2.0
 
 - An explicit Implementer `needs_architect` routes straight to durable strong

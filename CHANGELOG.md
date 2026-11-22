@@ -4,7 +4,38 @@ All notable changes to Abdullah Orchestrator are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — 2026-11-19
+## [Unreleased] — 2026-11-22
+
+### Live worker progress (post-v1.2.0)
+
+### Added
+
+- Durable stage attempts. Each `orchestrator_stage` admission records an attempt
+  ID, expected output, supervisor boot/PID/process identity and a monotonic
+  start, and writes exactly one matching `stage_end` even when an early return
+  follows admission. A superseding attempt never inherits the previous end
+  record, and legacy journals without attempt identity stay readable.
+- Read-only `stage_progress` in `orchestrator_status` and one shared snapshot for
+  the observer: attempt identity, current stage, effective role/model/effort,
+  batch, sanitized task and expected output, live or recorded elapsed time,
+  latest observed activity, outcome and next action. Verification shows a safe
+  task label instead of check argv.
+- Advisory MCP `notifications/progress` on `orchestrator_stage` when the caller
+  supplies a string or non-boolean integer `progressToken`: a start update, then
+  a bounded cadence of about one update per second, scoped to the attempt that
+  call admitted, with a strictly increasing `progress` value and no `total`.
+  Tokenless, invalid-token and refused calls emit nothing; cancellation, the
+  final response and connection teardown stop emission.
+- Opt-in `python3 scripts/orchestrator.py status --run <RUN_ID> --follow`: a
+  read-only terminal observer that shows the next stage before dispatch, ticks
+  elapsed time and observed activity, then shows outcome, measured elapsed time
+  and next action, and follows the run until a final state. Redirected output
+  uses a plain-text mode; `Ctrl-C` leaves the run untouched.
+
+### Changed
+
+- `journal_tail` reads a bounded trailing window instead of the whole journal,
+  so heartbeats never scan run history or worker logs.
 
 ### v1.2.0 release closure
 

@@ -80,7 +80,15 @@ The MCP server exposes small foreground tools:
 
 Plan approval, fallback authorization, route grants and worker-fallback consent are deliberately **not** MCP tools. A model cannot approve its own plan, authorize its own fallback, or grant its own billed route. The user runs `orchestrator.py approve-plan`, `approve-fallback`, `authorize-route`, or `approve-worker-fallback` in an interactive terminal, with the exact typed confirmation. The MCP server rejects those names.
 
-Each `orchestrator_stage` call runs one of: plan, required explore, implement, verify, review, accept, diagnose, integrate. Codex displays the tool call, its native running indicator and elapsed time, then the structured result. Codex does **not** display an external worker's private reasoning, intermediate tool calls, or MCP progress notifications; do not patch the TUI to pretend otherwise. A stage tool call may run for several minutes; it must never contain several stages or an entire hours-long run.
+Each `orchestrator_stage` call runs one of: plan, required explore, implement, verify, review, accept, diagnose, integrate. Codex displays the tool call, its native running indicator and elapsed time, then the structured result. Codex does **not** display an external worker's private reasoning, intermediate tool calls, or MCP progress notifications; do not patch the TUI to pretend otherwise. Installed Codex CLI `0.169.1` receives progress notifications but does not render them, so use the read-only observer for live detail:
+
+```bash
+python3 scripts/orchestrator.py status --run <RUN_ID> --follow
+```
+
+The observer shows the next stage's role, route, task and expected output while waiting, then ticks elapsed time with the latest observed activity, and finally the outcome, measured elapsed time and next action. It follows the run across stages until a final state; `Ctrl-C` only closes the viewer. Redirected output switches to a plain-text mode. `orchestrator_status` also exposes the same snapshot as an additive `stage_progress` field.
+
+When the client supplies a valid `progressToken`, the stage call emits advisory `notifications/progress` updates at roughly one update per second, scoped to the attempt that call admitted. They carry a bounded message, a strictly increasing `progress` value and no `total`; tokenless calls and refused calls emit nothing, and cancellation or teardown stops them. Claude Code `2.1.247` renders these natively in its TUI. A stage tool call may run for several minutes; it must never contain several stages or an entire hours-long run.
 
 Codex waits at most `mcp_servers.abdullah-orchestrator.tool_timeout_sec` for one `tools/call`. Configure it per server in `~/.codex/config.toml` and restart Codex:
 

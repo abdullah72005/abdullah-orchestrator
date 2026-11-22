@@ -23,7 +23,7 @@ Interactive foreground mode is the default. The user opens **one Codex CLI chat*
 - When the call returns, the coordinator summarizes only the structured result and the next stage.
 - The coordinator proceeds to the next stage within the same conversation.
 
-Stock Codex does not render an external worker's internal progress, private reasoning, intermediate shell commands or MCP progress notifications continuously. Do not promise that visibility, and do not patch the Codex TUI to fake it.
+Stock Codex does not render an external worker's internal progress, private reasoning, intermediate shell commands or MCP progress notifications continuously. Do not promise that visibility, and do not patch the Codex TUI to fake it. Installed Codex CLI `0.169.1` does accept the progress token and receive the notifications, but its terminal view still shows only the tool start/completion lines; use the read-only terminal observer below.
 
 Legacy detached `start --background` mode is optional, is **not** the default, and must not be selected without the user's explicit authorization. It survives closing a chat only while WSL stays awake; a sleeping host cannot execute jobs.
 
@@ -166,7 +166,7 @@ Recovery from a new chat: `orchestrator_runs` → `orchestrator_status` → `orc
 - **Fallbacks require explicit approval**: after a genuine rate limit or model blocker, ask the user before one Codex Luna / Claude Haiku dispatch. There is no automatic fallback; approval covers one attempt only.
 - Trusted *development* mode allows local Docker/test commands and local `.env` edits unattended; never implicitly push/deploy, operate on production, or perform broad destructive actions.
 - **Tool routing (hybrid)**: use LeanCTX MCP (`ctx_read`, `ctx_search`, `ctx_tree`, `ctx_compose`) for reading/search/context; run Python, tests, Docker, Git, `orchestrator.py`, and Explorer dispatch through the native shell. Never route execution through `ctx_shell`.
-- A worker process is not a terminal UI. Codex displays the tool call, its running indicator, elapsed time and returned result, not the worker's private reasoning or MCP progress notifications. Do not patch Codex's TUI to fake that visibility.
+- A worker process is not a terminal UI. Codex displays the tool call, its running indicator, elapsed time and returned result, not the worker's private reasoning. It may receive MCP progress notifications without drawing them (installed `0.169.1` does). For live stage detail use the read-only observer `python3 <SKILL_DIR>/scripts/orchestrator.py status --run <ID> --follow`; it shows the next stage before dispatch, ticks elapsed time and observed activity, then the outcome, measured time and next action. Do not patch either TUI to fake visibility.
 
 ## CLI fallback
 
@@ -175,6 +175,7 @@ The MCP tools are the primary interface. The same durable operations remain avai
 ```bash
 python3 <SKILL_DIR>/scripts/orchestrator.py stage <ID>
 python3 <SKILL_DIR>/scripts/orchestrator.py status <ID>
+python3 <SKILL_DIR>/scripts/orchestrator.py status --run <ID> --follow   # read-only live observer
 python3 <SKILL_DIR>/scripts/orchestrator.py recap <ID> --detail developer
 python3 <SKILL_DIR>/scripts/orchestrator.py interrupt <ID> --reason "user stop"
 python3 <SKILL_DIR>/scripts/orchestrator.py amend <ID> --text "requirement change" --architect-review

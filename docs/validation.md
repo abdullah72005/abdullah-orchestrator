@@ -467,9 +467,35 @@ repository tree against `git ls-files`.
 
 ## Post-v1.2.0 TODO
 
-- [ ] Show live subagent/worker progress for the active Orchestrator worker in
+- [x] Show live subagent/worker progress for the active Orchestrator worker in
   Codex and Claude Code, across CLI and GUI hosts. Before launch, show the
   worker and model, batch task, and expected output. While it runs, show elapsed
-  time and the latest reported activity when available. Verify the display in
-  each actual client. Preserve the existing foreground stage and interruption
-  behavior.
+  time and the latest reported activity when available. Preserve the existing
+  foreground stage and interruption behavior.
+  Implemented: `orchestrator_status.stage_progress`, MCP progress notifications
+  and the read-only `status --follow` observer. Evidence below.
+- [ ] Remaining desktop surfaces: in-app Codex desktop Stop and live worker
+  detail, and the Claude desktop presentation. Use the adjacent
+  [terminal observer](installation.md#windows-codex-desktop-with-its-agent-in-wsl)
+  in the meantime.
+
+### Live progress evidence (post-v1.2.0)
+
+Client protocol probes used disposable repositories and a fixture MCP server
+whose slow tool emits progress only when the client supplies a token. They
+establish what each installed client does with notifications; they do not
+replace the orchestrator-level checks below.
+
+| Surface | Version | Evidence |
+|---|---|---|
+| Claude Code CLI | `2.1.247` | Fixture probe: `progressToken: 2` and native TUI ticks. Stage probe (real orchestrator MCP, disposable repo, delayed fixture worker, loopback model): the TUI rendered `Implementer — DeepSeek opencode-go/deepseek-v4.1-flash · implement · Batch 1/1 … supervisor processing the worker report · 1s`, `worker launching · 6s`, `check running · 6s`, `… 38s`, then `Called orchestrator` / `Crunched for 39s`. The recorded attempt end is 38.61 s. Native rendering confirmed. |
+| Codex CLI | `0.169.1` | Fixture probe: integer `progressToken: 1`, six ordered notifications during a three-second call, terminal printed only `mcp: probe/probe_wait started` / `(completed)`. Stage probe (real orchestrator MCP, loopback model, 36.4 s delayed stage): `mcp: orchestrator/orchestrator_stage started` … `(completed)` with no progress text. The adjacent `status --follow` pty observer ticked `elapsed 0.7s` … `36.0s`, showed `worker running` / `worker step finished`, then `measured 36.4s` and `outcome: complete · next: orchestrator_stage`. |
+| Codex desktop, WSL agent | prior installed host | The v1.2.0 smoke showed the tool card and whole-turn duration only. Live detail and in-app Stop remain unverified; use the integrated-terminal observer. |
+| Claude desktop | n/a | No suitable desktop profile was available in this batch. Pending. |
+
+The fixture and the exact operator steps are recorded with the batch evidence.
+Stage-level checks (real supervisor, disposable repository, delayed fake worker)
+cover multiple notifications before the final stage response, no trailing or
+cross-request notifications, tokenless and invalid-token silence, cancellation,
+attach during a stage, and a viewer that ticks while the worker runs without
+changing its outcome.

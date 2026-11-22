@@ -122,8 +122,19 @@ Windows-native setup below includes a `wsl.exe` registration example.
 The desktop smoke used a separate MCP registration that launched the disposable
 WSL supervisor through `wsl.exe`. The GUI completed planning and implementation
 and displayed the stage tool card. See the
-[desktop smoke evidence](release-evidence/v1.2.0/README.md#native-windows-codex-desktop-compatibility)
-and the [live worker progress follow-up](validation.md#post-v120-todo).
+[desktop smoke evidence](release-evidence/v1.2.0/README.md#native-windows-codex-desktop-compatibility).
+
+For live worker detail, keep a WSL integrated terminal beside the desktop chat
+and run the read-only observer against the same run:
+
+```bash
+python3 <SKILL_DIR>/scripts/orchestrator.py status --run <RUN_ID> --follow
+```
+
+Codex desktop does not draw MCP progress notifications; the observer is the
+supported view there. Claude desktop likewise uses an adjacent terminal observer.
+The terminal view never advances, cancels or repairs the run, so quitting it
+cannot change the stage outcome.
 
 ### Native Windows Codex desktop
 
