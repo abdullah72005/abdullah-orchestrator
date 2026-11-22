@@ -12323,11 +12323,24 @@ def strong_call(run_dir, state, cfg, kind, extra=None, deadline=None, route=None
                       binding_sha256=binding["binding_sha256"],
                       verification_sha256=[item["sha256"] for item in binding["verification"]])
     if kind == "plan":
-        context["instruction"] = (
+        if state.get("plan_approval"):
+            instruction = (
+                "The user expressly requested plan approval before execution. In summary, give "
+                "the concise rationale for the proposed direction and flag each consequential "
+                "design fork with its practical trade-off and your recommendation. If a decision "
+                "must be answered before a valid plan can be produced, return status blocked with "
+                "the exact decision question in blocker and the rationale in summary. Otherwise "
+                "propose a concrete design; do not invent a question when the requirements "
+                "already decide it. ")
+        else:
+            instruction = (
+                "The default is automated execution: do not pause for plan approval and do not "
+                "ask the user to choose a design. Return the complete plan with the rationale "
+                "in summary. ")
+        context["instruction"] = instruction + (
             "Create a complete, economical engineering plan with an explicit invariant list, "
             "cohesive batches, acceptance criteria and supervisor-runnable check argv lists. "
             "Inspect important constraints directly; use cheap Explorer for bulk navigation as needed. "
-            "Require user consultation only if plan approval was expressly requested. "
             "If required exploration is satisfied by your own completed synchronous Explorer, set "
             "required_exploration to its exact job_id and scope_satisfied true only after consuming its report "
             "and establishing it covers the goal; otherwise use an empty job_id and false. "
@@ -13854,7 +13867,9 @@ def advance(run_dir, state, cfg, deadline=None):
         return
     if stage == "plan":
         if state.get("plan") is None:
-            # A new plan must not inherit stale batch-scoped context.
+            # A new plan must not inherit stale batch-scoped context, and a prior
+            # blocked attempt is no longer the current attempt once planning resumes.
+            state.pop("plan_attempt", None)
             state["implementation"] = None
             state["implementation_job"] = None
             state["review"] = None
@@ -13902,6 +13917,7 @@ def advance(run_dir, state, cfg, deadline=None):
             plan = strong_call(
                 run_dir, state, cfg, "plan", deadline=deadline, route=trial_route)
         if plan["status"] == "blocked":
+            _record_plan_attempt(state, plan)
             consume_last(state)
             pause_with(run_dir, state, plan.get("blocker") or "Architect cannot plan the goal")
             return
@@ -13947,6 +13963,7 @@ def advance(run_dir, state, cfg, deadline=None):
                                     state.get("accepted_batches", [])),
                                 "archived_at": now()})
         state["plan"] = plan
+        state.pop("plan_attempt", None)
         state["plan_version"] = new_version
         state["plan_revision"] = state.get("plan_revision", 0) + 1
         state["plan_authority"] = {
@@ -16390,8 +16407,9 @@ def do_status(run_id):
     folder, state = load(run_id)
     result = {key: state.get(key) for key in (
         "id", "status", "phase", "updated_at", "batch_index", "corrections", "pause_reason",
-        "active_job", "verification", "architect_verdict", "final_verdict")}
+        "active_job", "verification", "architect_verdict", "diagnosis_verdict", "final_verdict")}
     result["total_batches"] = len(state["plan"]["batches"]) if state.get("plan") else 0
+    result["plan_view"] = plan_view(state)
     result["recent_completed_jobs"] = state.get("completed_jobs", [])[-3:]
     result["usage"] = usage_report(state)
     result["stage_progress"] = stage_snapshot(folder, state)
@@ -17108,7 +17126,13 @@ def _safe_read(path):
 
 def stage_report(state, stage):
     if stage == "plan":
-        return state.get("plan")
+        blocked = _plan_attempt_report(state)
+        if blocked is not None:
+            return blocked
+        plan = state.get("plan")
+        if isinstance(plan, dict):
+            return plan
+        return None
     if stage == "explore":
         return state.get("exploration")
     if stage == "implement":
@@ -17137,6 +17161,26 @@ def stage_report(state, stage):
     return None
 
 
+PLAN_VIEW_BATCH_LIMIT = 8
+PLAN_VIEW_INVARIANT_LIMIT = 8
+PLAN_VIEW_ACCEPTANCE_LIMIT = 4
+FINDING_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _prioritized_findings(findings, limit):
+    """Material findings first, preserving original order within a severity.
+
+    The authoritative report is never reordered or truncated; this only shapes
+    the bounded preview returned to the coordinator.
+    """
+    indexed = list(enumerate(findings))
+    ordered = sorted(indexed, key=lambda pair: (
+        FINDING_SEVERITY_ORDER.get(pair[1].get("severity") if isinstance(pair[1], dict) else None, 4),
+        pair[0]))
+    selected = [finding for _, finding in ordered[:limit]]
+    return selected, max(0, len(findings) - len(selected))
+
+
 def compact_report(report, limit=8):
     if not isinstance(report, dict):
         return report
@@ -17149,10 +17193,160 @@ def compact_report(report, limit=8):
         if key not in report:
             continue
         value = report[key]
-        if isinstance(value, list):
+        if isinstance(value, list) and key == "findings":
+            value, omitted = _prioritized_findings(value, limit)
+            if omitted:
+                result["findings_omitted_count"] = omitted
+        elif isinstance(value, list):
             value = value[:limit]
         result[key] = value
     return result
+
+
+def _plan_approval_view(state):
+    authority = state.get("plan_authority")
+    authority = authority if isinstance(authority, dict) else {}
+    approval = authority.get("approval")
+    approval = approval if isinstance(approval, dict) else {}
+    required = bool(state.get("plan_approval"))
+    if not required:
+        status = "not_required"
+    elif state.get("status") == "awaiting_plan_approval":
+        status = "awaiting_user"
+    elif authority.get("approved"):
+        status = "approved"
+    else:
+        status = "pending"
+    return {
+        "required": required,
+        "status": status,
+        "approved": bool(authority.get("approved")),
+        "approved_at": approval.get("approved_at") or authority.get("approved_at"),
+        "source": authority.get("source"),
+        "plan_version": authority.get("plan_version") or state.get("plan_version"),
+        "plan_revision": authority.get("plan_revision", state.get("plan_revision", 0)),
+    }
+
+
+def _plan_attempt_report(state):
+    """The current blocked planning attempt, never an older proposal."""
+    attempt = state.get("plan_attempt")
+    if not isinstance(attempt, dict) or attempt.get("status") != "blocked":
+        return None
+    reference = attempt.get("report") if isinstance(attempt.get("report"), dict) else {}
+    if reference.get("path"):
+        report = _safe_read(reference["path"])
+        if isinstance(report, dict):
+            expected = reference.get("sha256")
+            if not expected or content_hash(report) == expected:
+                return report
+            # A changed/unattested report file is not trusted as the current
+            # attempt; the recorded summary/blocker remain truthful.
+    report = {"status": "blocked",
+              "summary": attempt.get("summary") or "",
+              "blocker": attempt.get("blocker") or ""}
+    return report if (report["summary"] or report["blocker"]) else None
+
+
+def _record_plan_attempt(state, plan):
+    """Persist the exact plan attempt so a blocked question is not lost."""
+    attempt = {"status": plan.get("status"),
+               "summary": plan.get("summary"),
+               "blocker": plan.get("blocker"),
+               "report_sha256": content_hash(plan),
+               "recorded_at": now()}
+    jobs = state.get("completed_jobs") or []
+    if jobs and jobs[-1].get("kind") == "plan":
+        job = jobs[-1]
+        attempt["job_id"] = job.get("id")
+        if job.get("path"):
+            path = Path(job["path"]) / "report.json"
+            attempt["report"] = {"job_id": job.get("id"), "path": str(path),
+                                 "sha256": content_hash(plan)}
+    state["plan_attempt"] = attempt
+
+
+def _plan_detail_reference(state):
+    reference = {"recap": "orchestrator_recap detail=developer",
+                 "archived_plans": len(state.get("plan_history", []) or [])}
+    attempt = state.get("plan_attempt")
+    if isinstance(attempt, dict) and isinstance(attempt.get("report"), dict):
+        reference["report"] = attempt["report"]
+    return reference
+
+
+def plan_view(state):
+    """Bounded, structured view of the actual plan for status and planning.
+
+    The full plan, hashes, approvals and worker reports stay untouched in
+    durable state. Raw check argv is deliberately absent.
+    """
+    approval = _plan_approval_view(state)
+    blocked = _plan_attempt_report(state)
+    if blocked is not None:
+        return {
+            "available": False,
+            "status": "blocked",
+            "revision": state.get("plan_revision", 0),
+            "version": state.get("plan_version"),
+            "approval": approval,
+            "summary": _safe_progress_text(blocked.get("summary"), 1200),
+            "blocker": _safe_progress_text(blocked.get("blocker"), 800),
+            "detail": _plan_detail_reference(state),
+        }
+    plan = state.get("plan")
+    if isinstance(plan, dict) and plan:
+        raw_batches = plan.get("batches")
+        raw_batches = raw_batches if isinstance(raw_batches, list) else []
+        batches = []
+        for index, batch in enumerate(raw_batches[:PLAN_VIEW_BATCH_LIMIT]):
+            if not isinstance(batch, dict):
+                continue
+            acceptance = batch.get("acceptance")
+            acceptance = acceptance if isinstance(acceptance, list) else []
+            shown = [_safe_progress_text(item, 300) for item in
+                     acceptance[:PLAN_VIEW_ACCEPTANCE_LIMIT]
+                     if isinstance(item, str)]
+            entry = {
+                "index": index,
+                "title": _safe_progress_text(batch.get("title"), 200),
+                "goal": _safe_progress_text(batch.get("goal"), 400),
+                "acceptance": [item for item in shown if item],
+                "risk": batch.get("risk"),
+            }
+            omitted = len(acceptance) - len(shown)
+            if omitted > 0:
+                entry["acceptance_omitted_count"] = omitted
+            purpose = _safe_progress_text(batch.get("verification_purpose"), 300)
+            if purpose:
+                entry["verification_purpose"] = purpose
+            batches.append(entry)
+        raw_invariants = plan.get("invariants")
+        raw_invariants = raw_invariants if isinstance(raw_invariants, list) else []
+        invariants = [_safe_progress_text(item, 300) for item in
+                      raw_invariants[:PLAN_VIEW_INVARIANT_LIMIT]
+                      if isinstance(item, str)]
+        return {
+            "available": True,
+            "status": plan.get("status") or "complete",
+            "revision": state.get("plan_revision", 0),
+            "version": state.get("plan_version"),
+            "approval": approval,
+            "summary": _safe_progress_text(plan.get("summary"), 1200),
+            "invariants": [item for item in invariants if item],
+            "invariants_omitted_count": max(0, len(raw_invariants) - len(invariants)),
+            "batches": batches,
+            "batches_omitted_count": max(0, len(raw_batches) - len(batches)),
+            "detail": _plan_detail_reference(state),
+        }
+    return {
+        "available": False,
+        "status": "none",
+        "revision": state.get("plan_revision", 0),
+        "version": state.get("plan_version"),
+        "approval": approval,
+        "detail": _plan_detail_reference(state),
+    }
 
 
 def stage_summary(state, stage):
@@ -17631,6 +17825,7 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
             "status": status, "phase": state.get("phase"),
             "summary": summary,
             "report": compact_report(stage_report(state, stage)),
+            "plan_view": plan_view(state) if stage == "plan" else None,
             "error": error, "pause_reason": state.get("pause_reason"),
             "progress_line": progress, "next_action": next_action_for(state),
             "next": next_preview,
@@ -17958,6 +18153,9 @@ def status_run(run_id):
         "last_implementation": compact_report(state.get("implementation")),
         "last_review": compact_report(state.get("review")),
         "architect_verdict": compact_report(state.get("architect_verdict")),
+        "diagnosis_verdict": compact_report(state.get("diagnosis_verdict")),
+        "final_verdict": compact_report(state.get("final_verdict")),
+        "plan_view": plan_view(state),
         "usage": usage_report(state),
         "plan_revision": state.get("plan_revision", 0),
         "plan_history": len(state.get("plan_history", [])),
@@ -18050,6 +18248,8 @@ def recap_run(run_id, detail="quick"):
         if facts["commands"]:
             passed = sum(1 for c in facts["commands"] if c.get("returncode") == 0)
             verification_text = f"{passed}/{len(facts['commands'])} checks passed"
+        elif state.get("implementation") and state.get("verification") is None:
+            verification_text = "pending supervisor verification"
         else:
             verification_text = "not run or not recorded"
         decision_bits = []

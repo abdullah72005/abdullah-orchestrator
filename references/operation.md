@@ -70,7 +70,7 @@ The MCP server exposes small foreground tools:
 |---|---|
 | `orchestrator_start` | Create durable run state; no worker dispatch |
 | `orchestrator_stage` | Run exactly one stage in the foreground |
-| `orchestrator_status` | Deterministic compact status; no model call |
+| `orchestrator_status` | Deterministic compact status, bounded plan view and canonical verdict; no model call |
 | `orchestrator_recap` | Quick or developer recap from persisted evidence; no model call |
 | `orchestrator_interrupt` | Persist, terminate and verify an interruption |
 | `orchestrator_amend` | Persist an amendment; interrupt first if needed |
@@ -86,6 +86,30 @@ output before calling. After the call, send one short line with the outcome,
 measured `elapsed_seconds` and next action. Include the reason for a blocker or
 pause. Native live rendering varies by client. The read-only observer is
 optional.
+
+The planning result carries `plan_view`: revision and approval state, summary
+rationale, main invariants, and each displayed batch's title, goal, acceptance,
+risk and verification purpose, plus omitted counts and a recap/report reference.
+`orchestrator_status` returns the same view for reconnect. Raw check argv is not
+included. A blocked plan exposes its decision question and rationale through the
+current attempt's attested report reference, never through an older proposal.
+Review previews place material findings first and count omissions; the stored
+report keeps its original evidence and ordering. Status and the accept result
+carry the canonical Architect verdict and reason even when the run routes
+immediately to a correction. A completed Implementer report is not proof that
+tests passed; identify verification as pending until the supervisor runs it.
+
+Plan approval is opt-in. The default plan continues automatically, and an
+ordinary request to see the plan or its rationale is not an approval pause. Only
+an explicit request such as “Ask me about architecture and design choices before
+you finalize the plan” should start the run with `plan_approval: true`. That
+Architect puts the rationale in `summary`, flags consequential forks with
+trade-offs and a recommendation, and uses `blocker` for a question that must be
+answered before a valid plan exists. Present the proposal and actual questions
+in chat; record the user's exact reply with `orchestrator_amend`, resume, and
+obtain a versioned revised plan. Discussion cannot grant execution authority,
+and approval of an earlier plan never authorizes its revision. The executing
+plan still requires the human-only `approve-plan` command.
 
 ```bash
 python3 scripts/orchestrator.py status --run <RUN_ID> --follow

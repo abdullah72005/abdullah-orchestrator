@@ -83,7 +83,7 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
    consequential diagnosis, integration and final acceptance always use the
    pinned High route. Do not opt in when the risk is unknown.
 2. **Execute one stage** — `orchestrator_stage` with `run_id`. It runs exactly one of plan, explore, implement, verify, review, accept, diagnose or integrate. Announce the agent, task and expected output first. Never hide several stages in one call.
-3. **Inspect status** — `orchestrator_status` with `run_id`. Deterministic compact status, active job/check, next action and run directory; makes no model call.
+3. **Inspect status** — `orchestrator_status` with `run_id`. Deterministic compact status, bounded `plan_view`, active job/check, canonical verdict and reason, next action and run directory; makes no model call.
 4. **Interrupt or pause** — `orchestrator_interrupt` with `run_id` and a short `reason`. Persists the interruption, terminates the process session and descendants, verifies termination and preserves changes. A verified stop leaves `paused`; an unverified stop leaves `uncertain`.
 5. **Quick recap** — `orchestrator_recap` with `detail: "quick"` (the default). About 5–12 lines covering phase/agent, completed work, changed files, verification, decisions, outstanding issues and next action.
 6. **Detailed developer explanation** — `orchestrator_recap` with `detail: "developer"`. What was implemented, how it works, why that approach was chosen, important files/symbols, actual test commands and results, and remaining limitations. Makes no model call.
@@ -121,9 +121,55 @@ For every engineering task use this loop:
 
    Use a concise clause for each detail. Expand only when the user needs to
    decide or act. Keep one stage per call.
+
+   At milestones, include the useful engineering fact, not just status. A
+   Reviewer result includes finding counts and material findings with severity,
+   location, impact and requested correction; if the preview is capped, say how
+   many were omitted and use `orchestrator_recap detail=developer` for detail. An
+   Architect acceptance line starts with its actual **PASS**, **CHANGES
+   REQUIRED** or **BLOCKED** verdict, gives the reason, and states what happens
+   next. A completed Implementer is not verified tests: say verification is
+   pending until the supervisor has run the checks.
 4. Repeat `orchestrator_stage` until the run is complete, paused, blocked or uncertain.
 
+The planning result and `orchestrator_status` carry a bounded `plan_view`:
+revision and approval state, summary rationale, main invariants, and each shown
+batch's title, goal, acceptance, risk and verification purpose. Omitted counts
+and the recap/report reference point to the full durable plan. Raw check argv is
+not part of the chat view.
+
 Do not poll with a model; status and recap are deterministic. Do not select the legacy background mode in an interactive chat.
+
+## Plan approval and design consultation (opt-in)
+
+The default is automated execution. An ordinary request to see the plan,
+rationale or progress does not pause for approval. Use `plan_approval: true`
+only when the user explicitly asks for design consultation before the plan is
+finalized, for example: “Ask me about architecture and design choices before
+you finalize the plan.”
+
+With that opt-in, the strong Architect puts the proposed direction and concise
+rationale in the plan `summary`. It flags each consequential fork with the
+practical trade-off and its recommendation, and uses `blocker` for a question
+that must be answered before a valid plan can exist. Present the proposed plan
+and the actual questions in chat. When the user replies:
+
+1. Record the exact reply with `orchestrator_amend` and `architect_review: true`.
+2. `orchestrator_resume`, then `orchestrator_stage` to obtain a versioned
+   revised plan.
+3. Present the revised plan and its rationale, then ask the user to run the
+   human-only approval command shown by `next_action`:
+
+   ```bash
+   orchestrator.py approve-plan <ID> --confirm approve-plan:<ID>
+   ```
+
+Chat discussion and answers can inform the plan but cannot grant execution
+authority. Approval of an earlier plan never authorizes a revision. A blocked
+planning attempt exposes its decision question and rationale through
+`plan_view` and its attested report reference; it never shows an older proposal
+as the current plan. An unapproved plan cannot start a writer through
+`orchestrator_stage` or `orchestrator_resume`.
 
 ## Interruption, questions and amendment
 

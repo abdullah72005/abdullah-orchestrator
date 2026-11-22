@@ -120,6 +120,7 @@ safe to leave running for hours.
 | **Fresh independent review** | Ordinary work gets a separate Reviewer context; high-risk work needs two distinct checks. Review/decision authority is invalidated when verification is redone. |
 | **Source-bound acceptance** | Evidence is rejected if HEAD, dirty files, runtime inputs, environment, config, toolchain, plan revision or checked executable changed. |
 | **Correction cycles** | A `changes_required` verdict returns to a bounded Implementer correction instead of restarting the batch. |
+| **Informative chat** | A bounded plan view, material-first review findings and the canonical Architect verdict with its reason; opt-in design consultation without weakening human plan approval. |
 | **Durable run state** | Atomic `state.json`, append-only journal, per-job artifacts and verification logs under one run ID. |
 | **Crash and interruption recovery** | Verified interrupt → `paused`; unverified → `uncertain` → reconcile only after containment proves every marked process stopped. |
 | **Stale-provenance recovery** | Compatible environment/toolchain drift on intact evidence rewinds once to `verify`, preserving implementation and history, and disarms pre-invalidation review authority. |
@@ -290,7 +291,7 @@ Inside the Codex/Claude chat, the skill drives nine MCP tools:
 |---|---|
 | `orchestrator_start` | Create durable run state (does not dispatch a worker). |
 | `orchestrator_stage` | Run exactly one stage in the foreground. |
-| `orchestrator_status` | Deterministic compact status; no model call. |
+| `orchestrator_status` | Deterministic compact status, bounded plan view and canonical verdict; no model call. |
 | `orchestrator_recap` | Quick or developer recap from recorded evidence. |
 | `orchestrator_interrupt` | Persist, terminate and verify an interruption. |
 | `orchestrator_amend` | Record a requirement/correction amendment and pause safely. |
@@ -304,6 +305,27 @@ The stage loop is:
 plan → implement → verify → review → accept → complete
                         └── changes_required ──► implement (correction)
 ```
+
+The planning response and `orchestrator_status` include a bounded `plan_view`:
+revision and approval state, summary rationale, main invariants, and each
+displayed batch's title, goal, acceptance, risk and verification purpose. It
+counts omitted entries and points to the developer recap or the durable report
+for the rest; raw check argv stays out of the chat view. Review previews put
+material findings first and count what was omitted. The canonical Architect
+verdict and reason remain visible even when the run routes directly to a
+correction. A completed Implementer is not the same as verified tests: the
+coordinator says verification is pending until the supervisor runs it.
+
+Plan approval is opt-in and the default stays automated. An ordinary request to
+see the plan is not an approval pause. Start with `plan_approval: true` only for
+an explicit request such as “Ask me about architecture and design choices before
+you finalize the plan.” The Architect then puts concise rationale in the plan
+summary, flags consequential forks with trade-offs and its recommendation, and
+uses the blocker for a question that must be answered before a valid plan is
+possible. The coordinator presents that actual proposal or question, records
+the user's reply with `orchestrator_amend`, and obtains a versioned revised
+plan. Chat discussion never grants execution authority, and approval of an
+earlier plan cannot authorize its revision.
 
 Human-only actions are **not** MCP tools and run in your own terminal:
 
@@ -356,6 +378,10 @@ in-flight updates depend on the client, and the terminal observer is optional.
   elapsed seconds (live monotonic time while the recorded owner is proven alive,
   recorded duration after completion), latest observed activity, outcome and next
   action. Legacy journals without attempt identity stay readable.
+- The same status and the plan stage carry `plan_view`, a bounded structured
+  plan for reconnect from a fresh chat. A blocked plan reports its current
+  question and rationale with a report reference; an older proposal is never
+  substituted. Review previews prioritize material findings and count omissions.
 - When the MCP client supplies a `progressToken`, the `orchestrator_stage` call
   also emits advisory `notifications/progress` updates about once per second for
   the attempt that call admitted. They carry a bounded human-readable message, a
