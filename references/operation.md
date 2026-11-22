@@ -100,9 +100,9 @@ preview and quick recap remain bounded. Its returned `artifacts`
 reference resolvable files inside the run directory, including `state.json` and
 the current Reviewer report when present. A blocked plan exposes its decision
 question and rationale through the current attempt; its report reference is used
-only with the recorded digest, current plan job and run/amendment scope, and
-otherwise the saved bounded fields are shown with the artifact marked
-unavailable. Review previews place material findings first and count omissions;
+only with the recorded digest, loaded run, current plan job, plan revision and
+amendment scope, and otherwise the saved bounded fields are shown with the
+artifact marked unavailable. Review previews place material findings first and count omissions;
 the stored report keeps its original evidence and ordering. Status and the accept
 result carry the canonical Architect verdict and reason even when the run routes
 immediately to a correction. A completed Implementer report is not proof that

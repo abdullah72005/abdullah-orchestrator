@@ -183,9 +183,12 @@ Chat discussion and answers can inform the plan but cannot grant execution
 authority. Approval of an earlier plan never authorizes a revision. A blocked
 planning attempt exposes its decision question and rationale through
 `plan_view` and its attested report reference; it never shows an older proposal
-as the current plan. Once an amendment supersedes that question, status shows
-replanning pending rather than the answered question. An unapproved plan cannot
-start a writer through `orchestrator_stage` or `orchestrator_resume`.
+as the current plan. The reference must match this loaded run, plan revision,
+amendment epoch, current job and digest; otherwise only the saved bounded
+question and rationale are shown. Once an amendment supersedes that question,
+status shows replanning pending rather than the answered question. An unapproved
+plan cannot start a writer through `orchestrator_stage` or
+`orchestrator_resume`.
 
 ## Interruption, questions and amendment
 

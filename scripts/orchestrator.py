@@ -17124,9 +17124,9 @@ def _safe_read(path):
         return None
 
 
-def stage_report(state, stage):
+def stage_report(state, stage, folder=None):
     if stage == "plan":
-        blocked = _plan_attempt_report(state)
+        blocked = _plan_attempt_report(state, folder)
         if blocked is not None:
             return blocked
         plan = state.get("plan")
@@ -17236,6 +17236,11 @@ def _current_plan_attempt(state):
     if attempt.get("amendment_epoch", state.get("amendment_epoch", 0)) != \
             state.get("amendment_epoch", 0):
         return None
+    if attempt.get("run_id") is not None and attempt.get("run_id") != state.get("id"):
+        return None
+    if (attempt.get("plan_revision") is not None
+            and attempt.get("plan_revision") != state.get("plan_revision", 0)):
+        return None
     if state.get("phase") != "plan":
         return None
     if state.get("status") not in {"blocked", "paused"}:
@@ -17243,8 +17248,35 @@ def _current_plan_attempt(state):
     return attempt
 
 
-def _plan_attempt_artifact(state, attempt):
+def _scoped_artifact_path(folder, path):
+    """Resolve a path beneath the loaded run without reading its contents."""
+    if not folder or not path:
+        return None
+    try:
+        root = Path(folder).resolve()
+        resolved = Path(path).resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def _plan_attempt_artifact(state, attempt, folder=None):
     """Return (report, None) only for a current, digest-attested job artifact."""
+    if not folder:
+        return None, "missing_run_scope"
+    if attempt.get("run_id") is None or attempt.get("plan_revision") is None:
+        # A pre-correction record may still show its saved bounded fields, but
+        # it has no inferred authority to publish an artifact.
+        return None, "missing_attestation"
+    if attempt.get("amendment_epoch") is None:
+        return None, "missing_attestation"
+    if attempt.get("amendment_epoch") != state.get("amendment_epoch", 0):
+        return None, "epoch_mismatch"
+    if attempt.get("run_id") != state.get("id"):
+        return None, "run_mismatch"
+    if attempt.get("plan_revision") != state.get("plan_revision", 0):
+        return None, "revision_mismatch"
     reference = attempt.get("report") if isinstance(attempt.get("report"), dict) else {}
     path = reference.get("path")
     if not path:
@@ -17252,27 +17284,34 @@ def _plan_attempt_artifact(state, attempt):
     expected = reference.get("sha256")
     if not isinstance(expected, str) or not expected.strip():
         return None, "missing_digest"
-    if reference.get("run_id") not in (None, state.get("id")):
+    if reference.get("run_id") is None:
+        return None, "missing_reference_scope"
+    if reference.get("run_id") != state.get("id"):
         return None, "run_mismatch"
-    if reference.get("amendment_epoch", attempt.get("amendment_epoch")) != \
-            state.get("amendment_epoch", 0):
+    if reference.get("amendment_epoch") is None:
+        return None, "missing_reference_scope"
+    if reference.get("amendment_epoch") != state.get("amendment_epoch", 0):
         return None, "epoch_mismatch"
-    job_id = reference.get("job_id") or attempt.get("job_id")
+    job_id = attempt.get("job_id")
+    if not job_id:
+        return None, "missing_job_attestation"
+    if reference.get("job_id") != job_id:
+        return None, "job_mismatch"
     jobs = [job for job in state.get("completed_jobs", [])
             if job.get("kind") == "plan"]
     if not jobs:
         return None, "job_not_found"
-    if job_id and jobs[-1].get("id") != job_id:
+    job = jobs[-1]
+    if job.get("id") != job_id:
         return None, "stale_job"
-    job = jobs[-1] if job_id else None
-    if job is None or job.get("id") != attempt.get("job_id", job_id):
-        return None, "job_mismatch"
-    try:
-        job_path = Path(job.get("path", "")).resolve()
-        report_path = Path(path).resolve()
-        report_path.relative_to(job_path)
-    except (OSError, ValueError):
-        return None, "outside_job"
+    if job.get("amendment_epoch", 0) != state.get("amendment_epoch", 0):
+        return None, "stale_job_epoch"
+    job_path = _scoped_artifact_path(folder, job.get("path"))
+    if job_path is None:
+        return None, "outside_run"
+    report_path = _scoped_artifact_path(folder, path)
+    if report_path is None:
+        return None, "outside_run"
     if report_path != (job_path / "report.json").resolve():
         return None, "unexpected_artifact"
     report = _safe_read(report_path)
@@ -17285,12 +17324,12 @@ def _plan_attempt_artifact(state, attempt):
     return report, None
 
 
-def _plan_attempt_report(state):
+def _plan_attempt_report(state, folder=None):
     """The current blocked planning attempt, never an older proposal."""
     attempt = _current_plan_attempt(state)
     if attempt is None:
         return None
-    report, _reason = _plan_attempt_artifact(state, attempt)
+    report, _reason = _plan_attempt_artifact(state, attempt, folder)
     if report is not None:
         return report
     # The saved fields remain the honest current question when the artifact
@@ -17344,11 +17383,12 @@ def _run_scope_artifacts(folder, state):
     if state_ref:
         artifacts["state"] = state_ref
     plan_path = _completed_job_artifact(state, "plan")
-    if plan_path:
-        plan_report = _safe_read(plan_path)
+    scoped_plan_path = _scoped_artifact_path(folder, plan_path)
+    if scoped_plan_path:
+        plan_report = _safe_read(scoped_plan_path)
         if (isinstance(plan_report, dict)
                 and content_hash(plan_report) == state.get("plan_version")):
-            plan_ref = _run_artifact_reference(folder, plan_path)
+            plan_ref = _run_artifact_reference(folder, scoped_plan_path)
             if plan_ref:
                 artifacts["plan_report"] = plan_ref
     review_path = _completed_job_artifact(state, "reviewer")
@@ -17378,7 +17418,7 @@ def _plan_detail_reference(state, folder=None):
     if attempt is not None:
         raw = attempt.get("report") if isinstance(attempt.get("report"), dict) else {}
         shown = dict(raw)
-        _report, reason = _plan_attempt_artifact(state, attempt)
+        _report, reason = _plan_attempt_artifact(state, attempt, folder)
         shown["available"] = reason is None
         if reason:
             shown["reason"] = reason
@@ -17413,7 +17453,7 @@ def plan_view(state, folder=None):
     durable state. Raw check argv is deliberately absent.
     """
     approval = _plan_approval_view(state)
-    blocked = _plan_attempt_report(state)
+    blocked = _plan_attempt_report(state, folder)
     if blocked is not None:
         return {
             "available": False,
@@ -17493,8 +17533,8 @@ def plan_view(state, folder=None):
     }
 
 
-def stage_summary(state, stage):
-    report = stage_report(state, stage) or {}
+def stage_summary(state, stage, folder=None):
+    report = stage_report(state, stage, folder) or {}
     if stage == "plan":
         if report.get("status") == "blocked":
             return f"blocked: {report.get('blocker') or report.get('summary') or 'no plan'}"
@@ -17942,7 +17982,7 @@ def stage_progress_message(snapshot):
 def stage_payload(folder, state, stage, role, task, expected, elapsed, error=None,
                   *, started=None):
     status = state.get("status")
-    summary = stage_summary(state, stage)
+    summary = stage_summary(state, stage, folder)
     started = started or {}
     label = started.get("agent_label") or agent_label(state, role)
     progress = f"{'✓' if error is None else '⚠'} {label} | {summary} | {elapsed:.1f}s"
@@ -17968,7 +18008,7 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
             "host": state.get("host"),
             "status": status, "phase": state.get("phase"),
             "summary": summary,
-            "report": compact_report(stage_report(state, stage)),
+            "report": compact_report(stage_report(state, stage, folder)),
             "plan_view": plan_view(state, folder) if stage == "plan" else None,
             "error": error, "pause_reason": state.get("pause_reason"),
             "progress_line": progress, "next_action": next_action_for(state),
@@ -18148,7 +18188,7 @@ def stage_run(run_id, expected_phase=None, on_admit=None):
                 outcome = stage_outcome(state.get("status"), error)
                 end_error = error
             journal_event(folder, state, "stage_end", stage=stage, role=role,
-                          summary=stage_summary(state, stage),
+                          summary=stage_summary(state, stage, folder),
                           elapsed_seconds=round(elapsed, 2),
                           error=end_error, next_action=next_action_for(state),
                           outcome=outcome, attempt=attempt_id,

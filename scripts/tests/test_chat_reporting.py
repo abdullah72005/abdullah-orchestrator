@@ -405,15 +405,23 @@ class ChatReportingTests(ControlTests):
         review_dir = self.rundir / "jobs" / "review-1"
         review_dir.mkdir(parents=True)
         orc.atomic_json(review_dir / "report.json", review)
+        plan = plan_report("Complete detail", batches=10,
+                           invariants=[f"Invariant {index}" for index in range(11)])
+        plan_dir = self.rundir / "jobs" / "plan-1"
+        plan_dir.mkdir(parents=True)
+        orc.atomic_json(plan_dir / "report.json", plan)
+        plan_version = orc.content_hash(plan)
         self.state.update({
-            "plan": plan_report("Complete detail", batches=10,
-                                invariants=[f"Invariant {index}" for index in range(11)]),
-            "plan_version": "detail-version",
+            "plan": plan,
+            "plan_version": plan_version,
             "plan_revision": 4,
-            "plan_authority": approved_authority("detail-version", 4),
+            "plan_authority": approved_authority(plan_version, 4),
             "review": review,
-            "completed_jobs": [{"id": "review-1", "kind": "reviewer",
-                                "path": str(review_dir), "amendment_epoch": 0}],
+            "completed_jobs": [
+                {"id": "plan-1", "kind": "plan", "path": str(plan_dir),
+                 "amendment_epoch": 0},
+                {"id": "review-1", "kind": "reviewer",
+                 "path": str(review_dir), "amendment_epoch": 0}],
             "status": "running",
             "phase": "review",
         })
@@ -427,6 +435,7 @@ class ChatReportingTests(ControlTests):
             self.assertIn(value, text)
         self.assertNotIn("SECRET-ARGV", text)
         self.assertEqual(recap["artifacts"]["state"]["valid"], True)
+        self.assertEqual(recap["artifacts"]["plan_report"]["valid"], True)
         self.assertEqual(recap["artifacts"]["reviewer_report"]["valid"], True)
         for reference in recap["artifacts"].values():
             path = Path(reference["path"])
@@ -479,6 +488,7 @@ class ChatReportingTests(ControlTests):
                 "job_id": "answered-plan",
                 "run_id": "test-run00",
                 "amendment_epoch": 0,
+                "plan_revision": 0,
                 "report": {"job_id": "answered-plan",
                            "path": str(job_dir / "report.json"),
                            "sha256": orc.content_hash(report),
@@ -518,14 +528,18 @@ class ChatReportingTests(ControlTests):
         attempts = [
             ("missing_path", {}),
             ("missing_digest",
-             {"job_id": "provenance-plan", "path": str(report_path)}),
+             {"job_id": "provenance-plan", "path": str(report_path),
+              "run_id": "test-run00", "amendment_epoch": 0}),
             ("digest_mismatch",
              {"job_id": "provenance-plan", "path": str(report_path),
-              "sha256": "0" * 64}),
+              "sha256": "0" * 64, "run_id": "test-run00",
+              "amendment_epoch": 0}),
             ("outside_job",
              {"job_id": "provenance-plan", "path": str(self.rundir / "state.json"),
-              "sha256": orc.content_hash(report)}),
+              "sha256": orc.content_hash(report), "run_id": "test-run00",
+              "amendment_epoch": 0}),
         ]
+        expected = {"outside_job": "unexpected_artifact"}
         for reason, reference in attempts:
             self.state.update({
                 "phase": "plan", "status": "blocked",
@@ -535,13 +549,14 @@ class ChatReportingTests(ControlTests):
                     "status": "blocked", "summary": report["summary"],
                     "blocker": report["blocker"], "job_id": "provenance-plan",
                     "run_id": "test-run00", "amendment_epoch": 0,
-                    "report": reference}})
+                    "plan_revision": 0, "report": reference}})
             orc.save(self.rundir, self.state)
             view = orc.status_run("test-run00")["plan_view"]
             self.assertEqual(view["status"], "blocked")
             self.assertEqual(view["blocker"], "Saved question")
             self.assertFalse(view["detail"]["report"]["available"], reason)
-            self.assertEqual(view["detail"]["report"]["reason"], reason)
+            self.assertEqual(view["detail"]["report"]["reason"],
+                             expected.get(reason, reason))
 
     def test_stale_blocked_question_is_not_current_after_epoch_change(self):
         report = {"status": "blocked", "summary": "Old rationale",
@@ -557,6 +572,7 @@ class ChatReportingTests(ControlTests):
                 "status": "blocked", "summary": report["summary"],
                 "blocker": report["blocker"], "job_id": "epoch-plan",
                 "run_id": "test-run00", "amendment_epoch": 0,
+                "plan_revision": 0,
                 "report": {"job_id": "epoch-plan",
                            "path": str(job_dir / "report.json"),
                            "sha256": orc.content_hash(report),
@@ -565,3 +581,180 @@ class ChatReportingTests(ControlTests):
         view = orc.status_run("test-run00")["plan_view"]
         self.assertNotEqual(view["status"], "blocked")
         self.assertNotIn("Old question", json.dumps(view))
+
+    def test_foreign_plan_job_is_never_read_or_published(self):
+        foreign_dir = self.root / "other-run" / "jobs" / "other-plan"
+        foreign_dir.mkdir(parents=True)
+        foreign_report = foreign_dir / "report.json"
+        foreign = {"status": "blocked", "summary": "FOREIGN SENTINEL rationale",
+                   "blocker": "FOREIGN SENTINEL question"}
+        orc.atomic_json(foreign_report, foreign)
+        self.state.update({
+            "plan": None, "phase": "plan", "status": "blocked",
+            "plan_revision": 1, "amendment_epoch": 0,
+            "plan_attempt": {
+                "status": "blocked", "summary": "Saved rationale",
+                "blocker": "Saved question", "job_id": "other-plan",
+                "run_id": "test-run00", "amendment_epoch": 0,
+                "plan_revision": 1,
+                "report": {"job_id": "other-plan", "path": str(foreign_report),
+                           "sha256": orc.content_hash(foreign),
+                           "run_id": "test-run00", "amendment_epoch": 0}},
+            "completed_jobs": [{"id": "other-plan", "kind": "plan",
+                                "path": str(foreign_dir), "amendment_epoch": 0}],
+        })
+        orc.save(self.rundir, self.state)
+        real_safe_read = orc._safe_read
+        reads = []
+
+        def spy(path):
+            resolved = Path(path).resolve()
+            reads.append(resolved)
+            if resolved == foreign_report.resolve():
+                raise AssertionError("foreign plan artifact was read")
+            return real_safe_read(path)
+
+        with patch.object(orc, "_safe_read", side_effect=spy):
+            status = orc._mcp_tool_call("orchestrator_status",
+                                        {"run_id": "test-run00"})
+            recap = orc.recap_run("test-run00", "developer")
+
+        view = status["plan_view"]
+        self.assertEqual(view["status"], "blocked")
+        self.assertEqual(view["summary"], "Saved rationale")
+        self.assertEqual(view["blocker"], "Saved question")
+        self.assertFalse(view["detail"]["report"]["available"])
+        self.assertEqual(view["detail"]["report"]["reason"], "outside_run")
+        rendered = json.dumps(status) + recap["text"]
+        self.assertNotIn("FOREIGN SENTINEL", rendered)
+        self.assertNotIn(foreign_report.resolve(), reads)
+        self.assertNotIn("plan_report", recap["artifacts"])
+
+    def test_blocked_attempt_rejects_foreign_run_and_older_revision(self):
+        report = {"status": "blocked", "summary": "Saved rationale",
+                  "blocker": "Saved question"}
+        job_dir = self.rundir / "jobs" / "identity-plan"
+        job_dir.mkdir(parents=True)
+        report_path = job_dir / "report.json"
+        orc.atomic_json(report_path, report)
+        base = {
+            "status": "blocked", "summary": report["summary"],
+            "blocker": report["blocker"], "job_id": "identity-plan",
+            "run_id": "test-run00", "amendment_epoch": 0,
+            "plan_revision": 2,
+            "report": {"job_id": "identity-plan", "path": str(report_path),
+                       "sha256": orc.content_hash(report),
+                       "run_id": "test-run00", "amendment_epoch": 0}}
+        for field, value in (("run_id", "other-run"), ("plan_revision", 1)):
+            attempt = {**base, field: value}
+            self.state.update({
+                "plan": None, "phase": "plan", "status": "blocked",
+                "plan_revision": 2, "amendment_epoch": 0,
+                "plan_attempt": attempt,
+                "completed_jobs": [{"id": "identity-plan", "kind": "plan",
+                                    "path": str(job_dir), "amendment_epoch": 0}],
+            })
+            orc.save(self.rundir, self.state)
+            status = orc._mcp_tool_call("orchestrator_status",
+                                        {"run_id": "test-run00"})
+            self.assertNotEqual(status["plan_view"]["status"], "blocked", field)
+            self.assertNotIn("Saved question", json.dumps(status["plan_view"]))
+
+    def test_blocked_artifact_rejects_stale_job_epoch(self):
+        report = {"status": "blocked", "summary": "Saved rationale",
+                  "blocker": "Saved question"}
+        job_dir = self.rundir / "jobs" / "stale-epoch-plan"
+        job_dir.mkdir(parents=True)
+        report_path = job_dir / "report.json"
+        orc.atomic_json(report_path, report)
+        self.state.update({
+            "plan": None, "phase": "plan", "status": "blocked",
+            "plan_revision": 1, "amendment_epoch": 2,
+            "plan_attempt": {
+                "status": "blocked", "summary": report["summary"],
+                "blocker": report["blocker"], "job_id": "stale-epoch-plan",
+                "run_id": "test-run00", "amendment_epoch": 2,
+                "plan_revision": 1,
+                "report": {"job_id": "stale-epoch-plan",
+                           "path": str(report_path),
+                           "sha256": orc.content_hash(report),
+                           "run_id": "test-run00", "amendment_epoch": 2}},
+            "completed_jobs": [{"id": "stale-epoch-plan", "kind": "plan",
+                                "path": str(job_dir), "amendment_epoch": 1}],
+        })
+        orc.save(self.rundir, self.state)
+        view = orc._mcp_tool_call("orchestrator_status",
+                                  {"run_id": "test-run00"})["plan_view"]
+        self.assertEqual(view["status"], "blocked")
+        self.assertEqual(view["blocker"], "Saved question")
+        self.assertEqual(view["detail"]["report"]["reason"], "stale_job_epoch")
+        self.assertNotIn("FOREIGN", json.dumps(view))
+
+    def test_successful_plan_artifact_outside_run_is_not_read(self):
+        foreign_dir = self.root / "other-run" / "jobs" / "successful-plan"
+        foreign_dir.mkdir(parents=True)
+        foreign_report = foreign_dir / "report.json"
+        foreign_plan = plan_report("FOREIGN SUCCESS")
+        orc.atomic_json(foreign_report, foreign_plan)
+        self.state.update({
+            "plan": plan_report("Local success"),
+            "plan_version": orc.content_hash(foreign_plan),
+            "plan_revision": 1,
+            "status": "running", "phase": "implement",
+            "completed_jobs": [{"id": "successful-plan", "kind": "plan",
+                                "path": str(foreign_dir), "amendment_epoch": 0}],
+        })
+        orc.save(self.rundir, self.state)
+        real_safe_read = orc._safe_read
+        reads = []
+
+        def spy(path):
+            resolved = Path(path).resolve()
+            reads.append(resolved)
+            if resolved == foreign_report.resolve():
+                raise AssertionError("out-of-run plan artifact was read")
+            return real_safe_read(path)
+
+        with patch.object(orc, "_safe_read", side_effect=spy):
+            status = orc._mcp_tool_call("orchestrator_status",
+                                        {"run_id": "test-run00"})
+            recap = orc.recap_run("test-run00", "developer")
+
+        self.assertNotIn("plan_report", status["plan_view"]["detail"]["artifacts"])
+        self.assertNotIn("plan_report", recap["artifacts"])
+        self.assertNotIn(foreign_report.resolve(), reads)
+        self.assertNotIn("FOREIGN SUCCESS", json.dumps(status) + recap["text"])
+
+    def test_pre_correction_attempt_has_no_artifact_authority(self):
+        job_dir = self.rundir / "jobs" / "legacy-plan"
+        job_dir.mkdir(parents=True)
+        report_path = job_dir / "report.json"
+        report = {"status": "blocked", "summary": "Legacy rationale",
+                  "blocker": "Legacy question"}
+        orc.atomic_json(report_path, report)
+        self.state.update({
+            "plan": None, "phase": "plan", "status": "blocked",
+            "plan_revision": 0, "amendment_epoch": 0,
+            "plan_attempt": {
+                "status": "blocked", "summary": report["summary"],
+                "blocker": report["blocker"], "job_id": "legacy-plan",
+                "amendment_epoch": 0,
+                "report": {"job_id": "legacy-plan", "path": str(report_path),
+                           "sha256": orc.content_hash(report)}},
+        })
+        orc.save(self.rundir, self.state)
+        real_safe_read = orc._safe_read
+        reads = []
+
+        def spy(path):
+            reads.append(Path(path).resolve())
+            return real_safe_read(path)
+
+        with patch.object(orc, "_safe_read", side_effect=spy):
+            view = orc._mcp_tool_call("orchestrator_status",
+                                      {"run_id": "test-run00"})["plan_view"]
+        self.assertEqual(view["status"], "blocked")
+        self.assertEqual(view["blocker"], "Legacy question")
+        self.assertFalse(view["detail"]["report"]["available"])
+        self.assertEqual(view["detail"]["report"]["reason"], "missing_attestation")
+        self.assertNotIn(report_path.resolve(), reads)
