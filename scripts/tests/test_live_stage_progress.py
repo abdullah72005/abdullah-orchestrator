@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import queue
@@ -210,6 +211,57 @@ class AttemptIdentityTests(ProgressFixture):
         snapshot = self.snapshot()
         self.assertFalse(snapshot["active"])
         self.assertEqual(snapshot["outcome"], "error")
+
+    @staticmethod
+    @contextmanager
+    def failing_activity_journal():
+        original = orc.journal_event
+
+        def journal(run_dir, state, event, **fields):
+            if event == "stage_activity":
+                raise OSError("injected advisory activity failure")
+            return original(run_dir, state, event, **fields)
+
+        with patch.object(orc, "journal_event", side_effect=journal):
+            yield
+
+    def test_activity_write_failure_during_admission_and_worker_does_not_abort(self):
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env), \
+                self.failing_activity_journal():
+            result = orc.stage_run(self.run_id)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["stage"], "plan")
+        self.assertEqual(result["phase"], "implement")
+        self.assertIsNone(orc._current_attempt())
+        records = _records(self.folder)
+        starts = [row for row in records if row.get("event") == "stage_start"]
+        ends = [row for row in records if row.get("event") == "stage_end"]
+        self.assertEqual(starts[-1]["attempt"], ends[-1]["attempt"])
+        self.assertEqual(ends[-1]["outcome"], "complete")
+        self.assertTrue(ends[-1]["elapsed_seconds"] > 0)
+        snapshot = self.snapshot()
+        self.assertFalse(snapshot["active"])
+        self.assertEqual(snapshot["ownership"], "complete")
+        self.assertIn("stage finished", snapshot["activity"])
+
+    def test_activity_write_failure_during_verification_preserves_evidence(self):
+        self.stage()  # plan
+        self.stage()  # implement
+        self.assertIn("# implemented", (self.project / "app.py").read_text())
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env), \
+                self.failing_activity_journal():
+            result = orc.stage_run(self.run_id)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["stage"], "verify")
+        self.assertTrue(result["report"]["passed"])
+        self.assertIsNone(orc._current_attempt())
+        state = json.loads((self.folder / "state.json").read_text())
+        self.assertTrue(state["verification"]["passed"])
+        self.assertIn("# implemented", (self.project / "app.py").read_text())
+        ends = [row for row in _records(self.folder) if row.get("event") == "stage_end"]
+        self.assertEqual(ends[-1]["outcome"], "complete")
 
     def test_task_metadata_is_bounded_and_terminal_safe(self):
         hostile = ("Implement \x1b[31mred\x1b[0m\nsecond\ttab"
@@ -437,7 +489,7 @@ class ProgressSinkTests(unittest.TestCase):
         self.assertIn("first", stream.getvalue())
         self.assertNotIn("second", stream.getvalue())
 
-    def test_close_waits_for_an_in_flight_write_and_blocks_later_ones(self):
+    def test_close_does_not_wait_for_a_stalled_notification_write(self):
         released = threading.Event()
         entered = threading.Event()
 
@@ -458,16 +510,31 @@ class ProgressSinkTests(unittest.TestCase):
         sender = threading.Thread(target=send, args=("tok", 1, "in flight"))
         sender.start()
         self.assertTrue(entered.wait(5))
-        closer = threading.Thread(target=close)
-        closer.start()
-        time.sleep(0.2)
-        self.assertTrue(closer.is_alive(), "close did not wait for the write")
+        started = time.monotonic()
+        close()
+        self.assertLess(time.monotonic() - started, 0.2,
+                        "close blocked on the stalled write")
+        self.assertTrue(sender.is_alive())
+        self.assertFalse(send("tok", 2, "late"))
         released.set()
         sender.join(5)
-        closer.join(5)
-        self.assertFalse(closer.is_alive())
-        self.assertFalse(send("tok", 2, "late"))
         self.assertEqual(len(stream.writes), 1)
+
+    def test_sender_waiting_on_the_output_lock_is_dropped_after_close(self):
+        stream = io.StringIO()
+        lock = threading.Lock()
+        send, close = orc._progress_sink(stream, lock)
+        lock.acquire()  # hold the shared serialization a response would use
+        result = {}
+        sender = threading.Thread(
+            target=lambda: result.setdefault("value", send("tok", 1, "queued")))
+        sender.start()
+        time.sleep(0.1)
+        close()
+        lock.release()
+        sender.join(5)
+        self.assertIs(result.get("value"), False)
+        self.assertEqual(stream.getvalue(), "")
 
 
 class _LineInput:
@@ -647,6 +714,97 @@ class McpAdmissionBindingTests(unittest.TestCase):
             finally:
                 instream.close()
                 thread.join(timeout=10)
+
+    def test_cancellation_starts_containment_while_a_progress_write_is_stalled(self):
+        interrupted = threading.Event()
+        allow_tool_end = threading.Event()
+
+        def tool(name, arguments, on_admit=None):
+            on_admit({"attempt": "attempt-A"})
+            allow_tool_end.wait(10)
+            return {"ok": True}
+
+        class GatedOutput(_LineOutput):
+            def __init__(self):
+                super().__init__()
+                self.gate = threading.Event()
+                self.entered = threading.Event()
+
+            def write(self, text):
+                self.entered.set()
+                self.gate.wait(10)
+                super().write(text)
+
+        instream, outstream = _LineInput(), GatedOutput()
+        thread = threading.Thread(target=orc.mcp_serve,
+                                  args=(instream, outstream), daemon=True)
+        with patch.object(orc, "_mcp_tool_call", side_effect=tool), \
+                patch.object(orc, "stage_progress",
+                             side_effect=lambda _run: self._snapshot()), \
+                patch.object(orc, "interrupt_run",
+                             side_effect=lambda *args, **kwargs: interrupted.set()):
+            thread.start()
+            try:
+                instream.push({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "orchestrator_stage",
+                                          "arguments": {"run_id": "run"},
+                                          "_meta": {"progressToken": "tok"}}})
+                self.assertTrue(outstream.entered.wait(5),
+                                "progress write never started")
+                instream.push({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                               "params": {"requestId": 1, "reason": "user stop"}})
+                self.assertTrue(interrupted.wait(2),
+                                "containment waited for stalled output")
+            finally:
+                allow_tool_end.set()
+                outstream.gate.set()
+                instream.close()
+                thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+
+    def test_eof_starts_emergency_stop_while_a_progress_write_is_stalled(self):
+        stopped = threading.Event()
+        allow_tool_end = threading.Event()
+
+        def tool(name, arguments, on_admit=None):
+            on_admit({"attempt": "attempt-A"})
+            allow_tool_end.wait(10)
+            return {"ok": True}
+
+        class GatedOutput(_LineOutput):
+            def __init__(self):
+                super().__init__()
+                self.gate = threading.Event()
+                self.entered = threading.Event()
+
+            def write(self, text):
+                self.entered.set()
+                self.gate.wait(10)
+                super().write(text)
+
+        instream, outstream = _LineInput(), GatedOutput()
+        thread = threading.Thread(target=orc.mcp_serve,
+                                  args=(instream, outstream), daemon=True)
+        with patch.object(orc, "_mcp_tool_call", side_effect=tool), \
+                patch.object(orc, "stage_progress",
+                             side_effect=lambda _run: self._snapshot()), \
+                patch.object(orc, "_emergency_stop",
+                             side_effect=lambda _run: stopped.set()):
+            thread.start()
+            try:
+                instream.push({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "orchestrator_stage",
+                                          "arguments": {"run_id": "run"},
+                                          "_meta": {"progressToken": 3}}})
+                self.assertTrue(outstream.entered.wait(5))
+                instream.close()  # host EOF
+                self.assertTrue(stopped.wait(2),
+                                "teardown waited for stalled output")
+            finally:
+                allow_tool_end.set()
+                outstream.gate.set()
+                thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
 
     def test_malformed_meta_or_invalid_token_disables_progress(self):
         seen = {}

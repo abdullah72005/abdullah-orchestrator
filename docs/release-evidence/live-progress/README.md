@@ -53,7 +53,10 @@ FAKE_SLEEP = "10"
    final block shows the outcome, measured elapsed time and next action. The
    Codex desktop chat itself is not expected to render MCP progress
    notifications; the integrated terminal is the supported view.
-6. Press Ctrl-C in the viewer. The stage must keep running and complete normally.
+6. While the worker is still active, press Ctrl-C to close the observer; confirm
+   the stage keeps running. Reattach with the same `status --follow` command
+   before completion and confirm the live view resumes and reaches the measured
+   outcome. Observation and stopping must be independent.
 
 ## Observe (Claude desktop)
 

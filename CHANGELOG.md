@@ -37,6 +37,21 @@ uses [Semantic Versioning](https://semver.org/).
 - `journal_tail` reads a bounded trailing window instead of the whole journal,
   so heartbeats never scan run history or worker logs.
 
+### Live worker progress · correction 2
+
+- Progress closure is now a nonblocking signal. The sink's guard protects only
+  the closed flag; the shared output lock still orders started notifications
+  with the final response, and a sender waiting on that lock or on a stalled
+  write is dropped. Cancellation and host EOF signal closure and start
+  containment/teardown outside the active-request lock, so a stalled transport
+  cannot delay pause, terminate or reconcile.
+- Attempt activity records are best effort. A failed `stage_activity` write
+  during admission, worker launch, report handling or verification no longer
+  aborts the stage; durable stage start/end, model and verification artifacts,
+  containment and previously authoritative journal events keep their
+  guarantees. Stage context is cleared on every path and missing activity falls
+  back to the existing safe waiting/process labels.
+
 ### Live worker progress · correction 1
 
 - Progress observers are bound to the exact attempt admitted under the existing

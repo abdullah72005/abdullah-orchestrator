@@ -500,6 +500,13 @@ cross-request notifications, tokenless and invalid-token silence, cancellation,
 attach during a stage, and a viewer that ticks while the worker runs without
 changing its outcome.
 
+The containment correction adds deterministic coverage for cancellation and
+host EOF entering containment/emergency stop while a progress write is stalled,
+nonblocking sink closure, and injected failure of advisory activity writes
+during admission, worker launch/report handling and verification (same stage
+outcome, matching end, no stale attempt or context, preserved edit and
+verification evidence).
+
 The correction batch adds deterministic coverage for exact admission binding
 (two requests to one run with different tokens and a refused concurrent
 admission), a progress read held beyond the final response, cancellation closing

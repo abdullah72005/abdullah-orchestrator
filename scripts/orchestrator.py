@@ -17393,14 +17393,19 @@ _WORKER_STREAM_LABELS = {
 
 
 def _record_stage_activity(run_dir, state, activity, **fields):
-    """Journal one attempt-scoped lifecycle observation for progress viewers."""
+    """Best-effort attempt-scoped observation; never affects stage execution."""
     if not isinstance(state, dict):
         return
     attempt = _current_attempt()
     if not attempt:
         return
-    journal_event(run_dir, state, "stage_activity", activity=activity,
-                  attempt=attempt, **fields)
+    try:
+        journal_event(run_dir, state, "stage_activity", activity=activity,
+                      attempt=attempt, **fields)
+    except Exception:
+        # Progress visibility is advisory. The durable stage_start/stage_end,
+        # artifacts and authoritative events keep their own guarantees.
+        return
 
 
 def _worker_stream_activity(folder, job, tail_bytes=64 * 1024, limit=16 * 1024):
@@ -19287,7 +19292,12 @@ def _valid_progress_token(value):
 
 
 def _progress_sink(stream, lock):
-    """Serialize progress writes and close them atomically before the reply."""
+    """Serialize progress writes; closing is a nonblocking signal.
+
+    ``guard`` only protects the closed flag, so cancellation and teardown can
+    signal closure while a notification write is stalled. The shared output
+    lock keeps started notifications and the final response ordered.
+    """
     state = {"closed": False}
     guard = threading.Lock()
 
@@ -19295,14 +19305,17 @@ def _progress_sink(stream, lock):
         with guard:
             if state["closed"]:
                 return False
-            with lock:
+        with lock:
+            # Recheck under the serialization used by responses: a close that
+            # happened while this sender waited drops the update.
+            with guard:
                 if state["closed"]:
                     return False
-                stream.write(json.dumps({
-                    "jsonrpc": "2.0", "method": "notifications/progress",
-                    "params": {"progressToken": token, "progress": sequence,
-                               "message": message}}, ensure_ascii=False) + "\n")
-                stream.flush()
+            stream.write(json.dumps({
+                "jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": token, "progress": sequence,
+                           "message": message}}, ensure_ascii=False) + "\n")
+            stream.flush()
         return True
 
     def close():
@@ -19422,11 +19435,17 @@ def mcp_serve(instream=None, outstream=None):
                 entry = active.get(request_id)
                 if entry is not None:
                     entry["cancelled"] = True
-                    if entry.get("progress_close") is not None:
-                        entry["progress_close"]()
-                    if entry.get("progress_stop") is not None:
-                        entry["progress_stop"].set()
-                run_id = (entry or {}).get("run_id")
+                    run_id = entry.get("run_id")
+                    close_progress = entry.get("progress_close")
+                    stop_progress = entry.get("progress_stop")
+                else:
+                    run_id = close_progress = stop_progress = None
+            # Signalling and containment run outside the request lock and never
+            # wait for a notification write to drain.
+            if close_progress is not None:
+                close_progress()
+            if stop_progress is not None:
+                stop_progress.set()
             if run_id:
                 threading.Thread(target=interrupt_run,
                                  args=(run_id, "Host cancelled the foreground tool call"),
@@ -19470,12 +19489,13 @@ def mcp_serve(instream=None, outstream=None):
             _mcp_send(outstream, response, write_lock)
     # Host connection closed: stop owned workers and let guard leases close.
     with active_lock:
-        run_ids = [item.get("run_id") for item in active.values() if item.get("run_id")]
-        for item in active.values():
-            if item.get("progress_close") is not None:
-                item["progress_close"]()
-            if item.get("progress_stop") is not None:
-                item["progress_stop"].set()
+        entries = list(active.values())
+        run_ids = [item.get("run_id") for item in entries if item.get("run_id")]
+    for entry in entries:
+        if entry.get("progress_close") is not None:
+            entry["progress_close"]()
+        if entry.get("progress_stop") is not None:
+            entry["progress_stop"].set()
     for run_id in set(run_ids):
         _emergency_stop(run_id)
 
