@@ -80,7 +80,11 @@ The MCP server exposes small foreground tools:
 
 Plan approval, fallback authorization, route grants and worker-fallback consent are deliberately **not** MCP tools. A model cannot approve its own plan, authorize its own fallback, or grant its own billed route. The user runs `orchestrator.py approve-plan`, `approve-fallback`, `authorize-route`, or `approve-worker-fallback` in an interactive terminal, with the exact typed confirmation. The MCP server rejects those names.
 
-Each `orchestrator_stage` call runs one of: plan, required explore, implement, verify, review, accept, diagnose, integrate. Codex displays the tool call, its native running indicator and elapsed time, then the structured result. Codex does **not** display an external worker's private reasoning, intermediate tool calls, or MCP progress notifications; do not patch the TUI to pretend otherwise. Installed Codex CLI `0.169.1` receives progress notifications but does not render them, so use the read-only observer for live detail:
+Each `orchestrator_stage` call runs one stage in the foreground. In the current
+chat, show the worker, model and effort, task and expected output before
+calling. After the call, show the returned `elapsed_seconds`, outcome and next
+action. Native live rendering varies by client. The read-only observer is
+optional for users who want another view:
 
 ```bash
 python3 scripts/orchestrator.py status --run <RUN_ID> --follow

@@ -18,12 +18,16 @@ Interactive foreground mode is the default. The user opens **one Codex CLI chat*
 
 - The strong Architect remains a separate Sol High worker; the Python supervisor remains deterministic.
 - Every engineering stage is one visible foreground MCP invocation.
-- Before dispatch, the coordinator announces the worker, its task and the expected output in a compact message.
-- Codex renders the tool call, its native running-tool indicator and elapsed time.
-- When the call returns, the coordinator summarizes only the structured result and the next stage.
+- Before dispatch, the coordinator sends a visible chat message with the worker, effective model and effort, task and expected output.
+- During the call, native progress appears on clients that render the supervisor's updates. This varies by client and version.
+- When the call returns, the coordinator sends a visible chat message with the outcome, measured stage time from `elapsed_seconds`, and next action.
 - The coordinator proceeds to the next stage within the same conversation.
 
-Stock Codex does not render an external worker's internal progress, private reasoning, intermediate shell commands or MCP progress notifications continuously. Do not promise that visibility, and do not patch the Codex TUI to fake it. Installed Codex CLI `0.169.1` does accept the progress token and receive the notifications, but its terminal view still shows only the tool start/completion lines; use the read-only terminal observer below.
+The stage announcement and result belong in the current chat on Codex and
+Claude Code, in CLI and desktop. The stage result supplies measured duration
+even on clients without live rendering. Claude Code CLI `2.1.247` showed native
+updates during testing. Codex CLI `0.169.1` showed tool start and completion in
+the tested `exec` session. The read-only terminal observer is optional.
 
 Legacy detached `start --background` mode is optional, is **not** the default, and must not be selected without the user's explicit authorization. It survives closing a chat only while WSL stays awake; a sleeping host cannot execute jobs.
 
@@ -94,20 +98,23 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
 For every engineering task use this loop:
 
 1. Call `orchestrator_start` with the absolute project path, precise goal, and explicit `host`.
-2. Call `orchestrator_stage` once per stage. Announce first, in a compact message built from the returned `next` preview, for example:
+2. Before each `orchestrator_stage` call, send the announcement as a visible
+   chat message built from the returned `next` preview. Use `orchestrator_status`
+   to get the preview when attaching to an existing run. For example:
 
    **14:32 (local) · Architect / Sol gpt-6.2-sol · High · Batch 1/1**
    - Task: review concurrent webhook retries in the candidate.
    - Expected: an acceptance verdict or a specific correction.
 
    `next` supplies `started_at` with its offset, `agent_label`, `model`, `effort`,
-   `batch` and `expected_phase`. When `config_route_differs` is true, show both the
+   `batch` and phase. When `config_route_differs` is true, show both the
    configured and the effective route.
 
-3. `orchestrator_stage` is one foreground tool call. Codex shows its native running-tool indicator and elapsed time; when it returns, report the elapsed time, outcome, any blocker and the next action (`next` / `next_action`). Never hide several stages inside one call.
+3. Call `orchestrator_stage` once in the foreground. When it returns, send a
+   visible chat message with the outcome, `elapsed_seconds`, any blocker and
+   the next action (`next` / `next_action`). Use the stage's measured time so
+   the recap is consistent across clients. Keep one stage per call.
 4. Repeat `orchestrator_stage` until the run is complete, paused, blocked or uncertain.
-
-Pass `expected_phase` from the preview if you want the supervisor to reject a stale announcement instead of running a different stage.
 
 Do not poll with a model; status and recap are deterministic. Do not select the legacy background mode in an interactive chat.
 
@@ -166,7 +173,7 @@ Recovery from a new chat: `orchestrator_runs` → `orchestrator_status` → `orc
 - **Fallbacks require explicit approval**: after a genuine rate limit or model blocker, ask the user before one Codex Luna / Claude Haiku dispatch. There is no automatic fallback; approval covers one attempt only.
 - Trusted *development* mode allows local Docker/test commands and local `.env` edits unattended; never implicitly push/deploy, operate on production, or perform broad destructive actions.
 - **Tool routing (hybrid)**: use LeanCTX MCP (`ctx_read`, `ctx_search`, `ctx_tree`, `ctx_compose`) for reading/search/context; run Python, tests, Docker, Git, `orchestrator.py`, and Explorer dispatch through the native shell. Never route execution through `ctx_shell`.
-- A worker process is not a terminal UI. Codex displays the tool call, its running indicator, elapsed time and returned result, not the worker's private reasoning. It may receive MCP progress notifications without drawing them (installed `0.169.1` does). For live stage detail use the read-only observer `python3 <SKILL_DIR>/scripts/orchestrator.py status --run <ID> --follow`; it shows the next stage before dispatch, ticks elapsed time and observed activity, then the outcome, measured time and next action. Do not patch either TUI to fake visibility.
+- The optional read-only observer `python3 <SKILL_DIR>/scripts/orchestrator.py status --run <ID> --follow` shows the next stage before dispatch, ticks elapsed time and observed activity, then shows the outcome, measured time and next action. The normal chat workflow uses the stage announcement and result above.
 
 ## CLI fallback
 

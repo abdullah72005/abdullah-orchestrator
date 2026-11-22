@@ -346,6 +346,11 @@ clock and supervisor identity. Reading progress is additive and read-only: it
 takes no write lock, never repairs or advances a run, and never changes the stage
 outcome.
 
+The coordinator posts the worker, model, task and expected output in chat before
+each call, then posts the outcome, measured stage duration and next action.
+This works with a single chat. Native in-flight updates depend on the client,
+and the terminal observer is optional.
+
 - `orchestrator_status` now carries `stage_progress`: attempt identity, current
   stage, effective role/model/effort, batch, sanitized task and expected output,
   elapsed seconds (live monotonic time while the recorded owner is proven alive,

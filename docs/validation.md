@@ -499,6 +499,16 @@ cross-request notifications, tokenless and invalid-token silence, cancellation,
 attach during a stage, and a viewer that ticks while the worker runs without
 changing its outcome.
 
+**Single-chat presentation.** The chat workflow on all four surfaces uses a
+visible stage announcement and measured result. Native in-flight updates are
+verified in Claude Code CLI. A model-driven turn on Codex app-server `0.169.1`
+completed the fixture MCP call after six valid progress notifications, with
+zero `item/mcpToolCall/progress` events forwarded to the app-server client.
+This isolates the forwarding limit on that build and probe. The Codex desktop
+operator saw the tool card and result in chat. The terminal viewer is optional.
+An in-chat desktop MCP App card and the experimental Codex CLI MCP status line
+are candidate presentation paths that still need client-level tests.
+
 The containment correction adds deterministic coverage for cancellation and
 host EOF entering containment/emergency stop while a progress write is stalled,
 nonblocking sink closure, and injected failure of advisory activity writes
