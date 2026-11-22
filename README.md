@@ -363,14 +363,16 @@ Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Tested behavior
 
-**Deterministic suite (offline, no model calls):** the corrected v1.2.0
-candidate ran **980 tests, with 972 passing and 8 skipped** on Python 3.10.12
-(1030.1 s). The initial v1.2.0 candidate ran 911 tests (7 skipped). The
-previous v1.0.0 baseline was 870 tests. All 8 skips are the opt-in OpenCode
-introspection module,
-which runs only when `ABDULLAH_OPENCODE_V2_BIN` is set; it passes all 8 tests
-against the installed `opencode v2.2.7`. A guard replaces real `codex`, `claude`
-and `opencode` processes with fakes. CI configuration for Python 3.10, 3.12 and
+**Deterministic suite (offline, no model calls):** the final v1.2.0
+candidate ran **1,069 tests, with 1,059 passing and 10 skipped** on Python
+3.10.12 (1,779.7 s) at the stabilized code/test revision `16a0816`; the
+documentation-only follow-up preserves the tested tree. The earlier `f59a2cd`
+stabilization ran 1,065 tests (10 skipped); the r06 candidate ran 980, the
+initial v1.2.0 candidate 911 (7 skipped), and the previous v1.0.0 baseline 870.
+All 10 skips are the opt-in OpenCode introspection module, which runs only when
+`ABDULLAH_OPENCODE_V2_BIN` is set; it passes all 10 tests against the installed
+`opencode v2.2.7` separately. A guard replaces real `codex`, `claude` and
+`opencode` processes with fakes. CI configuration for Python 3.10, 3.12 and
 3.13 is unchanged; this candidate's local evidence is Python 3.10 only.
 
 **Real end-to-end milestone (2026-11-16 → 2026-11-18):**

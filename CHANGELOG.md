@@ -133,6 +133,9 @@ Additive state fields keep older runs readable.
 - README, installation, validation and release evidence now state these limits
   consistently. Live subagent progress for Codex and Claude Code on CLI and GUI
   is recorded as a post-v1.2.0 TODO.
+- Final local regression at `9a150de` (code/tests identical to `16a0816`):
+  1,069 tests, 1,059 passed, 10 opt-in OpenCode V2 skips, 1,779.655 s, exit 0.
+  The installed OpenCode V2 module passed all 10 tests separately on `v2.2.7`.
 
 ## [1.2.0] — 2026-11-18
 

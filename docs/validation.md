@@ -240,6 +240,8 @@ adds documentation and logs. No live model call was made by any of these gates.
 | Full deterministic suite (r06 candidate) | exit 0 — **980 tests, OK, 8 skipped** |
 | Installed OpenCode V2 compatibility module (r06) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Installed OpenCode V2 compatibility module (r02) | exit 0 — **8 tests, OK** on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
+| Full deterministic suite (final candidate `16a0816`, run at `9a150de`) | exit 0 — **1,069 tests, 1,059 passed, 10 skipped**, 1,779.655 s |
+| Installed OpenCode V2 compatibility module (final candidate) | exit 0 — **10 tests, OK**, 45.636 s on installed `opencode v2.2.7`, isolated `HOME`, no model transport |
 | Compile | exit 0 |
 | `orchestrator.py version` | product `1.2.0`; supervisor `3.1.0`; schema `3`; contract `2` |
 | Config/risk policy | valid; mechanical 1 check/no review, ordinary 1 check/review, high 2 checks/review |
@@ -247,9 +249,10 @@ adds documentation and logs. No live model call was made by any of these gates.
 | Fresh-`HOME` install, twice | exit 0; links created once; config created then preserved; Codex/Claude registration idempotent |
 | MCP initialize/tools/state-only start | 9 tools; start `ok: true`, phase `plan`, no dispatch |
 
-The eight full-suite skips are the opt-in `test_opencode_v2_integration` module,
-which requires `ABDULLAH_OPENCODE_V2_BIN`; it is run separately above. Detailed
-logs are in [release-evidence/v1.2.0](release-evidence/v1.2.0/README.md).
+The r06 run skipped eight full-suite cases and the final candidate skipped ten;
+all are the opt-in `test_opencode_v2_integration` module, which requires
+`ABDULLAH_OPENCODE_V2_BIN`; it is run separately above. Detailed logs are in
+[release-evidence/v1.2.0](release-evidence/v1.2.0/README.md).
 
 The installed V2 read test now generates its hunk through the actual supervisor
 delta path (`capture_batch_boundary` -> `finalize_batch_delta` ->
@@ -257,7 +260,9 @@ delta path (`capture_batch_boundary` -> `finalize_batch_delta` ->
 only that the installed binary's filesystem endpoint returns the exact bytes of
 that supervisor-generated hunk under the checkout review projection. It does
 **not** attest a real Reviewer Read-tool invocation, model transport, agent
-permission enforcement or native terminal lifecycle.
+permission enforcement or native terminal lifecycle. The separate authenticated
+Reviewer Read and its unobserved shell/edit probes are recorded in the release
+evidence.
 
 Not measured in this candidate: live Medium-vs-High planning quality/cost,
 token or wall-time savings, native terminal duration/Esc/reconnect behavior,

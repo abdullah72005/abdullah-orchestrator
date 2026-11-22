@@ -1,0 +1,18 @@
+test_captured_variant_config_normalizes_to_the_recorded_document (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_disjoint_legacy_native_providers_match_real_normalizer (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_doctor_introspection_matches_binary (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_generated_profiles_are_accepted_with_effective_denials (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_installed_binary_fs_read_returns_supervisor_generated_hunk (test_opencode_v2_integration.OpenCodeV2Binary)
+Precise boundary: the installed V2 binary's filesystem read path. ... ok
+test_parent_config_above_git_root_is_freshly_observed (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_reviewer_read_binds_to_the_checkout_under_stale_ambient_pwd (test_opencode_v2_integration.OpenCodeV2Binary)
+The real Read tool resolves relative paths from the intended checkout. ... ok
+test_run_help_supports_generated_flags (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+test_stale_ambient_pwd_does_not_redirect_config_observation (test_opencode_v2_integration.OpenCodeV2Binary)
+Preflight must observe the intended checkout, not a stale sibling. ... ok
+test_version_is_tested_v2_line (test_opencode_v2_integration.OpenCodeV2Binary) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 45.636s
+
+OK

@@ -772,6 +772,23 @@ Twenty-three focused tests also passed on `16a0816`. They cover Claude setup,
 stage deadlines, the Claude-hosted multi-batch fixture, MCP cancellation,
 fresh-session recovery, and release identity.
 
+## Final candidate regression and main integration (22 November 2026)
+
+The stabilized code/test revision was `16a0816`. Documentation-only commits
+followed; `git diff 16a0816..9a150de -- scripts` is empty and the
+`scripts/tests` tree hash is identical (`d319cbca8e9442ced6dd74035d863e6031f8eac5`).
+The full local suite therefore ran on the exact tested code/test tree.
+
+| Check | Result |
+|---|---|
+| Full local suite at `9a150de`, Python 3.10.12 | exit 0 — **1,069 tests, 1,059 passed, 10 skipped**, 1,779.655 s (`suite-main-final-9a150de.txt`) |
+| Installed OpenCode V2 module at `9a150de` | exit 0 — **10 tests, OK**, 45.636 s on `opencode v2.2.7`, isolated credential-free `HOME` (`opencode-v2-final-9a150de.txt`) |
+
+All 10 full-suite skips are the opt-in `test_opencode_v2_integration` module,
+which requires `ABDULLAH_OPENCODE_V2_BIN`; the separate installed run above
+passes all 10. The earlier `f59a2cd` full-suite result (1,065 tests, 1,055
+passes, 10 skips) remains historical.
+
 ## Explicit limitations
 
 - The authenticated Reviewer smoke recorded one Go Reviewer dispatch per fixture.
