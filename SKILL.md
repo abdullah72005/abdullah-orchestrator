@@ -14,13 +14,15 @@ See `docs/versioning.md` for upgrade and compatibility policy.
 
 ## Default mode: one interactive foreground conversation
 
-Interactive foreground mode is the default. The user opens **one Codex CLI chat** with Luna Medium as the visible coordinator, invokes `$abdullah-orchestrator`, and stays in that same conversation.
+Interactive foreground mode keeps the user in one Codex or Claude Code chat.
+For Codex, Luna Medium is the usual coordinator. Invoke
+`$abdullah-orchestrator` and stay in the same conversation.
 
 - The strong Architect remains a separate Sol High worker; the Python supervisor remains deterministic.
 - Every engineering stage is one visible foreground MCP invocation.
-- Before dispatch, the coordinator sends a visible chat message with the worker, effective model and effort, task and expected output.
+- Before dispatch, the coordinator sends one short chat line with the worker, model and effort, task and expected output.
 - During the call, native progress appears on clients that render the supervisor's updates. This varies by client and version.
-- When the call returns, the coordinator sends a visible chat message with the outcome, measured stage time from `elapsed_seconds`, and next action.
+- When the call returns, the coordinator sends one short chat line with the outcome, measured stage time from `elapsed_seconds`, and next action.
 - The coordinator proceeds to the next stage within the same conversation.
 
 The stage announcement and result belong in the current chat on Codex and
@@ -98,22 +100,27 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
 For every engineering task use this loop:
 
 1. Call `orchestrator_start` with the absolute project path, precise goal, and explicit `host`.
-2. Before each `orchestrator_stage` call, send the announcement as a visible
-   chat message built from the returned `next` preview. Use `orchestrator_status`
-   to get the preview when attaching to an existing run. For example:
+2. Before each `orchestrator_stage` call, post one short line using the
+   returned `next` preview. Use `orchestrator_status` to get it when attaching
+   to an existing run.
 
-   **14:32 (local) · Architect / Sol gpt-6.2-sol · High · Batch 1/1**
-   - Task: review concurrent webhook retries in the candidate.
-   - Expected: an acceptance verdict or a specific correction.
+   **14:32 · Architect / gpt-6.2-sol High · Review webhook retries · Expected verdict**
 
-   `next` supplies `started_at` with its offset, `agent_label`, `model`, `effort`,
-   `batch` and phase. When `config_route_differs` is true, show both the
-   configured and the effective route.
+   Use the local time, role, effective model and effort, short task, and
+   expected output. Include the batch when it distinguishes work. For a
+   supervisor check, use its role and task without a model label. When
+   `config_route_differs` is true, include the configured and effective routes.
 
-3. Call `orchestrator_stage` once in the foreground. When it returns, send a
-   visible chat message with the outcome, `elapsed_seconds`, any blocker and
-   the next action (`next` / `next_action`). Use the stage's measured time so
-   the recap is consistent across clients. Keep one stage per call.
+3. Call `orchestrator_stage` once in the foreground. Then post one short line
+   with the outcome, measured `elapsed_seconds`, and the next action (`next`
+   or `next_action`). Include a reason if the run is blocked or paused.
+
+   **Review complete · 32.9s · Next acceptance**
+
+   **Paused · 32.9s · Check timed out · Next reconcile**
+
+   Use a concise clause for each detail. Expand only when the user needs to
+   decide or act. Keep one stage per call.
 4. Repeat `orchestrator_stage` until the run is complete, paused, blocked or uncertain.
 
 Do not poll with a model; status and recap are deterministic. Do not select the legacy background mode in an interactive chat.
