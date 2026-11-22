@@ -99,3 +99,20 @@ This checks the terminal fallback in the actual Codex desktop. Native
 tool-card progress, desktop Stop and viewer reattachment during this stage
 remain unverified. The documented programmatic interruption and observer
 tests cover their respective supervisor paths. Claude desktop remains open.
+
+## Verification
+
+The accepted follow-up revision
+`720dd7c2e4c0b404cccc430e14f40c1f1385dd04` ran **1,183 tests, OK, 10 skipped** in
+1,715.570 s on Python 3.10.12. The 10 skips are the opt-in OpenCode V2
+introspection module. A documentation commit after it does not change
+`scripts/`. This follow-up result is separate from the original v1.2.0 result of
+1,069 tests at `16a0816` (recorded at `9a150de`), which remains unchanged.
+
+Verified client behavior: Claude Code CLI `2.1.247` rendered native MCP progress
+in its TUI; Codex CLI `0.169.1` received the notifications but showed only tool
+start/completion, so the adjacent observer was used; the Windows Codex desktop
+WSL agent showed the observer in the integrated terminal. Unverified: Codex CLI
+in-chat progress, Codex desktop tool-card progress, in-app Stop and fresh-thread
+recovery, Claude desktop in-chat progress and observer, and authenticated long
+Claude stages.

@@ -272,6 +272,53 @@ recorded separately; its shell/edit probes stayed unobserved, so same-session
 capability remains unverified. Fake-CLI and fake-host fixtures establish
 supervisor behavior only.
 
+### Post-v1.2.0 follow-up (2026-11-22 → 2026-11-23)
+
+This follow-up adds live stage progress and richer single-chat reporting. It is
+kept separate from the v1.2.0 candidate above: the public version, internal
+identifiers and release evidence are unchanged, and no tag or release was
+created.
+
+| Check | Result |
+|---|---|
+| Full deterministic suite at `720dd7c` | exit 0 — **1,183 tests, OK, 10 skipped**, 1,715.570 s on Python 3.10.12 |
+| Focused follow-up gate before the final revision | exit 0 — **326 tests, OK**, 694.272 s |
+| `git diff --check` on the documentation commit | exit 0 |
+| Documentation commit `scripts/` tree | byte-identical to `720dd7c` |
+
+The 1,183-test result belongs to the accepted feature revision
+`720dd7c2e4c0b404cccc430e14f40c1f1385dd04`. It does not replace the v1.2.0
+result of 1,069 tests at `16a0816` (recorded at `9a150de`), and it is not a
+v1.2.0 or CI recertification. The 10 skips remain the opt-in
+`test_opencode_v2_integration` module; its separate installed-CLI run is
+unchanged by this follow-up.
+
+Deterministic coverage for the chat reporting itself is in
+`scripts/tests/test_chat_reporting.py`: bounded plan views, material-first
+finding previews without mutating the report, completed-Implementer versus
+verified-test wording, current blocked questions, default automation versus
+explicit consultation, a material reply carried into a versioned revised plan,
+earlier approval not authorizing a revision, canonical verdict retention,
+developer-recap detail, amendment superseding a question, and digest/job/scope
+binding that rejects foreign or stale planning artifacts.
+
+Live progress coverage is in `scripts/tests/test_live_stage_progress.py`:
+attempt identity and matching end records, live versus recorded elapsed time,
+side-effect-free reads, bounded and terminal-safe activity, verification
+argv exclusion, admission-bound progress notifications, nonblocking sink
+closure, containment during stalled writes, malformed tokens and `_meta`, and
+the terminal viewer's waiting, ticking, reattachment, plain-mode and narrow
+output paths.
+
+Client behavior verified on this follow-up: Claude Code CLI `2.1.247` rendered
+native MCP progress in its TUI; Codex CLI `0.169.1` received notifications but
+printed only tool start/completion, so the adjacent `status --follow` observer
+was used; the Windows Codex desktop with a WSL agent verified the observer in
+the integrated terminal during a 32.92 s Implementer stage. Remaining
+unverified: Claude desktop in-chat progress and its observer, Codex desktop
+tool-card progress and in-app Stop, fresh-thread recovery in the desktop UI,
+and authenticated long Claude stages.
+
 ### Real end-to-end milestone (2026-11-16 → 2026-11-18)
 
 Run `20261116T124500-973e8c02`, on a dedicated isolated Codex profile, config,
@@ -467,15 +514,20 @@ repository tree against `git ls-files`.
 
 ## Post-v1.2.0 TODO
 
-- [x] Show live subagent/worker progress for the active Orchestrator worker in
-  Codex and Claude Code, across CLI and GUI hosts. Before launch, show the
-  worker and model, batch task, and expected output. While it runs, show elapsed
-  time and the latest reported activity when available. Preserve the existing
-  foreground stage and interruption behavior.
-  Implemented: `orchestrator_status.stage_progress`, MCP progress notifications
-  and the read-only `status --follow` observer. Evidence below.
+- [x] Implement live worker progress for the active Orchestrator worker: before
+  launch show the worker and model, batch task, and expected output; while it
+  runs show elapsed time and the latest reported activity when available;
+  preserve the existing foreground stage and interruption behavior.
+  Implemented with `orchestrator_status.stage_progress`, MCP progress
+  notifications and the read-only `status --follow` observer. The full
+  deterministic result is 1,183 tests at `720dd7c`; evidence below.
 - [x] Verify the Windows Codex desktop WSL terminal observer during a live
   Implementer stage. In-app Stop and native tool-card progress remain unverified.
+- [ ] Complete client-level live progress across every CLI and GUI host.
+  Verified: Claude Code CLI native TUI progress and the Windows Codex desktop
+  integrated-terminal observer. Unverified: Codex CLI in-chat rendering, Codex
+  desktop tool-card progress, in-app Stop and fresh-thread recovery, Claude
+  desktop in-chat progress and observer, and authenticated long Claude stages.
 - [ ] Verify the Claude desktop presentation with the adjacent terminal observer.
 
 ### Live progress evidence (post-v1.2.0)

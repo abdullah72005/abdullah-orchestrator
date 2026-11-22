@@ -142,6 +142,17 @@ Prepare a disposable check with
 `docs/release-evidence/live-progress/desktop_fixture.py`; its README records the
 exact desktop operator steps and pass criteria.
 
+Live progress and chat reporting need no extra installation. Every stage keeps
+its short before/after line in the same controlling chat, and the bounded plan
+view, Reviewer findings and Architect verdict arrive as ordinary tool results.
+Native in-flight rendering depends on the host: Claude Code CLI renders MCP
+progress natively, while Codex CLI and Claude desktop need the adjacent
+observer; Codex desktop tool-card progress is unverified. Opt-in design
+consultation is a start-time choice (`plan_approval: true`), described in the
+[README](../README.md#usage). See
+[validation](validation.md#post-v120-follow-up-2026-11-22--2026-11-23) for the
+exact observed client behavior.
+
 ### Native Windows Codex desktop
 
 The Windows-native agent reads Windows-side Codex configuration. Keep the

@@ -102,11 +102,14 @@ the current Reviewer report when present. A blocked plan exposes its decision
 question and rationale through the current attempt; its report reference is used
 only with the recorded digest, loaded run, current plan job, plan revision and
 amendment scope, and otherwise the saved bounded fields are shown with the
-artifact marked unavailable. Review previews place material findings first and count omissions;
-the stored report keeps its original evidence and ordering. Status and the accept
-result carry the canonical Architect verdict and reason even when the run routes
-immediately to a correction. A completed Implementer report is not proof that
-tests passed; identify verification as pending until the supervisor runs it.
+artifact marked unavailable. Review previews place critical, high, medium and low
+findings first in recorded order within a severity, report
+`findings_omitted_count`, and leave the stored report's evidence and ordering
+unchanged. Status and the accept result carry the canonical Architect verdict
+and reason even when the run routes immediately to a correction; the acceptance
+line presents that verdict as **PASS**, **CHANGES REQUIRED** or **BLOCKED**.
+A completed Implementer report is not proof that tests passed; identify
+verification as pending until the supervisor runs it.
 After a successful Implementer milestone, add the requested short developer
 summary: what changed, how it works, key paths or symbols, the worker's test
 notes and pending supervisor verification. Give the short final handback when
@@ -133,6 +136,10 @@ python3 scripts/orchestrator.py status --run <RUN_ID> --follow
 ```
 
 The observer shows the next stage's role, route, task and expected output while waiting, then ticks elapsed time with the latest observed activity, and finally the outcome, measured elapsed time and next action. It follows the run across stages until a final state; `Ctrl-C` only closes the viewer. Redirected output switches to a plain-text mode. `orchestrator_status` also exposes the same snapshot as an additive `stage_progress` field.
+
+The plan view, finding preview and verdict are read-only projections of durable
+state. Presenting or discussing them in chat never grants approval, changes a
+plan or authorizes execution.
 
 When the client supplies a valid `progressToken`, the stage call emits advisory `notifications/progress` updates at roughly one update per second, scoped to the attempt that call admitted. They carry a bounded message, a strictly increasing `progress` value and no `total`; tokenless calls and refused calls emit nothing, and cancellation or teardown stops them. Claude Code `2.1.247` renders these natively in its TUI. A stage tool call may run for several minutes; it must never contain several stages or an entire hours-long run.
 

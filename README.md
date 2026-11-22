@@ -35,6 +35,11 @@ default worker route is OpenCode Go.
 > completed planning and implementation through the disposable supervisor.
 > Authenticated long Claude stages, desktop Stop controls and same-session
 > Reviewer shell/edit capability remain unverified.
+> A **post-v1.2.0 follow-up** adds live stage progress and richer single-chat
+> reporting. It is not a new release and does not recertify v1.2.0. Native
+> in-chat progress was observed only on Claude Code CLI; Codex CLI and Claude
+> desktop lack a verified in-chat live view, and Codex desktop tool-card progress
+> remains unverified.
 > Broader live compatibility and long-duration endurance testing remain ongoing.
 > See [Tested behavior](#tested-behavior) and
 > [Security and limitations](#security-and-limitations).
@@ -120,7 +125,8 @@ safe to leave running for hours.
 | **Fresh independent review** | Ordinary work gets a separate Reviewer context; high-risk work needs two distinct checks. Review/decision authority is invalidated when verification is redone. |
 | **Source-bound acceptance** | Evidence is rejected if HEAD, dirty files, runtime inputs, environment, config, toolchain, plan revision or checked executable changed. |
 | **Correction cycles** | A `changes_required` verdict returns to a bounded Implementer correction instead of restarting the batch. |
-| **Informative chat** | A bounded plan view, material-first review findings and the canonical Architect verdict with its reason; opt-in design consultation without weakening human plan approval. |
+| **Informative chat** | One short before/after line per stage in the controlling chat, a bounded plan view, material-first review findings and the canonical Architect verdict with its reason; opt-in design consultation without weakening human plan approval. |
+| **Live stage progress** | Read-only `stage_progress` in status, advisory MCP progress where the client renders it, and an optional `status --follow` terminal observer; none of them can mutate or stop the stage. |
 | **Durable run state** | Atomic `state.json`, append-only journal, per-job artifacts and verification logs under one run ID. |
 | **Crash and interruption recovery** | Verified interrupt → `paused`; unverified → `uncertain` → reconcile only after containment proves every marked process stopped. |
 | **Stale-provenance recovery** | Compatible environment/toolchain drift on intact evidence rewinds once to `verify`, preserving implementation and history, and disarms pre-invalidation review authority. |
@@ -316,13 +322,18 @@ evidence, confidence and disposition. That plan and finding detail has no
 pagination bound; other developer-recap lists keep their labeled bounds, and the
 compact preview and quick recap stay bounded. Returned artifact references
 resolve inside the run directory. Raw check argv stays out of routine previews.
-Review previews put material findings first and count what was omitted. The
-canonical Architect verdict and reason remain visible even when the run routes
-directly to a correction. A completed Implementer is not the same as verified
-tests: the coordinator says verification is pending until the supervisor runs
-it, and after each successful Implementer milestone adds a short developer
-summary of what changed, how it works, key paths, worker test notes and pending
-verification.
+Review previews put critical, high, medium and low findings first, preserve the
+recorded order within a severity, and report `findings_omitted_count`; the
+stored report is never reordered or truncated. The canonical Architect verdict
+and reason remain visible even when the run routes directly to a correction;
+the acceptance line presents that verdict as **PASS**, **CHANGES REQUIRED** or
+**BLOCKED**. A completed Implementer is not the same as verified tests:
+the coordinator says verification is pending until the supervisor runs it, and
+after each successful Implementer milestone adds a short developer summary of
+what changed, how it works, key paths, worker test notes and pending
+verification. Reviewer findings and Architect verdicts are summarized from the
+recorded report; role prompts, private reasoning and raw worker output are not
+replayed into routine chat.
 
 Plan approval is opt-in and the default stays automated. An ordinary request to
 see the plan is not an approval pause. Start with `plan_approval: true` only for
@@ -373,17 +384,33 @@ running ──verified interrupt──► paused ──resume──► running
 Operations reference: [references/operation.md](references/operation.md).
 Day-to-day recovery: [docs/troubleshooting.md](docs/troubleshooting.md).
 
-## Live worker progress
+## Live progress and chat reporting (post-v1.2.0)
+
+This follow-up is recorded separately from the v1.2.0 evidence below. It keeps
+the public `1.2.0` version and internal identifiers; it is not a release.
 
 Every stage records one durable attempt with its route, task, expected output,
 clock and supervisor identity. Reading progress is additive and read-only: it
 takes no write lock, never repairs or advances a run, and never changes the stage
 outcome.
 
-The coordinator posts one short line in the current chat before each call with
-the worker, model and effort, task and expected output. After the call it posts
-one short line with the outcome, measured duration and next action. Native
-in-flight updates depend on the client, and the terminal observer is optional.
+The single controlling chat is the primary surface. Before each call the
+coordinator posts one short line with the worker, model and effort, task and
+expected output. After the call it posts one short line with the outcome,
+measured duration and next action. On the same chat it also:
+
+- presents the bounded `plan_view` when a plan is created or status is
+  inspected, and the current blocking question when planning is blocked;
+- reports material Reviewer findings first and says how many were omitted;
+- states the canonical Architect verdict and reason, including a
+  `changes_required` verdict that routes straight to correction;
+- adds a short Implementer summary at a successful milestone, without claiming
+  tests passed;
+- holds the opt-in design conversation only after an explicit `plan_approval`
+  request.
+
+Native in-flight updates depend on the client, and the terminal observer is
+optional.
 
 - `orchestrator_status` now carries `stage_progress`: attempt identity, current
   stage, effective role/model/effort, batch, sanitized task and expected output,
@@ -412,7 +439,8 @@ the outcome, measured elapsed time and next action. It keeps following until the
 run reaches a final state, and `Ctrl-C` only closes the viewer. Redirected output
 uses a plain-text mode instead of in-place redraws.
 
-What each client actually does while a stage runs (verified in this batch):
+What each client actually does while a stage runs (verified on the follow-up
+revision):
 
 | Surface | Observed behaviour |
 |---|---|
@@ -424,7 +452,21 @@ What each client actually does while a stage runs (verified in this batch):
 Native notifications never replace the guarded foreground stage: a progress
 failure cannot advance, cancel or delay it.
 
+Remaining unverified client behavior:
+
+- Codex CLI `0.169.1` received the notifications but printed no in-chat progress
+  text, so its live view depends on the adjacent observer.
+- Codex desktop tool-card progress, in-app Stop and fresh-thread recovery were
+  not exercised; only the integrated WSL terminal observer was verified.
+- Claude desktop in-chat progress and its adjacent terminal observer were not
+  tested.
+- Authenticated long Claude stages and native Claude desktop stop/reconnect
+  behavior remain unverified.
+
 ## What changed in 1.2.0
+
+The live-progress and chat-reporting work above is post-v1.2.0 follow-up, not
+part of this v1.2.0 list.
 
 - An explicit Implementer `needs_architect` routes straight to durable strong
   diagnosis with its question, evidence and unknowns, not to a cheap retry.
@@ -448,6 +490,13 @@ failure cannot advance, cancel or delay it.
 
 ## Tested behavior
 
+**Post-v1.2.0 follow-up suite (offline, no model calls):** the accepted feature
+revision `720dd7c2e4c0b404cccc430e14f40c1f1385dd04` (`720dd7c`) ran **1,183
+tests, OK, 10 skipped** in 1,715.570 s on Python 3.10.12. The 10 skips are the
+same opt-in OpenCode introspection module. The documentation-only commit after it
+does not change `scripts/`. Earlier follow-up gates also passed; the 1,183 result
+is the final one. This is follow-up evidence, not a new v1.2.0 suite result.
+
 **Deterministic suite (offline, no model calls):** the final v1.2.0
 candidate ran **1,069 tests, with 1,059 passing and 10 skipped** on Python
 3.10.12 (1,779.7 s) at the stabilized code/test revision `16a0816`; the
@@ -459,6 +508,14 @@ All 10 skips are the opt-in OpenCode introspection module, which runs only when
 `opencode v2.2.7` separately. A guard replaces real `codex`, `claude` and
 `opencode` processes with fakes. CI configuration for Python 3.10, 3.12 and
 3.13 is unchanged; this candidate's local evidence is Python 3.10 only.
+
+**Follow-up client evidence:** native in-chat progress was observed on Claude
+Code CLI `2.1.247`. Codex CLI `0.169.1` received notifications but rendered only
+tool start/completion, so its live view needs the adjacent observer. Codex
+desktop was verified only through the integrated WSL terminal during a 32.92 s
+Implementer stage. Claude desktop in-chat progress and observer, Codex desktop
+tool-card progress and in-app Stop, and authenticated long Claude stages remain
+unverified. The follow-up did not measure quota savings or provider settlement.
 
 **Real end-to-end milestone (2026-11-16 → 2026-11-18):**
 
@@ -542,6 +599,7 @@ Reporting: [SECURITY.md](SECURITY.md).
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → exact recovery command |
 | [docs/versioning.md](docs/versioning.md) | Public release vs supervisor, schema and contract versions |
 | [docs/validation.md](docs/validation.md) | Test evidence, E2E milestone, explicit non-claims |
+| [docs/release-evidence/live-progress/](docs/release-evidence/live-progress/README.md) | Follow-up live-progress evidence, desktop fixture and operator steps |
 | [docs/security-model.md](docs/security-model.md) | Trust boundaries, permissions, limitations |
 | [docs/maintenance.md](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 handoff |
 | [docs/audit/](docs/audit/) | Independent audit findings and before/after probes |
@@ -556,6 +614,10 @@ byte-aware OpenCode exec checks, foreground stage announcements, the ordinary
 Medium planning trial, the `gpt-6.2-sol` Codex Architect default, and scoped
 Superpowers instructions for active runs. The candidate suite result is recorded
 in [docs/release-evidence/v1.2.0/](docs/release-evidence/v1.2.0/README.md).
+A post-v1.2.0 follow-up adds live stage progress, the read-only `status --follow`
+observer and richer single-chat reporting. Its 1,183-test evidence belongs to
+revision `720dd7c`, is kept separate from the v1.2.0 result, and is not a new
+release or tag.
 Codex + OpenCode Go E2E and interrupted-run recovery demonstrated at v1.0.0.
 Broader live compatibility and endurance testing remain ongoing. Earlier
 internal tags (`v3.0.0`, `v3.1.0-audit-candidate.1`) are historical engineering

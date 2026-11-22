@@ -4,7 +4,67 @@ All notable changes to Abdullah Orchestrator are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — 2026-11-22
+## [Unreleased] — 2026-11-23
+
+### Chat reporting (post-v1.2.0)
+
+### Added
+
+- One short before/after line in the controlling chat for every stage: role,
+  effective model and effort, batch or scope, task and expected output before the
+  call; outcome, measured elapsed time and next action after it.
+- Bounded `plan_view` on the planning result and `orchestrator_status`: revision
+  and approval state, summary rationale, main invariants, and up to eight batches
+  with title, goal, up to four acceptance criteria, risk and verification
+  purpose. Omitted counts and a developer-recap reference point to the full
+  durable plan; raw check argv is excluded.
+- The current blocked planning question and rationale, read only from the
+  attempt that still matches the loaded run, plan revision, amendment epoch and
+  job digest. An older proposal or superseded question is never presented as
+  current, and an amendment reports replanning pending.
+- Material-first Reviewer previews: critical, high, medium and low findings are
+  shown first in recorded order within a severity, with
+  `findings_omitted_count`; the authoritative report is never reordered or
+  truncated.
+- `orchestrator_recap detail=developer` is the no-model detail path for every
+  current-plan batch, invariant and acceptance criterion and every recorded
+  Reviewer finding with location, evidence, confidence and disposition. Those
+  plan/finding lists have no pagination bound; other developer-recap lists keep
+  their labelled bounds.
+- The canonical Architect verdict and reason remain visible in status and the
+  accept result, including a `changes_required` verdict that routes directly to
+  a correction. The acceptance line presents that verdict as **PASS**,
+  **CHANGES REQUIRED** or **BLOCKED**.
+- Implementer milestones add a short developer summary — what changed, how it
+  works, key paths or symbols, worker test notes and pending supervisor
+  verification — without treating a completed Implementer as verified tests.
+- Opt-in design consultation through `plan_approval: true`. With that explicit
+  request the Architect gives concise rationale, flags consequential forks with
+  trade-offs and a recommendation, and uses a blocker for a question that must
+  be answered before a valid plan. A material reply is recorded with
+  `orchestrator_amend` and replanned; accepting the unchanged plan shows the
+  existing human `approve-plan` action without a needless replan. Ordinary plans
+  stay automated.
+
+### Fixed
+
+- Plan and finding detail is reachable from the same run: developer-recap
+  artifacts resolve inside the run directory, and blocked-plan evidence is bound
+  to the loaded run, current plan job, revision, amendment epoch and digest.
+  Foreign, stale, pre-correction or older-revision artifacts are not read or
+  published.
+- A superseded plan attempt is retired rather than silently reused, and the
+  answered blocking question stops being reported after an amendment.
+
+### Verification
+
+- The accepted follow-up revision `720dd7c2e4c0b404cccc430e14f40c1f1385dd04`
+  ran **1,183 tests, OK, 10 skipped** in 1,715.570 s on Python 3.10.12. The 10
+  skips are the opt-in OpenCode V2 introspection module. The documentation
+  commit after it does not change `scripts/`.
+- The original v1.2.0 result remains **1,069 tests, 1,059 passed, 10 skipped**
+  at the stabilized code/test revision `16a0816` (recorded at `9a150de`); it is
+  not replaced by the follow-up count.
 
 ### Live worker progress (post-v1.2.0)
 
