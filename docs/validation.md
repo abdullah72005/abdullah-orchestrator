@@ -474,10 +474,9 @@ repository tree against `git ls-files`.
   foreground stage and interruption behavior.
   Implemented: `orchestrator_status.stage_progress`, MCP progress notifications
   and the read-only `status --follow` observer. Evidence below.
-- [ ] Remaining desktop surfaces: in-app Codex desktop Stop and live worker
-  detail, and the Claude desktop presentation. Use the adjacent
-  [terminal observer](installation.md#windows-codex-desktop-with-its-agent-in-wsl)
-  in the meantime.
+- [x] Verify the Windows Codex desktop WSL terminal observer during a live
+  Implementer stage. In-app Stop and native tool-card progress remain unverified.
+- [ ] Verify the Claude desktop presentation with the adjacent terminal observer.
 
 ### Live progress evidence (post-v1.2.0)
 
@@ -490,7 +489,7 @@ replace the orchestrator-level checks below.
 |---|---|---|
 | Claude Code CLI | `2.1.247` | Fixture probe: `progressToken: 2` and native TUI ticks. Correction rerun (real orchestrator MCP, disposable repo, delayed fixture worker, loopback model): the TUI rendered `Implementer — DeepSeek opencode-go/deepseek-v4.1-flash · implement · Batch 1/1 … preparing the stage · 1s`, ticking to `30s`, then `step finished · 33s`, `Called orchestrator`. The recorded attempt end is 33.75 s on the containment candidate (`d724f28`). Native rendering confirmed. |
 | Codex CLI | `0.169.1` | Fixture probe: integer `progressToken: 1`, six ordered notifications during a three-second call, terminal printed only `mcp: probe/probe_wait started` / `(completed)`. Containment-candidate rerun (real orchestrator MCP, loopback model, 33.7 s delayed stage): `mcp: orchestrator/orchestrator_stage started` … `(completed)` with no progress text. The adjacent `status --follow` pty observer ticked `elapsed 1.0s` … `33.3s`, ended `measured 33.7s`, `outcome: complete`, and showed the next stage's safe task (`Run supervisor verification checks`) and expected output. |
-| Codex desktop, WSL agent | prior installed host | The v1.2.0 smoke showed the tool card and whole-turn duration only. Live detail and in-app Stop remain unverified; use the integrated-terminal observer. |
+| Codex desktop, WSL agent | `26.1111.2228.0` Windows package | The desktop chat ran one Implementer stage. The integrated-terminal observer showed elapsed time at 0.8, 2.3, 17.3 and 32.4 s before showing completion at a measured 32.92 s. The run reached `verify` with the edit present and no active job or check. [Smoke evidence](release-evidence/live-progress/README.md#windows-codex-desktop-result) |
 | Claude desktop | n/a | No suitable desktop profile was available in this batch. Pending. |
 
 The fixture and the exact operator steps are recorded with the batch evidence.

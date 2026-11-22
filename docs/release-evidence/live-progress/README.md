@@ -25,13 +25,13 @@ desktop agent runs in WSL, including every printed environment entry, for
 example:
 
 ```toml
-[mcp_servers.abdullah-orchestrator]
+[mcp_servers.abdullah-live-progress-smoke]
 command = "/usr/bin/python3"
 args = ["<CHECKOUT>/scripts/orchestrator.py", "mcp"]
 startup_timeout_sec = 30
 tool_timeout_sec = 18000
 
-[mcp_servers.abdullah-orchestrator.env]
+[mcp_servers.abdullah-live-progress-smoke.env]
 ABDULLAH_STATE_DIR = "/tmp/opencode/desktop-live-progress/runs"
 ABDULLAH_CONFIG = "/tmp/opencode/desktop-live-progress/config.json"
 HOME = "/tmp/opencode/desktop-live-progress/home"
@@ -74,3 +74,28 @@ response alone.
 
 Deterministic checks for the same behaviours live in
 `scripts/tests/test_live_stage_progress.py`.
+
+## Windows Codex desktop result
+
+The operator ran one Implementer stage from Windows Codex desktop with its
+agent in Ubuntu WSL. The registered Windows package was `26.1111.2228.0`.
+The supervisor checkout was `435012e`, with the same runtime and tests as
+`d724f28`. The integrated terminal opened the observer through the Windows
+`wsl.exe` launcher because the fixture's `/tmp` path gave a file-not-found
+error when invoked directly.
+
+- Run `20261122T150221-f56c5bfd`, attempt `8b06414f5fa841e1`.
+- The viewer showed the next Implementer, task and expected report before
+  dispatch. During the stage, the operator saw `elapsed 0.8s`, `elapsed 2.3s`,
+  `elapsed 17.3s` and `elapsed 32.4s`, including `worker running` and `worker
+  step finished`. The final block reported `complete`, `measured 32.9s` and
+  the supervisor verification task and expected output.
+- An independent read of the run journal confirmed one matching Implementer
+  start/end pair with a measured 32.92 s. The run reached `verify` with the
+  fixture edit in `app.py` and no active worker or verification check.
+  Journal SHA-256 `7565a0faf960400934ed1e5f927558edcb9f5c8ab63ed85dd213c95bf35a0364`.
+
+This checks the terminal fallback in the actual Codex desktop. Native
+tool-card progress, desktop Stop and viewer reattachment during this stage
+remain unverified. The documented programmatic interruption and observer
+tests cover their respective supervisor paths. Claude desktop remains open.

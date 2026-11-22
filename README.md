@@ -374,7 +374,7 @@ What each client actually does while a stage runs (verified in this batch):
 |---|---|
 | Claude Code CLI `2.1.247` | Renders native MCP progress in the TUI. A real 38.6 s stage showed the role, route, batch, activity and ticking seconds, then `Called orchestrator` and `Crunched for 39s`. |
 | Codex CLI `0.169.1` | Supplies an integer progress token and receives the notifications, but its terminal prints only `mcp: … started` / `(completed)`. The adjacent `status --follow` pane ticked elapsed time, activity, measured duration and next action during the same 36.4 s stage. |
-| Codex desktop (Windows + WSL agent) | The v1.2.0 smoke showed only the tool card and turn duration. Native MCP progress and in-app Stop remain unverified; use `status --follow` in the integrated WSL terminal. Fixture: [docs/release-evidence/live-progress](docs/release-evidence/live-progress/README.md). |
+| Codex desktop (Windows + WSL agent) | Verified the `status --follow` view in the integrated terminal during a 32.92 s Implementer stage. It showed live elapsed time, activity, outcome and the next stage. Native tool-card progress and in-app Stop remain unverified. [Smoke evidence](docs/release-evidence/live-progress/README.md#windows-codex-desktop-result) |
 | Claude desktop | No suitable desktop session was available in this batch; use an adjacent terminal observer with the same fixture. |
 
 Native notifications never replace the guarded foreground stage: a progress

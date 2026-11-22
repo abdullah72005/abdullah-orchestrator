@@ -131,13 +131,12 @@ and run the read-only observer against the same run:
 python3 <SKILL_DIR>/scripts/orchestrator.py status --run <RUN_ID> --follow
 ```
 
-In the v1.2.0 installed-host smoke, Codex desktop showed only the tool card and
-whole-turn duration; MCP progress notifications were not displayed. That GUI
-behaviour has not been re-verified in this batch, so treat the integrated
-terminal observer as the supported view there rather than claiming native
-desktop rendering. Claude desktop likewise uses an adjacent terminal observer.
-The terminal view never advances, cancels or repairs the run, so quitting it
-cannot change the stage outcome.
+The post-v1.2.0 Windows Codex desktop smoke verified live progress in the
+integrated WSL terminal. When the terminal cannot resolve the supervisor's
+fixture path directly, use `wsl.exe` with the supervisor's distribution and
+run-state environment to launch the observer. Native desktop tool-card
+progress remains unverified. The adjacent terminal for Claude desktop awaits a
+desktop smoke. [Windows desktop result](release-evidence/live-progress/README.md#windows-codex-desktop-result)
 
 Prepare a disposable check with
 `docs/release-evidence/live-progress/desktop_fixture.py`; its README records the
