@@ -37,6 +37,35 @@ uses [Semantic Versioning](https://semver.org/).
 - `journal_tail` reads a bounded trailing window instead of the whole journal,
   so heartbeats never scan run history or worker logs.
 
+### Live worker progress · correction 1
+
+- Progress observers are bound to the exact attempt admitted under the existing
+  run lock, not to request arrival time. A refused concurrent call receives no
+  updates and cannot mirror another call's activity.
+- The progress sink closes atomically before the final tool response: a sender
+  that was waiting on a heartbeat read or the stream lock is dropped, so no
+  notification can follow the response. Cancellation and connection teardown
+  close the sink by the same path; malformed `_meta` and invalid tokens disable
+  progress without affecting the stage.
+- Verification progress always uses the safe label, including for recorded
+  history and the upcoming-stage preview; check argv is never published.
+  Progress rendering strips C1 controls as well as ANSI/control bytes.
+- Lifecycle activity is attempt-scoped with explicit admission, launch, report,
+  check and completion observations; a new attempt cannot inherit a previous
+  attempt's activity. A recorded owner without a process start time is
+  unproven, never active.
+- Structured worker tails are read only from the producing OpenCode jsonl
+  stream inside the run's job directory; malformed or untyped records are
+  ignored. Heartbeat reads are length-bounded, and the shared full-journal tail
+  used by recaps keeps its previous semantics.
+- Unexpected stage exceptions keep the prior no-partial-save policy while
+  recording a truthful `error` attempt end.
+- The terminal observer shows expected output while waiting and the next
+  role/task/expected after a completed stage, waits briefly for the matching end
+  record when a final save precedes the journal append, refreshes plain-mode
+  heartbeats only after a write, falls back to append rendering on narrow
+  terminals and clears leftover rows when a block shrinks.
+
 ### v1.2.0 release closure
 
 Same public `1.2.0` version and internal identifiers (supervisor `3.1.0`,

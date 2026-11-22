@@ -131,10 +131,17 @@ and run the read-only observer against the same run:
 python3 <SKILL_DIR>/scripts/orchestrator.py status --run <RUN_ID> --follow
 ```
 
-Codex desktop does not draw MCP progress notifications; the observer is the
-supported view there. Claude desktop likewise uses an adjacent terminal observer.
+In the v1.2.0 installed-host smoke, Codex desktop showed only the tool card and
+whole-turn duration; MCP progress notifications were not displayed. That GUI
+behaviour has not been re-verified in this batch, so treat the integrated
+terminal observer as the supported view there rather than claiming native
+desktop rendering. Claude desktop likewise uses an adjacent terminal observer.
 The terminal view never advances, cancels or repairs the run, so quitting it
 cannot change the stage outcome.
+
+Prepare a disposable check with
+`docs/release-evidence/live-progress/desktop_fixture.py`; its README records the
+exact desktop operator steps and pass criteria.
 
 ### Native Windows Codex desktop
 

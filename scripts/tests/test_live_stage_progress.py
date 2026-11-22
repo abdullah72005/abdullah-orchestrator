@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import select
 import subprocess
@@ -160,6 +161,14 @@ class AttemptIdentityTests(ProgressFixture):
         self.assertFalse(reused["active"])
         self.assertEqual(reused["ownership"], "stale")
         self.assertIsNone(reused["elapsed_seconds"])
+        _append(self.folder, {"event": "stage_end", "attempt": "synthetic0002",
+                              "outcome": "complete"})
+        self.synthetic_start(attempt="synthetic0003", owner_pid_start=None,
+                             monotonic_started=round(time.monotonic() - 1, 3))
+        unproven = self.snapshot()
+        self.assertFalse(unproven["active"])
+        self.assertEqual(unproven["ownership"], "unknown")
+        self.assertIn("could not be proven", unproven["activity"])
 
     def test_paused_run_does_not_tick(self):
         self.synthetic_start(monotonic_started=round(time.monotonic() - 5, 3))
@@ -188,14 +197,30 @@ class AttemptIdentityTests(ProgressFixture):
         self.assertEqual(before, after)
         self.assertEqual(before_stat, after_stat)
 
+    def test_unexpected_failure_keeps_no_partial_save_and_records_error(self):
+        before = (self.folder / "state.json").read_bytes()
+        with patch.object(orc, "advance", side_effect=TypeError("boom")):
+            with self.assertRaises(TypeError):
+                self.stage()
+        self.assertEqual((self.folder / "state.json").read_bytes(), before)
+        ends = [row for row in _records(self.folder) if row.get("event") == "stage_end"]
+        self.assertTrue(ends)
+        self.assertEqual(ends[-1]["outcome"], "error")
+        self.assertIn("TypeError", ends[-1]["error"])
+        snapshot = self.snapshot()
+        self.assertFalse(snapshot["active"])
+        self.assertEqual(snapshot["outcome"], "error")
+
     def test_task_metadata_is_bounded_and_terminal_safe(self):
-        hostile = "Implement \x1b[31mred\x1b[0m\nsecond\ttab" + "x" * 400
+        hostile = ("Implement \x1b[31mred\x1b[0m\nsecond\ttab"
+                   "\x9b31mC1\x9d" + "x" * 400)
         self.synthetic_start(task=hostile, expected="ok\nAlso bad \x07" + "y" * 400)
         snapshot = self.snapshot()
         for value in (snapshot["task"], snapshot["expected"]):
             self.assertNotIn("\x1b", value)
             self.assertNotIn("\n", value)
             self.assertNotIn("\t", value)
+            self.assertFalse(any(127 <= ord(char) <= 159 for char in value))
             self.assertLessEqual(len(value), 200)
         self.assertNotIn("\x1b", snapshot["activity"])
 
@@ -205,14 +230,34 @@ class AttemptIdentityTests(ProgressFixture):
         state["plan"] = {"batches": [{"title": "b", "goal": "g",
                                       "checks": [["echo", "SECRET-CHECK-ARGV"]]}]}
         (self.folder / "state.json").write_text(json.dumps(state))
+        raw = ('Run supervisor verification: [["echo", '
+               '"TEST-ONLY-ARGV-MARKER"]]')
         _append(self.folder, {"event": "stage_start", "stage": "verify",
                               "role": None, "agent_label": "Supervisor",
+                              "task": raw,
                               "attempt": "synthetic-verify",
                               "monotonic_started": round(time.monotonic(), 3),
                               **_identity()})
         snapshot = self.snapshot()
         self.assertEqual(snapshot["task"], orc._VERIFICATION_TASK)
-        self.assertNotIn("SECRET-CHECK-ARGV", snapshot["task"])
+        self.assertNotIn("TEST-ONLY-ARGV-MARKER", snapshot["task"])
+        # The upcoming stage preview must be safe even when the phase is verify.
+        self.assertEqual(snapshot["next"]["task"], orc._VERIFICATION_TASK)
+        self.assertNotIn("SECRET-CHECK-ARGV", json.dumps(snapshot["next"]))
+
+    def test_activity_never_inherits_a_previous_attempt(self):
+        _append(self.folder, {"event": "stage_start", "stage": "verify",
+                              "attempt": "old-attempt",
+                              "monotonic_started": round(time.monotonic() - 20, 3),
+                              **_identity()})
+        _append(self.folder, {"event": "stage_activity",
+                              "activity": "verification_complete",
+                              "attempt": "old-attempt"})
+        _append(self.folder, {"event": "stage_end", "stage": "verify",
+                              "attempt": "old-attempt", "outcome": "complete",
+                              "elapsed_seconds": 3.0})
+        self.synthetic_start()
+        self.assertEqual(self.snapshot()["activity"], "preparing the stage")
 
     def test_worker_stream_activity_is_bounded_and_content_free(self):
         job_dir = self.folder / "jobs" / "job-1"
@@ -225,24 +270,66 @@ class AttemptIdentityTests(ProgressFixture):
             "not-json",
         ])
         (job_dir / "events.log").write_text(payload)
-        label = orc._worker_stream_activity(self.folder, {"path": str(job_dir)})
+        job = {"path": str(job_dir), "route": {"provider": "opencode"}}
+        label = orc._worker_stream_activity(self.folder, job)
         self.assertEqual(label, "worker step running")
         self.assertNotIn("SECRET", label)
         (job_dir / "events.log").write_text('{"type":"unknown"}\nnot json\n')
-        self.assertIsNone(orc._worker_stream_activity(self.folder, {"path": str(job_dir)}))
+        self.assertIsNone(orc._worker_stream_activity(self.folder, job))
 
-    def test_oversized_single_journal_record_stays_readable(self):
+    def test_malformed_structured_worker_records_are_ignored(self):
+        job_dir = self.folder / "jobs" / "job-1"
+        job_dir.mkdir(parents=True)
+        (job_dir / "events.log").write_text(
+            '{"type":{"unexpected":true}}\n'
+            '{"type":["tool"]}\n'
+            '{"type":null}\n'
+            '{"type":"tool","part":{"input":"SECRET"}}\n')
+        job = {"path": str(job_dir), "route": {"provider": "opencode"}}
+        self.assertEqual(orc._worker_stream_activity(self.folder, job),
+                         "worker using a tool")
+
+    def test_plain_worker_providers_are_never_parsed(self):
+        job_dir = self.folder / "jobs" / "job-1"
+        job_dir.mkdir(parents=True)
+        (job_dir / "events.log").write_text('{"type":"tool"}\n')
+        for provider in ("codex", "claude"):
+            job = {"path": str(job_dir), "route": {"provider": provider}}
+            self.assertIsNone(orc._worker_stream_activity(self.folder, job))
+
+    def test_worker_stream_outside_the_jobs_dir_is_not_read(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "events.log").write_text('{"type":"tool"}\n')
+        job = {"path": str(outside), "route": {"provider": "opencode"}}
+        self.assertIsNone(orc._worker_stream_activity(self.folder, job))
+
+    def test_full_journal_reads_preserve_rows_after_large_newer_records(self):
+        first = {"event": "run_created", "attempt": "old"}
+        _append(self.folder, first)
         huge = {"event": "stage_start", "stage": "implement", "attempt": "huge",
-                "payload": "x" * (300 * 1024)}
+                "payload": "x" * (200 * 1024)}
         with (self.folder / orc.JOURNAL_FILE).open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(huge) + "\n")
-        tail = orc.journal_tail(self.folder, 5)
-        self.assertEqual(tail[-1]["attempt"], "huge")
+        _append(self.folder, {"event": "stage_end", "attempt": "last"})
+        tail = orc.journal_tail(self.folder, 50)
+        self.assertEqual(tail[-1]["attempt"], "last")
+        self.assertIn("old", [row.get("attempt") for row in tail])
+        bounded = orc.journal_tail_bounded(self.folder, 50, tail_bytes=64 * 1024)
+        self.assertEqual(bounded[-1]["attempt"], "last")
+        self.assertNotIn("old", [row.get("attempt") for row in bounded])
+
+    def test_bounded_tail_never_reads_past_its_window(self):
+        path = self.folder / "tail.bin"
+        path.write_bytes(b"a" * 5000 + b"\n" + b"b" * 5000)
+        data = orc._read_tail_bytes(path, 1024)
+        self.assertLessEqual(len(data), 1024)
+        self.assertFalse(data.startswith(b"a"), data[:20])
 
     def test_missing_worker_stream_keeps_waiting_activity(self):
         self.synthetic_start()
         snapshot = self.snapshot()
-        self.assertEqual(snapshot["activity"], "supervisor processing the worker report")
+        self.assertEqual(snapshot["activity"], "preparing the stage")
 
 
 class ProgressMessageTests(unittest.TestCase):
@@ -268,10 +355,10 @@ class ProgressMessageTests(unittest.TestCase):
 
 
 class ProgressEmitterTests(unittest.TestCase):
-    def _snapshot(self, started, *, active=True, ownership="active",
+    def _snapshot(self, *, attempt="attempt-A", active=True, ownership="active",
                   elapsed=1.0, source="live", outcome=None):
         return {"available": True, "active": active, "ownership": ownership,
-                "attempt_monotonic_started": started, "elapsed_seconds": elapsed,
+                "attempt_id": attempt, "elapsed_seconds": elapsed,
                 "elapsed_source": source, "outcome": outcome, "stage": "implement",
                 "agent_label": "Implementer", "batch": {"label": "Batch 1/1"},
                 "model": "gpt-5.1", "effort": "high", "activity": "worker running"}
@@ -279,33 +366,43 @@ class ProgressEmitterTests(unittest.TestCase):
     def test_updates_are_ordered_and_bounded(self):
         sent = []
         stop = threading.Event()
-        now = time.monotonic()
 
         def reader(_run_id):
-            value = self._snapshot(now)
-            value["elapsed_seconds"] = round(time.monotonic() - now, 1)
+            value = self._snapshot()
+            value["elapsed_seconds"] = round(time.monotonic() % 100, 1)
             return value
 
-        def send(sequence, token, message):
-            sent.append((sequence, token, message))
+        def send(token, sequence, message):
+            sent.append((token, sequence, message))
             if sequence >= 2:
                 stop.set()
+            return True
 
-        orc._emit_stage_progress(send, 7, "run", now, stop,
+        orc._emit_stage_progress(send, 7, "run", {"attempt": "attempt-A"}, stop,
                                  snapshot_reader=reader, interval=0.05)
         self.assertGreaterEqual(len(sent), 2)
-        self.assertEqual([row[0] for row in sent], list(range(1, len(sent) + 1)))
-        self.assertTrue(all(row[1] == 7 for row in sent))
+        self.assertEqual([row[1] for row in sent], list(range(1, len(sent) + 1)))
+        self.assertTrue(all(row[0] == 7 for row in sent))
         self.assertTrue(all(len(row[2]) <= 240 for row in sent))
 
-    def test_older_attempt_is_never_reported(self):
+    def test_other_attempt_is_never_reported(self):
         sent = []
         stop = threading.Event()
         threading.Timer(0.3, stop.set).start()
         orc._emit_stage_progress(
-            lambda *row: sent.append(row), 1, "run", time.monotonic(), stop,
-            snapshot_reader=lambda _run_id: self._snapshot(time.monotonic() - 30),
+            lambda *row: sent.append(row), 1, "run", {"attempt": "attempt-A"}, stop,
+            snapshot_reader=lambda _run_id: self._snapshot(attempt="attempt-B"),
             interval=0.05)
+        self.assertEqual(sent, [])
+
+    def test_no_admission_means_no_updates(self):
+        sent = []
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        orc._emit_stage_progress(
+            lambda *row: sent.append(row), 1, "run", {}, stop,
+            snapshot_reader=lambda _run_id: self._snapshot(), interval=0.05,
+            admission_timeout=1.0)
         self.assertEqual(sent, [])
 
     def test_unavailable_snapshot_is_not_reported(self):
@@ -313,21 +410,273 @@ class ProgressEmitterTests(unittest.TestCase):
         stop = threading.Event()
         threading.Timer(0.3, stop.set).start()
         orc._emit_stage_progress(
-            lambda *row: sent.append(row), 1, "run", time.monotonic(), stop,
+            lambda *row: sent.append(row), 1, "run", {"attempt": "attempt-A"}, stop,
             snapshot_reader=lambda _run_id: {"available": False}, interval=0.05)
         self.assertEqual(sent, [])
 
     def test_completion_sends_one_final_update(self):
         sent = []
-        now = time.monotonic()
         orc._emit_stage_progress(
-            lambda *row: sent.append(row), "tok", "run", now, threading.Event(),
+            lambda *row: sent.append(row), "tok", "run", {"attempt": "attempt-A"},
+            threading.Event(),
             snapshot_reader=lambda _run_id: self._snapshot(
-                now, active=False, ownership="complete", elapsed=2.5,
+                active=False, ownership="complete", elapsed=2.5,
                 source="recorded", outcome="complete"),
             interval=0.05)
         self.assertEqual(len(sent), 1)
         self.assertIn("complete", sent[0][2])
+
+
+class ProgressSinkTests(unittest.TestCase):
+    def test_send_is_dropped_after_close(self):
+        stream = io.StringIO()
+        send, close = orc._progress_sink(stream, threading.Lock())
+        self.assertTrue(send("tok", 1, "first"))
+        close()
+        self.assertFalse(send("tok", 2, "second"))
+        self.assertIn("first", stream.getvalue())
+        self.assertNotIn("second", stream.getvalue())
+
+    def test_close_waits_for_an_in_flight_write_and_blocks_later_ones(self):
+        released = threading.Event()
+        entered = threading.Event()
+
+        class BlockingStream:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, text):
+                entered.set()
+                released.wait(5)
+                self.writes.append(text)
+
+            def flush(self):
+                pass
+
+        stream = BlockingStream()
+        send, close = orc._progress_sink(stream, threading.Lock())
+        sender = threading.Thread(target=send, args=("tok", 1, "in flight"))
+        sender.start()
+        self.assertTrue(entered.wait(5))
+        closer = threading.Thread(target=close)
+        closer.start()
+        time.sleep(0.2)
+        self.assertTrue(closer.is_alive(), "close did not wait for the write")
+        released.set()
+        sender.join(5)
+        closer.join(5)
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(send("tok", 2, "late"))
+        self.assertEqual(len(stream.writes), 1)
+
+
+class _LineInput:
+    """Blocking line source for an in-process mcp_serve call."""
+
+    def __init__(self):
+        self.items = queue.Queue()
+
+    def push(self, request):
+        self.items.put(json.dumps(request) + "\n")
+
+    def close(self):
+        self.items.put(None)
+
+    def __iter__(self):
+        while True:
+            item = self.items.get()
+            if item is None:
+                return
+            yield item
+
+
+class _LineOutput:
+    def __init__(self):
+        self.items = queue.Queue()
+
+    def write(self, text):
+        self.items.put(text)
+
+    def flush(self):
+        pass
+
+    def messages(self, timeout=5.0, count=None):
+        collected = []
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                text = self.items.get(timeout=0.05)
+            except queue.Empty:
+                if count is not None and len(collected) >= count:
+                    break
+                continue
+            for line in text.splitlines():
+                if line.strip():
+                    collected.append(json.loads(line))
+            if count is not None and len(collected) >= count:
+                break
+        return collected
+
+    def quiet(self, seconds=0.4):
+        try:
+            text = self.items.get(timeout=seconds)
+        except queue.Empty:
+            return True
+        return not text.strip()
+
+
+class McpAdmissionBindingTests(unittest.TestCase):
+    def _snapshot(self, attempt="attempt-A", *, active=True):
+        return {"available": True, "active": active, "ownership": "active",
+                "attempt_id": attempt, "elapsed_seconds": 1.0,
+                "elapsed_source": "live", "outcome": None, "stage": "implement",
+                "agent_label": "Implementer", "batch": {"label": "Batch 1/1"},
+                "model": "gpt-5.1", "effort": "high", "activity": "worker running"}
+
+    def test_only_the_admitted_attempt_reports_and_the_refused_call_is_silent(self):
+        admitted = threading.Event()
+        release = threading.Event()
+
+        def tool(name, arguments, on_admit=None):
+            if arguments["run_id"] == "won":
+                on_admit({"attempt": "attempt-A"})
+                admitted.set()
+                release.wait(10)
+                return {"ok": True}
+            raise RuntimeError("Another supervisor owns this run")
+
+        instream, outstream = _LineInput(), _LineOutput()
+        thread = threading.Thread(target=orc.mcp_serve,
+                                  args=(instream, outstream), daemon=True)
+        with patch.object(orc, "_mcp_tool_call", side_effect=tool), \
+                patch.object(orc, "stage_progress",
+                             side_effect=lambda _run: self._snapshot()):
+            thread.start()
+            try:
+                instream.push({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "orchestrator_stage",
+                                          "arguments": {"run_id": "won"},
+                                          "_meta": {"progressToken": "t1"}}})
+                self.assertTrue(admitted.wait(5), "admission was not reported")
+                instream.push({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                               "params": {"name": "orchestrator_stage",
+                                          "arguments": {"run_id": "refused"},
+                                          "_meta": {"progressToken": "t2"}}})
+                collected = []
+
+                def until(request_id, timeout=5.0):
+                    end = time.monotonic() + timeout
+                    while time.monotonic() < end:
+                        for message in outstream.messages(timeout=0.2, count=None):
+                            collected.append(message)
+                            if message.get("id") == request_id:
+                                return message
+                    raise AssertionError("no response for %r" % (request_id,))
+
+                # The first update arrives before the refused response.
+                def next_message(timeout=5.0):
+                    end = time.monotonic() + timeout
+                    while time.monotonic() < end:
+                        for message in outstream.messages(timeout=0.2, count=None):
+                            collected.append(message)
+                            return message
+                    raise AssertionError("no MCP message arrived")
+
+                refused = None
+                saw_progress = False
+                end = time.monotonic() + 5
+                while time.monotonic() < end and not saw_progress:
+                    message = next_message(1.0)
+                    if message.get("method") == "notifications/progress":
+                        saw_progress = True
+                        self.assertEqual(message["params"]["progressToken"], "t1")
+                    elif message.get("id") == 2:
+                        refused = message
+                    elif message.get("id") == 1:
+                        raise AssertionError("stage finished before any update")
+                self.assertTrue(saw_progress, "the admitted call produced no update")
+                while refused is None:
+                    message = next_message(1.0)
+                    if message.get("id") == 2:
+                        refused = message
+                self.assertTrue(refused["result"]["isError"])
+                release.set()
+                final = until(1)
+                self.assertEqual(final.get("id"), 1)
+                tokens = [row["params"].get("progressToken")
+                          for row in collected
+                          if row.get("method") == "notifications/progress"]
+                self.assertNotIn("t2", tokens)
+                self.assertTrue(outstream.quiet(0.4))
+            finally:
+                instream.close()
+                thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+
+    def test_read_held_past_the_reply_is_dropped(self):
+        read_entered = threading.Event()
+        allow_read = threading.Event()
+
+        def tool(name, arguments, on_admit=None):
+            on_admit({"attempt": "attempt-A"})
+            read_entered.wait(5)
+            return {"ok": True}
+
+        def reader(_run_id):
+            read_entered.set()
+            allow_read.wait(10)
+            return self._snapshot()
+
+        instream, outstream = _LineInput(), _LineOutput()
+        thread = threading.Thread(target=orc.mcp_serve,
+                                  args=(instream, outstream), daemon=True)
+        with patch.object(orc, "_mcp_tool_call", side_effect=tool), \
+                patch.object(orc, "stage_progress", side_effect=reader):
+            thread.start()
+            try:
+                instream.push({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "orchestrator_stage",
+                                          "arguments": {"run_id": "run"},
+                                          "_meta": {"progressToken": 9}}})
+                self.assertTrue(read_entered.wait(5))
+                messages = outstream.messages(timeout=5, count=1)
+                self.assertEqual(messages[0].get("id"), 1)
+                allow_read.set()
+                self.assertTrue(outstream.quiet(0.6),
+                                "progress was sent after the final response")
+            finally:
+                instream.close()
+                thread.join(timeout=10)
+
+    def test_malformed_meta_or_invalid_token_disables_progress(self):
+        seen = {}
+
+        def tool(name, arguments, on_admit=None):
+            seen["on_admit"] = on_admit
+            return {"ok": True}
+
+        for meta in ({"progressToken": True}, {"progressToken": {"nested": 1}},
+                     ["not", "an", "object"]):
+            instream, outstream = _LineInput(), _LineOutput()
+            thread = threading.Thread(target=orc.mcp_serve,
+                                      args=(instream, outstream), daemon=True)
+            with patch.object(orc, "_mcp_tool_call", side_effect=tool), \
+                    patch.object(orc, "stage_progress",
+                                 side_effect=lambda _run: self._snapshot()):
+                thread.start()
+                try:
+                    instream.push({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "orchestrator_stage",
+                                              "arguments": {"run_id": "run"},
+                                              "_meta": meta}})
+                    messages = outstream.messages(timeout=5, count=1)
+                    self.assertEqual(messages[0].get("id"), 1)
+                    self.assertIsNone(seen.get("on_admit"))
+                    self.assertTrue(outstream.quiet(0.3),
+                                    "progress was emitted for %r" % (meta,))
+                finally:
+                    instream.close()
+                    thread.join(timeout=10)
 
 
 class McpProgressTransportTests(ProgressFixture):
@@ -556,6 +905,126 @@ class TerminalViewerTests(ProgressFixture):
         self.assertIn("Implementer".lower(), text.lower())
         self.assertIn(attempt, text)
         self.assertIn("elapsed", text)
+
+    def test_waiting_view_shows_role_task_and_expected_output(self):
+        out = io.StringIO()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env):
+            orc.status_follow(self.run_id, out, inplace=True, interval=0.05,
+                              max_seconds=0.3)
+        text = out.getvalue()
+        self.assertIn("next:", text)
+        self.assertIn("next task:", text)
+        self.assertIn("next expected:", text)
+
+    def test_between_stages_shows_outcome_and_next_preview(self):
+        self.stage()  # plan completes; next stage is implement
+        out = io.StringIO()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env):
+            orc.status_follow(self.run_id, out, inplace=True, interval=0.05,
+                              max_seconds=0.3)
+        text = out.getvalue()
+        self.assertIn("outcome: complete", text)
+        self.assertIn("next:", text)
+        self.assertIn("next task:", text)
+        self.assertIn("next expected:", text)
+
+    def test_plain_heartbeat_refires_for_unchanged_activity(self):
+        self.stage()  # plan completed; activity/outcome no longer change
+        out = io.StringIO()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env):
+            orc.status_follow(self.run_id, out, inplace=False, interval=0.05,
+                              heartbeat=0.2, max_seconds=0.55)
+        self.assertGreaterEqual(out.getvalue().count("run "), 2)
+
+    def test_final_state_waits_for_the_matching_end_record(self):
+        self.synthetic_start(monotonic_started=round(time.monotonic() - 3, 3))
+        state = json.loads((self.folder / "state.json").read_text())
+        state["status"] = "complete"
+        (self.folder / "state.json").write_text(json.dumps(state))
+        out = io.StringIO()
+
+        def append_end():
+            time.sleep(0.25)
+            _append(self.folder, {"event": "stage_end", "stage": "implement",
+                                  "attempt": "synthetic0001",
+                                  "elapsed_seconds": 3.4, "outcome": "complete",
+                                  "next_action": "none"})
+
+        writer = threading.Thread(target=append_end)
+        writer.start()
+        started = time.monotonic()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env):
+            orc.status_follow(self.run_id, out, inplace=True, interval=0.05,
+                              max_seconds=3.0, final_grace=2.0)
+        writer.join(5)
+        self.assertLess(time.monotonic() - started, 2.0)
+        text = out.getvalue()
+        self.assertIn("measured 3.4s", text)
+        self.assertIn("stage finished (complete)", text)
+
+    def test_final_state_without_end_exits_after_the_grace_bound(self):
+        self.synthetic_start(monotonic_started=round(time.monotonic() - 3, 3))
+        state = json.loads((self.folder / "state.json").read_text())
+        state["status"] = "complete"
+        (self.folder / "state.json").write_text(json.dumps(state))
+        out = io.StringIO()
+        started = time.monotonic()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env):
+            orc.status_follow(self.run_id, out, inplace=True, interval=0.05,
+                              max_seconds=3.0, final_grace=0.4)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIn("run is finished", out.getvalue())
+
+    def test_narrow_output_falls_back_to_plain_append(self):
+        self.stage()
+        out = io.StringIO()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env), \
+                patch.object(orc.shutil, "get_terminal_size",
+                             return_value=os.terminal_size((20, 24))):
+            orc.status_follow(self.run_id, out, inplace=True, interval=0.05,
+                              max_seconds=0.25)
+        text = out.getvalue()
+        self.assertNotIn("\x1b[", text)
+        self.assertIn("expected:", text)
+
+    def test_shrinking_block_clears_remaining_rows(self):
+        self.stage()
+        long_snapshot = {
+            "available": True, "run_id": self.run_id,
+            "batch": {"label": "Batch 1/1"}, "agent_label": "Implementer",
+            "stage": "implement", "attempt_id": "attempt-1", "model": "m",
+            "effort": "high", "elapsed_seconds": 1.0, "elapsed_source": "live",
+            "activity": "worker running", "task": "task", "expected": "expected",
+            "outcome": "complete", "ownership": "complete", "next_action": "next",
+            "next": {"phase": "verify", "agent_label": "Supervisor",
+                     "task": "checks", "expected": "evidence", "model": "m",
+                     "effort": "high"}}
+        short_snapshot = {"available": False, "run_id": self.run_id,
+                          "batch": {"label": "Batch 1/1"},
+                          "next": {"phase": "verify", "agent_label": "Supervisor",
+                                   "task": "checks", "expected": "evidence",
+                                   "model": "m", "effort": "high"}}
+        calls = {"count": 0}
+
+        def snapshot(_folder, _state):
+            calls["count"] += 1
+            return long_snapshot if calls["count"] == 1 else short_snapshot
+
+        out = io.StringIO()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env), \
+                patch.object(orc, "stage_snapshot", side_effect=snapshot), \
+                patch.object(orc.shutil, "get_terminal_size",
+                             return_value=os.terminal_size((200, 24))):
+            orc.status_follow(self.run_id, out, inplace=True, interval=0.05,
+                              max_seconds=0.3)
+        self.assertIn("\x1b[0J", out.getvalue())
 
     def _active(self):
         state = json.loads((self.folder / "state.json").read_text())

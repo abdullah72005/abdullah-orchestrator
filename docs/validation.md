@@ -488,8 +488,8 @@ replace the orchestrator-level checks below.
 
 | Surface | Version | Evidence |
 |---|---|---|
-| Claude Code CLI | `2.1.247` | Fixture probe: `progressToken: 2` and native TUI ticks. Stage probe (real orchestrator MCP, disposable repo, delayed fixture worker, loopback model): the TUI rendered `Implementer — DeepSeek opencode-go/deepseek-v4.1-flash · implement · Batch 1/1 … supervisor processing the worker report · 1s`, `worker launching · 6s`, `check running · 6s`, `… 38s`, then `Called orchestrator` / `Crunched for 39s`. The recorded attempt end is 38.61 s. Native rendering confirmed. |
-| Codex CLI | `0.169.1` | Fixture probe: integer `progressToken: 1`, six ordered notifications during a three-second call, terminal printed only `mcp: probe/probe_wait started` / `(completed)`. Stage probe (real orchestrator MCP, loopback model, 36.4 s delayed stage): `mcp: orchestrator/orchestrator_stage started` … `(completed)` with no progress text. The adjacent `status --follow` pty observer ticked `elapsed 0.7s` … `36.0s`, showed `worker running` / `worker step finished`, then `measured 36.4s` and `outcome: complete · next: orchestrator_stage`. |
+| Claude Code CLI | `2.1.247` | Fixture probe: `progressToken: 2` and native TUI ticks. Correction rerun (real orchestrator MCP, disposable repo, delayed fixture worker, loopback model): the TUI rendered `Implementer — DeepSeek opencode-go/deepseek-v4.1-flash · implement · Batch 1/1 … preparing the stage · 1s`, ticking to `30s`, then `step finished · 33s`, `Called orchestrator` / `Crunched for 34s`. The recorded attempt end is 33.76 s. Native rendering confirmed. |
+| Codex CLI | `0.169.1` | Fixture probe: integer `progressToken: 1`, six ordered notifications during a three-second call, terminal printed only `mcp: probe/probe_wait started` / `(completed)`. Correction rerun (real orchestrator MCP, loopback model, 33.6 s delayed stage): `mcp: orchestrator/orchestrator_stage started` … `(completed)` with no progress text. The adjacent `status --follow` pty observer ticked `elapsed 0.9s` … `33.3s`, ended `measured 33.6s`, `outcome: complete`, and showed the next stage's safe task (`Run supervisor verification checks`) and expected output. |
 | Codex desktop, WSL agent | prior installed host | The v1.2.0 smoke showed the tool card and whole-turn duration only. Live detail and in-app Stop remain unverified; use the integrated-terminal observer. |
 | Claude desktop | n/a | No suitable desktop profile was available in this batch. Pending. |
 
@@ -499,3 +499,15 @@ cover multiple notifications before the final stage response, no trailing or
 cross-request notifications, tokenless and invalid-token silence, cancellation,
 attach during a stage, and a viewer that ticks while the worker runs without
 changing its outcome.
+
+The correction batch adds deterministic coverage for exact admission binding
+(two requests to one run with different tokens and a refused concurrent
+admission), a progress read held beyond the final response, cancellation closing
+the sink, malformed `_meta` and invalid tokens, verification argv exclusion for
+recorded and upcoming verify stages, attempt-scoped lifecycle observations,
+unproven owner identity, C1/ANSI sanitization, malformed structured worker
+records, bounded heartbeat reads, a full-journal recap preserved beside the
+bounded heartbeat tail, the plain-mode heartbeat, final-save-before-journal
+ordering, and narrow/shrinking terminal rendering. A runnable desktop fixture
+and operator steps are in
+[docs/release-evidence/live-progress](release-evidence/live-progress/README.md).

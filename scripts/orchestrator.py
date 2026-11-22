@@ -9681,6 +9681,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             if state is not None:
                 state["active_job"] = job
                 save(run_dir, state)
+                _record_stage_activity(run_dir, state, "worker_launched",
+                                       job_id=job_id, role=role)
             while proc.poll() is None:
                 action = control(run_dir) if state is not None else "run"
                 if action in {"pause", "cancel"}:
@@ -9699,6 +9701,9 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     raise TimeoutError(f"{role} ran beyond configured {timeout}s")
                 time.sleep(0.5)
         output = out_file.read_text(encoding="utf-8", errors="replace")
+        if state is not None:
+            _record_stage_activity(run_dir, state, "worker_report_received",
+                                   job_id=job_id, role=role)
         result_record = {"returncode": proc.returncode, "seconds": round(time.monotonic() - started, 2),
                          "pid": proc.pid, "process": process_identity(proc.pid),
                          "identity": job.get("process")}
@@ -10268,6 +10273,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False, deadline=None):
                                  "candidate_hash": evidence["candidate_hash"],
                                  "launch_file": str(launch_file), "check_token": token}
         save(run_dir, state)
+        _record_stage_activity(run_dir, state, "check_running", check_id=check_id)
         with logpath.open("wb") as log:
             # Every verification mode uses the guard.  The guard owns the
             # process session and kills descendants if this supervisor or the
@@ -10403,6 +10409,7 @@ def run_checks(run_dir, state, cfg, project, batch, final=False, deadline=None):
     state.pop("verification_interrupted", None)
     progress["finished"] = True
     save(run_dir, state)
+    _record_stage_activity(run_dir, state, "verification_complete", final=final)
     journal_event(run_dir, state, "verification_complete",
                   passed=evidence.get("passed"), final=final,
                   batch=evidence.get("batch"),
@@ -13256,7 +13263,7 @@ def _read_tail_bytes(path, limit):
             size = stream.tell()
             start = max(0, size - max(1, limit))
             stream.seek(start)
-            data = stream.read()
+            data = stream.read(limit)
     except OSError:
         return b""
     if start:
@@ -13266,12 +13273,8 @@ def _read_tail_bytes(path, limit):
     return data
 
 
-def journal_tail(run_dir, limit=200, tail_bytes=128 * 1024):
-    path = Path(run_dir) / JOURNAL_FILE
-    if not path.exists():
-        return []
+def _journal_records(text, limit):
     records = []
-    text = _read_tail_bytes(path, tail_bytes).decode("utf-8", errors="replace")
     for line in text.splitlines()[-limit:]:
         try:
             value = json.loads(line)
@@ -13279,21 +13282,28 @@ def journal_tail(run_dir, limit=200, tail_bytes=128 * 1024):
             continue
         if isinstance(value, dict):
             records.append(value)
-    if not records:
-        # A single pathological record larger than the tail window must remain
-        # readable; this is a rare fallback, not the heartbeat path.
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return records
-        for line in text.splitlines()[-limit:]:
-            try:
-                value = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(value, dict):
-                records.append(value)
     return records
+
+
+def journal_tail(run_dir, limit=200):
+    """Full-journal tail used by recaps; preserves its established semantics."""
+    path = Path(run_dir) / JOURNAL_FILE
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return _journal_records(text, limit)
+
+
+def journal_tail_bounded(run_dir, limit=200, tail_bytes=128 * 1024):
+    """Bounded tail for heartbeats: never scans the whole journal."""
+    path = Path(run_dir) / JOURNAL_FILE
+    if not path.exists():
+        return []
+    text = _read_tail_bytes(path, tail_bytes).decode("utf-8", errors="replace")
+    return _journal_records(text, limit)
 
 
 def escalate_to_diagnose(run_dir, state, report, *, source="implementer_escalation",
@@ -16396,6 +16406,21 @@ def _viewer_route(snapshot):
     return model
 
 
+def _viewer_next_lines(nxt, prefix="next"):
+    """Role, task and expected output for the stage after this one."""
+    if not isinstance(nxt, dict):
+        return []
+    label = _safe_progress_text(nxt.get("agent_label") or nxt.get("phase"), 80)
+    lines = []
+    if label:
+        lines.append(f"{prefix}: {label} · {_viewer_route(nxt)}")
+    if nxt.get("task"):
+        lines.append("%s task: %s" % (prefix, nxt["task"]))
+    if nxt.get("expected"):
+        lines.append("%s expected: %s" % (prefix, nxt["expected"]))
+    return lines
+
+
 def _viewer_lines(state, snapshot):
     """Small, bounded block for the read-only terminal observer."""
     batch = snapshot.get("batch") or {}
@@ -16406,16 +16431,11 @@ def _viewer_lines(state, snapshot):
     if batch.get("label"):
         heading += " · " + (_safe_progress_text(batch["label"], 40) or "")
     lines = [heading]
+    nxt = snapshot.get("next") or {}
     if not snapshot.get("available"):
-        nxt = snapshot.get("next") or {}
-        lines.append("waiting for the next stage: "
-                     + (_safe_progress_text(nxt.get("agent_label")
-                                            or nxt.get("phase"), 80) or "unknown stage"))
-        detail = " · ".join(part for part in (
-            _viewer_route(nxt), _safe_progress_text(nxt.get("task"), 120)) if part)
-        if detail:
-            lines.append("next: " + detail)
-        return lines
+        lines.append("waiting for the next stage")
+        lines.extend(_viewer_next_lines(nxt))
+        return lines[:10]
     lines.append("%s · %s · %s" % (
         _safe_progress_text(snapshot.get("agent_label"), 60) or "worker",
         _safe_progress_text(snapshot.get("stage"), 40) or "stage",
@@ -16436,17 +16456,18 @@ def _viewer_lines(state, snapshot):
         lines.append("expected: " + snapshot["expected"])
     if snapshot.get("outcome") or snapshot.get("ownership") in {"complete", "stale"}:
         outcome = snapshot.get("outcome") or snapshot.get("ownership")
-        next_action = snapshot.get("next_action") or (snapshot.get("next") or {}).get(
-            "agent_label")
+        next_action = snapshot.get("next_action") or nxt.get("agent_label")
         lines.append("outcome: %s · elapsed %s · next: %s" % (
             _safe_progress_text(outcome, 40),
             ("%.1fs" % elapsed) if elapsed is not None else "unavailable",
             _safe_progress_text(next_action, 80) or "unknown"))
-    return lines[:6]
+        if state.get("status") not in FINAL_STATES and nxt.get("phase"):
+            lines.extend(_viewer_next_lines(nxt))
+    return lines[:10]
 
 
 def status_follow(run_id, out=None, *, interval=0.75, inplace=None,
-                  heartbeat=15.0, max_seconds=None):
+                  heartbeat=15.0, max_seconds=None, final_grace=5.0):
     """Read-only observer: follow one run across stages until it is finished."""
     out = out or sys.stdout
     if inplace is None:
@@ -16458,32 +16479,54 @@ def status_follow(run_id, out=None, *, interval=0.75, inplace=None,
     rendered = None
     signature = None
     last_print = 0.0
+    final_since = None
     deadline = None if max_seconds is None else time.monotonic() + max_seconds
     try:
         while True:
             folder, state = load(run_id)
             snapshot = stage_snapshot(folder, state)
             lines = _viewer_lines(state, snapshot)
+            if inplace:
+                width = shutil.get_terminal_size((80, 24)).columns
+                if width < 40 or any(len(line) >= width for line in lines):
+                    # Wrapped rows cannot be rewound safely; append instead.
+                    inplace = False
+                    rendered = None
+                    printed = 0
+                    signature = None
             current = (snapshot.get("attempt_id"), snapshot.get("activity"),
                        snapshot.get("outcome"), state.get("status"),
-                       snapshot.get("available"))
+                       snapshot.get("available"), snapshot.get("ownership"))
             due = current != signature or time.monotonic() - last_print >= heartbeat
             if inplace:
                 if lines != rendered:
                     if printed:
                         out.write("\x1b[%dA" % printed)
                     out.write("".join("\x1b[2K" + line + "\n" for line in lines))
+                    if printed > len(lines):
+                        out.write("\x1b[0J")
                     rendered = lines
                     printed = len(lines)
                     out.flush()
+                    last_print = time.monotonic()
             elif due:
                 out.write(("" if signature is None else "\n") + "\n".join(lines) + "\n")
                 out.flush()
+                last_print = time.monotonic()
             signature = current
-            last_print = time.monotonic()
             finished = state.get("status") in FINAL_STATES
             if finished and not snapshot.get("active"):
-                break
+                if snapshot.get("available") and snapshot.get("owner") == "active" \
+                        and snapshot.get("ownership") != "complete":
+                    # The state save precedes the stage_end append; wait briefly
+                    # for the matching end instead of calling a live attempt stale.
+                    now_monotonic = time.monotonic()
+                    if final_since is None:
+                        final_since = now_monotonic
+                    elif now_monotonic - final_since >= max(0.0, final_grace):
+                        break
+                else:
+                    break
             if deadline is not None and time.monotonic() >= deadline:
                 break
             time.sleep(max(0.05, interval))
@@ -16493,7 +16536,6 @@ def status_follow(run_id, out=None, *, interval=0.75, inplace=None,
             out.flush()
         return 0
     return 0
-
 
 
 def _processes_referencing_launch(launch_file):
@@ -17261,7 +17303,7 @@ def _safe_progress_text(value, limit=200):
     if value is None:
         return None
     text = _CONTROL_ESCAPE.sub(" ", str(value))
-    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char
+    text = "".join(" " if (ord(char) < 32 or 127 <= ord(char) <= 159) else char
                    for char in text)
     text = " ".join(text.split())
     if len(text) > limit:
@@ -17271,10 +17313,11 @@ def _safe_progress_text(value, limit=200):
 
 def _safe_stage_task(state, stage, recorded=None):
     """A task label safe for terminal output; verification argv is never shown."""
+    if stage == "verify":
+        # Check argv is present in the real stage task; always replace it.
+        return _VERIFICATION_TASK
     if recorded:
         return _safe_progress_text(recorded)
-    if stage == "verify":
-        return _VERIFICATION_TASK
     try:
         return _safe_progress_text(stage_task(state, stage))
     except (KeyError, TypeError, ValueError):
@@ -17312,29 +17355,31 @@ def _attempt_ownership(record):
         pid = int(record.get("owner_pid"))
     except (TypeError, ValueError):
         return "unknown"
+    recorded_start = record.get("owner_pid_start")
+    if recorded_start is None:
+        # A live PID without its start time can be a reused PID.
+        return "unknown"
     stat = process_stat(pid)
     if not stat or stat.get("state") in {"Z", "X", "x"}:
         return "stale"
-    recorded_start = record.get("owner_pid_start")
-    if recorded_start is not None and str(recorded_start) != str(stat.get("starttime")):
+    if str(recorded_start) != str(stat.get("starttime")):
         return "stale"
     return "active"
 
 
-_ACTIVITY_EVENTS = {
-    "route_grant_reserved": "worker dispatch reserved",
-    "worker_fallback_approved": "fallback worker approved",
-    "human_authorization": "human authorization recorded",
-    "decision_binding_captured": "architect decision bound",
-    "decision_binding_validated": "architect decision validated",
-    "job_failed": "worker report failed",
-    "report_recovered": "worker report recovered",
+_STAGE_CONTEXT = threading.local()
+
+
+def _current_attempt():
+    return getattr(_STAGE_CONTEXT, "attempt", None)
+
+
+_STAGE_ACTIVITY_LABELS = {
+    "stage_admitted": "preparing the stage",
+    "worker_launched": "worker launched",
+    "worker_report_received": "worker report received",
+    "check_running": "supervisor check running",
     "verification_complete": "verification finished",
-    "verification_review_blocked": "review blocked after verification",
-    "review_projection_created": "review packet prepared",
-    "batch_delta_recorded": "batch delta recorded",
-    "interrupted": "interruption requested",
-    "stale_cached_review_ignored": "stale review evidence ignored",
 }
 
 _WORKER_STREAM_LABELS = {
@@ -17347,12 +17392,36 @@ _WORKER_STREAM_LABELS = {
 }
 
 
+def _record_stage_activity(run_dir, state, activity, **fields):
+    """Journal one attempt-scoped lifecycle observation for progress viewers."""
+    if not isinstance(state, dict):
+        return
+    attempt = _current_attempt()
+    if not attempt:
+        return
+    journal_event(run_dir, state, "stage_activity", activity=activity,
+                  attempt=attempt, **fields)
+
+
 def _worker_stream_activity(folder, job, tail_bytes=64 * 1024, limit=16 * 1024):
     """Bounded, content-free activity from an existing structured worker stream."""
-    path = job.get("path") if isinstance(job, dict) else None
+    if not isinstance(job, dict):
+        return None
+    route = job.get("route") if isinstance(job.get("route"), dict) else {}
+    if route.get("provider") != "opencode":
+        # Codex and Claude workers emit plain text; never parse them as events.
+        return None
+    path = job.get("path")
     if not path:
         return None
-    data = _read_tail_bytes(Path(path) / "events.log", tail_bytes)
+    try:
+        base = Path(folder).resolve()
+        stream_path = (Path(path) / "events.log").resolve()
+        if not stream_path.is_relative_to(base / "jobs"):
+            return None
+    except (OSError, ValueError):
+        return None
+    data = _read_tail_bytes(stream_path, tail_bytes)
     if not data:
         return None
     latest = None
@@ -17365,7 +17434,10 @@ def _worker_stream_activity(folder, job, tail_bytes=64 * 1024, limit=16 * 1024):
             continue
         if not isinstance(record, dict):
             continue
-        label = _WORKER_STREAM_LABELS.get(record.get("type"))
+        kind = record.get("type")
+        if not isinstance(kind, str):
+            continue
+        label = _WORKER_STREAM_LABELS.get(kind)
         if label:
             latest = label
     return latest
@@ -17384,13 +17456,18 @@ def _stage_activity(state, started, ended, records, ownership, folder):
         return "previous attempt is no longer running"
     if ownership == "unknown":
         return "attempt ownership could not be proven"
-    job = state.get("active_job") or {}
-    job_status = job.get("status")
+    attempt = (started or {}).get("attempt")
     observed = None
     for event in records:
-        label = _ACTIVITY_EVENTS.get(event.get("event"))
+        if event.get("event") != "stage_activity":
+            continue
+        if not attempt or event.get("attempt") != attempt:
+            continue
+        label = _STAGE_ACTIVITY_LABELS.get(event.get("activity"))
         if label:
             observed = label
+    job = state.get("active_job") or {}
+    job_status = job.get("status")
     if job_status in {"running"}:
         return _worker_stream_activity(folder, job) or "worker running"
     if job_status in {"dispatched"}:
@@ -17399,8 +17476,6 @@ def _stage_activity(state, started, ended, records, ownership, folder):
         return "supervisor check running"
     if observed:
         return observed
-    if started.get("attempt") or started.get("monotonic_started") is not None:
-        return "supervisor processing the worker report"
     return "preparing the stage"
 
 
@@ -17415,11 +17490,12 @@ def _attempt_route(started):
 
 def stage_snapshot(folder, state):
     """Read-only progress for the most recent stage attempt in a run."""
-    records = journal_tail(folder, 200)
+    records = journal_tail_bounded(folder, 200)
     started, ended = _attempt_markers(records)
     stage = (started or {}).get("stage") or state.get("phase")
     role = (started or {}).get("role") or stage_agent_role(state.get("phase"))
-    ownership = _attempt_ownership(started) if started else "unknown"
+    owner = _attempt_ownership(started) if started else "unknown"
+    ownership = owner
     active = bool(started) and ended is None and ownership == "active" \
         and state.get("status") == "running"
     if ended is None and started and not active and ownership == "active":
@@ -17445,6 +17521,7 @@ def stage_snapshot(folder, state):
     if not isinstance(batch, dict):
         batch = batch_identifier(state)
     next_preview = next_stage_preview(state)
+    next_phase = next_preview.get("phase")
     outcome = (ended or {}).get("outcome")
     return {
         "available": started is not None,
@@ -17452,6 +17529,7 @@ def stage_snapshot(folder, state):
         "attempt_id": (started or {}).get("attempt"),
         "attempt_monotonic_started": (started or {}).get("monotonic_started"),
         "active": active,
+        "owner": owner,
         "ownership": ("complete" if ended is not None else ownership),
         "stage": stage,
         "phase": state.get("phase"),
@@ -17460,7 +17538,8 @@ def stage_snapshot(folder, state):
         "provider": route.get("provider"), "model": route.get("model"),
         "effort": route.get("effort"), "billing": route.get("billing"),
         "batch": batch,
-        "task": _safe_stage_task(state, stage, (started or {}).get("task")),
+        "task": _safe_stage_task(state, stage, (started or {}).get("progress_task")
+                                 or (started or {}).get("task")),
         "expected": _safe_progress_text((started or {}).get("expected")
                                         or stage_expected(stage)),
         "started_at": (started or {}).get("started_at"),
@@ -17468,14 +17547,16 @@ def stage_snapshot(folder, state):
         "elapsed_seconds": elapsed, "elapsed_source": elapsed_source,
         "activity": _stage_activity(state, started or {}, ended, records,
                                     ownership, folder),
-        "outcome": outcome,
-        "next_action": (ended or {}).get("next_action") or next_action_for(state),
-        "next": {"phase": next_preview.get("phase"),
-                 "agent_label": next_preview.get("agent_label"),
-                 "task": _safe_progress_text(next_preview.get("task")),
-                 "expected": _safe_progress_text(next_preview.get("expected")),
-                 "model": next_preview.get("model"),
-                 "effort": next_preview.get("effort")},
+        "outcome": _safe_progress_text(outcome, 40),
+        "next_action": _safe_progress_text(
+            (ended or {}).get("next_action") or next_action_for(state), 80),
+        "next": {"phase": next_phase,
+                 "agent_label": _safe_progress_text(next_preview.get("agent_label"), 60),
+                 "task": _safe_stage_task(state, next_phase,
+                                          next_preview.get("task")),
+                 "expected": _safe_progress_text(next_preview.get("expected"), 200),
+                 "model": _safe_progress_text(next_preview.get("model"), 60),
+                 "effort": _safe_progress_text(next_preview.get("effort"), 24)},
         "status": state.get("status"),
     }
 
@@ -17568,8 +17649,12 @@ def _checkout_conflict_payload(folder, state, exc):
                          0.0, error=str(exc))
 
 
-def stage_run(run_id, expected_phase=None):
-    """Execute exactly one durable workflow stage in the foreground."""
+def stage_run(run_id, expected_phase=None, on_admit=None):
+    """Execute exactly one durable workflow stage in the foreground.
+
+    ``on_admit`` fires under the run lock once this call actually owns the
+    admitted attempt, so observers can bind to that exact attempt.
+    """
     validate_workflow()
     folder, state = load(run_id)
     assert_state_compatible(state)
@@ -17652,12 +17737,14 @@ def stage_run(run_id, expected_phase=None):
             "owner_pid": os.getpid(),
             "owner_pid_start": owner.get("pid_start"),
             "task": task, "expected": expected,
+            "progress_task": _safe_stage_task(state, stage),
             # Capture the attempted route before advance() can consume a
             # fallback, adopt a planning trial or change the phase.
             "route": route_report(state, role, stage=stage),
         }
         journal_event(folder, state, "stage_start", stage=stage, role=role,
                       agent_label=started["agent_label"], task=task,
+                      progress_task=started["progress_task"],
                       expected=expected,
                       started_at=started["started_at"],
                       started_at_utc=started["started_at_utc"],
@@ -17670,9 +17757,19 @@ def stage_run(run_id, expected_phase=None):
                       owner_pid=started["owner_pid"],
                       owner_pid_start=started["owner_pid_start"],
                       route=started["route"])
+        _STAGE_CONTEXT.attempt = attempt_id
+        _record_stage_activity(folder, state, "stage_admitted")
+        if on_admit is not None:
+            # Bind observers only after this request won admission under the lock.
+            try:
+                on_admit({"attempt": attempt_id, "stage": stage, "role": role,
+                          "run_id": state.get("id")})
+            except Exception:
+                pass
         started_monotonic = started["monotonic_started"]
         error = None
         conflict = None
+        crash = None
         try:
             advance(folder, state, cfg, deadline=stage_deadline(cfg))
         except CheckoutOwnedError as exc:
@@ -17688,17 +17785,28 @@ def stage_run(run_id, expected_phase=None):
             status = "uncertain" if state.get("active_job") or state.get("active_check") else (
                 "rate_limited" if "rate_limited" in error else "blocked")
             pause_with(folder, state, error, status)
+        except BaseException as exc:
+            # Unexpected failures keep the established policy: no partial save
+            # and no payload, but a truthful attempt end for observers.
+            crash = exc
+            raise
         finally:
+            _STAGE_CONTEXT.attempt = None
             # Exactly one matching end record, including an early return after
             # admission, so a real in-flight attempt can never look abandoned.
             elapsed = time.monotonic() - started_monotonic
-            if conflict is None:
+            if conflict is None and crash is None:
                 save(folder, state)
-            outcome = stage_outcome(state.get("status"), error)
+            if crash is not None:
+                outcome = "error"
+                end_error = type(crash).__name__ + ": " + str(crash)
+            else:
+                outcome = stage_outcome(state.get("status"), error)
+                end_error = error
             journal_event(folder, state, "stage_end", stage=stage, role=role,
                           summary=stage_summary(state, stage),
                           elapsed_seconds=round(elapsed, 2),
-                          error=error, next_action=next_action_for(state),
+                          error=end_error, next_action=next_action_for(state),
                           outcome=outcome, attempt=attempt_id,
                           monotonic_started=started_monotonic,
                           expected=expected,
@@ -19075,7 +19183,7 @@ MCP_TOOLS = [
 MCP_TOOL_NAMES = {tool["name"] for tool in MCP_TOOLS}
 
 
-def _mcp_tool_call(name, arguments):
+def _mcp_tool_call(name, arguments, *, on_admit=None):
     arguments = arguments or {}
     if name == "orchestrator_start":
         return start_run(project=arguments["project"], goal=arguments.get("goal"),
@@ -19095,7 +19203,7 @@ def _mcp_tool_call(name, arguments):
                          allow_unverified_metadata=bool(arguments.get(
                              "allow_unverified_metadata", False)))
     if name == "orchestrator_stage":
-        return stage_run(arguments["run_id"])
+        return stage_run(arguments["run_id"], on_admit=on_admit)
     if name == "orchestrator_status":
         return status_run(arguments["run_id"])
     if name == "orchestrator_recap":
@@ -19178,39 +19286,69 @@ def _valid_progress_token(value):
     return isinstance(value, str) and bool(value.strip())
 
 
-def _admitted_attempt(snapshot, admitted_after):
-    """True only for an attempt this request admitted, not an older one."""
-    if not snapshot or not snapshot.get("available"):
-        return False
-    started = snapshot.get("attempt_monotonic_started")
-    if not isinstance(started, (int, float)):
-        return False
-    return float(started) >= admitted_after - 0.05
+def _progress_sink(stream, lock):
+    """Serialize progress writes and close them atomically before the reply."""
+    state = {"closed": False}
+    guard = threading.Lock()
+
+    def send(token, sequence, message):
+        with guard:
+            if state["closed"]:
+                return False
+            with lock:
+                if state["closed"]:
+                    return False
+                stream.write(json.dumps({
+                    "jsonrpc": "2.0", "method": "notifications/progress",
+                    "params": {"progressToken": token, "progress": sequence,
+                               "message": message}}, ensure_ascii=False) + "\n")
+                stream.flush()
+        return True
+
+    def close():
+        with guard:
+            state["closed"] = True
+
+    return send, close
 
 
-def _emit_stage_progress(send, token, run_id, admitted_after, stop, *,
-                         snapshot_reader=None, interval=MCP_PROGRESS_INTERVAL):
-    """Advisory, read-only progress for the stage this request admitted."""
+def _emit_stage_progress(send, token, run_id, attempt_state, stop, *,
+                         snapshot_reader=None, interval=MCP_PROGRESS_INTERVAL,
+                         admission_timeout=30.0):
+    """Advisory, read-only progress for the exact attempt this call admitted."""
     reader = snapshot_reader or stage_progress
+    deadline = time.monotonic() + max(0.0, admission_timeout)
+    attempt = None
+    while not stop.is_set():
+        attempt = (attempt_state or {}).get("attempt")
+        if attempt:
+            break
+        if time.monotonic() >= deadline:
+            return
+        if stop.wait(0.1):
+            return
+    if not attempt or stop.is_set():
+        return
     sequence = 0
-    wait = 0.25
+    wait = 0.0
     while not stop.is_set():
         snapshot = None
         try:
             snapshot = reader(run_id)
         except (KeyError, TypeError, ValueError, OSError, RuntimeError):
             snapshot = None
-        if snapshot and _admitted_attempt(snapshot, admitted_after):
+        if snapshot and snapshot.get("attempt_id") == attempt:
             sequence += 1
             try:
-                send(sequence, token, stage_progress_message(snapshot))
+                if not send(token, sequence, stage_progress_message(snapshot)):
+                    return
             except (OSError, ValueError):
                 # A closed or broken host stream must never affect the stage.
                 return
             if not snapshot.get("active") and snapshot.get("ownership") in {
                     "complete", "stale"}:
                 return
-        if stop.wait(wait):
+        if stop.wait(wait if wait else interval):
             return
         wait = interval
 
@@ -19231,15 +19369,20 @@ def mcp_serve(instream=None, outstream=None):
     active = {}
     active_lock = threading.Lock()
 
-    def worker(request_id, name, arguments, stop=None, progress=None):
+    def worker(request_id, name, arguments, stop=None, progress=None,
+               close_sink=None, admit=None):
         payload = None
         error = None
         try:
-            payload = _mcp_tool_call(name, arguments)
+            payload = _mcp_tool_call(name, arguments, on_admit=admit)
         except (KeyError, TypeError, ValueError, RuntimeError, OSError,
                 subprocess.SubprocessError) as exc:
             error = str(exc)
         finally:
+            # Close the progress sink before the reply is written: a sender
+            # waiting on a read or the stream lock is dropped, never reordered.
+            if close_sink is not None:
+                close_sink()
             if stop is not None:
                 stop.set()
             if progress is not None:
@@ -19264,14 +19407,6 @@ def mcp_serve(instream=None, outstream=None):
             response = {"jsonrpc": "2.0", "id": request_id, "result": mcp_result(payload)}
         _mcp_send(outstream, response, write_lock)
 
-    def progress_writer(request_id):
-        def send(sequence, token, message):
-            _mcp_send(outstream, {
-                "jsonrpc": "2.0", "method": "notifications/progress",
-                "params": {"progressToken": token, "progress": sequence,
-                           "message": message}}, write_lock)
-        return send
-
     for line in instream:
         line = line.strip()
         if not line:
@@ -19287,6 +19422,8 @@ def mcp_serve(instream=None, outstream=None):
                 entry = active.get(request_id)
                 if entry is not None:
                     entry["cancelled"] = True
+                    if entry.get("progress_close") is not None:
+                        entry["progress_close"]()
                     if entry.get("progress_stop") is not None:
                         entry["progress_stop"].set()
                 run_id = (entry or {}).get("run_id")
@@ -19298,26 +19435,35 @@ def mcp_serve(instream=None, outstream=None):
         if method == "tools/call":
             params = request.get("params") or {}
             request_id = request.get("id")
-            run_id = (params.get("arguments") or {}).get("run_id")
+            arguments = params.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            run_id = arguments.get("run_id")
             name = params.get("name")
-            token = (params.get("_meta") or {}).get("progressToken")
-            stop = progress = None
+            meta = params.get("_meta")
+            token = meta.get("progressToken") if isinstance(meta, dict) else None
+            stop = progress = close_sink = admit = None
             if (name == "orchestrator_stage" and run_id
                     and _valid_progress_token(token)):
+                attempt_state = {}
                 stop = threading.Event()
+                send, close_sink = _progress_sink(outstream, write_lock)
+
+                def admit(info, state=attempt_state):
+                    state.update(info)
+
                 progress = threading.Thread(
                     target=_emit_stage_progress,
-                    args=(progress_writer(request_id), token, run_id,
-                          time.monotonic(), stop),
+                    args=(send, token, run_id, attempt_state, stop),
                     daemon=True)
                 progress.start()
             with active_lock:
                 active[request_id] = {"run_id": run_id,
-                                      "progress_stop": stop}
+                                      "progress_stop": stop,
+                                      "progress_close": close_sink}
             threading.Thread(target=worker, daemon=True,
-                             args=(request_id, name,
-                                   params.get("arguments") or {},
-                                   stop, progress)).start()
+                             args=(request_id, name, arguments,
+                                   stop, progress, close_sink, admit)).start()
             continue
         response = mcp_handle(request)
         if response is not None:
@@ -19326,6 +19472,8 @@ def mcp_serve(instream=None, outstream=None):
     with active_lock:
         run_ids = [item.get("run_id") for item in active.values() if item.get("run_id")]
         for item in active.values():
+            if item.get("progress_close") is not None:
+                item["progress_close"]()
             if item.get("progress_stop") is not None:
                 item["progress_stop"].set()
     for run_id in set(run_ids):
