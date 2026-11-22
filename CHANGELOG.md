@@ -116,6 +116,24 @@ Additive state fields keep older runs readable.
   A model that declines to call a tool it cannot see therefore leaves the
   negative unverified rather than inferred from silence.
 
+### v1.2.0 release closure · installed-host evidence
+
+- The authenticated OpenCode Go Reviewer dispatch at
+  `fb88c50` completed and read the exact projected hunk. Shell and edit were not
+  observed, so same-session capability stays unverified and the combined smoke
+  result stays false.
+- The Windows Codex desktop with its agent in WSL completed planning and
+  implementation through the disposable supervisor. Backend and stdio
+  cancellation/recovery passed separately; in-app Stop, live worker activity and
+  fresh-thread recovery remain unverified.
+- Installed Claude Code `2.1.247` registered the supervisor and completed a
+  headless planning stage through a local scripted endpoint with fixture
+  workers. Interactive control, authentication and provider-backed Claude
+  workers remain unverified.
+- README, installation, validation and release evidence now state these limits
+  consistently. Live subagent progress for Codex and Claude Code on CLI and GUI
+  is recorded as a post-v1.2.0 TODO.
+
 ## [1.2.0] — 2026-11-18
 
 **Local release candidate.** Discrete workflow and evidence improvements over

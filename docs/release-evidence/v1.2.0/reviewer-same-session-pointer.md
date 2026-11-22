@@ -2,8 +2,8 @@
 
 Prepared 20 November 2026 from code/test revision
 `fb88c50bf0c09ff1a8814d2a56336aebe4ff3ba2`. Preparation and the read-only
-preflight made **no model call**. The single authenticated Reviewer dispatch is
-the operator action below; nothing in this file claims its result in advance.
+preflight made **no model call**. The operator then ran exactly one authenticated
+Reviewer dispatch; its recorded result is below.
 
 This fixture supersedes the `f59a2cd` fixture for the same-session permission
 question. The earlier run remains valid Read evidence and remains recorded as
@@ -83,20 +83,38 @@ cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke
 cd /home/abdullah/abdullah-orchestrator-v1.2.0 && python3 scripts/reviewer_smoke.py inspect --root /tmp/opencode/abdullah-reviewer-smoke-fb88c50
 ```
 
-## How to read the result
+## Recorded result
+
+The operator dispatch completed and produced `evidence.json`. The redacted
+record is [authenticated-reviewer-fb88c50.json](authenticated-reviewer-fb88c50.json).
+
+- Contract-v2 report ingested and complete; the summary quoted the challenge.
+- Read: `completed`, exact prepared hunk, producing session
+  `ses_e066ecfaaffe0gQ3PFflj6GpoP`, challenge line found and matched.
+- Checkout, hunk, projection, binding and verification digests unchanged; the
+  dispatched route matched the pinned Go High route; no prohibited execution.
+- Shell and edit: `not_observed` in the producing session, so both stayed
+  `unverified`. The fixtures and all prepared bindings remained intact.
+- Combined result: `false`; `read_verified: true`,
+  `negative_evidence_verified: false`.
+
+The model did not emit the two requested calls to tools absent from its list.
+This is the conditional outcome described below, not a harness failure, and it
+is not promoted to a permission proof.
+
+## What the predicate requires
 
 `launch` and `inspect` print `read_verified` and `negative_evidence_verified`
 separately from the combined `ok`.
 
 - `read_verified: true` requires a completed, path-matched Read from the
   producing session whose output carries the exact challenge line.
-- `negative_evidence_verified: true` now requires, for each probe, an exact
+- `negative_evidence_verified: true` requires, for each probe, an exact
   producing-session event whose classification is `denied` (policy refusal) or
   `absent` (the exact runtime unavailable-tool response) — or an authoritative
   inventory.
 - If the model emits no shell/edit call, or emits an unclassified error, that
-  probe stays `unverified` and the combined result stays false. This is the
-  expected conditional outcome, not a harness failure to hide.
+  probe stays `unverified` and the combined result stays false.
 
 ## Honest limits
 
@@ -104,5 +122,6 @@ separately from the combined `ok`.
   session. It is not a provider-wide enforcement proof.
 - The authenticated model may decline to emit a call to a tool it cannot see.
   If it does, no same-session capability evidence exists without an inventory
-  surface; retain the conditional verdict and record the limitation.
-- One subscription model call is billable to the operator's Go account.
+  surface; retain the conditional verdict and record the limitation. That is
+  what happened here.
+- The operator's single Go Reviewer dispatch is billable to their account.

@@ -29,8 +29,12 @@ default worker route is OpenCode Go.
 > [!IMPORTANT]
 > **Project status — v1.2.0 release candidate.** Codex + OpenCode V2 is
 > the primary route; Codex + OpenCode Go end-to-end execution and
-> interrupted-run recovery are demonstrated. OpenCode V1 remains experimental
-> and Claude Code is supported at its demonstrated fake-CLI/registration level.
+> interrupted-run recovery are demonstrated. OpenCode V1 remains experimental.
+> Claude Code has passed installed-CLI registration and a headless
+> fixture-backed planning stage, and the Windows Codex desktop with a WSL agent
+> completed planning and implementation through the disposable supervisor.
+> Authenticated long Claude stages, desktop Stop controls and same-session
+> Reviewer shell/edit capability remain unverified.
 > Broader live compatibility and long-duration endurance testing remain ongoing.
 > See [Tested behavior](#tested-behavior) and
 > [Security and limitations](#security-and-limitations).
@@ -122,7 +126,7 @@ safe to leave running for hours.
 | **Explicit billing authorization** | Non-Go routes require a human `authorize-route` grant bound to role, run and exact route material; unknown routes refuse rather than silently bill an API. |
 | **Fallback safety** | Fallback is never automatic and never inherited from another route. |
 | **Checkout ownership** | One lease per canonical Git checkout; conflicts return resolution commands instead of retrying. |
-| **Codex and Claude host integration** | stdio MCP server plus installer registration for both hosts; Claude long-stage behavior is not yet live-certified. |
+| **Codex and Claude host integration** | stdio MCP server plus installer registration for both hosts; Claude has installed-CLI registration and a headless fixture-backed stage, but authenticated long stages are not yet certified. |
 
 Implemented behavior and *live-validated* behavior are deliberately separated.
 See [Tested behavior](#tested-behavior) and [docs/validation.md](docs/validation.md).
@@ -427,8 +431,13 @@ Other limitations:
 - Billing classifications are policy/attestation; there is no hard dollar cap and
   no inference of provider-side settlement.
 - `doctor` does not authenticate, prove entitlement or execute a model.
-- OpenCode V1 has no live runtime verification; Claude host mode is fake-CLI
-  tested only; macOS/Windows managed configuration is not certified.
+- OpenCode V1 has no live runtime verification. Claude Code has installed-CLI
+  registration and a headless fixture-backed stage; interactive controls,
+  authentication and provider-backed Claude workers are not live-certified.
+  The Windows Codex desktop with a WSL agent completed planning and
+  implementation, but in-app Stop, live worker activity and fresh-thread
+  recovery were not exercised. macOS/Windows managed configuration is not
+  certified.
 
 Full threat model: [docs/security-model.md](docs/security-model.md).
 Reporting: [SECURITY.md](SECURITY.md).

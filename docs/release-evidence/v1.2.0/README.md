@@ -719,18 +719,58 @@ Read completed, the advertised list contained only `glob`, `grep`, `read`, and
 negatives, no file was created, and the fixture stayed intact.
 [Loopback log](reviewer-negative-loopback-v2-fb88c50.txt)
 
-A fresh authenticated fixture is prepared but **not launched**:
-`/tmp/opencode/abdullah-reviewer-smoke-fb88c50` (run
+The operator launched `/tmp/opencode/abdullah-reviewer-smoke-fb88c50` (run
 `20261120T151504-dc79fb44`, code revision
 `fb88c50bf0c09ff1a8814d2a56336aebe4ff3ba2`, prepared manifest SHA-256
 `f9f36e8c8b9eb4e01865a8f227afa080b7d3d3668457ab8716eaef7f759dcdeb`). Preflight
 returned `ok: true` with intact bindings and the pinned Go High route; see
 [the operator pointer](reviewer-same-session-pointer.md) and
-[preflight output](reviewer-smoke-preflight-fb88c50.json). The single
-authenticated dispatch and its same-session absent/denied classifications remain
-an operator action. If the model declines to emit calls to tools it cannot see,
-the combined verdict stays conditional and the limitation is recorded rather
-than promoted.
+[preflight output](reviewer-smoke-preflight-fb88c50.json). The digest-verified
+trace contains a completed Read of the exact projected hunk. Both shell and
+edit remained unobserved, and the fixture checkout and evidence bindings
+stayed intact. The combined smoke result remains unverified for same-session
+permissions. [Redacted authenticated evidence](authenticated-reviewer-fb88c50.json)
+
+### Native Windows Codex desktop compatibility
+
+The installed Windows desktop backend (Codex CLI `0.169.0-alpha.11.1` bundled
+with desktop package `26.1111.2228.0`) discovered the project-local skill and
+listed all nine WSL-hosted Orchestrator MCP tools from an isolated Windows
+configuration. Both the native Windows backend and WSL Codex CLI
+`0.169.1` completed a plan, interrupted a fixture worker, retained its edit,
+and resumed the existing run from a fresh backend thread. A separate Windows
+`wsl.exe` stdio run passed host cancellation, reconnect and resume through
+to verification. The WSL supervisor pinned `gpt-6.2-sol` at High. Four focused
+WSL CLI/MCP transport and recovery regressions passed on the candidate.
+
+The operator used the Windows desktop app with its agent in WSL and a separate
+`abdullah-gui-smoke` registration. In run `20261120T155838-9855c86c`, the GUI
+reported the pinned `gpt-6.2-sol` High route and completed one planning stage
+and one Implementer stage. In run `20261122T061758-e422faca`, the GUI completed
+another Implementer stage. The WSL run state confirmed both runs reached
+`verify` with the fixture edit present and no active worker. The stage journal
+recorded 34.62 s and 32.96 s for the respective Implementer stages.
+
+The GUI showed the stage tool card and a whole-turn duration. Live worker
+elapsed time and activity were not visible on the card. Desktop Stop and
+fresh-thread recovery were unverified in the UI. Cancellation and recovery have
+separate backend and stdio evidence above. [Windows registration](../../installation.md#windows-codex-desktop-with-its-agent-in-wsl) ·
+[Live worker progress follow-up](../../validation.md#post-v120-todo)
+
+### Claude Code CLI compatibility
+
+Installed Claude Code `2.1.247` on WSL registered the supervisor through the
+shipped installer helper in a disposable profile. Repeating registration was
+a no-op and `claude mcp list` reported `Connected`. A headless session against a
+local scripted model endpoint discovered all nine Orchestrator tools and called
+`orchestrator_start`, `orchestrator_status`, and `orchestrator_stage`. The saved
+run identified `claude` as its host, recorded exactly one Architect planning
+stage, and reached `implement` with no active worker. The probe used fixture
+workers and required no account credentials.
+
+Twenty-three focused tests also passed on `16a0816`. They cover Claude setup,
+stage deadlines, the Claude-hosted multi-batch fixture, MCP cancellation,
+fresh-session recovery, and release identity.
 
 ## Explicit limitations
 
@@ -744,5 +784,10 @@ than promoted.
 - Native OpenCode V2 read-policy proof depends on an installed isolated binary;
   the deterministic test mirrors the effective policy but is not a substitute
   for that installed-binary check.
-- Claude Code remains at its demonstrated fake-CLI/registration support level.
+- Claude Code interactive controls, authentication and provider-backed worker
+  stages remain unverified.
+- The Windows desktop smoke covered planning and implementation through the
+  disposable supervisor. In-app Stop, live worker activity and fresh-thread
+  recovery were not exercised in the UI; native backend and Windows-to-WSL stdio
+  cancellation/recovery are separate evidence.
 - OpenCode V1 remains experimental.

@@ -15,11 +15,13 @@ exact recovery commands.
 | Environment | Status | Notes |
 |---|---|---|
 | **WSL2 Ubuntu + Codex CLI + OpenCode V2 + OpenCode Go** | **Verified** | The configuration used for the real end-to-end run. |
+| Windows Codex desktop with its agent in WSL | Stage execution smoke-tested | Planning and implementation completed on a disposable WSL supervisor. Desktop Stop and fresh-thread recovery remain unverified. |
+| Native Windows Codex desktop + WSL2 supervisor | GUI smoke pending | The native Codex backend discovered the skill and connected to WSL MCP. Desktop stage controls still require live validation. |
 | Linux (x86_64) + Codex CLI | Supported | Same code paths; specific distributions are not individually certified. |
-| Linux/WSL + Claude Code CLI | **Experimental** | Registration, snippets and stage deadlines are fake-CLI tested; authenticated long stages, Esc/cancel and reconnect are not live-certified. |
+| Linux/WSL + Claude Code CLI | **Experimental** | Installed CLI registration and a headless stage passed with local fixtures. Authenticated interactive stages, Esc/cancel and reconnect remain unverified. |
 | OpenCode V1 (`>=1.18 <2.0`) | **Experimental** | Source-backed and fixture-tested; no live V1 binary was available for this release. |
 | Alternative OpenCode providers (non-Go) | **Experimental** | Policy, grants and fail-closed routing are tested with fake CLIs; live provider settlement is not. |
-| Native Windows (PowerShell/cmd) | Unsupported | Use WSL2. |
+| Supervisor running directly on Windows | Unsupported | Run the supervisor in WSL2. |
 | Native macOS | Untested | The supervisor is stdlib Python and may work, but no release validation exists. |
 | Managed configuration delivery (system policy files) | Linux only | Not certified on macOS/Windows. |
 
@@ -109,6 +111,62 @@ tool_timeout_sec = 18000
 the stage caps, raise this value above them too. Do not set it globally for every
 MCP server.
 
+### Windows Codex desktop with its agent in WSL
+
+When the desktop app's **Agent environment** is WSL, use the Linux skill
+location and the WSL CLI's MCP registration shown above. Open the project from
+its WSL distribution, confirm skill discovery and check `/mcp` in a fresh
+desktop thread. Use the Linux absolute path for `orchestrator_start`. The
+Windows-native setup below includes a `wsl.exe` registration example.
+
+The desktop smoke used a separate MCP registration that launched the disposable
+WSL supervisor through `wsl.exe`. The GUI completed planning and implementation
+and displayed the stage tool card. See the
+[desktop smoke evidence](release-evidence/v1.2.0/README.md#native-windows-codex-desktop-compatibility)
+and the [live worker progress follow-up](validation.md#post-v120-todo).
+
+### Native Windows Codex desktop
+
+The Windows-native agent reads Windows-side Codex configuration. Keep the
+supervisor and its run state in WSL. Set up the WSL CLI as above, then register
+the same supervisor using Windows `wsl.exe` in a trusted desktop project's
+`.codex/config.toml` or the Windows user's `%USERPROFILE%\.codex\config.toml`.
+Use the actual Windows executable path, WSL distribution and Linux checkout
+path. A project-local copy of the complete skill under
+`.agents/skills/abdullah-orchestrator/` makes it visible to the Windows-native
+agent. [Windows desktop and WSL](https://learn.chatgpt.com/docs/windows/windows-app)
+
+```toml
+[mcp_servers.abdullah-orchestrator]
+command = "C:/Windows/System32/wsl.exe"
+args = [
+  "-d", "Ubuntu", "--cd", "/home/your-user",
+  "--exec", "/usr/bin/env",
+  "PATH=/home/your-user/path-to-codex-bin:/home/your-user/.opencode/bin:/usr/local/bin:/usr/bin:/bin",
+  "/usr/bin/python3", "/home/your-user/abdullah-orchestrator/scripts/orchestrator.py", "mcp",
+]
+startup_timeout_sec = 30
+tool_timeout_sec = 18000
+```
+
+In WSL, use `command -v codex` and `command -v opencode` to identify the
+directories for `PATH`. The non-interactive launch can miss directories
+installed by a shell startup script, such as an NVM bin directory. Restart
+the desktop app after saving a user-level registration, or open the trusted
+project in a fresh thread for a project-level registration. Confirm discovery
+with `$abdullah-orchestrator` and `/mcp`. Pass the **Linux absolute path** of
+the target project to `orchestrator_start` because it runs in WSL. The desktop
+model is the coordinator. Architect and worker model choices come from the
+WSL supervisor's configuration. [Codex MCP registration](https://learn.chatgpt.com/docs/extend/mcp)
+
+Skill discovery, MCP registration, stage execution and backend interruption and
+fresh-thread recovery passed through the native Windows backend. A separate
+Windows-to-WSL stdio run passed host cancellation, reconnect and resume with
+local fixture workers. In the desktop GUI, the stage tool card and whole-turn
+duration appeared, but in-app Stop, live worker activity and fresh-thread
+recovery were not exercised; the operator deferred the desktop Stop retest.
+Backend/stdio cancellation evidence does not attest those UI controls.
+
 ### Claude Code host
 
 ```bash
@@ -126,6 +184,7 @@ Then merge the printed snippets yourself:
 
 The installer deliberately never rewrites host settings. Verify with
 `claude mcp get abdullah-orchestrator` and `/mcp` inside Claude Code.
+[Claude Code CLI validation evidence](release-evidence/v1.2.0/README.md#claude-code-cli-compatibility)
 
 ## 4. Configure
 

@@ -261,8 +261,11 @@ permission enforcement or native terminal lifecycle.
 
 Not measured in this candidate: live Medium-vs-High planning quality/cost,
 token or wall-time savings, native terminal duration/Esc/reconnect behavior,
-authenticated Codex/Claude/OpenCode stages, and real Reviewer tool calls.
-Fake-CLI and fake-host fixtures establish supervisor behavior only.
+authenticated Claude stages, provider-backed Claude workers, and live
+alternative providers. The one authenticated OpenCode Go Reviewer Read is
+recorded separately; its shell/edit probes stayed unobserved, so same-session
+capability remains unverified. Fake-CLI and fake-host fixtures establish
+supervisor behavior only.
 
 ### Real end-to-end milestone (2026-11-16 → 2026-11-18)
 
@@ -402,13 +405,23 @@ Be explicit with reviewers and users:
   tested with fixtures and fakes against the pinned upstream contracts; no V1
   binary was available, so no V1 compatibility claim is made. V2.2.7 was tested
   for normalization and permissions, not for provider inference.
-- **Authenticated model execution is not covered by the default suite.** Two real
-  paths exist: the historical v3.0.0 pilot and the v1.0.0 milestone run, both
-  Codex + OpenCode Go. Neither is a compatibility matrix.
-- **Claude host mode** was not exercised end-to-end. Registration, rollback,
-  snippets, flags and a whole-stage deadline are covered by fake-CLI tests; no
-  real Claude long stage, Esc/cancel/reconnect or `/mcp` UX is part of this
-  evidence.
+- **Authenticated model execution is not covered by the default suite.** Two
+  historical real paths exist: the v3.0.0 pilot and the v1.0.0 milestone run,
+  both Codex + OpenCode Go. Neither is a compatibility matrix. A separate
+  authenticated OpenCode Go Reviewer Read is recorded in the v1.2.0 release
+  evidence; its shell/edit probes were not observed, so same-session capability
+  remains unverified.
+- **Claude host mode.** The installed CLI connected to the stdio server and
+  completed a headless planning stage with local fixtures. Automated tests cover
+  registration, rollback, flags, deadlines and a Claude-hosted workflow with
+  fixture workers. Interactive Escape, reconnect, `/mcp` and authenticated
+  long stages remain unverified. [Claude Code CLI evidence](release-evidence/v1.2.0/README.md#claude-code-cli-compatibility)
+- **Windows desktop UI controls.** The Windows Codex desktop with its agent in
+  WSL discovered the skill and completed planning and implementation through
+  the disposable supervisor. In-app Stop, live worker activity and fresh-thread
+  recovery were not exercised in the UI; the operator deferred the desktop Stop
+  retest. Native backend and Windows-to-WSL stdio cancellation/recovery are
+  separate evidence. [Windows desktop evidence](release-evidence/v1.2.0/README.md#native-windows-codex-desktop-compatibility)
 - **New provider routes and fallback** are exercised with fake CLIs and route
   policy tests, not with paid/local provider accounts. Billing classifications
   are attested policy, not provider settlement; no dollar/token cap is proven.
@@ -446,3 +459,12 @@ python3 scripts/orchestrator.py doctor --project /absolute/path/to/repo
 A clean-room validation from a fresh clone is the authoritative check for a
 release ZIP: install nothing globally, run the suite, then inspect the
 repository tree against `git ls-files`.
+
+## Post-v1.2.0 TODO
+
+- [ ] Show live subagent/worker progress for the active Orchestrator worker in
+  Codex and Claude Code, across CLI and GUI hosts. Before launch, show the
+  worker and model, batch task, and expected output. While it runs, show elapsed
+  time and the latest reported activity when available. Verify the display in
+  each actual client. Preserve the existing foreground stage and interruption
+  behavior.
