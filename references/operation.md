@@ -89,15 +89,28 @@ optional.
 
 The planning result carries `plan_view`: revision and approval state, summary
 rationale, main invariants, and each displayed batch's title, goal, acceptance,
-risk and verification purpose, plus omitted counts and a recap/report reference.
-`orchestrator_status` returns the same view for reconnect. Raw check argv is not
-included. A blocked plan exposes its decision question and rationale through the
-current attempt's attested report reference, never through an older proposal.
-Review previews place material findings first and count omissions; the stored
-report keeps its original evidence and ordering. Status and the accept result
-carry the canonical Architect verdict and reason even when the run routes
+risk and verification purpose, plus omitted counts and a recap/artifact
+reference. `orchestrator_status` returns the same view for reconnect. Raw check
+argv is not included. `orchestrator_recap detail=developer` is the read-only
+detail path for omitted items: it lists every current-plan batch, invariant and
+acceptance criterion and every recorded Reviewer finding with location,
+evidence, confidence and disposition. That plan/finding detail has no pagination
+bound; other developer-recap lists keep their labeled bounds, and the compact
+preview and quick recap remain bounded. Its returned `artifacts`
+reference resolvable files inside the run directory, including `state.json` and
+the current Reviewer report when present. A blocked plan exposes its decision
+question and rationale through the current attempt; its report reference is used
+only with the recorded digest, current plan job and run/amendment scope, and
+otherwise the saved bounded fields are shown with the artifact marked
+unavailable. Review previews place material findings first and count omissions;
+the stored report keeps its original evidence and ordering. Status and the accept
+result carry the canonical Architect verdict and reason even when the run routes
 immediately to a correction. A completed Implementer report is not proof that
 tests passed; identify verification as pending until the supervisor runs it.
+After a successful Implementer milestone, add the requested short developer
+summary: what changed, how it works, key paths or symbols, the worker's test
+notes and pending supervisor verification. Give the short final handback when
+the run completes.
 
 Plan approval is opt-in. The default plan continues automatically, and an
 ordinary request to see the plan or its rationale is not an approval pause. Only
@@ -106,10 +119,14 @@ you finalize the plan” should start the run with `plan_approval: true`. That
 Architect puts the rationale in `summary`, flags consequential forks with
 trade-offs and a recommendation, and uses `blocker` for a question that must be
 answered before a valid plan exists. Present the proposal and actual questions
-in chat; record the user's exact reply with `orchestrator_amend`, resume, and
-obtain a versioned revised plan. Discussion cannot grant execution authority,
-and approval of an earlier plan never authorizes its revision. The executing
-plan still requires the human-only `approve-plan` command.
+in chat. If the reply answers a blocking question or materially changes the
+design or requirements, record the user's exact reply with `orchestrator_amend`,
+resume, and obtain a versioned revised plan. If the user accepts the unchanged
+plan, do not amend or replan; show the exact human approval action. Discussion
+cannot grant execution authority, and approval of an earlier plan never
+authorizes its revision. Once an amendment supersedes a blocked question,
+status shows replanning pending. The executing plan still requires the human-only
+`approve-plan` command.
 
 ```bash
 python3 scripts/orchestrator.py status --run <RUN_ID> --follow

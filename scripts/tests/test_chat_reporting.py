@@ -7,6 +7,7 @@ verdicts, and the opt-in Architect consultation path. No model calls.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from test_orchestrator import ControlTests, orc
@@ -388,3 +389,179 @@ class ChatReportingTests(ControlTests):
                          "The authorization bypass is still reachable.")
         self.assertIn("changes_required", payload["summary"])
         self.assertIn("authorization bypass", payload["summary"])
+
+    def test_developer_recap_retrieves_omitted_plan_and_all_findings(self):
+        findings = [
+            {"severity": "low" if index % 2 else "high",
+             "confidence": "confirmed" if index % 3 else "probable",
+             "location": f"finding-{index}", "claim": f"Claim {index}",
+             "evidence": f"evidence for {index}",
+             "disposition": f"disposition {index}"}
+            for index in range(12)
+        ]
+        review = {"status": "complete", "summary": "Review complete",
+                  "findings": findings, "files": [], "tests": [],
+                  "evidence": ["app.py:1"], "unknowns": [], "blocker": ""}
+        review_dir = self.rundir / "jobs" / "review-1"
+        review_dir.mkdir(parents=True)
+        orc.atomic_json(review_dir / "report.json", review)
+        self.state.update({
+            "plan": plan_report("Complete detail", batches=10,
+                                invariants=[f"Invariant {index}" for index in range(11)]),
+            "plan_version": "detail-version",
+            "plan_revision": 4,
+            "plan_authority": approved_authority("detail-version", 4),
+            "review": review,
+            "completed_jobs": [{"id": "review-1", "kind": "reviewer",
+                                "path": str(review_dir), "amendment_epoch": 0}],
+            "status": "running",
+            "phase": "review",
+        })
+        orc.save(self.rundir, self.state)
+
+        recap = orc.recap_run("test-run00", "developer")
+        text = recap["text"]
+        for value in ("Batch 10/10", "Acceptance 10.5", "Invariant 10",
+                      "finding-11", "evidence for 11", "[low/probable]",
+                      "disposition 11"):
+            self.assertIn(value, text)
+        self.assertNotIn("SECRET-ARGV", text)
+        self.assertEqual(recap["artifacts"]["state"]["valid"], True)
+        self.assertEqual(recap["artifacts"]["reviewer_report"]["valid"], True)
+        for reference in recap["artifacts"].values():
+            path = Path(reference["path"])
+            self.assertTrue(path.is_relative_to(self.rundir), path)
+            self.assertTrue(path.is_file(), path)
+
+        mcp_recap = orc._mcp_tool_call(
+            "orchestrator_recap", {"run_id": "test-run00", "detail": "developer"})
+        self.assertIn("Batch 10/10", mcp_recap["text"])
+        self.assertEqual(mcp_recap["artifacts"]["reviewer_report"]["valid"], True)
+
+        status = orc._mcp_tool_call("orchestrator_status",
+                                    {"run_id": "test-run00"})
+        detail = status["plan_view"]["detail"]
+        self.assertEqual(status["plan_view"]["batches_omitted_count"], 2)
+        self.assertIn("all current plan batches", detail["includes"])
+        self.assertIn("no pagination", detail["bounds"])
+        self.assertEqual(detail["artifacts"]["state"]["valid"], True)
+        self.assertTrue(Path(detail["artifacts"]["state"]["path"]).is_relative_to(self.rundir))
+
+        # The stage entry point carries the same bounded plan view.
+        self.state["phase"] = "plan"
+        orc.save(self.rundir, self.state)
+        with patch.object(orc, "advance"):
+            staged = orc._mcp_tool_call("orchestrator_stage",
+                                        {"run_id": "test-run00"})
+        self.assertEqual(staged["stage"], "plan")
+        self.assertEqual(staged["plan_view"]["batches_omitted_count"], 2)
+
+    def test_amendment_retires_the_answered_blocked_question(self):
+        report = {
+            "contract_version": 2, "status": "blocked",
+            "summary": "The data-store choice changes the migration path.",
+            "invariants": [], "batches": [],
+            "blocker": "Should this use SQLite or Postgres?",
+            "required_exploration": {"job_id": "", "scope_satisfied": False}}
+        job_dir = self.rundir / "jobs" / "answered-plan"
+        job_dir.mkdir(parents=True)
+        orc.atomic_json(job_dir / "report.json", report)
+        self.state.update({
+            "plan_approval": True,
+            "plan": None,
+            "phase": "plan",
+            "status": "blocked",
+            "amendment_epoch": 0,
+            "plan_attempt": {
+                "status": "blocked",
+                "summary": report["summary"],
+                "blocker": report["blocker"],
+                "job_id": "answered-plan",
+                "run_id": "test-run00",
+                "amendment_epoch": 0,
+                "report": {"job_id": "answered-plan",
+                           "path": str(job_dir / "report.json"),
+                           "sha256": orc.content_hash(report),
+                           "run_id": "test-run00",
+                           "amendment_epoch": 0}},
+            "completed_jobs": [{"id": "answered-plan", "kind": "plan",
+                                "path": str(job_dir), "amendment_epoch": 0}],
+        })
+        orc.save(self.rundir, self.state)
+        current = orc.status_run("test-run00")["plan_view"]
+        self.assertEqual(current["status"], "blocked")
+        self.assertEqual(current["blocker"], "Should this use SQLite or Postgres?")
+
+        reply = "Use SQLite; keep the migration reversible."
+        amended = orc.amend_run("test-run00", reply, architect_review=True)
+        self.assertTrue(amended["persisted"])
+        after = orc._mcp_tool_call("orchestrator_status",
+                                   {"run_id": "test-run00"})
+        view = after["plan_view"]
+        self.assertEqual(view["status"], "replanning")
+        self.assertNotIn("blocker", view)
+        self.assertEqual(view["pending_amendment"]["text"], reply)
+        folder, state = orc.load("test-run00")
+        self.assertNotIn("plan_attempt", state)
+        self.assertEqual(state["plan_attempt_history"][-1]["retired_reason"],
+                         "superseded_by_amendment")
+        self.assertTrue(Path(state["plan_attempt_history"][-1]["report"]["path"]).is_file())
+        self.assertIn("Material amendment", view["summary"])
+
+    def test_blocked_artifact_requires_current_digest_job_and_scope(self):
+        report = {"status": "blocked", "summary": "Saved rationale",
+                  "blocker": "Saved question"}
+        job_dir = self.rundir / "jobs" / "provenance-plan"
+        job_dir.mkdir(parents=True)
+        report_path = job_dir / "report.json"
+        orc.atomic_json(report_path, report)
+        attempts = [
+            ("missing_path", {}),
+            ("missing_digest",
+             {"job_id": "provenance-plan", "path": str(report_path)}),
+            ("digest_mismatch",
+             {"job_id": "provenance-plan", "path": str(report_path),
+              "sha256": "0" * 64}),
+            ("outside_job",
+             {"job_id": "provenance-plan", "path": str(self.rundir / "state.json"),
+              "sha256": orc.content_hash(report)}),
+        ]
+        for reason, reference in attempts:
+            self.state.update({
+                "phase": "plan", "status": "blocked",
+                "completed_jobs": [{"id": "provenance-plan", "kind": "plan",
+                                    "path": str(job_dir), "amendment_epoch": 0}],
+                "plan_attempt": {
+                    "status": "blocked", "summary": report["summary"],
+                    "blocker": report["blocker"], "job_id": "provenance-plan",
+                    "run_id": "test-run00", "amendment_epoch": 0,
+                    "report": reference}})
+            orc.save(self.rundir, self.state)
+            view = orc.status_run("test-run00")["plan_view"]
+            self.assertEqual(view["status"], "blocked")
+            self.assertEqual(view["blocker"], "Saved question")
+            self.assertFalse(view["detail"]["report"]["available"], reason)
+            self.assertEqual(view["detail"]["report"]["reason"], reason)
+
+    def test_stale_blocked_question_is_not_current_after_epoch_change(self):
+        report = {"status": "blocked", "summary": "Old rationale",
+                  "blocker": "Old question"}
+        job_dir = self.rundir / "jobs" / "epoch-plan"
+        job_dir.mkdir(parents=True)
+        orc.atomic_json(job_dir / "report.json", report)
+        self.state.update({
+            "phase": "plan", "status": "paused", "amendment_epoch": 1,
+            "completed_jobs": [{"id": "epoch-plan", "kind": "plan",
+                                "path": str(job_dir), "amendment_epoch": 0}],
+            "plan_attempt": {
+                "status": "blocked", "summary": report["summary"],
+                "blocker": report["blocker"], "job_id": "epoch-plan",
+                "run_id": "test-run00", "amendment_epoch": 0,
+                "report": {"job_id": "epoch-plan",
+                           "path": str(job_dir / "report.json"),
+                           "sha256": orc.content_hash(report),
+                           "run_id": "test-run00", "amendment_epoch": 0}}})
+        orc.save(self.rundir, self.state)
+        view = orc.status_run("test-run00")["plan_view"]
+        self.assertNotEqual(view["status"], "blocked")
+        self.assertNotIn("Old question", json.dumps(view))

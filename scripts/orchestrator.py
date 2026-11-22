@@ -13869,7 +13869,7 @@ def advance(run_dir, state, cfg, deadline=None):
         if state.get("plan") is None:
             # A new plan must not inherit stale batch-scoped context, and a prior
             # blocked attempt is no longer the current attempt once planning resumes.
-            state.pop("plan_attempt", None)
+            _retire_plan_attempt(state, "superseded_by_new_planning_attempt")
             state["implementation"] = None
             state["implementation_job"] = None
             state["review"] = None
@@ -13963,7 +13963,7 @@ def advance(run_dir, state, cfg, deadline=None):
                                     state.get("accepted_batches", [])),
                                 "archived_at": now()})
         state["plan"] = plan
-        state.pop("plan_attempt", None)
+        _retire_plan_attempt(state, "replaced_by_accepted_plan")
         state["plan_version"] = new_version
         state["plan_revision"] = state.get("plan_revision", 0) + 1
         state["plan_authority"] = {
@@ -16409,7 +16409,7 @@ def do_status(run_id):
         "id", "status", "phase", "updated_at", "batch_index", "corrections", "pause_reason",
         "active_job", "verification", "architect_verdict", "diagnosis_verdict", "final_verdict")}
     result["total_batches"] = len(state["plan"]["batches"]) if state.get("plan") else 0
-    result["plan_view"] = plan_view(state)
+    result["plan_view"] = plan_view(state, folder)
     result["recent_completed_jobs"] = state.get("completed_jobs", [])[-3:]
     result["usage"] = usage_report(state)
     result["stage_progress"] = stage_snapshot(folder, state)
@@ -17228,20 +17228,73 @@ def _plan_approval_view(state):
     }
 
 
-def _plan_attempt_report(state):
-    """The current blocked planning attempt, never an older proposal."""
+def _current_plan_attempt(state):
+    """The blocked attempt that still answers the current planning state."""
     attempt = state.get("plan_attempt")
     if not isinstance(attempt, dict) or attempt.get("status") != "blocked":
         return None
+    if attempt.get("amendment_epoch", state.get("amendment_epoch", 0)) != \
+            state.get("amendment_epoch", 0):
+        return None
+    if state.get("phase") != "plan":
+        return None
+    if state.get("status") not in {"blocked", "paused"}:
+        return None
+    return attempt
+
+
+def _plan_attempt_artifact(state, attempt):
+    """Return (report, None) only for a current, digest-attested job artifact."""
     reference = attempt.get("report") if isinstance(attempt.get("report"), dict) else {}
-    if reference.get("path"):
-        report = _safe_read(reference["path"])
-        if isinstance(report, dict):
-            expected = reference.get("sha256")
-            if not expected or content_hash(report) == expected:
-                return report
-            # A changed/unattested report file is not trusted as the current
-            # attempt; the recorded summary/blocker remain truthful.
+    path = reference.get("path")
+    if not path:
+        return None, "missing_path"
+    expected = reference.get("sha256")
+    if not isinstance(expected, str) or not expected.strip():
+        return None, "missing_digest"
+    if reference.get("run_id") not in (None, state.get("id")):
+        return None, "run_mismatch"
+    if reference.get("amendment_epoch", attempt.get("amendment_epoch")) != \
+            state.get("amendment_epoch", 0):
+        return None, "epoch_mismatch"
+    job_id = reference.get("job_id") or attempt.get("job_id")
+    jobs = [job for job in state.get("completed_jobs", [])
+            if job.get("kind") == "plan"]
+    if not jobs:
+        return None, "job_not_found"
+    if job_id and jobs[-1].get("id") != job_id:
+        return None, "stale_job"
+    job = jobs[-1] if job_id else None
+    if job is None or job.get("id") != attempt.get("job_id", job_id):
+        return None, "job_mismatch"
+    try:
+        job_path = Path(job.get("path", "")).resolve()
+        report_path = Path(path).resolve()
+        report_path.relative_to(job_path)
+    except (OSError, ValueError):
+        return None, "outside_job"
+    if report_path != (job_path / "report.json").resolve():
+        return None, "unexpected_artifact"
+    report = _safe_read(report_path)
+    if not isinstance(report, dict):
+        return None, "unreadable"
+    if content_hash(report) != expected:
+        return None, "digest_mismatch"
+    if report.get("status") != "blocked":
+        return None, "status_mismatch"
+    return report, None
+
+
+def _plan_attempt_report(state):
+    """The current blocked planning attempt, never an older proposal."""
+    attempt = _current_plan_attempt(state)
+    if attempt is None:
+        return None
+    report, _reason = _plan_attempt_artifact(state, attempt)
+    if report is not None:
+        return report
+    # The saved fields remain the honest current question when the artifact
+    # cannot be proven current.
     report = {"status": "blocked",
               "summary": attempt.get("summary") or "",
               "blocker": attempt.get("blocker") or ""}
@@ -17254,7 +17307,10 @@ def _record_plan_attempt(state, plan):
                "summary": plan.get("summary"),
                "blocker": plan.get("blocker"),
                "report_sha256": content_hash(plan),
-               "recorded_at": now()}
+               "recorded_at": now(),
+               "run_id": state.get("id"),
+               "amendment_epoch": state.get("amendment_epoch", 0),
+               "plan_revision": state.get("plan_revision", 0)}
     jobs = state.get("completed_jobs") or []
     if jobs and jobs[-1].get("kind") == "plan":
         job = jobs[-1]
@@ -17262,20 +17318,95 @@ def _record_plan_attempt(state, plan):
         if job.get("path"):
             path = Path(job["path"]) / "report.json"
             attempt["report"] = {"job_id": job.get("id"), "path": str(path),
-                                 "sha256": content_hash(plan)}
+                                 "sha256": content_hash(plan),
+                                 "run_id": state.get("id"),
+                                 "amendment_epoch": state.get("amendment_epoch", 0)}
     state["plan_attempt"] = attempt
 
 
-def _plan_detail_reference(state):
-    reference = {"recap": "orchestrator_recap detail=developer",
-                 "archived_plans": len(state.get("plan_history", []) or [])}
-    attempt = state.get("plan_attempt")
-    if isinstance(attempt, dict) and isinstance(attempt.get("report"), dict):
-        reference["report"] = attempt["report"]
+def _retire_plan_attempt(state, reason):
+    attempt = state.pop("plan_attempt", None)
+    if not isinstance(attempt, dict):
+        return None
+    attempt = dict(attempt)
+    attempt.update({"retired_at": now(), "retired_reason": reason})
+    state.setdefault("plan_attempt_history", []).append(attempt)
+    return attempt
+
+
+def _run_scope_artifacts(folder, state):
+    """Resolvable read-only references inside this run's own directory."""
+    artifacts = {}
+    if not folder:
+        return artifacts
+    folder = Path(folder)
+    state_ref = _run_artifact_reference(folder, folder / "state.json")
+    if state_ref:
+        artifacts["state"] = state_ref
+    plan_path = _completed_job_artifact(state, "plan")
+    if plan_path:
+        plan_report = _safe_read(plan_path)
+        if (isinstance(plan_report, dict)
+                and content_hash(plan_report) == state.get("plan_version")):
+            plan_ref = _run_artifact_reference(folder, plan_path)
+            if plan_ref:
+                artifacts["plan_report"] = plan_ref
+    review_path = _completed_job_artifact(state, "reviewer")
+    if review_path:
+        review_ref = _run_artifact_reference(folder, review_path)
+        if review_ref:
+            artifacts["reviewer_report"] = review_ref
+    verification_path = (state.get("verification") or {}).get("path")
+    if verification_path:
+        verification_ref = _run_artifact_reference(folder, verification_path)
+        if verification_ref:
+            artifacts["verification_record"] = verification_ref
+    return artifacts
+
+
+def _plan_detail_reference(state, folder=None):
+    reference = {
+        "recap": "orchestrator_recap detail=developer",
+        "includes": ("all current plan batches, invariants and acceptance criteria; "
+                     "all recorded Reviewer findings"),
+        "bounds": ("no pagination for plan batches/invariants/acceptance or recorded "
+                   "findings; other developer-recap lists keep their labeled bounds"),
+        "archived_plans": len(state.get("plan_history", []) or []),
+        "artifacts": _run_scope_artifacts(folder, state),
+    }
+    attempt = _current_plan_attempt(state)
+    if attempt is not None:
+        raw = attempt.get("report") if isinstance(attempt.get("report"), dict) else {}
+        shown = dict(raw)
+        _report, reason = _plan_attempt_artifact(state, attempt)
+        shown["available"] = reason is None
+        if reason:
+            shown["reason"] = reason
+        reference["report"] = shown
     return reference
 
 
-def plan_view(state):
+def _plan_replan_pending(state):
+    if isinstance(state.get("plan"), dict) and state["plan"]:
+        return False
+    if state.get("phase") != "plan":
+        return False
+    if state.get("status") not in {"paused", "blocked"}:
+        return False
+    if not (state.get("amendment_material") or state.get("correction_replan")):
+        return False
+    return True
+
+
+def _pending_amendment_view(state):
+    for entry in reversed(state.get("amendments", []) or []):
+        if isinstance(entry, dict) and entry.get("kind") == "material":
+            return {"id": entry.get("id"), "at": entry.get("at"),
+                    "text": _safe_progress_text(entry.get("text"), 800)}
+    return None
+
+
+def plan_view(state, folder=None):
     """Bounded, structured view of the actual plan for status and planning.
 
     The full plan, hashes, approvals and worker reports stay untouched in
@@ -17292,7 +17423,7 @@ def plan_view(state):
             "approval": approval,
             "summary": _safe_progress_text(blocked.get("summary"), 1200),
             "blocker": _safe_progress_text(blocked.get("blocker"), 800),
-            "detail": _plan_detail_reference(state),
+            "detail": _plan_detail_reference(state, folder),
         }
     plan = state.get("plan")
     if isinstance(plan, dict) and plan:
@@ -17337,7 +17468,20 @@ def plan_view(state):
             "invariants_omitted_count": max(0, len(raw_invariants) - len(invariants)),
             "batches": batches,
             "batches_omitted_count": max(0, len(raw_batches) - len(batches)),
-            "detail": _plan_detail_reference(state),
+            "detail": _plan_detail_reference(state, folder),
+        }
+    if _plan_replan_pending(state):
+        return {
+            "available": False,
+            "status": "replanning",
+            "revision": state.get("plan_revision", 0),
+            "version": state.get("plan_version"),
+            "approval": approval,
+            "summary": _safe_progress_text(
+                state.get("pause_reason")
+                or "A material amendment requires a new versioned plan.", 1200),
+            "pending_amendment": _pending_amendment_view(state),
+            "detail": _plan_detail_reference(state, folder),
         }
     return {
         "available": False,
@@ -17345,7 +17489,7 @@ def plan_view(state):
         "revision": state.get("plan_revision", 0),
         "version": state.get("plan_version"),
         "approval": approval,
-        "detail": _plan_detail_reference(state),
+        "detail": _plan_detail_reference(state, folder),
     }
 
 
@@ -17825,7 +17969,7 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
             "status": status, "phase": state.get("phase"),
             "summary": summary,
             "report": compact_report(stage_report(state, stage)),
-            "plan_view": plan_view(state) if stage == "plan" else None,
+            "plan_view": plan_view(state, folder) if stage == "plan" else None,
             "error": error, "pause_reason": state.get("pause_reason"),
             "progress_line": progress, "next_action": next_action_for(state),
             "next": next_preview,
@@ -18155,7 +18299,7 @@ def status_run(run_id):
         "architect_verdict": compact_report(state.get("architect_verdict")),
         "diagnosis_verdict": compact_report(state.get("diagnosis_verdict")),
         "final_verdict": compact_report(state.get("final_verdict")),
-        "plan_view": plan_view(state),
+        "plan_view": plan_view(state, folder),
         "usage": usage_report(state),
         "plan_revision": state.get("plan_revision", 0),
         "plan_history": len(state.get("plan_history", [])),
@@ -18224,11 +18368,73 @@ def _recap_facts(folder, state):
             "accepted_history": len(state.get("accepted_history", []))}
 
 
+def _recap_plan_detail_lines(state):
+    plan = state.get("plan")
+    lines = ["\nPlan detail (complete):"]
+    if not isinstance(plan, dict) or not plan:
+        lines.append("- No current plan is recorded.")
+        return lines
+    lines.append(f"- Revision: {state.get('plan_revision', 0)}; "
+                 f"version: {state.get('plan_version') or 'unavailable'}; "
+                 f"status: {plan.get('status') or 'complete'}")
+    if plan.get("summary"):
+        lines.append(f"- Summary: {plan['summary']}")
+    invariants = plan.get("invariants") if isinstance(plan.get("invariants"), list) else []
+    lines.append(f"- Invariants ({len(invariants)}):")
+    for invariant in invariants:
+        lines.append(f"  - {invariant}")
+    if not invariants:
+        lines.append("  - none recorded")
+    batches = plan.get("batches") if isinstance(plan.get("batches"), list) else []
+    lines.append(f"- Batches ({len(batches)}):")
+    for index, batch in enumerate(batches):
+        if not isinstance(batch, dict):
+            continue
+        lines.append(f"  - Batch {index + 1}/{len(batches)}: "
+                     f"{batch.get('title') or 'untitled'} "
+                     f"(risk: {batch.get('risk') or 'unknown'})")
+        lines.append(f"    goal: {batch.get('goal') or 'not recorded'}")
+        acceptance = batch.get("acceptance")
+        acceptance = acceptance if isinstance(acceptance, list) else []
+        for item in acceptance:
+            lines.append(f"    acceptance: {item}")
+        if not acceptance:
+            lines.append("    acceptance: none recorded")
+        if batch.get("verification_purpose"):
+            lines.append(f"    verification purpose: {batch['verification_purpose']}")
+    return lines
+
+
+def _recap_finding_lines(finding):
+    if not isinstance(finding, dict):
+        return ["- malformed finding record"]
+    return [
+        f"- [{finding.get('severity')}/{finding.get('confidence')}] "
+        f"{finding.get('location')}: {finding.get('claim')}",
+        f"  evidence: {finding.get('evidence')}",
+        f"  disposition: {finding.get('disposition')}",
+    ]
+
+
+def _recap_artifact_lines(artifacts):
+    lines = ["\nRead-only run artifacts:"]
+    if not artifacts:
+        lines.append("- none recorded")
+        return lines
+    for name, reference in artifacts.items():
+        if not isinstance(reference, dict):
+            continue
+        lines.append(f"- {name}: {reference.get('path')} "
+                     f"(valid={reference.get('valid')}, sha256={reference.get('sha256')})")
+    return lines
+
+
 def recap_run(run_id, detail="quick"):
     folder, state = load(run_id)
     if detail not in {"quick", "developer"}:
         raise ValueError("Recap detail must be 'quick' or 'developer'")
     facts = _recap_facts(folder, state)
+    artifacts = _run_scope_artifacts(folder, state)
     started_event, ended_event = _last_stage_markers(folder)
     last_stage = ({"stage": started_event.get("stage"),
                    "agent_label": started_event.get("agent_label"),
@@ -18279,6 +18485,7 @@ def recap_run(run_id, detail="quick"):
             lines.insert(1, "State is uncertain; this recap reflects persisted evidence only, not live worker state.")
         return {"ok": True, "run_id": run_id, "detail": detail, "current": not uncertain,
                 "text": "\n".join(lines[:12]), "next_action": next_action_for(state),
+                "artifacts": artifacts,
                 "facts": {"files": facts["files"], "verification": verification_text,
                           "remaining_batches": facts["remaining_batches"],
                           "usage": facts["usage"], "plan_revision": facts["plan_revision"],
@@ -18311,14 +18518,13 @@ def recap_run(run_id, detail="quick"):
     if not facts["evidence"]:
         sections.append("- No source-level evidence recorded.")
     sections.append("\nWhy this approach:")
-    if plan.get("invariants"):
-        sections.append("- Invariants: " + "; ".join(plan["invariants"][:8]))
     if plan.get("summary"):
         sections.append(f"- Plan: {plan['summary']}")
     if verdict.get("reason"):
         sections.append(f"- Acceptance: {verdict.get('reason')}")
     if not (plan or verdict):
         sections.append("- No architectural rationale recorded yet.")
+    sections.extend(_recap_plan_detail_lines(state))
     sections.append("\nImportant files, symbols and commands:")
     for item in facts["files"][:20]:
         sections.append(f"- {item}")
@@ -18340,9 +18546,12 @@ def recap_run(run_id, detail="quick"):
     sections.append("\nReview and acceptance decisions:")
     if review:
         sections.append(f"- Reviewer: {review.get('summary') or review.get('status')}")
-        for finding in review.get("findings", [])[:10]:
-            sections.append(f"- [{finding.get('severity')}] {finding.get('location')}: "
-                            f"{finding.get('claim')} ({finding.get('disposition')})")
+        findings = review.get("findings", []) or []
+        sections.append(f"- Recorded findings ({len(findings)}, complete):")
+        for finding in findings:
+            sections.extend(_recap_finding_lines(finding))
+        if not findings:
+            sections.append("  - none recorded")
     if verdict:
         sections.append(f"- Architect: {verdict.get('verdict')}: {verdict.get('reason')}")
     journal = journal_tail(folder, 80)
@@ -18363,16 +18572,19 @@ def recap_run(run_id, detail="quick"):
     sections.append("\nLimitations and remaining work:")
     for item in facts["unknowns"][:12]:
         sections.append(f"- unknown: {item}")
-    for finding in facts["findings"][:12]:
-        sections.append(f"- finding: [{finding.get('severity')}] {finding.get('claim')}")
+    if facts["findings"]:
+        sections.append(f"- {len(facts['findings'])} recorded finding(s); "
+                        "all are listed under Review and acceptance decisions above.")
     if state.get("pause_reason"):
         sections.append(f"- pause: {state['pause_reason']}")
     sections.append(f"- Remaining batches: {facts['remaining_batches']}")
     sections.append(f"- Next action: {next_action_for(state)}")
+    sections.extend(_recap_artifact_lines(artifacts))
     sections.append("\nNote: LLM internal reasoning is never restored; this recap is grounded "
                     "in persisted reports, checkpoints, diffs and verification evidence.")
     return {"ok": True, "run_id": run_id, "detail": detail, "current": not uncertain,
-            "text": "\n".join(sections), "next_action": next_action_for(state)}
+            "text": "\n".join(sections), "next_action": next_action_for(state),
+            "artifacts": artifacts}
 
 
 def _acquire_lock_file(folder, timeout=30.0):
@@ -18605,6 +18817,8 @@ def amend_run(run_id, amendment, architect_review=False, kind="requirement"):
                  "routed_to": ("plan" if plan_required else
                                "diagnose" if material else "implement")}
         state.setdefault("amendments", []).append(entry)
+        if state.get("phase") == "plan":
+            _retire_plan_attempt(state, "superseded_by_amendment")
         consume_last(state)
         if pending_requirement_replan:
             # Both verbatim entries stay in requirements; the pending route is

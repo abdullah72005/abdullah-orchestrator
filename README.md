@@ -309,12 +309,20 @@ plan → implement → verify → review → accept → complete
 The planning response and `orchestrator_status` include a bounded `plan_view`:
 revision and approval state, summary rationale, main invariants, and each
 displayed batch's title, goal, acceptance, risk and verification purpose. It
-counts omitted entries and points to the developer recap or the durable report
-for the rest; raw check argv stays out of the chat view. Review previews put
-material findings first and count what was omitted. The canonical Architect
-verdict and reason remain visible even when the run routes directly to a
-correction. A completed Implementer is not the same as verified tests: the
-coordinator says verification is pending until the supervisor runs it.
+counts omitted entries and points to `orchestrator_recap detail=developer`, the
+no-model read-only detail path that lists every current-plan batch, invariant
+and acceptance criterion plus every recorded Reviewer finding with location,
+evidence, confidence and disposition. That plan and finding detail has no
+pagination bound; other developer-recap lists keep their labeled bounds, and the
+compact preview and quick recap stay bounded. Returned artifact references
+resolve inside the run directory. Raw check argv stays out of routine previews.
+Review previews put material findings first and count what was omitted. The
+canonical Architect verdict and reason remain visible even when the run routes
+directly to a correction. A completed Implementer is not the same as verified
+tests: the coordinator says verification is pending until the supervisor runs
+it, and after each successful Implementer milestone adds a short developer
+summary of what changed, how it works, key paths, worker test notes and pending
+verification.
 
 Plan approval is opt-in and the default stays automated. An ordinary request to
 see the plan is not an approval pause. Start with `plan_approval: true` only for
@@ -322,10 +330,14 @@ an explicit request such as “Ask me about architecture and design choices befo
 you finalize the plan.” The Architect then puts concise rationale in the plan
 summary, flags consequential forks with trade-offs and its recommendation, and
 uses the blocker for a question that must be answered before a valid plan is
-possible. The coordinator presents that actual proposal or question, records
-the user's reply with `orchestrator_amend`, and obtains a versioned revised
-plan. Chat discussion never grants execution authority, and approval of an
-earlier plan cannot authorize its revision.
+possible. The coordinator presents that actual proposal or question. If the
+reply answers a blocking question or materially changes the design or
+requirements, it records the exact reply with `orchestrator_amend` and obtains a
+versioned revised plan; if the user accepts the unchanged plan, it shows the
+existing human approval action without a needless replan. Chat discussion never
+grants execution authority, and approval of an earlier plan cannot authorize its
+revision. Once an amendment supersedes a blocked question, status reports
+replanning pending rather than the answered question.
 
 Human-only actions are **not** MCP tools and run in your own terminal:
 
@@ -380,8 +392,9 @@ in-flight updates depend on the client, and the terminal observer is optional.
   action. Legacy journals without attempt identity stay readable.
 - The same status and the plan stage carry `plan_view`, a bounded structured
   plan for reconnect from a fresh chat. A blocked plan reports its current
-  question and rationale with a report reference; an older proposal is never
-  substituted. Review previews prioritize material findings and count omissions.
+  question and rationale with a verified report reference; an older proposal or
+  a superseded question is never substituted, and an amendment shows replanning
+  pending. Review previews prioritize material findings and count omissions.
 - When the MCP client supplies a `progressToken`, the `orchestrator_stage` call
   also emits advisory `notifications/progress` updates about once per second for
   the attempt that call admitted. They carry a bounded human-readable message, a

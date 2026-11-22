@@ -86,7 +86,7 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
 3. **Inspect status** — `orchestrator_status` with `run_id`. Deterministic compact status, bounded `plan_view`, active job/check, canonical verdict and reason, next action and run directory; makes no model call.
 4. **Interrupt or pause** — `orchestrator_interrupt` with `run_id` and a short `reason`. Persists the interruption, terminates the process session and descendants, verifies termination and preserves changes. A verified stop leaves `paused`; an unverified stop leaves `uncertain`.
 5. **Quick recap** — `orchestrator_recap` with `detail: "quick"` (the default). About 5–12 lines covering phase/agent, completed work, changed files, verification, decisions, outstanding issues and next action.
-6. **Detailed developer explanation** — `orchestrator_recap` with `detail: "developer"`. What was implemented, how it works, why that approach was chosen, important files/symbols, actual test commands and results, and remaining limitations. Makes no model call.
+6. **Detailed developer explanation** — `orchestrator_recap` with `detail: "developer"`. What was implemented, how it works, why that approach was chosen, important files/symbols, actual test commands and results, and remaining limitations. It also returns every current-plan batch, invariant and acceptance criterion plus every recorded Reviewer finding with evidence, confidence and disposition, and resolvable run-scoped artifact references. Makes no model call.
 7. **Amend requirements** — `orchestrator_amend` with `amendment` (exact text), `kind` and `architect_review`. `kind` defaults to `requirement`, which replans and invalidates affected evidence; use `kind: "correction"` only for a bounded implementation detail. It interrupts active work first when needed and leaves the run paused.
 8. **Resume the same conversation** — `orchestrator_resume` with `run_id`, then continue with `orchestrator_stage`. Resume only marks the paused run runnable; it does not execute a stage.
 9. **Attach from a new conversation** — `orchestrator_runs` to list recent runs, then `orchestrator_status` for the chosen `run_id`, then `orchestrator_resume` when the state is safe.
@@ -125,12 +125,21 @@ For every engineering task use this loop:
    At milestones, include the useful engineering fact, not just status. A
    Reviewer result includes finding counts and material findings with severity,
    location, impact and requested correction; if the preview is capped, say how
-   many were omitted and use `orchestrator_recap detail=developer` for detail. An
-   Architect acceptance line starts with its actual **PASS**, **CHANGES
-   REQUIRED** or **BLOCKED** verdict, gives the reason, and states what happens
-   next. A completed Implementer is not verified tests: say verification is
-   pending until the supervisor has run the checks.
+   many were omitted and use `orchestrator_recap detail=developer` for all
+   findings. An Architect acceptance line starts with its actual **PASS**,
+   **CHANGES REQUIRED** or **BLOCKED** verdict, gives the reason, and states what
+   happens next. A completed Implementer is not verified tests: say verification
+   is pending until the supervisor has run the checks.
+
+   After each successful Implementer milestone, add the short developer summary
+   the user requested, in addition to the ordinary before/after stage lines:
+   what changed, how it works, one or two key paths or symbols, the Implementer's
+   observed test notes attributed to the worker, and whether supervisor
+   verification is still pending. Keep it concise; expand only on request.
 4. Repeat `orchestrator_stage` until the run is complete, paused, blocked or uncertain.
+
+On completion, give the short final handback: delivered behavior, verification
+evidence, Architect verdict, material limitations and the final run state.
 
 The planning result and `orchestrator_status` carry a bounded `plan_view`:
 revision and approval state, summary rationale, main invariants, and each shown
@@ -152,24 +161,31 @@ With that opt-in, the strong Architect puts the proposed direction and concise
 rationale in the plan `summary`. It flags each consequential fork with the
 practical trade-off and its recommendation, and uses `blocker` for a question
 that must be answered before a valid plan can exist. Present the proposed plan
-and the actual questions in chat. When the user replies:
+and the actual questions in chat. Then distinguish the reply:
 
-1. Record the exact reply with `orchestrator_amend` and `architect_review: true`.
-2. `orchestrator_resume`, then `orchestrator_stage` to obtain a versioned
-   revised plan.
-3. Present the revised plan and its rationale, then ask the user to run the
-   human-only approval command shown by `next_action`:
+- If the reply answers a blocking question, or materially changes the design or
+  requirements, record the exact reply with `orchestrator_amend` and
+  `architect_review: true`, then `orchestrator_resume` and `orchestrator_stage`
+  to obtain a versioned revised plan. Present the revision and its rationale.
+- If the user says the unchanged plan looks good or otherwise accepts it without
+  changes, do not amend or replan. Show the existing exact human approval action
+  from `next_action`:
 
-   ```bash
-   orchestrator.py approve-plan <ID> --confirm approve-plan:<ID>
-   ```
+  ```bash
+  orchestrator.py approve-plan <ID> --confirm approve-plan:<ID>
+  ```
+
+Routine runs stay automated. Do not manufacture a consultation pause for an
+ordinary request to see the plan. Genuine blockers still surface as blocked
+planning questions with their rationale.
 
 Chat discussion and answers can inform the plan but cannot grant execution
 authority. Approval of an earlier plan never authorizes a revision. A blocked
 planning attempt exposes its decision question and rationale through
 `plan_view` and its attested report reference; it never shows an older proposal
-as the current plan. An unapproved plan cannot start a writer through
-`orchestrator_stage` or `orchestrator_resume`.
+as the current plan. Once an amendment supersedes that question, status shows
+replanning pending rather than the answered question. An unapproved plan cannot
+start a writer through `orchestrator_stage` or `orchestrator_resume`.
 
 ## Interruption, questions and amendment
 
