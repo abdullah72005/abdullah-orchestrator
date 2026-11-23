@@ -18812,6 +18812,7 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                 "approved_at": approval["approved_at"]})
         state["status"] = "running"
         state["pause_reason"] = None
+        permission_preflight(state, config(), Path(state["project"]))
         save(folder, state)
         atomic_json(folder / "control.json", {"action": "run"})
         journal_event(folder, state, "plan_approved",
@@ -21413,6 +21414,8 @@ def resume_run(run_id, host=None):
         folder, state = load(run_id)
     return {"ok": True, "run_id": run_id, "status": state["status"],
             "phase": state["phase"], "host": state.get("host"),
+            "permission_preflight": state.get("permission_preflight"),
+            "permission_blocked": state.get("permission_blocked"),
             "next_action": next_action_for(state),
             "next": next_stage_preview(state)}
 
@@ -21475,6 +21478,7 @@ def approve_plan_run(run_id, confirmation=None):
         journal_event(folder, state, "human_authorization", **authorization)
     return {"ok": True, "run_id": run_id, "status": state["status"],
             "phase": state["phase"], "human_authorization": authorization,
+            "permission_preflight": state.get("permission_preflight"),
             "next_action": next_action_for(state)}
 
 
