@@ -521,6 +521,48 @@ Keep the Codex MCP `tool_timeout_sec` strictly above the largest of the three
 stage caps. Raising a stage cap without raising the MCP timeout lets the client
 race the supervisor at the boundary.
 
+## Parallel writer permission and explicit skills
+
+`max_parallel_writers` is a **start-time per-run permission**, not a config
+default: `orchestrator_start` accepts `max_parallel_writers: 1..3` and the CLI
+accepts `--max-parallel-writers 1..3`. The default is one. The strong Architect
+still chooses the actual count (one to three) through optional per-batch
+`writers` assignments; the effective count is capped by the permission and falls
+back to one with a durable reason when the starting checkout is not reproducible.
+Batch `writers` entries are validated for stable IDs, nonempty goal/completion
+criteria, exact relative paths or component prefixes and pairwise overlap.
+Isolated worktrees, integration identities and recovery artifacts live under the
+run directory; the canonical checkout is written only after a scratch dry run.
+
+The optional `skills` config object bounds explicit skill routing:
+
+```json
+"skills": {
+  "roots": ["/absolute/path/to/skills"],
+  "max_skills_per_role": 6,
+  "max_instruction_bytes": 32768,
+  "max_resource_bytes": 131072,
+  "max_total_bytes": 163840,
+  "bundles": {
+    "superpowers": [
+      "using-superpowers",
+      "brainstorming",
+      "writing-plans",
+      "verification-before-completion"
+    ]
+  }
+}
+```
+
+`roots` is optional; the supervisor also checks `ABDULLAH_SKILLS_ROOT`, the
+project's `.abdullah/skills`, the skill directory and configured user roots.
+Skills are only resolved when explicitly named in the start request. Missing,
+ambiguous, oversized, changed or path-escaping content fails visibly; required
+tools are checked by name and never authorized by skill prose. Selected content
+is copied into the run with SHA-256 identities and injected into the role/writer
+prompt. Native per-adapter skill loading is not claimed; the fallback is explicit
+and persisted.
+
 ## Ordinary planning trial
 
 `orchestrator_start` / `orchestrator.py start` accepts

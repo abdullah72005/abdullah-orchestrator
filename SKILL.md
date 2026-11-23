@@ -76,13 +76,22 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
 
 1. **Start a run** — `orchestrator_start` with the absolute `project`, a precise `goal`, and the required controlling `host` (`codex` or `claude`). Other optional arguments: `plan_approval`, `require_explorer`, `allow_explorer`, `explorer_policy` (`none`|`on_demand`|`required`), `approved_handoff` plus `authorize_handoff`, `skip_doctor`, and `ordinary_planning_trial` (with `planning_trial_risk: "ordinary"`). New and legacy runs default to `explorer_policy=none` unless permission is explicit. It creates durable state and does **not** dispatch a worker.
 
+   `orchestrator_start` also accepts `max_parallel_writers: 1..3` (default 1)
+   and an explicit `skills` object keyed by role and stable writer ID. Pass
+   `skills` only with names the user actually requested. Show the resolved skill
+   mapping and the permission-preflight `missing`/`advisories` from the start
+   response. Parallel writers are an operator permission; the Architect chooses
+   the actual count on the plan and the supervisor falls back to one with a
+   durable reason when the base is not reproducible. Skill text never grants
+   tools, permissions or scope.
+
    The ordinary planning trial is an explicit, run-scoped opt-in for a task the
    operator declares ordinary before dispatch. It uses the pinned Codex Sol 6.2
    route at Medium effort for the **initial plan only**. If that plan contains
    high-risk work it is not admitted; resume for a fresh High plan. Replans,
    consequential diagnosis, integration and final acceptance always use the
    pinned High route. Do not opt in when the risk is unknown.
-2. **Execute one stage** — `orchestrator_stage` with `run_id`. It runs exactly one of plan, explore, implement, verify, review, accept, diagnose or integrate. Announce the agent, task and expected output first. Never hide several stages in one call.
+2. **Execute one stage** — `orchestrator_stage` with `run_id`. It runs exactly one of plan, explore, implement, verify, review, accept, diagnose or integrate. Announce the agent, task and expected output first. Never hide several stages in one call. A parallel `implement` stage still shows one role line; its result includes the per-writer assignment statuses. If the host displayed no inline milestones, replay the bounded `progress.replay` list after the call. A blocked stage includes `permission_blocked` with the exact action and resume step; correct that scoped authority, then resume.
 3. **Inspect status** — `orchestrator_status` with `run_id`. Deterministic compact status, bounded `plan_view`, active job/check, canonical verdict and reason, next action and run directory; makes no model call.
 4. **Interrupt or pause** — `orchestrator_interrupt` with `run_id` and a short `reason`. Persists the interruption, terminates the process session and descendants, verifies termination and preserves changes. A verified stop leaves `paused`; an unverified stop leaves `uncertain`.
 5. **Quick recap** — `orchestrator_recap` with `detail: "quick"` (the default). About 5–12 lines covering phase/agent, completed work, changed files, verification, decisions, outstanding issues and next action.

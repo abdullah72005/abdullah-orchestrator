@@ -6,6 +6,54 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased] — 2026-11-23
 
+### v1.2.1 phase: verified reuse, parallel writers, skills and preflight
+
+### Added
+
+- Final acceptance and feature integration reuse the formal `verify` stage's
+  supervisor-owned evidence instead of re-running the same required ordered argv
+  when plan/revision/amendment epochs, source, runtime inputs, environment,
+  toolchain, configuration, command policy, containment and command-log digests
+  still match. Explicit repeat/freshness requirements, changed source, tampering
+  or uncovered final checks execute again; worker prose and local test claims
+  are never authority.
+- Bounded stage progress now covers Architect, Explorer, each writer, checks,
+  integration and resumed stages. OpenCode 2.x nested
+  `part.state.status: completed` tool completions are recognized as
+  worker-reported milestones; tool starts are not. A bounded milestone replay is
+  included in stage payloads for hosts without inline rendering. Quiet-stage
+  heartbeats are coalesced; the 45-minute marker is informational only.
+- Opt-in `max_parallel_writers: 1..3` start permission and optional per-batch
+  `writers` assignments. Writers run in isolated worktrees on one pinned clean
+  base with persisted lane artifacts, supervisor-validated ownership, binary
+  patches, scratch dry integration, durable before/after identities, no double
+  apply, preserved failed lanes, single-writer recovery and one fresh Reviewer
+  on the combined canonical candidate. Dirty or unreproducible bases select one
+  writer with a durable reason.
+- Explicit role/writer skill routing with bounded roots, immutable content
+  digests, deterministic bundle aliases, copied run artifacts, prompt injection
+  with supervisor precedence and persistence across retry/recovery/review.
+  Missing, ambiguous, changed or unsafe skills fail visibly.
+- Grouped startup/plan permission preflight for routes and billing, skill tools,
+  approved check argv policy and parallel prerequisites. Recognized unexpected
+  structured permission/credential prompts persist a bounded sanitized blocked
+  record (role, assignment, action, reason, resume step), contain active lanes
+  and resume from the preserved boundary without repeating completed work.
+
+### Changed
+
+- `call_model` supports an isolated execution-slot control directory and
+  per-lane state persistence while keeping the parent grant ledger authoritative.
+- Plan structured-output schema adds required nullable `repeat_checks` and
+  `writers` fields and validates writer ownership before dispatch.
+
+### Documentation
+
+- README, configuration reference and `scripts/config.example.json` document
+  evidence reuse/invalidation, heartbeat/replay, parallel-writer limits and
+  fallback behavior, explicit skill routing, permission preflight and blocked
+  recovery, compatibility and the fixture/live-rendering distinction.
+
 ### Chat reporting (post-v1.2.0)
 
 ### Added

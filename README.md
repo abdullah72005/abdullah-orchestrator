@@ -463,6 +463,98 @@ Remaining unverified client behavior:
 - Authenticated long Claude stages and native Claude desktop stop/reconnect
   behavior remain unverified.
 
+## Verified verification reuse, parallel writers, skills and preflight
+
+This v1.2.1-phase work is additive: existing state/protocol versions, manual
+plan approval, model pins, billing controls and the independent Reviewer are
+unchanged. Defaults keep one writer and no explicitly selected skill.
+
+### Reuse the one formal verification
+
+The Implementer request boundary remains the formal `verify` stage. Normally the
+final acceptance gate and integration reuse its supervisor-owned evidence
+instead of executing the same required argv again. Reuse fails closed unless the
+complete ordered command set, plan/batch/revision and amendment/recovery epochs,
+source and runtime-input identity, environment, toolchain, configuration,
+command policy, containment and per-command log digests still match. A changed
+candidate, tampered record/log, environment drift, explicit
+`repeat_checks: true`, `fresh_verification_required`, or an uncovered final check
+executes the checks again. Worker prose and arbitrary local test claims are
+never authority. Old evidence records stay readable but cannot silently certify
+a new completion.
+
+### Opt-in parallel writers
+
+Parallel writing is a per-run permission, not an implicit model choice:
+
+- `orchestrator_start` / `start` accepts `max_parallel_writers: 1..3`
+  (CLI: `--max-parallel-writers 1..3`). The default is one.
+- The strong Architect may put an optional `writers` array on a batch. Each
+  assignment has a stable ID, goal, exact literal paths and/or unambiguous
+  component prefixes, completion criteria and the Implementer role. Pairwise
+  overlap, duplicate IDs, unsafe paths and more than three writers fail before
+  launch.
+- The effective count is the smallest of permission and plan. A dirty,
+  untracked, sparse, submodule-bearing or otherwise unreproducible base selects
+  one writer with a durable reason instead of guessing.
+- With permission, each writer gets an isolated Git worktree on the same pinned
+  clean base, its own persisted execution slot/job artifacts and the existing
+  route grant, quota, cancellation and containment controls. Parent state and
+  `active_job` are not shared between lanes.
+- The supervisor inspects actual tracked/untracked/rename/delete/mode changes,
+  rejects unowned paths or HEAD changes, generates a binary patch per lane and
+  proves a dry integration in scratch before touching the canonical checkout.
+  Integration is recorded with expected before/after identities; a crash or
+  unrecognized intermediate identity blocks for recovery instead of resetting or
+  applying twice.
+- If one sibling fails after another completes, the completed patch is preserved
+  and integrated; the unfinished lane's worktree stays inspectable and the batch
+  moves to single-writer recovery. Ownership conflicts, unplanned dependencies
+  or integration conflicts preserve every lane and route to strong diagnosis.
+- The combined canonical candidate then goes through supervisor checks, one
+  fresh independent Reviewer and the strong Architect decision. Timing records
+  lane wall/sum, integration and review separately; concurrent durations are
+  reported as wall time, not added together.
+
+### Explicit skill routing
+
+Start input may name skills per role and per stable writer ID, for example
+`{"architect": ["systematic-debugging"], "implementer": ["django-testing"],
+"reviewer": ["code-review"], "writers": {"w1": ["superpowers"]}}`. The mapping,
+content digests and bounded artifacts persist across retries, recovery,
+corrections and fresh review. A small deterministic bundle alias expands
+`superpowers` to the four documented skills; a missing member fails visibly.
+Resolution is bounded to configured/known roots with exact content digests and
+path/symlink checks.
+
+Skill text is delivered as bounded prompt material with explicit precedence:
+supervisor and role policy override it, and it never grants permissions,
+approval, shell access, routing, billing or scope. Native per-role loading is not
+claimed for the supported adapters; the prompt-injection fallback is recorded in
+state. Missing required tools fail before the affected stage. Task keywords never
+select a skill.
+
+### Authorization preflight and blocked recovery
+
+`orchestrator_start` response and state include a grouped permission preflight
+for known routes/billing, skill tools, approved check argv policy and parallel
+worktree prerequisites. `authorize-route` remains the human billing grant;
+`approve-plan`, fallback, destructive changes and deployment keep their existing
+gates.
+
+An unexpected recognized structured permission/approval request, or a documented
+noninteractive credential prompt, becomes a bounded sanitized durable record
+with role, assignment, action, reason and resume step. Active lanes are contained
+through the existing guard/interrupt paths; completed edits and verified evidence
+are preserved. The run reports **blocked**, not a retry loop. After the scoped
+authorization/authentication is corrected, `orchestrator_resume` re-runs
+preflight and continues from the preserved boundary without repeating completed
+work. Unknown causes are labelled unknown; raw credential text is not persisted.
+
+Fixture coverage is distinguished from live host rendering: the Codex CLI
+received MCP notifications but printed no in-chat text in the recorded run, so
+its adjacent viewer/replay remains the fallback.
+
 ## What changed in 1.2.0
 
 The live-progress and chat-reporting work above is post-v1.2.0 follow-up, not
