@@ -10384,6 +10384,12 @@ def run_checks(run_dir, state, cfg, project, batch, final=False, deadline=None):
                                      "source_proof": mounts,
                                      "command_policy": policy,
                                      "containment": containment})
+        _record_stage_milestone(
+            run_dir, state,
+            f"supervisor check {index + 1}/{len(commands)} finished "
+            f"(returncode {rc})", source="supervisor",
+            next_action=("remaining supervisor checks" if index + 1 < len(commands)
+                         else "verification result"))
         if rc != 0:
             evidence["passed"] = False
         not_contained = bool(detected) or not inspection["stopped"]
@@ -14114,6 +14120,9 @@ def advance(run_dir, state, cfg, deadline=None):
             deadline=deadline)
         consume_last(state)
         state["diagnosis_verdict"] = verdict
+        _record_stage_milestone(run_dir, state,
+                                f"diagnosis verdict: {verdict.get('verdict')}",
+                                next_action="plan or bounded correction")
         if verdict["verdict"] != "changes_required":
             pause_with(run_dir, state, "Strong diagnosis blocked: " + verdict["reason"])
             return
@@ -14234,6 +14243,10 @@ def advance(run_dir, state, cfg, deadline=None):
                                 "archived_at": now()})
         state["plan"] = plan
         _retire_plan_attempt(state, "replaced_by_accepted_plan")
+        _record_stage_milestone(
+            run_dir, state,
+            f"plan recorded with {len(plan['batches'])} batch(es)",
+            next_action="plan approval or implementation")
         state["plan_version"] = new_version
         state["plan_revision"] = state.get("plan_revision", 0) + 1
         state["plan_authority"] = {
@@ -14290,6 +14303,9 @@ def advance(run_dir, state, cfg, deadline=None):
                                      deadline=deadline)
         state["exploration"] = report
         consume_last(state)
+        _record_stage_milestone(run_dir, state,
+                                f"explorer report received ({report.get('status')})",
+                                next_action="implementation")
         if report["status"] != "complete":
             pause_with(run_dir, state, report.get("blocker") or "Required Explorer did not complete")
         else:
@@ -14345,6 +14361,9 @@ def advance(run_dir, state, cfg, deadline=None):
         state["implementation"] = report
         state["implementation_job"] = job["id"]
         consume_last(state)
+        _record_stage_milestone(run_dir, state,
+                                f"implementer report received ({report.get('status')})",
+                                next_action="supervisor verification")
         if report["status"] == "blocked":
             pause_with(run_dir, state, report.get("blocker", "Implementer blocked"))
         elif report["status"] == "needs_architect":
@@ -14496,6 +14515,9 @@ def advance(run_dir, state, cfg, deadline=None):
             job["review_verification_sha256"] = projection.get("verification_sha256")
         state["review"] = report
         consume_last(state)
+        _record_stage_milestone(run_dir, state,
+                                f"independent review received ({report.get('status')})",
+                                next_action="strong acceptance decision")
         if report["status"] != "complete":
             pause_with(run_dir, state, report.get("blocker", "Independent review was incomplete"))
         else:
@@ -14632,6 +14654,9 @@ def advance(run_dir, state, cfg, deadline=None):
                                   deadline=deadline)
         state["architect_verdict"] = verdict
         consume_last(state)
+        _record_stage_milestone(run_dir, state,
+                                f"acceptance decision received ({verdict.get('verdict')})",
+                                next_action="batch acceptance or correction")
         current = source_snapshot(project)
         try:
             validate_acceptance_references(state, project, references)
@@ -14707,6 +14732,12 @@ def advance(run_dir, state, cfg, deadline=None):
                 if isinstance(evidence.get("path"), str)
                 and Path(evidence["path"]).is_file() else None),
             "final": True, "reuse": bool(evidence.get("reuse"))}
+        _record_stage_milestone(
+            run_dir, state,
+            "integration verification "
+            + ("reused bound supervisor evidence" if evidence.get("reuse")
+               else "executed"),
+            next_action="final integrated acceptance")
         if not evidence["passed"]:
             state["check_progress"] = None
             pause_with(run_dir, state, "Feature integration verification failed: " +
@@ -16794,6 +16825,14 @@ def _viewer_lines(state, snapshot):
     lines.append("%s · %s · %s" % (
         _viewer_route(snapshot), timing,
         _safe_progress_text(snapshot.get("activity"), 100) or "waiting for activity"))
+    if snapshot.get("milestone"):
+        lines.append("milestone: " + _safe_progress_text(snapshot["milestone"], 160))
+    if snapshot.get("assignment"):
+        lines.append("assignment: " + snapshot["assignment"])
+    if snapshot.get("heartbeat"):
+        lines.append(_safe_progress_text(snapshot["heartbeat"], 80))
+    if snapshot.get("long_running_marker"):
+        lines.append(_safe_progress_text(snapshot["long_running_marker"], 140))
     if snapshot.get("task"):
         lines.append("task: " + snapshot["task"])
     if snapshot.get("expected"):
@@ -18095,6 +18134,113 @@ _WORKER_STREAM_LABELS = {
     "reasoning": "worker reasoning",
 }
 
+PROGRESS_MILESTONE_VERSION = 1
+PROGRESS_HEARTBEAT_SECONDS = 30
+PROGRESS_LONG_RUNNING_SECONDS = 45 * 60
+
+
+def _record_stage_milestone(run_dir, state, milestone, *, source="supervisor",
+                            assignment=None, next_action=None):
+    """Persist one bounded milestone; worker-reported values are labelled."""
+    if not isinstance(state, dict):
+        return None
+    attempt = _current_attempt()
+    if not attempt:
+        return None
+    text = _safe_progress_text(milestone, 160)
+    if not text:
+        return None
+    if source not in {"supervisor", "worker_reported", "tool_completion"}:
+        source = "worker_reported"
+    if source != "supervisor" and not text.lower().startswith("reported:"):
+        text = "reported: " + text
+    fields = {"attempt": attempt, "milestone": text, "source": source,
+              "version": PROGRESS_MILESTONE_VERSION,
+              "assignment": _safe_progress_text(assignment, 80),
+              "next_action": _safe_progress_text(next_action, 80)}
+    try:
+        return journal_event(run_dir, state, "stage_milestone", **fields)
+    except Exception:
+        return None
+
+
+def _coalesced_heartbeat(run_dir, state, attempt, elapsed, *,
+                         floor=PROGRESS_HEARTBEAT_SECONDS):
+    """Append at most one heartbeat per elapsed bucket for one attempt."""
+    if not attempt or elapsed is None:
+        return None
+    try:
+        bucket = int(max(0.0, float(elapsed)) // max(1, floor))
+    except (TypeError, ValueError):
+        return None
+    for event in reversed(journal_tail_bounded(run_dir, 120)):
+        if (event.get("event") == "stage_heartbeat"
+                and event.get("attempt") == attempt):
+            if event.get("bucket") == bucket:
+                return None
+            break
+    try:
+        return journal_event(run_dir, state, "stage_heartbeat", attempt=attempt,
+                             elapsed_seconds=round(float(elapsed), 1),
+                             bucket=bucket,
+                             informational_only=True)
+    except Exception:
+        return None
+
+
+def _structured_worker_milestone(folder, job, tail_bytes=64 * 1024,
+                                 limit=16 * 1024):
+    """Explicit, allowlisted worker signal from a structured stream only.
+
+    A tool *start* is never an outcome.  Only an explicit milestone/progress
+    record or a structured completion status is surfaced, and the caller labels
+    it as worker-reported.
+    """
+    if not isinstance(job, dict):
+        return None
+    route = job.get("route") if isinstance(job.get("route"), dict) else {}
+    if route.get("provider") != "opencode":
+        return None
+    path = job.get("path")
+    if not path:
+        return None
+    try:
+        base = Path(folder).resolve()
+        stream_path = (Path(path) / "events.log").resolve()
+        if not stream_path.is_relative_to(base / "jobs"):
+            return None
+    except (OSError, ValueError):
+        return None
+    data = _read_tail_bytes(stream_path, tail_bytes)
+    if not data:
+        return None
+    milestone = None
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        if not line or len(line) > limit:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("type")
+        if kind in {"milestone", "progress"}:
+            value = record.get("milestone") or record.get("message")
+            text = _safe_progress_text(value, 120)
+            if text:
+                milestone = "reported: " + text
+            continue
+        part = record.get("part") if isinstance(record.get("part"), dict) else {}
+        status = record.get("status") or part.get("state") or part.get("status")
+        if kind in {"tool", "tool_use"} and str(status).lower() in {
+                "completed", "complete", "finished"}:
+            name = _safe_progress_text(
+                record.get("tool") or part.get("tool") or part.get("name"), 40)
+            milestone = ("reported: tool completion observed"
+                         + (f": {name}" if name else ""))
+    return milestone
+
 
 def _record_stage_activity(run_dir, state, activity, **fields):
     """Best-effort attempt-scoped observation; never affects stage execution."""
@@ -18178,7 +18324,8 @@ def _stage_activity(state, started, ended, records, ownership, folder):
     job = state.get("active_job") or {}
     job_status = job.get("status")
     if job_status in {"running"}:
-        return _worker_stream_activity(folder, job) or "worker running"
+        return (_structured_worker_milestone(folder, job)
+                or _worker_stream_activity(folder, job) or "worker running")
     if job_status in {"dispatched"}:
         return "worker launching"
     if state.get("active_check"):
@@ -18197,10 +18344,54 @@ def _attempt_route(started):
             "billing": route.get("billing") or effective.get("billing")}
 
 
+def _event_age_seconds(value):
+    if not value:
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=dt.timezone.utc)
+        return max(0.0, (dt.datetime.now(dt.timezone.utc) - moment).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
 def stage_snapshot(folder, state):
     """Read-only progress for the most recent stage attempt in a run."""
     records = journal_tail_bounded(folder, 200)
     started, ended = _attempt_markers(records)
+    attempt = (started or {}).get("attempt")
+    milestone = None
+    milestone_source = None
+    assignment = None
+    observed_next = None
+    quiet = None
+    for event in records:
+        if event.get("event") not in {"stage_activity", "stage_milestone",
+                                      "stage_heartbeat"}:
+            continue
+        if attempt and event.get("attempt") not in (None, attempt):
+            continue
+        if event.get("event") == "stage_heartbeat":
+            continue
+        age = _event_age_seconds(event.get("at"))
+        if age is not None:
+            quiet = age
+        if event.get("event") == "stage_milestone":
+            text = _safe_progress_text(event.get("milestone"), 160)
+            if text:
+                milestone = text
+                milestone_source = event.get("source") or "supervisor"
+                assignment = _safe_progress_text(event.get("assignment"), 80)
+                observed_next = _safe_progress_text(event.get("next_action"), 80)
+    if quiet is None and started:
+        quiet = _event_age_seconds(started.get("at"))
+    worker = state.get("active_job") or {}
+    if milestone is None and worker.get("status") == "running":
+        stream_milestone = _structured_worker_milestone(folder, worker)
+        if stream_milestone:
+            milestone = stream_milestone
+            milestone_source = "worker_reported"
     stage = (started or {}).get("stage") or state.get("phase")
     role = (started or {}).get("role") or stage_agent_role(state.get("phase"))
     owner = _attempt_ownership(started) if started else "unknown"
@@ -18256,6 +18447,22 @@ def stage_snapshot(folder, state):
         "elapsed_seconds": elapsed, "elapsed_source": elapsed_source,
         "activity": _stage_activity(state, started or {}, ended, records,
                                     ownership, folder),
+        "milestone": milestone,
+        "milestone_source": milestone_source,
+        "milestone_reported": bool(milestone and milestone_source != "supervisor"),
+        "assignment": assignment,
+        "observed_next_action": observed_next,
+        "quiet_seconds": round(quiet, 1) if quiet is not None else None,
+        "heartbeat": (f"no new progress for {quiet:.0f}s"
+                      if quiet is not None and quiet >= PROGRESS_HEARTBEAT_SECONDS
+                      else None),
+        "long_running": bool(active and elapsed is not None
+                             and elapsed >= PROGRESS_LONG_RUNNING_SECONDS),
+        "long_running_marker": (
+            "45-minute informational marker: still running; this never restarts "
+            "or redispatches the worker" if active and elapsed is not None
+            and elapsed >= PROGRESS_LONG_RUNNING_SECONDS else None),
+        "informational_only": True,
         "outcome": _safe_progress_text(outcome, 40),
         "next_action": _safe_progress_text(
             (ended or {}).get("next_action") or next_action_for(state), 80),
@@ -18294,6 +18501,12 @@ def stage_progress_message(snapshot):
         parts.append(route)
     if snapshot.get("activity"):
         parts.append(_safe_progress_text(snapshot["activity"], 80))
+    if snapshot.get("milestone"):
+        parts.append(_safe_progress_text(snapshot["milestone"], 120))
+    if snapshot.get("heartbeat"):
+        parts.append(_safe_progress_text(snapshot["heartbeat"], 60))
+    if snapshot.get("long_running"):
+        parts.append("45m marker")
     if snapshot.get("elapsed_seconds") is not None:
         parts.append(f"{snapshot['elapsed_seconds']:.0f}s")
     elif snapshot.get("elapsed_source") == "unknown":
@@ -18316,6 +18529,7 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
     batch = started.get("batch") or batch_identifier(state)
     next_preview = next_stage_preview(state)
     route = started.get("route") or route_report(state, role, stage=stage)
+    live_progress = stage_snapshot(folder, state)
     return {"ok": error is None, "run_id": state.get("id"), "stage": stage,
             "agent": role, "agent_label": label,
             "agent_label_next": next_preview.get("agent_label"),
@@ -18338,6 +18552,14 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
             "plan_view": plan_view(state, folder) if stage == "plan" else None,
             "error": error, "pause_reason": state.get("pause_reason"),
             "progress_line": progress, "next_action": next_action_for(state),
+            "progress": {
+                "milestone": live_progress.get("milestone"),
+                "milestone_source": live_progress.get("milestone_source"),
+                "heartbeat": live_progress.get("heartbeat"),
+                "long_running": live_progress.get("long_running"),
+                "long_running_marker": live_progress.get("long_running_marker"),
+                "informational_only": True,
+            },
             "next": next_preview,
             "next_phase": next_preview.get("phase"),
             "recovery": (state.get("review_recovery")
@@ -20124,6 +20346,7 @@ def _emit_stage_progress(send, token, run_id, attempt_state, stop, *,
         return
     sequence = 0
     wait = 0.0
+    last_heartbeat_bucket = None
     while not stop.is_set():
         snapshot = None
         try:
@@ -20138,6 +20361,16 @@ def _emit_stage_progress(send, token, run_id, attempt_state, stop, *,
             except (OSError, ValueError):
                 # A closed or broken host stream must never affect the stage.
                 return
+            elapsed = snapshot.get("elapsed_seconds")
+            if snapshot.get("active") and elapsed is not None:
+                bucket = int(max(0.0, float(elapsed)) // PROGRESS_HEARTBEAT_SECONDS)
+                if bucket != last_heartbeat_bucket:
+                    try:
+                        folder, state = load(run_id)
+                        _coalesced_heartbeat(folder, state, attempt, elapsed)
+                    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+                        pass
+                    last_heartbeat_bucket = bucket
             if not snapshot.get("active") and snapshot.get("ownership") in {
                     "complete", "stale"}:
                 return
