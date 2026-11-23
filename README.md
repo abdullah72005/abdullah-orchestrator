@@ -524,14 +524,23 @@ Parallel writing is a per-run permission, not an implicit model choice:
   promoted when its provenance and stopped execution still match.
 - Authority for every admitted lane is reserved in the run-scoped ledger before
   any model dispatch. Each reservation carries its exact run, route, role
-  generation, batch and lane attempt. Route preflight admits that held slot
-  instead of searching for a second unused one, launch records the one-way
-  reserved→launched transition before spawn, and a launched slot is never
-  refunded automatically. Insufficient or wrong-scope authority produces zero
-  launches. A parent loss after the group reservation but before a lane launch
-  reuses the same held slot on resume rather than charging twice; a refusal that
-  proves the admitted launch was never attempted releases only that slot and
-  preserves unrelated grants.
+  generation, batch, lane attempt and owning grant. Route preflight admits that
+  held slot instead of searching for a second unused one, launch records the
+  one-way reserved→launched transition before spawn, and a launched slot is never
+  refunded automatically. A positively proven no-exec failure (for example an
+  `E2BIG` refusal before any child exists) may refund only that exact slot. Public
+  resume accounts for the next actual action: a resumed writer may reuse its held
+  slot, an exact integration checkpoint needs no new writer grant, and only
+  uncovered launches need capacity. A later same-route grant never re-homes or
+  re-books an existing reservation. Insufficient or wrong-scope authority
+  produces zero launches; invalid, mismatched, released and already-launched
+  slots stay denied, and unrelated grants are untouched.
+- Host and configured worker fallback consent belongs to the parent run and is
+  never copied into a parallel lane. Before admission a one-shot fallback may
+  select the ordinary single-writer path; after admission the pinned primary is
+  resolved first, and any route change or single-writer collapse is an explicit
+  parent-owned recovery transition. At most one fallback dispatch is spent per
+  approval, including across restart.
 - A lane is promoted only for a `complete` report. A valid `blocked` report
   preserves its partial worktree/patch and exact report but never enters the
   verification candidate; a completed sibling is preserved for reuse and is not
@@ -560,10 +569,15 @@ Parallel writing is a per-run permission, not an implicit model choice:
   intent is saved. That partial apply can never authorize verification; a crash
   after a sibling patch but before its durable apply record leaves a divergent
   identity that blocks instead of dispatching a writer, while an exact before
-  identity continues only the sibling apply and a completed sibling apply resumes
-  through single-writer recovery. The unfinished lane's worktree stays
-  inspectable. Ownership conflicts, unplanned dependencies or integration
-  conflicts preserve every lane and route to strong diagnosis.
+  identity continues only the sibling apply. A finalized sibling manifest is
+  revalidated against its scope, intent and exact canonical after identity before
+  its first single-writer correction is admitted. A valid continuation persists
+  that accepted transition so the single writer's own edits and an interrupted
+  authorized correction are handled by existing source-bound recovery; an
+  unexpected divergence stays blocked with every edit and artifact preserved. The
+  unfinished lane's worktree stays inspectable. Ownership conflicts, unplanned
+  dependencies or integration conflicts preserve every lane and route to strong
+  diagnosis.
 - The combined canonical candidate then goes through supervisor checks, one
   fresh independent Reviewer and the strong Architect decision. Timing records
   lane wall/sum, integration and review separately; concurrent durations are

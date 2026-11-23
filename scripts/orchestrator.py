@@ -3940,6 +3940,34 @@ def _reservation_metadata(metadata):
             if isinstance(metadata, dict) and metadata.get(key) is not None}
 
 
+def _grant_entry_owning_reservation(state, run_dir, role, route,
+                                    reservation_id):
+    """Return the grant entry that owns one held reservation ID.
+
+    A slot keeps the grant that authorized it; a newer grant for the same
+    route never re-homes or re-books an existing reservation.
+    """
+    if not reservation_id or not isinstance(state, dict):
+        return None
+    sha = route_authorization_sha(route)
+    generation = _role_generation(state, role)
+    try:
+        ledger = load_grant_ledger(run_dir)
+    except RuntimeError:
+        return None
+    for entry in reversed(state.get("route_authorizations", [])):
+        if (entry.get("role") != role or entry.get("route_sha256") != sha
+                or entry.get("role_generation", 0) != generation):
+            continue
+        grant = (ledger.get("grants") or {}).get(entry.get("id"))
+        if not isinstance(grant, dict):
+            continue
+        if any(isinstance(item, dict) and item.get("id") == reservation_id
+               for item in grant.get("reservations", [])):
+            return entry
+    return None
+
+
 def _reserve_in_ledger(run_dir, entry, reservation_id, role, route_sha, *,
                        cfg=None, deadline=None, cancel=None, metadata=None):
     with grant_ledger_lock(run_dir, cfg=cfg, deadline=deadline, cancel=cancel):
@@ -3976,6 +4004,14 @@ def _reserve_in_ledger(run_dir, entry, reservation_id, role, route_sha, *,
             return _grant_usage(grant), grant
         if _grant_usage(grant) >= int(grant.get("max_dispatches", 0)):
             raise RuntimeError("Route authorization grant is missing or exhausted")
+        for other_id, other in (ledger.get("grants") or {}).items():
+            if other_id == grant["id"] or not isinstance(other, dict):
+                continue
+            if any(isinstance(item, dict) and item.get("id") == reservation_id
+                   for item in other.get("reservations", [])):
+                raise RuntimeError(
+                    "Route reservation already belongs to another grant; a slot "
+                    "cannot be re-booked under a second grant")
         reservations.append({"id": reservation_id, "at": now(), "role": role,
                              "route_sha256": route_sha, "grant_id": grant["id"],
                              "job_intent": "reserved_before_spawn",
@@ -3986,7 +4022,8 @@ def _reserve_in_ledger(run_dir, entry, reservation_id, role, route_sha, *,
 
 
 def _release_in_ledger(run_dir, entry, reservation_id, reason, *,
-                       cfg=None, deadline=None, cancel=None):
+                       cfg=None, deadline=None, cancel=None,
+                       proven_no_exec=False):
     with grant_ledger_lock(run_dir, cfg=cfg, deadline=deadline, cancel=cancel):
         ledger = load_grant_ledger(run_dir, run_id=entry.get("run_id"))
         grant = _ledger_grant(ledger, entry)
@@ -4004,17 +4041,20 @@ def _release_in_ledger(run_dir, entry, reservation_id, reason, *,
         if selected is None:
             return _grant_usage(grant), grant
         releases = grant.setdefault("releases", [])
-        if selected.get("state") == "launched":
+        if selected.get("state") == "launched" and not proven_no_exec:
             # A launch may have consumed paid authority.  It is never refunded
-            # automatically; only reconciliation may resolve the containment.
+            # automatically; only a positively proven no-exec failure may pass
+            # through the exact-slot refund path.
             return _grant_usage(grant), grant
         if not any(item.get("id") == selected["id"] for item in releases
                    if isinstance(item, dict)):
             releases.append({"id": selected["id"], "at": now(), "reason": reason,
                              "role": selected.get("role"),
-                             "route_sha256": selected.get("route_sha256")})
+                             "route_sha256": selected.get("route_sha256"),
+                             "proven_no_exec": bool(proven_no_exec)})
             selected["state"] = "released"
             selected["released_at"] = now()
+            selected["release_reason"] = reason
             _save_grant_ledger(run_dir, ledger)
         return _grant_usage(grant), grant
 
@@ -4491,7 +4531,11 @@ def reserve_route_grant(state, run_dir, role, route, *, reservation_id=None,
             raise RuntimeError(OPENCODE_ROUTE_UNBOUND_GUIDANCE)
     reservation_id = reservation_id or uuid.uuid4().hex[:12]
     sha = route_authorization_sha(route)
-    for entry in reversed(state.get("route_authorizations", [])):
+    owner = _grant_entry_owning_reservation(
+        state, run_dir, role, route, reservation_id)
+    entries = [owner] if owner is not None else list(
+        reversed(state.get("route_authorizations", [])))
+    for entry in entries:
         if (entry.get("role") == role and entry.get("route_sha256") == sha
                 and entry.get("role_generation", 0) == _role_generation(state, role)):
             used, grant = _reserve_in_ledger(
@@ -4513,15 +4557,20 @@ def reserve_route_grant(state, run_dir, role, route, *, reservation_id=None,
 
 
 def release_route_grant(state, run_dir, role, route, reason, *, reservation_id=None,
-                        cfg=None, deadline=None, cancel=None, state_dir=None):
+                        cfg=None, deadline=None, cancel=None, state_dir=None,
+                        proven_no_exec=False):
     """Release only a reservation whose launch was proven never attempted."""
     sha = route_authorization_sha(route)
-    for entry in reversed(state.get("route_authorizations", [])):
+    owner = _grant_entry_owning_reservation(
+        state, run_dir, role, route, reservation_id)
+    entries = [owner] if owner is not None else list(
+        reversed(state.get("route_authorizations", [])))
+    for entry in entries:
         if (entry.get("role") == role and entry.get("route_sha256") == sha
                 and entry.get("role_generation", 0) == _role_generation(state, role)):
             used, grant = _release_in_ledger(
                 run_dir, entry, reservation_id, reason, cfg=cfg,
-                deadline=deadline, cancel=cancel)
+                deadline=deadline, cancel=cancel, proven_no_exec=proven_no_exec)
             entry["used"] = used
             entry.setdefault("releases", []).append({
                 "at": now(), "reason": reason, "role": role,
@@ -10913,7 +10962,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                             authorization_state, authoritative_dir, role, route,
                             "unexpected E2BIG before launch",
                             reservation_id=ledger_reservation_id, cfg=cfg, deadline=deadline,
-                            state_dir=grant_state_dir)
+                            state_dir=grant_state_dir, proven_no_exec=True)
                     except GrantLedgerTimeout:
                         pass
                 rejection_path = jpath / "preflight-rejected.json"
@@ -15519,6 +15568,39 @@ def _integration_recovery_record(run_dir, index, state=None):
     return path, record
 
 
+def _parallel_sibling_acceptance(state, index):
+    """Return the persisted acceptance of a validated sibling-only apply."""
+    accepted = ((state or {}).get("parallel_sibling_single") or {}).get(str(index))
+    if not isinstance(accepted, dict):
+        return None
+    if accepted.get("plan_version") not in (None, (state or {}).get("plan_version")):
+        return None
+    if (accepted.get("plan_revision") is not None
+            and int(accepted["plan_revision"]) != int(
+                (state or {}).get("plan_revision", 0))):
+        return None
+    if (accepted.get("amendment_epoch") is not None
+            and int(accepted["amendment_epoch"]) != int(
+                (state or {}).get("amendment_epoch", 0))):
+        return None
+    return accepted
+
+
+def _accept_parallel_sibling_recovery(state, index, record):
+    """Persist the one accepted transition to source-bound single-writer work."""
+    entry = {
+        "version": 1, "at": now(), "batch_index": int(index),
+        "plan_version": state.get("plan_version"),
+        "plan_revision": state.get("plan_revision", 0),
+        "amendment_epoch": state.get("amendment_epoch", 0),
+        "after_sha": (record or {}).get("after_sha"),
+        "record_phase": (record or {}).get("phase"),
+        "mode": "sibling_single_writer",
+    }
+    state.setdefault("parallel_sibling_single", {})[str(index)] = entry
+    return entry
+
+
 def _parallel_decision(state, project, records, index, run_dir=None):
     """One explicit decision for what this batch may dispatch.
 
@@ -15549,15 +15631,46 @@ def _parallel_decision(state, project, records, index, run_dir=None):
                 or (phase == "complete" and not _record_is_full_integration(
                     record, {"writers": records}, state)))
             if mode == "sibling_recovery" and completed_sibling:
+                accepted = _parallel_sibling_acceptance(state, index)
+                if accepted is not None:
+                    decision.update({
+                        "mode": "single",
+                        "reason": ("A validated sibling-only parallel apply was "
+                                   "accepted; continue source-bound single-writer "
+                                   "recovery"),
+                        "recovery": {"source": "accepted_sibling_recovery",
+                                     "phase": phase,
+                                     "after_sha": accepted.get("after_sha")}})
+                    return decision
+                transaction = ((state or {}).get("parallel_writers") or {}).get(
+                    "transaction")
+                problem = _parallel_record_scope_problem(
+                    record, transaction, {"writers": records})
+                if problem is None and project is not None:
+                    identity, _current = _parallel_canonical_identity(
+                        project, record)
+                    if identity != "after":
+                        problem = (
+                            "the canonical checkout no longer matches the recorded "
+                            "sibling-only after identity")
+                if problem is not None:
+                    decision.update({
+                        "mode": "parallel",
+                        "recovery": {"source": "integration_record",
+                                     "path": str(record_path), "phase": phase,
+                                     "mode": mode},
+                        "reason": ("Sibling-only recovery requires explicit "
+                                   "validation: " + problem)})
+                    return decision
                 decision.update({
                     "mode": "single",
                     "reason": (
-                        "A saved sibling-only parallel apply exists for this batch; "
-                        "continue with single-writer recovery from the preserved "
-                        "canonical changes and lane artifacts"),
+                        "A validated sibling-only parallel apply exists for this "
+                        "batch; continue with single-writer recovery from the "
+                        "preserved canonical changes and lane artifacts"),
                     "recovery": {"source": "integration_record",
                                  "path": str(record_path), "phase": phase,
-                                 "mode": mode}})
+                                 "mode": mode, "validated": True}})
                 return decision
         # A durable integration attempt for this exact batch is always resolved
         # through the parallel recovery path, even if the canonical checkout is
@@ -15986,6 +16099,11 @@ def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
     lane_state.pop("checkout_lease", None)
     lane_state.pop("parallel_writers", None)
     lane_state.pop("parallel_active", None)
+    # One-shot fallback consent belongs to the parent run.  A lane may never
+    # copy or spend it; only the parent single-writer path may consume it once.
+    lane_state.pop("fallback_authorization", None)
+    lane_state.pop("worker_fallback_authorization", None)
+    lane_state.pop("host_fallback_route", None)
     lane_state["active_job"] = None
     lane_state["active_check"] = None
     save(lane_dir, lane_state)
@@ -17432,7 +17550,22 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
             missing.append(item)
         else:
             advisories.append({**item, "deferred": True, "blocking": False})
+    try:
+        ledger_dir = run_path(state["id"]) if state.get("id") else None
+    except ValueError:
+        ledger_dir = None
     routes = state.get("model_routes") or {}
+    batch_decisions = {}
+    planned_batches = (plan or {}).get("batches") if isinstance(plan, dict) else None
+    if isinstance(planned_batches, list):
+        for index, batch in enumerate(planned_batches):
+            if not isinstance(batch, dict):
+                continue
+            planned_writers = _writer_assignment_records(batch.get("writers"))
+            if len(planned_writers) <= 1:
+                continue
+            batch_decisions[index] = _parallel_decision(
+                state, project, planned_writers, index, ledger_dir)
     roles = {"architect", "implementer", "reviewer"}
     if state.get("require_explorer") or state.get("explorer_policy"):
         roles.add("explorer")
@@ -17449,11 +17582,18 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
             # Default host subscription and OpenCode Go behavior needs no new
             # grant question; that is the ordinary unattended path.
             continue
+        if role == "implementer" and ledger_dir is not None:
+            relevant = [
+                index for index, decision in batch_decisions.items()
+                if decision["mode"] == "parallel"
+                and (scope_info.get("all_roles")
+                     or index == (state or {}).get("batch_index", 0))]
+            if relevant:
+                # Per-lane accounting below decides whether the exact held
+                # slots cover the next actual launches, and an exact integration
+                # checkpoint needs no new Implementer grant at all.
+                continue
         try:
-            try:
-                ledger_dir = run_path(state["id"]) if state.get("id") else None
-            except ValueError:
-                ledger_dir = None
             authorization = route_authorization_status(
                 state, role, route, run_dir=ledger_dir)
         except (RuntimeError, ValueError) as exc:
@@ -17534,11 +17674,7 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
                     scope_info.get("parallel")
                     and (scope_info.get("all_roles")
                          or index == (state or {}).get("batch_index", 0)))
-                try:
-                    ledger_dir = run_path(state["id"]) if state.get("id") else None
-                except ValueError:
-                    ledger_dir = None
-                decision = _parallel_decision(
+                decision = batch_decisions.get(index) or _parallel_decision(
                     state, project, writers, index, ledger_dir)
                 if decision["mode"] == "parallel":
                     required_count = int(decision.get("required_launches") or 0)
@@ -18018,6 +18154,20 @@ def advance(run_dir, state, cfg, deadline=None):
         resolved_parallel = resolve_parallel_batch(
             state, project, batch, run_dir=run_dir)
         state["parallel_resolution"] = resolved_parallel
+        recovery = resolved_parallel.get("recovery") or {}
+        if (resolved_parallel["mode"] == "single"
+                and recovery.get("source") == "integration_record"
+                and recovery.get("validated")
+                and _parallel_sibling_acceptance(state, state["batch_index"]) is None):
+            _record_path, sibling_record = _integration_recovery_record(
+                run_dir, state["batch_index"], state)
+            accepted = _accept_parallel_sibling_recovery(
+                state, state["batch_index"], sibling_record or {})
+            save(run_dir, state)
+            journal_event(run_dir, state, "parallel_sibling_recovery_accepted",
+                          batch_index=state["batch_index"],
+                          after_sha=accepted.get("after_sha"),
+                          phase=accepted.get("record_phase"))
         if resolved_parallel["mode"] == "parallel":
             available = [record["id"] for record in resolved_parallel["writers"]
                          if not _lane_resumable(
