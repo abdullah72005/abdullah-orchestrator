@@ -96,6 +96,68 @@ class StageProgressTests(unittest.TestCase):
         self.assertIn("tool completion observed",
                       orc._structured_worker_milestone(self.rundir, job))
 
+    def test_opencode_v2_nested_tool_completion_is_observed(self):
+        jobdir = self.rundir / "jobs" / "writer-v2"
+        jobdir.mkdir(parents=True)
+        job = {"role": "implementer", "path": str(jobdir),
+               "route": {"provider": "opencode"}}
+        (jobdir / "events.log").write_text(json.dumps({
+            "type": "tool_use",
+            "part": {"tool": "read",
+                     "state": {"status": "completed"}}}) + "\n")
+        # v2.2.7 shape: part.state.status completed, no top-level status.
+        self.assertEqual(orc._structured_worker_milestone(self.rundir, job),
+                         "reported: tool completion observed: read")
+        (jobdir / "events.log").write_text(json.dumps({
+            "type": "tool_use",
+            "part": {"tool": "read",
+                     "state": {"status": "running"}}}) + "\n")
+        self.assertIsNone(orc._structured_worker_milestone(self.rundir, job))
+
+    def test_replay_contains_bounded_milestones_after_the_call(self):
+        attempt = self.start_attempt()
+        for text in ("writer a started", "writer b validated",
+                     "integration applied once"):
+            orc.journal_event(self.rundir, self.state, "stage_milestone",
+                              attempt=attempt, milestone=text,
+                              source="supervisor")
+        payload = orc.stage_payload(self.rundir, self.state, "implement",
+                                    "implementer", "task", "expected", 2.0)
+        self.assertEqual(payload["progress"]["replay"],
+                         ["writer a started", "writer b validated",
+                          "integration applied once"])
+
+    def test_parallel_assignment_view_is_bounded_and_safe(self):
+        attempt = self.start_attempt(elapsed=5.0)
+        self.state["parallel_writers"] = {"lanes": {
+            "a": {"status": "running", "goal": "slice a", "milestone": "x" * 500},
+            "b": {"status": "complete", "goal": "slice b"},
+            "c": {"status": "failed", "goal": "slice c"},
+            "d": {"status": "running", "goal": "excluded"}}}
+        snapshot = orc.stage_snapshot(self.rundir, self.state)
+        self.assertEqual([item["assignment"] for item in snapshot["assignments"]],
+                         ["a", "b", "c"])
+        self.assertLessEqual(len(snapshot["assignments"][0]["milestone"]), 120)
+        self.assertIn("writers: a running", "\n".join(
+            orc._viewer_lines(self.state, snapshot)))
+        self.assertNotIn("excluded", orc.stage_progress_message(snapshot))
+
+    def test_repeat_requirement_is_real_plan_schema(self):
+        batch = orc.schema("plan")["properties"]["batches"]["items"]
+        self.assertIn("repeat_checks", batch["properties"])
+        self.assertIn("repeat_checks", batch["required"])
+        self.assertEqual(sorted(batch["properties"]["repeat_checks"]["type"]),
+                         ["boolean", "null"])
+        plan = {"contract_version": 2, "status": "complete", "summary": "plan",
+                "invariants": ["Keep behavior"],
+                "batches": [{"title": "one", "goal": "g", "acceptance": ["a"],
+                             "checks": [["true"]], "risk": "ordinary",
+                             "verification_purpose": None,
+                             "repeat_checks": True, "writers": None}],
+                "blocker": "", "required_exploration": {
+                    "job_id": "", "scope_satisfied": True}}
+        self.assertIs(orc.validate_report("plan", plan), plan)
+
     def test_viewer_and_mcp_message_expose_milestone_and_heartbeat(self):
         attempt = self.start_attempt(elapsed=61.0)
         orc.journal_event(self.rundir, self.state, "stage_milestone",
