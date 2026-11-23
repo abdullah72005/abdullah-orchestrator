@@ -226,5 +226,96 @@ class EvidenceReuseTests(unittest.TestCase):
                             for reason in self.state["final_acceptance"]["reasons"]))
 
 
+    def test_log_change_during_strong_decision_cannot_complete(self):
+        check, counter = self.counting_check("decision-log")
+        plan = self.plan([batch("one", [check])])
+        self.prepare(plan)
+        reference, evidence = self.verify(plan["batches"][0])
+        log = Path(evidence["commands"][0]["log"])
+
+        def approve(_run_dir, state, _cfg, _kind, extra=None, **kwargs):
+            log.write_text(log.read_text() + "changed during decision\n")
+            references = ([state["single_batch_verification"], state["verification"]]
+                          if state.get("single_batch_verification")
+                          else [state["verification"]])
+            state["decision_binding"] = orc.make_decision_binding(
+                state, self.project, references)
+            return verdict()
+
+        with patch.object(orc, "strong_call", side_effect=approve):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.state["status"], "running")
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertIsNone(self.state["verification"])
+        self.assertIn("changed", self.state["pause_reason"])
+        self.assertEqual(self.invocations(counter), 1,
+                         "stale evidence was executed instead of rewound")
+        self.assertEqual(self.state["accepted_batches"], [])
+
+    def test_removed_log_is_detected_and_forces_one_fresh_execution(self):
+        check, counter = self.counting_check("removed-log")
+        plan = self.plan([batch("one", [check])])
+        self.prepare(plan)
+        _reference, evidence = self.verify(plan["batches"][0])
+        Path(evidence["commands"][0]["log"]).unlink()
+        with self.accept_with() as strong:
+            orc.advance(self.rundir, self.state, self.cfg)
+        strong.assert_called_once()
+        self.assertEqual(self.invocations(counter), 2)
+        self.assertEqual(self.state["final_acceptance"]["mode"], "executed")
+        self.assertTrue(any("missing" in reason
+                            for reason in self.state["final_acceptance"]["reasons"]))
+        self.assertEqual(self.state["status"], "complete")
+
+    def test_derived_reuse_record_revalidates_its_original_records(self):
+        check, _counter = self.counting_check("derived-source")
+        plan = self.plan([batch("one", [check])])
+        self.prepare(plan)
+        reference, _evidence = self.verify(plan["batches"][0])
+        with self.accept_with():
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.state["status"], "complete")
+        final = self.state["final_evidence"]
+        self.assertTrue(final["reuse"])
+        source = Path(final["reuse"]["sources"][0]["path"])
+        # Replace the bound source record with a different valid record. The
+        # derived record must not keep accepting it by path alone.
+        replacement = orc.read_json(source)
+        replacement["finished_at"] = "replaced"
+        orc.atomic_json(source, replacement)
+        assessment = orc.verification_reference_assessment(
+            self.rundir, self.state, self.cfg, self.project,
+            orc.source_snapshot(self.project), self.state["verification"],
+            required=[check], expected_batch_index=0)
+        self.assertTrue(assessment["reasons"], assessment)
+        self.assertTrue(any("changed" in reason.lower()
+                            for reason in assessment["reasons"]),
+                        assessment["reasons"])
+
+    def test_multi_batch_repeat_requirement_executes_at_integration(self):
+        first, first_counter = self.counting_check("repeat-first")
+        second, second_counter = self.counting_check("repeat-second")
+        plan = self.plan([batch("one", [first]),
+                          batch("two", [second], repeat_checks=True)])
+        self.prepare(plan, batch_index=0)
+        one_ref, _ = self.verify(plan["batches"][0], title="one", batch_index=0)
+        self.state["verification"] = None
+        two_ref, _ = self.verify(plan["batches"][1], title="two", batch_index=1)
+        self.state.update(phase="integrate", batch_index=2,
+                          verification=None, single_batch_fast_path=False,
+                          accepted_batches=[
+                              {"index": 0, "verification": copy.deepcopy(one_ref)},
+                              {"index": 1, "verification": copy.deepcopy(two_ref)}])
+        orc.save(self.rundir, self.state)
+        with self.accept_with():
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.state["status"], "complete")
+        self.assertEqual(self.state["final_acceptance"]["mode"], "executed")
+        self.assertTrue(any("repeat" in reason
+                            for reason in self.state["final_acceptance"]["reasons"]))
+        self.assertEqual(self.invocations(first_counter), 2)
+        self.assertEqual(self.invocations(second_counter), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

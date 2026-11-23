@@ -476,12 +476,16 @@ final acceptance gate and integration reuse its supervisor-owned evidence
 instead of executing the same required argv again. Reuse fails closed unless the
 complete ordered command set, plan/batch/revision and amendment/recovery epochs,
 source and runtime-input identity, environment, toolchain, configuration,
-command policy, containment and per-command log digests still match. A changed
-candidate, tampered record/log, environment drift, explicit
-`repeat_checks: true`, `fresh_verification_required`, or an uncovered final check
-executes the checks again. Worker prose and arbitrary local test claims are
-never authority. Old evidence records stay readable but cannot silently certify
-a new completion.
+command policy, containment and per-command log digests still match. The same
+rule is re-applied after the Architect returns and before completion, including
+for a derived reuse record, which must still bind its original records and logs.
+The record bytes that are hashed are the exact bytes parsed. A changed candidate,
+tampered/removed/replaced record or log, environment drift, explicit
+`repeat_checks: true` (honored for single- and multi-batch integration),
+`fresh_verification_required`, or an uncovered final check executes the checks
+again. Worker prose and arbitrary local test claims are never authority. Old
+evidence records stay readable with legacy validation but cannot silently
+certify a new completion.
 
 ### Opt-in parallel writers
 
@@ -494,19 +498,33 @@ Parallel writing is a per-run permission, not an implicit model choice:
   component prefixes, completion criteria and the Implementer role. Pairwise
   overlap, duplicate IDs, unsafe paths and more than three writers fail before
   launch.
-- The effective count is the smallest of permission and plan. A dirty,
-  untracked, sparse, submodule-bearing or otherwise unreproducible base selects
-  one writer with a durable reason instead of guessing.
+- The effective count is the smallest of permission and plan. An explicit
+  one-writer assignment uses the ordinary single-writer path. A dirty,
+  untracked, ignored-runtime, sparse, submodule-bearing or otherwise
+  unreproducible base selects one writer with a durable reason instead of
+  guessing.
 - With permission, each writer gets an isolated Git worktree on the same pinned
   clean base, its own persisted execution slot/job artifacts and the existing
   route grant, quota, cancellation and containment controls. Parent state and
-  `active_job` are not shared between lanes.
-- The supervisor inspects actual tracked/untracked/rename/delete/mode changes,
-  rejects unowned paths or HEAD changes, generates a binary patch per lane and
-  proves a dry integration in scratch before touching the canonical checkout.
-  Integration is recorded with expected before/after identities; a crash or
-  unrecognized intermediate identity blocks for recovery instead of resetting or
-  applying twice.
+  `active_job` are not shared between lanes. Lane intent, attempt identity,
+  run/plan/revision/epoch/batch/assignment/base provenance are journaled and
+  saved before the thread can launch; a durable result is only promoted when its
+  provenance and stopped execution still match.
+- A lane is promoted only for a `complete` report. A valid `blocked` report
+  preserves its partial worktree/patch and exact report but never enters the
+  verification candidate; a completed sibling is preserved for reuse and is not
+  redispatched. A `needs_architect` report goes to strong diagnosis with its
+  original question, evidence and unknowns. Resume re-runs only the blocked or
+  unfinished lanes, and an explicit one-writer plan stays on the ordinary path.
+- The supervisor inspects actual tracked/untracked/rename/delete/mode and index
+  changes, rejects unowned paths or HEAD changes, generates a binary patch per
+  lane and proves a dry integration in scratch before touching the canonical
+  checkout. Integration is recorded with the exact all-writer set and expected
+  before/after tree/index identities. A completed apply advances to verification
+  without another writer; an unreadable, foreign or unrecognized intermediate
+  identity blocks before any model dispatch instead of resetting or applying
+  twice. Interruption during startup or collection is reconciled from durable
+  lane records, so a completed sibling is validated rather than relaunched.
 - If one sibling fails after another completes, the completed patch is preserved
   and integrated; the unfinished lane's worktree stays inspectable and the batch
   moves to single-writer recovery. Ownership conflicts, unplanned dependencies
@@ -514,7 +532,9 @@ Parallel writing is a per-run permission, not an implicit model choice:
 - The combined canonical candidate then goes through supervisor checks, one
   fresh independent Reviewer and the strong Architect decision. Timing records
   lane wall/sum, integration and review separately; concurrent durations are
-  reported as wall time, not added together.
+  reported as wall time, not added together. A fast lane's completion is
+  observable while a quiet sibling is still running, and the bounded milestone
+  list is replayed after the call when inline rendering is unavailable.
 
 ### Explicit skill routing
 
@@ -531,25 +551,38 @@ Skill text is delivered as bounded prompt material with explicit precedence:
 supervisor and role policy override it, and it never grants permissions,
 approval, shell access, routing, billing or scope. Native per-role loading is not
 claimed for the supported adapters; the prompt-injection fallback is recorded in
-state. Missing required tools fail before the affected stage. Task keywords never
-select a skill.
+state. Required tools are checked against what the exact role can be offered on
+its adapter, not just the supervisor's PATH: a Reviewer/Explorer skill that needs
+shell, edit, network or subagent access fails visibly, while an Implementer skill
+may use it. Missing, changed or over-budget pinned artifacts fail before the
+affected stage; changing the original source after start does not mutate the
+pinned run-local copy. Task keywords never select a skill.
 
 ### Authorization preflight and blocked recovery
 
 `orchestrator_start` response and state include a grouped permission preflight
-for known routes/billing, skill tools, approved check argv policy and parallel
-worktree prerequisites. `authorize-route` remains the human billing grant;
-`approve-plan`, fallback, destructive changes and deployment keep their existing
-gates.
+for the actual route/billing policy (default host subscription and OpenCode Go
+need no new grant; API/OpenCode subscription/free/local do), route and check
+executables under the check environment, role/writer skill tools and pinned
+artifacts, approved check argv policy and parallel worktree/grant prerequisites.
+Plan approval and resume record/continue only when that preflight is clear;
+otherwise they stay blocked with every missing item and action grouped. A
+parallel fan-out reserves enough known route authority before launching any lane,
+so an insufficient grant produces zero launches. `authorize-route` remains the
+human billing grant; `approve-plan`, fallback, destructive changes and deployment
+keep their existing gates.
 
 An unexpected recognized structured permission/approval request, or a documented
-noninteractive credential prompt, becomes a bounded sanitized durable record
-with role, assignment, action, reason and resume step. Active lanes are contained
-through the existing guard/interrupt paths; completed edits and verified evidence
-are preserved. The run reports **blocked**, not a retry loop. After the scoped
-authorization/authentication is corrected, `orchestrator_resume` re-runs
-preflight and continues from the preserved boundary without repeating completed
-work. Unknown causes are labelled unknown; raw credential text is not persisted.
+noninteractive credential prompt, is observed while the worker or supervisor
+check is still active and stops it ahead of the normal stage/check deadline. It
+becomes a bounded sanitized durable record with role, assignment, action, reason
+and resume step. Running sibling lanes see the shared pause and are contained
+through the existing guard/interrupt paths before a blocked state is claimed;
+completed edits and verified evidence are preserved. The run reports **blocked**,
+not a retry loop. After the scoped authorization/authentication is corrected,
+`orchestrator_resume` re-runs preflight and continues from the preserved boundary
+without repeating completed work. Unknown causes are labelled unknown; raw
+credential text is not persisted.
 
 Fixture coverage is distinguished from live host rendering: the Codex CLI
 received MCP notifications but printed no in-chat text in the recorded run, so

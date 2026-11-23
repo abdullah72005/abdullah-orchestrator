@@ -182,7 +182,8 @@ class AcceptanceTransition(unittest.TestCase):
             {"title": "one", "checks": [["true"]]})
         self.verification = {"path": evidence["path"], "passed": True,
                              "candidate_hash": evidence["after_hash"],
-                             "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION}
+                             "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION,
+                             "record_sha256": orc._sha256_file(Path(evidence["path"]))}
         self.state["verification"] = copy.deepcopy(self.verification)
         self.state["check_progress"] = None
         orc.save(self.rundir, self.state)

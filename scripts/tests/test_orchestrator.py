@@ -319,22 +319,44 @@ class ControlTests(unittest.TestCase):
             calls.append("final" if final else "check")
             snapshot = orc.source_snapshot(project)
             fingerprint = orc.signature(snapshot)
-            evidence_path = self.root / "mock-verification.json"
-            orc.atomic_json(evidence_path, {"evidence_version": 2,
+            log = self.rundir / "jobs" / "mock-check.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("ok\n")
+            policy = orc.verification_command_policy(["true"], _cfg, project=project)
+            evidence_path = self.rundir / "jobs" / "mock-verification.json"
+            evidence = {"evidence_version": 2,
                 "provenance": {"version": orc.SOURCE_PROVENANCE_VERSION, "source": snapshot,
                     "configuration": snapshot.get("configuration"),
                     "environment": snapshot.get("environment"),
                     "toolchain": snapshot.get("toolchain"),
                     "runtime_inputs": snapshot.get("runtime_inputs"),
+                    "check_toolchain": orc.check_toolchain_identity([["true"]]),
                     "command_policy": _cfg.get("verification", {}).get("command_policy", {})},
                 "candidate":snapshot, "after":snapshot, "candidate_hash":fingerprint,
                 "after_hash":fingerprint, "passed":True, "source_unchanged":True,
-                "commands":[]})
+                "final": final, "batch": batch.get("title"),
+                "batch_index": state.get("batch_index", 0),
+                "run_id": state.get("id"),
+                "plan_version": state.get("plan_version"),
+                "plan_revision": state.get("plan_revision", 0),
+                "amendment_epoch": state.get("amendment_epoch", 0),
+                "authority_epoch": state.get("authority_epoch", 0),
+                "commands": [{"argv": ["true"], "returncode": 0, "log": str(log),
+                              "log_sha256": orc._sha256_file(log),
+                              "log_bytes": log.stat().st_size,
+                              "command_policy": policy,
+                              "containment": {"remaining": [],
+                                              "escaped_processes": []}}],
+                "containment": []}
+            orc.atomic_json(evidence_path, evidence)
+            record_sha = orc._sha256_file(evidence_path)
             state["verification"] = {"path": str(evidence_path), "passed": True,
                                      "candidate_hash": fingerprint,
-                                     "evidence_version": 2}
+                                     "evidence_version": 2,
+                                     "record_sha256": record_sha}
             orc.save(self.rundir, state)
-            return {"passed": True, "commands": [], "candidate_hash": fingerprint,
+            return {"passed": True, "commands": evidence["commands"],
+                    "candidate_hash": fingerprint,
                     "source_unchanged": True, "evidence_version": 2,
                     "path": str(evidence_path)}
 
@@ -345,7 +367,8 @@ class ControlTests(unittest.TestCase):
                 if self.state["status"] == "complete":
                     break
                 orc.advance(self.rundir, self.state, self.cfg)
-        self.assertEqual(self.state["status"], "complete")
+        self.assertEqual(self.state["status"], "complete",
+                         self.state.get("pause_reason"))
         self.assertEqual(len(self.state["accepted_batches"]), 2)
         self.assertEqual(calls.count("implementer"), 2)
         self.assertEqual(calls.count("reviewer"), 2)

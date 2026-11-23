@@ -167,7 +167,8 @@ class QuotaChanges(unittest.TestCase):
         self.state['verification'] = {
             'path': final_evidence['path'], 'passed': True,
             'candidate_hash': final_evidence['after_hash'],
-            'evidence_version': final_evidence['evidence_version']}
+            'evidence_version': final_evidence['evidence_version'],
+            'record_sha256': orc._sha256_file(Path(final_evidence['path']))}
         verdict = {'verdict': 'approved', 'reason': 'inspected', 'inspected': ['app.py'],
                    'dismissed_findings': []}
         binding = orc.make_decision_binding(

@@ -296,6 +296,16 @@ provider-side retries; there is no dollar cap claim. Nested Explorer dispatches
 consult current durable usage before authorization and cannot exceed the run's
 grant.
 
+The grouped permission preflight uses the actual route policy: default host
+subscription and unchanged OpenCode Go routes need no new grant, while API and
+non-Go OpenCode `subscription`/`free`/`local` routes do. It also checks route and
+approved-check executables under the scrubbed check environment, role/writer
+skill tools, pinned skill artifacts, check argv policy and parallel prerequisites.
+Plan approval and resume only start work when that preflight is clear; otherwise
+the run stays blocked with all missing actions grouped. A parallel fan-out must
+have enough remaining granted dispatches for the admitted set before any lane
+starts.
+
 `doctor` reports `route_authorization_required` without treating the absence of
 a per-run grant as a configuration defect—grants are run-scoped.
 
@@ -530,9 +540,19 @@ still chooses the actual count (one to three) through optional per-batch
 `writers` assignments; the effective count is capped by the permission and falls
 back to one with a durable reason when the starting checkout is not reproducible.
 Batch `writers` entries are validated for stable IDs, nonempty goal/completion
-criteria, exact relative paths or component prefixes and pairwise overlap.
-Isolated worktrees, integration identities and recovery artifacts live under the
-run directory; the canonical checkout is written only after a scratch dry run.
+criteria, exact relative paths or component prefixes and pairwise overlap. An
+explicit one-writer assignment uses the ordinary single-writer path. Isolated
+worktrees, per-lane intent/attempt provenance, integration identities and
+recovery artifacts live under the run directory; the canonical checkout is
+written only after a scratch dry run over the exact tree/index state. A recorded
+completed apply is never repeated; an unrecognized, unreadable or foreign
+transaction blocks before model dispatch. Only a `complete` lane report may
+enter the candidate; `blocked`/`needs_architect` reports preserve their partial
+work and are retried or diagnosed without granting a partial patch candidate
+authority.
+
+A parallel fan-out reuses the run's route-grant ledger and refuses to launch any
+lane when the remaining granted dispatches cannot cover the admitted set.
 
 The optional `skills` config object bounds explicit skill routing:
 
@@ -557,11 +577,15 @@ The optional `skills` config object bounds explicit skill routing:
 `roots` is optional; the supervisor also checks `ABDULLAH_SKILLS_ROOT`, the
 project's `.abdullah/skills`, the skill directory and configured user roots.
 Skills are only resolved when explicitly named in the start request. Missing,
-ambiguous, oversized, changed or path-escaping content fails visibly; required
-tools are checked by name and never authorized by skill prose. Selected content
-is copied into the run with SHA-256 identities and injected into the role/writer
-prompt. Native per-adapter skill loading is not claimed; the fallback is explicit
-and persisted.
+ambiguous, oversized, changed or path-escaping content fails visibly. Required
+tools are checked against the exact role and adapter capability, not just the
+supervisor's PATH: Reviewer/Explorer roles are read-only, so a skill requiring
+shell, edit, network or subagent access fails there, while an Implementer or
+writer may use it. Skill prose never authorizes a tool. Selected content is
+copied into the run with SHA-256 identities and injected into the role/writer
+prompt; changing the original source after start does not change the pinned copy,
+and a missing/changed pinned artifact fails preflight. Native per-adapter skill
+loading is not claimed; the fallback is explicit and persisted.
 
 ## Ordinary planning trial
 

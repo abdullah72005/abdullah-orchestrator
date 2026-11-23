@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -378,6 +380,320 @@ class ParallelWriterTests(unittest.TestCase):
         self.assertEqual((self.project / "unrecorded.txt").read_text(),
                          "manual edit\n")
         self.assertTrue(record_path.is_file())
+
+
+def blocked_report(blocker="shared contract decision is missing"):
+    return {"contract_version": 2, "status": "blocked", "summary": blocker,
+            "files": [], "tests": [], "evidence": ["partial writer evidence"],
+            "unknowns": [], "blocker": blocker}
+
+
+def escalation_report(question="Which shared contract should win?"):
+    return {"contract_version": 2, "status": "needs_architect",
+            "summary": question, "files": [], "tests": [],
+            "evidence": ["both slices touch the same public API"],
+            "unknowns": ["no approved precedence"], "blocker": question}
+
+
+def writer_job(run_dir, writer_id):
+    return {"id": f"job-{writer_id}", "role": "implementer",
+            "kind": "implementer",
+            "path": str(Path(run_dir) / "jobs" / f"implementer-{writer_id}")}
+
+
+class ParallelWriterRecoveryTests(unittest.TestCase):
+    """Corrections for completed-process vs completed-work and transaction recovery."""
+
+    setUp = baseline.ControlTests.setUp
+    tearDown = baseline.ControlTests.tearDown
+
+    def prepare(self, writers, max_writers=3):
+        return ParallelWriterTests.prepare(self, writers, max_writers)
+
+    def fake_model(self, writes, starts=None, fail=None, interrupt=None):
+        return ParallelWriterTests.fake_model(
+            self, writes, starts=starts, fail=fail, interrupt=interrupt)
+
+    def test_blocked_report_never_enters_candidate_and_sibling_resumes(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        self.assertEqual(resolved["mode"], "parallel")
+
+        def first(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            writer_id = kwargs.get("assignment")
+            project = Path(project)
+            if writer_id == "a":
+                (project / "a.py").write_text("a = 1\n")
+                return report("a finished"), writer_job(run_dir, "a")
+            (project / "b.py").write_text("b = 'partial'\n")
+            return blocked_report(), writer_job(run_dir, "b")
+
+        with patch.object(orc, "call_model", side_effect=first):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertIsNone(self.state.get("parallel_integration"))
+        self.assertFalse((self.project / "a.py").exists(),
+                         "a completed sibling was integrated before the blocker cleared")
+        self.assertFalse((self.project / "b.py").exists(),
+                         "a blocked writer's partial patch entered the candidate")
+        lane_a = self.state["parallel_writers"]["lanes"]["a"]
+        lane_b = self.state["parallel_writers"]["lanes"]["b"]
+        self.assertEqual(lane_a["status"], "complete")
+        self.assertEqual(lane_b["status"], "blocked")
+        self.assertEqual(lane_b["report"]["blocker"],
+                         "shared contract decision is missing")
+        self.assertTrue(Path(lane_b["patch"]["path"]).is_file())
+        self.assertTrue(Path(lane_b["worktree"]).is_dir())
+        self.assertEqual(self.state["parallel_blocked"]["lane"], "b")
+        # Resume reruns only the blocked lane; the completed sibling is reused
+        # from its durable patch/worktree and is not dispatched again.
+        resumed_calls = []
+
+        def second(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            writer_id = kwargs.get("assignment")
+            resumed_calls.append(writer_id)
+            (Path(project) / "b.py").write_text("b = 2\n")
+            return report("b finished"), writer_job(run_dir, "b")
+
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        with patch.object(orc, "call_model", side_effect=second):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(resumed_calls, ["b"])
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+        self.assertEqual(self.state["parallel_integration"]["phase"], "complete")
+
+    def test_needs_architect_report_reaches_diagnosis_without_applying_partials(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+
+        def fake(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            writer_id = kwargs.get("assignment")
+            project = Path(project)
+            if writer_id == "a":
+                (project / "a.py").write_text("a = 1\n")
+                return report("a finished"), writer_job(run_dir, "a")
+            (project / "b.py").write_text("b = 'partial'\n")
+            return escalation_report(), writer_job(run_dir, "b")
+
+        with patch.object(orc, "call_model", side_effect=fake):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.state["phase"], "diagnose")
+        request = self.state["diagnosis_request"]
+        self.assertEqual(request["source"], "parallel_writer_escalation")
+        self.assertEqual(request["question"], "Which shared contract should win?")
+        self.assertEqual(request["evidence"], ["both slices touch the same public API"])
+        self.assertEqual(request["unknowns"], ["no approved precedence"])
+        self.assertEqual(self.state["parallel_writers"]["lanes"]["b"]["status"],
+                         "needs_architect")
+        self.assertEqual(self.state["parallel_writers"]["lanes"]["a"]["status"],
+                         "complete")
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+        self.assertIsNone(self.state.get("parallel_integration"))
+
+    def test_cancellation_before_parent_reconciliation_reuses_completed_sibling(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        records = {record["id"]: record for record in resolved["writers"]}
+        base_head = orc.git(self.project, ["rev-parse", "HEAD"]).decode().strip()
+        lane_dir = orc._parallel_batch_dir(self.rundir, 0) / "a"
+        lane_dir.mkdir(parents=True, exist_ok=True)
+        worktree = orc.create_writer_worktree(
+            self.project, lane_dir / "worktree", base_head)
+        provenance = orc._lane_provenance(
+            self.state, 0, records["a"], base_head, "attempt-crash")
+        fake = self.fake_model({"a": {"a.py": "a = 1\n"}})
+        with patch.object(orc, "call_model", side_effect=fake):
+            orc._parallel_lane_worker(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                records["a"], worktree, lane_dir, base_head,
+                orc.source_snapshot(worktree), None, None, provenance)
+        self.assertEqual(fake.count["n"], 1)
+        self.assertTrue((lane_dir / "lane-result.json").is_file())
+        # The parent died before validation: the lane still says running and the
+        # result was never promoted, but the completed output is durable.
+        self.state["parallel_writers"] = {
+            "batch_index": 0, "lanes": {"a": {
+                "status": "running", "batch_index": 0,
+                "worktree": str(worktree), "lane_dir": str(lane_dir),
+                "base_head": base_head,
+                "plan_version": self.state["plan_version"], "plan_revision": 1,
+                "amendment_epoch": 0, "attempt": 1, "intent": provenance,
+                "assignment": records["a"]}}}
+        orc.save(self.rundir, self.state)
+        resumed = self.fake_model({"b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=resumed):
+            result = orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch, resolved,
+                None)
+        self.assertIsNotNone(result)
+        self.assertEqual(resumed.starts, ["b"],
+                         "the completed sibling was dispatched again")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+        self.assertEqual(self.state["parallel_integration"]["phase"], "complete")
+
+    def test_interruption_during_startup_has_no_duplicate_launch(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        base_head = orc.git(self.project, ["rev-parse", "HEAD"]).decode().strip()
+        # Lane a was journaled/admitted but its execution slot never existed
+        # because the parent stopped during startup.
+        lane_dir = orc._parallel_batch_dir(self.rundir, 0) / "a"
+        lane_dir.mkdir(parents=True, exist_ok=True)
+        worktree = orc.create_writer_worktree(
+            self.project, lane_dir / "worktree", base_head)
+        self.state["parallel_writers"] = {
+            "batch_index": 0, "lanes": {"a": {
+                "status": "starting", "batch_index": 0,
+                "worktree": str(worktree), "lane_dir": str(lane_dir),
+                "base_head": base_head, "plan_version": self.state["plan_version"],
+                "plan_revision": 1, "amendment_epoch": 0, "attempt": 1,
+                "intent": orc._lane_provenance(
+                    self.state, 0, writer("a"), base_head, "attempt-start")}}}
+        orc.save(self.rundir, self.state)
+        fake = self.fake_model({"a": {"a.py": "a = 1\n"},
+                                "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=fake):
+            result = orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch, resolved,
+                None)
+        self.assertIsNotNone(result)
+        self.assertEqual(sorted(fake.starts), ["a", "b"])
+        self.assertEqual(fake.count["n"], 2, "a lane was launched more than once")
+        self.assertEqual(self.state["parallel_integration"]["phase"], "complete")
+
+    def test_crash_after_apply_advances_without_another_writer(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        fake = self.fake_model({"a": {"a.py": "a = 1\n"},
+                                "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=fake):
+            orc.run_parallel_batch(self.rundir, self.state, self.cfg,
+                                   self.project, batch, resolved, None)
+        # Simulate process loss after the exact apply but before phase advance.
+        self.state["phase"] = "implement"
+        self.state["implementation"] = None
+        self.state["parallel_active"] = None
+        orc.save(self.rundir, self.state)
+        calls = []
+
+        def must_not_run(*args, **kwargs):
+            calls.append("model")
+            raise AssertionError("a fresh writer was dispatched after a complete apply")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertIn("integrated", self.state["implementation"]["summary"])
+        self.assertEqual(self.state["parallel_integration"]["phase"], "complete")
+
+    def test_index_state_mismatch_blocks_before_any_writer(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        fake = self.fake_model({"a": {"a.py": "a = 1\n"},
+                                "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=fake):
+            orc.run_parallel_batch(self.rundir, self.state, self.cfg,
+                                   self.project, batch, resolved, None)
+        # Change only the index entry (executable mode) after integration. The
+        # exact tree/index identity no longer matches the recorded apply.
+        orc.git(self.project, ["update-index", "--chmod=+x", "app.py"])
+        self.state["phase"] = "implement"
+        self.state["implementation"] = None
+        orc.save(self.rundir, self.state)
+        calls = []
+
+        def must_not_run(*args, **kwargs):
+            calls.append("model")
+            raise AssertionError("a writer was dispatched over a mismatched index")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("no longer matches", self.state["pause_reason"])
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+
+    def test_unreadable_integration_record_is_a_visible_blocker(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        path = orc._integration_record_path(self.rundir, 0)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not-json")
+        calls = []
+
+        def must_not_run(*args, **kwargs):
+            calls.append("model")
+            raise AssertionError("a writer was dispatched over an unreadable record")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("unreadable", self.state["pause_reason"])
+
+    def test_explicit_one_writer_uses_the_ordinary_single_writer_path(self):
+        batch, resolved = self.prepare([writer("a", path="a.py")])
+        self.assertEqual(resolved["mode"], "single")
+        starts = []
+
+        def fake(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            starts.append(kwargs.get("assignment"))
+            (Path(project) / "a.py").write_text("a = 1\n")
+            return report("single writer finished"), writer_job(run_dir, "single")
+
+        with patch.object(orc, "call_model", side_effect=fake):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(starts, [None])
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertFalse(orc._integration_record_path(self.rundir, 0).exists())
+        self.assertNotIn("parallel_writers", self.state)
+
+    def test_fast_lane_completion_is_observed_before_a_quiet_sibling(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        observed = {"value": False}
+        self.state["status"] = "running"
+
+        def fake(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            writer_id = kwargs.get("assignment")
+            project = Path(project)
+            if writer_id == "a":
+                (project / "a.py").write_text("a = 1\n")
+                return report("a finished"), writer_job(run_dir, "a")
+            limit = time.monotonic() + 10
+            while time.monotonic() < limit:
+                events = orc.journal_tail_bounded(self.rundir, 300)
+                if any(event.get("event") == "parallel_lane_observed"
+                       and event.get("assignment") == "a" for event in events):
+                    observed["value"] = True
+                    break
+                time.sleep(0.1)
+            (project / "b.py").write_text("b = 2\n")
+            return report("b finished"), writer_job(run_dir, "b")
+
+        orc._STAGE_CONTEXT.attempt = "stage-attempt"
+        try:
+            with patch.object(orc, "call_model", side_effect=fake):
+                result = orc.run_parallel_batch(
+                    self.rundir, self.state, self.cfg, self.project, batch,
+                    resolved, None)
+        finally:
+            orc._STAGE_CONTEXT.attempt = None
+        self.assertIsNotNone(result)
+        self.assertTrue(observed["value"],
+                        "lane a completion was not visible while b was running")
+        payload = orc.stage_payload(self.rundir, self.state, "implement",
+                                    "implementer", "task", "expected", 1.0)
+        self.assertTrue(any("writer a" in item for item in
+                            payload["progress"]["replay"]),
+                        payload["progress"]["replay"])
 
 
 if __name__ == "__main__":

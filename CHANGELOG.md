@@ -39,6 +39,33 @@ uses [Semantic Versioning](https://semver.org/).
   structured permission/credential prompts persist a bounded sanitized blocked
   record (role, assignment, action, reason, resume step), contain active lanes
   and resume from the preserved boundary without repeating completed work.
+- A completed CLI exit is no longer treated as completed work: only a `complete`
+  writer report may authorize a patch. Valid `blocked` reports preserve the
+  partial worktree/patch and exact report without entering the candidate;
+  `needs_architect` carries its original question, evidence and unknowns into
+  strong diagnosis. Completed siblings are reused, not redispatched.
+- Parallel lane intent, attempt identity and run/plan/revision/epoch/batch/
+  assignment/base provenance are durable before launch. Resume consults the
+  integration record and admitted lanes before the ordinary clean-base decision,
+  reuses results produced before parent reconciliation, retries only incomplete
+  lanes, and treats unreadable/foreign records as a visible blocker.
+- Integration is bound to the exact all-writer set and tree/index identity
+  (including file mode and index state). A completed apply advances directly to
+  verification without another writer; a mismatched index or partial apply
+  blocks before any model dispatch.
+- Grouped preflight now uses the actual route/role policy (default host
+  subscription and OpenCode Go need no new grant), checks route/check executables
+  under the scrubbed environment and role-specific skill tool availability, and
+  gates plan approval/resume. Parallel fan-out refuses to launch when the run's
+  grant ledger cannot cover the admitted set.
+- Worker and supervisor-check loops observe recognized prompt signals while
+  execution is active, stop the exact process ahead of the normal deadline,
+  propagate a shared pause to sibling lanes and record an unknown cause honestly.
+- Final acceptance revalidates the complete record, plan/epoch binding, every
+  command log, command policy, containment and any derived reuse record's
+  original records/logs after the Architect returns. The exact hashed bytes are
+  parsed, removed/replaced logs are detected, and multi-batch repeat policy is
+  honored at integration.
 
 ### Changed
 

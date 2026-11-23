@@ -677,7 +677,7 @@ class ModelMetadataTests(ReleaseFixture):
         with patch.object(orc, "strong_call", side_effect=strong), \
                 patch.object(orc, "load_verification_evidence", return_value={}), \
                 patch.object(orc, "validate_acceptance_references",
-                             side_effect=lambda st, pr, refs: orc.source_snapshot(pr)), \
+                             side_effect=lambda st, pr, refs, **kwargs: orc.source_snapshot(pr)), \
                 patch.object(orc, "cached_decision_report", return_value=None):
             orc.advance(folder, state, self.cfg)
         decision = [call for call in calls if call[0] == "decision"]

@@ -7119,11 +7119,6 @@ def resolve_skill_reference(name, *, cfg, project):
         raise ValueError(f"Skill {name!r} exceeds the instruction budget")
     text = data.decode("utf-8", errors="replace")
     required = _skill_required_tools(text)
-    missing = [tool for tool in required if shutil.which(tool) is None]
-    if missing:
-        raise ValueError(
-            f"Skill {name!r} requires tool(s) that cannot be offered: "
-            + ", ".join(missing))
     resources = (_skill_resources(path.parent, settings, name)
                  if path.name == SKILL_INSTRUCTION_FILE else [])
     total = len(data) + sum(item["bytes"] for item in resources)
@@ -7134,6 +7129,98 @@ def resolve_skill_reference(name, *, cfg, project):
             "instructions": text, "resources": resources,
             "required_tools": required,
             "delivery": settings["delivery"]}
+
+
+SKILL_READ_ONLY_TOOLS = frozenset({
+    "read", "glob", "grep", "list", "search", "find", "ls", "cat",
+    "view", "open",
+})
+SKILL_SHELL_TOOLS = frozenset({"bash", "shell", "sh", "zsh", "pwsh", "terminal"})
+SKILL_EDIT_TOOLS = frozenset({
+    "edit", "write", "apply_patch", "patch", "create_file", "str_replace",
+})
+SKILL_SUBAGENT_TOOLS = frozenset({"task", "subagent", "agent"})
+SKILL_NETWORK_TOOLS = frozenset({"webfetch", "websearch", "fetch", "browser"})
+SKILL_READ_ONLY_ROLES = frozenset({"explorer", "reviewer"})
+
+
+def _skill_tool_capability(tool):
+    name = str(tool or "").strip().lower()
+    if name in SKILL_READ_ONLY_TOOLS:
+        return "read_only"
+    if name in SKILL_SHELL_TOOLS:
+        return "shell"
+    if name in SKILL_EDIT_TOOLS:
+        return "edit"
+    if name in SKILL_SUBAGENT_TOOLS:
+        return "subagent"
+    if name in SKILL_NETWORK_TOOLS:
+        return "network"
+    return None
+
+
+def _skill_tool_problem(role, record, route=None):
+    """Reject a configured skill tool the exact role cannot actually be offered.
+
+    Reviewers and Explorers are read-only on every supported adapter (Codex
+    read-only sandbox, Claude plan mode, OpenCode explicit deny rules), so a
+    skill that requires shell/edit/network/subagent access from one of them is
+    visible configuration failure rather than a silent no-op in the prompt.
+    """
+    provider = (route or {}).get("provider") if isinstance(route, dict) else None
+    read_only = str(role or "").lower() in SKILL_READ_ONLY_ROLES
+    for tool in record.get("required_tools") or []:
+        capability = _skill_tool_capability(tool)
+        if capability is None:
+            if read_only:
+                return (f"skill {record.get('name')} requires unknown tool {tool}, "
+                        f"which cannot be attested for read-only role {role}")
+            try:
+                found = shutil.which(tool, path=scrubbed_env().get("PATH"))
+            except (OSError, TypeError):
+                found = None
+            if not found:
+                return (f"skill {record.get('name')} requires tool {tool}, which is "
+                        "not installed in the dispatch environment")
+            continue
+        if read_only and capability != "read_only":
+            return (f"skill {record.get('name')} requires {tool} ({capability}), "
+                    f"which cannot be offered to read-only role {role}"
+                    + (f" on provider {provider}" if provider else ""))
+    return None
+
+
+def _skill_artifact_problem(record):
+    """Validate the pinned run-local copy rather than the mutable source."""
+    settings = _skill_settings(config())
+    for value, digest, limit, label in [
+            (record.get("instructions_path"), record.get("sha256"),
+             settings["max_instruction"], "instructions")]:
+        path = Path(value) if value else None
+        if path is None or not path.is_file():
+            return f"skill {record.get('name')} {label} artifact is missing"
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            return f"skill {record.get('name')} {label} artifact is unreadable: {exc}"
+        if len(data) > limit:
+            return f"skill {record.get('name')} {label} artifact exceeds its budget"
+        if hashlib.sha256(data).hexdigest() != digest:
+            return (f"skill {record.get('name')} {label} artifact changed since "
+                    "resolution")
+    for resource in record.get("resources") or []:
+        path = Path(resource.get("path") or "")
+        if not path.is_file():
+            return (f"skill {record.get('name')} resource "
+                    f"{resource.get('relative')} is missing")
+        data = path.read_bytes()
+        if len(data) > settings["max_resource"]:
+            return (f"skill {record.get('name')} resource "
+                    f"{resource.get('relative')} exceeds its budget")
+        if hashlib.sha256(data).hexdigest() != resource.get("sha256"):
+            return (f"skill {record.get('name')} resource "
+                    f"{resource.get('relative')} changed since resolution")
+    return None
 
 
 def _skill_names(value, label):
@@ -7178,7 +7265,7 @@ def resolve_skill_assignments(project, cfg, request):
                 expanded.append(name)
         return expanded
 
-    def resolve_role(names, label):
+    def resolve_role(names, label, role):
         names = expand(names, label)
         if len(names) > settings["max_per_role"]:
             raise ValueError(
@@ -7188,6 +7275,9 @@ def resolve_skill_assignments(project, cfg, request):
         total = 0
         for name in names:
             record = resolve_skill_reference(name, cfg=cfg, project=project)
+            problem = _skill_tool_problem(role, record)
+            if problem:
+                raise ValueError(problem)
             total += record["bytes"] + sum(item["bytes"] for item in record["resources"])
             if total > settings["max_total"]:
                 raise ValueError(f"{label} exceeds the total skill budget")
@@ -7197,7 +7287,8 @@ def resolve_skill_assignments(project, cfg, request):
     for role in SKILL_ROLES:
         if role in request:
             roles[role] = resolve_role(
-                _skill_names(request.get(role), f"skills.{role}"), f"skills.{role}")
+                _skill_names(request.get(role), f"skills.{role}"), f"skills.{role}",
+                role)
     writers = request.get("writers")
     if writers is not None:
         if not isinstance(writers, dict):
@@ -7206,7 +7297,7 @@ def resolve_skill_assignments(project, cfg, request):
             writer_id = _skill_name(writer_id, "writer")
             writers_out[writer_id] = resolve_role(
                 _skill_names(value, f"skills.writers.{writer_id}"),
-                f"skills.writers.{writer_id}")
+                f"skills.writers.{writer_id}", "implementer")
     return {"version": 1, "delivery": "prompt_injection", "roles": roles,
             "writers": writers_out, "requested": copy.deepcopy(request),
             "resolved_at": now()}
@@ -10138,6 +10229,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     launch_file = jpath / "launch.json"
     spawn_attempted = False
     handled_failure = False
+    live_permission = None
     try:
         with out_file.open("w", encoding="utf-8") as log:
             spawn_attempted = True
@@ -10173,6 +10265,24 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     except subprocess.TimeoutExpired:
                         os.killpg(proc.pid, signal.SIGKILL)
                     raise TimeoutError(f"{role} ran beyond configured {timeout}s")
+                if live_permission is None and time.monotonic() - started >= 1.0:
+                    observed = _prompt_signal_from_file(out_file, route)
+                    if observed:
+                        live_permission = observed
+                        # Stop the whole run before the normal deadline. Siblings
+                        # see the same control channel and preserve their work.
+                        _request_execution_pause(control_dir,
+                                                 "recognized authority prompt")
+                        terminate_identity(job, grace=8)
+                        try:
+                            proc.wait(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        raise RuntimeError(
+                            "Recognized authority/credential prompt from "
+                            f"{role}; dispatch stopped before the configured "
+                            f"{timeout}s deadline. Correct the scoped "
+                            "authorization/authentication, then resume.")
                 time.sleep(0.5)
         output = out_file.read_text(encoding="utf-8", errors="replace")
         if state is not None:
@@ -10341,7 +10451,9 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                               if out_file.exists() else "")
             except OSError:
                 raw_output = ""
-            detected = _detect_permission_prompt(raw_output, route)
+            detected = (live_permission
+                        or _detect_permission_prompt(raw_output, route)
+                        or _unknown_permission_hint(raw_output))
             if detected:
                 job["permission_blocked"] = _record_permission_blocked(
                     run_dir, state, role=role, assignment=assignment,
@@ -10417,6 +10529,10 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             job["recovery_gate"] = inspection["reasons"]
             job["escaped_processes"] = inspection["survivors"]
             job["containment"] = containment
+        if isinstance(job.get("permission_blocked"), dict):
+            # A recognized prompt is a blocked authority state only when the
+            # exact child/session is proven stopped; otherwise it stays uncertain.
+            job["status"] = "blocked" if stopped is True else "uncertain"
         if state is not None:
             job["reported_usage"] = extract_reported_usage(
                 out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else "",
@@ -10823,6 +10939,59 @@ def run_checks(run_dir, state, cfg, project, batch, final=False, deadline=None):
                         state["active_check"]["termination"] = termination
                         save(run_dir, state)
                         raise TimeoutError(f"Verification timed out; reconcile {logpath}")
+                    if time.monotonic() - started_check >= 1.0:
+                        observed = _prompt_signal_from_file(logpath, None)
+                        if observed:
+                            _request_execution_pause(
+                                run_dir, "recognized supervisor-check prompt")
+                            termination = terminate_identity(
+                                state["active_check"], grace=5)
+                            try:
+                                proc.wait(timeout=8)
+                            except subprocess.TimeoutExpired:
+                                try:
+                                    os.killpg(proc.pid, signal.SIGKILL)
+                                except OSError:
+                                    pass
+                            escaped = _check_token_processes(token)
+                            if escaped:
+                                state["active_check"]["escaped_processes"] = escaped
+                                state["active_check"]["containment"] = _terminate_pids(escaped)
+                            state["active_check"]["termination"] = termination
+                            save(run_dir, state)
+                            inspection = inspect_execution(
+                                state["active_check"], run_id=state.get("id"),
+                                include_run=True)
+                            if inspection["survivors"]:
+                                state["active_check"]["containment"] = _terminate_pids(
+                                    inspection["survivors"])
+                                inspection = inspect_execution(
+                                    state["active_check"], run_id=state.get("id"),
+                                    include_run=True)
+                            record = _record_permission_blocked(
+                                run_dir, state, role="supervisor",
+                                assignment=check_id, action=observed["action"],
+                                reason=observed["reason"],
+                                unknown=observed.get("source") == "unknown")
+                            if inspection["stopped"]:
+                                state["active_check"] = None
+                                state["status"] = "blocked"
+                            else:
+                                state["active_check"].update({
+                                    "status": "uncertain",
+                                    "containment": inspection["reasons"],
+                                    "escaped_processes": inspection["survivors"]})
+                                state["status"] = "uncertain"
+                                state["pause_reason"] = (
+                                    "Recognized verification prompt detected but "
+                                    "process containment is unproven; reconcile the "
+                                    "exact check identity before resume.")
+                            save(run_dir, state)
+                            raise RuntimeError(
+                                "Recognized authority/credential prompt from "
+                                f"verification check {index + 1}; the check was "
+                                "stopped before its configured deadline. Correct "
+                                "the scoped environment/authorization, then resume.")
                     time.sleep(0.2)
                 rc = proc.returncode
             finally:
@@ -12788,19 +12957,30 @@ def clear_stale_acceptance(state, reason, *, phase="verify"):
     return state
 
 
-def validate_acceptance_references(state, project, references):
-    """Revalidate every supervisor-issued record immediately before completion."""
+def validate_acceptance_references(state, project, references, *, run_dir=None,
+                                   cfg=None, required=None, require_final=False,
+                                   expected_batch_index=None):
+    """Revalidate every supervisor-issued record immediately before completion.
+
+    This is the final boundary for record bytes, source/provenance, run/plan and
+    epoch binding, each required command log, command policy and containment.
+    """
     current = source_snapshot(project)
+    cfg = cfg or config()
+    run_dir = Path(run_dir) if run_dir is not None else None
+    if run_dir is None:
+        raise ValueError("Acceptance requires a durable run directory")
     for reference in references:
         if not isinstance(reference, dict) or not reference.get("path"):
             raise ValueError("Acceptance requires a supervisor-issued verification record")
         if reference.get("candidate_hash") not in (None, signature(current)):
             raise ValueError("Verification reference does not match current source")
-        load_verification_evidence(reference, current,
-                                   plan_version=state.get("plan_version"),
-                                   plan_revision=state.get("plan_revision", 0),
-                                   amendment_epoch=state.get("amendment_epoch", 0),
-                                   run_state=state)
+        assessment = verification_reference_assessment(
+            run_dir, state, cfg, project, current, reference,
+            required=required, require_final=require_final,
+            expected_batch_index=expected_batch_index)
+        if assessment["reasons"]:
+            raise ValueError("; ".join(assessment["reasons"]))
     return current
 
 
@@ -13559,6 +13739,133 @@ def _ordered_argv_missing(required, provided):
     return missing
 
 
+def verification_reference_assessment(run_dir, state, cfg, project, current,
+                                      reference, *, required=None,
+                                      require_final=False,
+                                      expected_batch_index=None, _depth=0):
+    """One integrity/provenance rule for reuse, decision and final acceptance.
+
+    Checks the complete authoritative reference, every required command log,
+    command policy and containment, run/plan/epoch binding and (for a derived
+    reuse record) the original records and logs it still claims to bind.  Any
+    missing or changed artifact fails closed.
+    """
+    reasons = []
+    if not isinstance(reference, dict) or not reference.get("path"):
+        return {"reasons": ["a required supervisor verification reference is missing"],
+                "resolved": None, "loaded": None, "evidence": None}
+    if not reference.get("record_sha256"):
+        return {"reasons": [f"{Path(reference['path']).name}: no supervisor record "
+                            "digest"], "resolved": None, "loaded": None,
+                "evidence": None}
+    resolved = _run_local_path(run_dir, reference["path"])
+    if resolved is None:
+        return {"reasons": [f"verification record is outside the run directory: "
+                            f"{reference['path']}"], "resolved": None,
+                "loaded": None, "evidence": None}
+    try:
+        loaded = load_verification_evidence(
+            reference, current, plan_version=state.get("plan_version"),
+            plan_revision=state.get("plan_revision", 0),
+            amendment_epoch=state.get("amendment_epoch", 0), run_state=state)
+    except (VerificationEvidenceRejected, KeyError, TypeError, ValueError) as exc:
+        return {"reasons": [f"{resolved.name}: {exc}"], "resolved": resolved,
+                "loaded": None, "evidence": None}
+    evidence = loaded["evidence"]
+    label = resolved.name
+    if loaded["evidence_version"] < VERIFICATION_EVIDENCE_VERSION:
+        reasons.append(f"{label}: legacy evidence cannot be reused or accepted")
+    if evidence.get("run_id") != state.get("id"):
+        reasons.append(f"{label}: record does not belong to this run")
+    if evidence.get("plan_version") not in (None, state.get("plan_version")):
+        reasons.append(f"{label}: plan version changed")
+    if evidence.get("plan_revision") not in (None, state.get("plan_revision", 0)):
+        reasons.append(f"{label}: plan revision changed")
+    if evidence.get("amendment_epoch") not in (None, state.get("amendment_epoch", 0)):
+        reasons.append(f"{label}: amendment epoch changed")
+    if evidence.get("authority_epoch") not in (None, state.get("authority_epoch", 0)):
+        reasons.append(f"{label}: authority/recovery epoch changed")
+    if (expected_batch_index is not None
+            and evidence.get("batch_index") != expected_batch_index):
+        reasons.append(f"{label}: batch index changed")
+    if require_final and evidence.get("final") is not True:
+        reasons.append(f"{label}: record is not marked as final acceptance evidence")
+    commands = evidence.get("commands") or []
+    if not isinstance(commands, list) or not commands:
+        reasons.append(f"{label}: record has no required command evidence")
+    provided = []
+    for command in commands:
+        if not isinstance(command, dict):
+            reasons.append(f"{label}: malformed command record")
+            continue
+        argv = [str(item) for item in command.get("argv") or []]
+        provided.append(argv)
+        if command.get("returncode") != 0:
+            reasons.append(f"{label}: a required command did not pass")
+            continue
+        if command.get("log_sha256") is None:
+            reasons.append(f"{label}: command log has no supervisor digest")
+            continue
+        log_path = _run_local_path(run_dir, command.get("log"))
+        if log_path is None or not log_path.is_file():
+            reasons.append(f"{label}: command log is missing or outside the run")
+            continue
+        try:
+            if _sha256_file(log_path) != command.get("log_sha256"):
+                reasons.append(f"{label}: command log bytes changed after verification")
+                continue
+        except OSError as exc:
+            reasons.append(f"{label}: command log is unreadable: {exc}")
+            continue
+        try:
+            recorded_policy = command.get("command_policy")
+            current_policy = verification_command_policy(
+                argv, cfg, project=Path(project))
+        except (TypeError, ValueError) as exc:
+            reasons.append(f"{label}: command policy could not be revalidated: {exc}")
+            continue
+        if recorded_policy != current_policy:
+            reasons.append(f"{label}: command policy changed")
+            continue
+        containment = command.get("containment") or {}
+        if containment.get("remaining") or containment.get("escaped_processes"):
+            reasons.append(f"{label}: verification containment was not clean")
+    if required is not None:
+        missing = _ordered_argv_missing(required, provided)
+        if missing:
+            reasons.append(f"{label}: required ordered argv is not covered: "
+                           + json.dumps(missing, ensure_ascii=False))
+    reuse = evidence.get("reuse")
+    if isinstance(reuse, dict) and _depth < 1:
+        sources = reuse.get("sources") or []
+        if not sources:
+            reasons.append(f"{label}: derived reuse record has no bound source")
+        for source in sources:
+            if not isinstance(source, dict) or not source.get("path"):
+                reasons.append(f"{label}: derived reuse source reference is invalid")
+                continue
+            source_reference = {"path": source.get("path"),
+                                "record_sha256": source.get("sha256"),
+                                "passed": True}
+            source_path = Path(source.get("path"))
+            if source_path.is_file():
+                try:
+                    source_evidence = read_json(source_path)
+                except (OSError, ValueError) as exc:
+                    reasons.append(f"{label}: bound source is unreadable: {exc}")
+                    continue
+                source_reference.update({
+                    "candidate_hash": source_evidence.get("candidate_hash"),
+                    "evidence_version": source_evidence.get("evidence_version")})
+            nested = verification_reference_assessment(
+                run_dir, state, cfg, project, current, source_reference,
+                required=None, require_final=False, expected_batch_index=None,
+                _depth=_depth + 1)
+            reasons.extend(nested["reasons"])
+    return {"reasons": reasons, "resolved": resolved, "loaded": loaded,
+            "evidence": evidence}
+
+
 def verification_reuse_assessment(run_dir, state, cfg, project, current, required, sources):
     """Decide whether supervisor verification records can serve a final gate.
 
@@ -13577,75 +13884,14 @@ def verification_reuse_assessment(run_dir, state, cfg, project, current, require
             reference, expected_index = source, source.get("batch_index")
         else:
             reference, expected_index = source
-        if not isinstance(reference, dict) or not reference.get("path"):
-            reasons.append("a required supervisor verification reference is missing")
+        assessment = verification_reference_assessment(
+            run_dir, state, cfg, project, current, reference, required=None,
+            require_final=False, expected_batch_index=expected_index)
+        if assessment["reasons"]:
+            reasons.extend(assessment["reasons"])
             continue
-        if not reference.get("record_sha256"):
-            reasons.append(f"{Path(reference['path']).name}: no supervisor record digest")
-            continue
-        resolved = _run_local_path(run_dir, reference["path"])
-        if resolved is None:
-            reasons.append(f"verification record is outside the run directory: {reference['path']}")
-            continue
-        try:
-            loaded = load_verification_evidence(
-                reference, current, plan_version=state.get("plan_version"),
-                plan_revision=state.get("plan_revision", 0),
-                amendment_epoch=state.get("amendment_epoch", 0), run_state=state)
-        except VerificationEvidenceRejected as exc:
-            reasons.append(f"{resolved.name}: {exc}")
-            continue
-        evidence = loaded["evidence"]
-        label = resolved.name
-        if loaded["evidence_version"] < VERIFICATION_EVIDENCE_VERSION:
-            reasons.append(f"{label}: legacy evidence cannot be reused")
-            continue
-        if evidence.get("run_id") != state.get("id"):
-            reasons.append(f"{label}: record does not belong to this run")
-            continue
-        if evidence.get("plan_revision") not in (state.get("plan_revision", 0),):
-            reasons.append(f"{label}: plan revision changed")
-            continue
-        if evidence.get("amendment_epoch") not in (state.get("amendment_epoch", 0),):
-            reasons.append(f"{label}: amendment epoch changed")
-            continue
-        if evidence.get("authority_epoch") != state.get("authority_epoch", 0):
-            reasons.append(f"{label}: authority/recovery epoch changed")
-            continue
-        if expected_index is not None and evidence.get("batch_index") != expected_index:
-            reasons.append(f"{label}: batch index changed")
-            continue
-        for command in evidence.get("commands") or []:
-            if not isinstance(command, dict):
-                reasons.append(f"{label}: malformed command record")
-                continue
-            argv = [str(item) for item in command.get("argv") or []]
-            if command.get("returncode") != 0:
-                reasons.append(f"{label}: a required command did not pass")
-                continue
-            if command.get("log_sha256") is None:
-                reasons.append(f"{label}: command log has no supervisor digest")
-                continue
-            log_path = _run_local_path(run_dir, command.get("log"))
-            if log_path is None or not log_path.is_file():
-                reasons.append(f"{label}: command log is missing or outside the run")
-                continue
-            if _sha256_file(log_path) != command.get("log_sha256"):
-                reasons.append(f"{label}: command log bytes changed after verification")
-                continue
-            try:
-                recorded_policy = command.get("command_policy")
-                current_policy = verification_command_policy(argv, cfg, project=project)
-            except (TypeError, ValueError) as exc:
-                reasons.append(f"{label}: command policy could not be revalidated: {exc}")
-                continue
-            if recorded_policy != current_policy:
-                reasons.append(f"{label}: command policy changed")
-                continue
-            containment = command.get("containment") or {}
-            if containment.get("remaining") or containment.get("escaped_processes"):
-                reasons.append(f"{label}: verification containment was not clean")
-        loaded_sources.append((resolved, loaded, evidence))
+        loaded_sources.append((assessment["resolved"], assessment["loaded"],
+                               assessment["evidence"]))
     if not reasons:
         provided = []
         for _, _, evidence in loaded_sources:
@@ -13719,27 +13965,20 @@ def final_acceptance_evidence(run_dir, state, cfg, project, *, batch, final,
     """
     current = source_snapshot(project, cfg=cfg)
     required = [[str(item) for item in check] for check in (batch.get("checks") or [])]
+    repeat = bool(batch.get("repeat_checks") or state.get("fresh_verification_required"))
     existing = state.get("verification") or {}
-    if existing.get("path"):
-        try:
-            loaded = load_verification_evidence(
-                existing, current, plan_version=state.get("plan_version"),
-                plan_revision=state.get("plan_revision", 0),
-                amendment_epoch=state.get("amendment_epoch", 0), run_state=state)
-            evidence = (loaded.get("evidence")
-                        if isinstance(loaded, dict) else None)
-        except (VerificationEvidenceRejected, KeyError, TypeError, ValueError):
-            # A record that cannot be interpreted is never final authority;
-            # the normal fresh/reuse path decides what to execute instead.
-            evidence = None
-        if (isinstance(evidence, dict) and evidence.get("final") is True
-                and not _ordered_argv_missing(required, _evidence_command_argv(evidence))):
+    if existing.get("path") and not repeat:
+        existing_assessment = verification_reference_assessment(
+            run_dir, state, cfg, project, current, existing, required=required,
+            require_final=True,
+            expected_batch_index=state.get("batch_index", 0))
+        if not existing_assessment["reasons"]:
             state["final_acceptance"] = {
                 "mode": "existing_final_record", "path": str(existing["path"]),
+                "record_sha256": existing_assessment["loaded"]["record_sha256"],
                 "reused_at": now(),
                 "note": "A final supervisor record for this candidate is already bound."}
-            return evidence, None
-    repeat = bool(batch.get("repeat_checks") or state.get("fresh_verification_required"))
+            return existing_assessment["evidence"], None
     if not repeat:
         assessment = verification_reuse_assessment(
             run_dir, state, cfg, project, current, required, sources)
@@ -13849,10 +14088,9 @@ def load_verification_evidence(reference, current, *, plan_version=None,
             "them; a tampered record cannot authorize reuse or acceptance",
             "record_bytes_changed")
     try:
-        evidence = read_json(path)
-    except (OSError, ValueError) as exc:
-        reject(f"Verification record is unreadable: {path}: {exc}",
-               "record_unreadable")
+        evidence = json.loads(record_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        reject(f"Verification record is unreadable: {path}", "record_unreadable")
     if not isinstance(evidence, dict):
         reject(f"Verification record is unreadable: {path}: not a JSON object",
                "record_unreadable")
@@ -14814,8 +15052,64 @@ def _parallel_source_problem(project):
     return None
 
 
-def resolve_parallel_batch(state, project, batch, batch_index=None):
-    """Choose parallel writers only after permission, ownership and source gates."""
+def _parallel_transaction_admitted(state, index):
+    """True when a parallel transaction for this plan/batch was admitted."""
+    parallel = (state or {}).get("parallel_writers")
+    if not isinstance(parallel, dict):
+        return False
+    lanes = parallel.get("lanes")
+    if not isinstance(lanes, dict):
+        return False
+    for lane in lanes.values():
+        if not isinstance(lane, dict) or lane.get("batch_index") != index:
+            continue
+        if lane.get("plan_version") != (state or {}).get("plan_version"):
+            continue
+        if lane.get("plan_revision", 0) != (state or {}).get("plan_revision", 0):
+            continue
+        if lane.get("amendment_epoch", 0) != (state or {}).get("amendment_epoch", 0):
+            continue
+        return True
+    return False
+
+
+def _integration_record_current(record, state):
+    """A durable integration record belongs to this run and plan revision."""
+    if not isinstance(record, dict):
+        return False
+    if record.get("run_id") not in (None, (state or {}).get("id")):
+        return False
+    if record.get("plan_version") not in (None, (state or {}).get("plan_version")):
+        return False
+    if (record.get("plan_revision") is not None
+            and int(record.get("plan_revision")) != int(
+                (state or {}).get("plan_revision", 0))):
+        return False
+    if (record.get("amendment_epoch") is not None
+            and int(record.get("amendment_epoch")) != int(
+                (state or {}).get("amendment_epoch", 0))):
+        return False
+    return True
+
+
+def _integration_recovery_record(run_dir, index, state=None):
+    """Read the durable integration record; distinguish absent/unreadable."""
+    path = _integration_record_path(run_dir, index)
+    if not path.is_file():
+        return None, None
+    try:
+        record = read_json(path)
+    except (OSError, ValueError) as exc:
+        return path, {"unreadable": str(exc)}
+    if not isinstance(record, dict):
+        return path, {"unreadable": "not a JSON object"}
+    if state is not None and not _integration_record_current(record, state):
+        return None, None
+    return path, record
+
+
+def resolve_parallel_batch(state, project, batch, batch_index=None, *, run_dir=None):
+    """Choose parallel writers only after recovery, permission and source gates."""
     records = _writer_assignment_records(
         batch.get("writers") if isinstance(batch, dict) else None)
     index = (state or {}).get("batch_index", 0) if batch_index is None else batch_index
@@ -14825,9 +15119,41 @@ def resolve_parallel_batch(state, project, batch, batch_index=None):
                 "batch_index": index, "resolved_at": now()}
     if not records:
         return resolved
+    if len(records) <= 1:
+        # An explicit one-writer assignment is the ordinary single-writer path.
+        resolved["reason"] = None
+        return resolved
     if bool((state or {}).get("parallel_fallback_batches", {}).get(str(index))):
         resolved["reason"] = (
             "A previous attempt for this batch required single-writer recovery")
+        return resolved
+    try:
+        directory = (Path(run_dir) if run_dir is not None
+                     else (run_path(state["id"]) if (state or {}).get("id") else None))
+    except (ValueError, TypeError):
+        directory = None
+    record_path, record = (None, None)
+    if directory is not None:
+        record_path, record = _integration_recovery_record(directory, index, state)
+    if record_path is not None:
+        # A durable integration attempt for this exact batch is always resolved
+        # through the parallel recovery path, even if the canonical checkout is
+        # now dirty.  A fresh single writer must never be dispatched over an
+        # admitted transaction.
+        resolved["mode"] = "parallel"
+        resolved["recovery"] = {
+            "source": "integration_record", "path": str(record_path),
+            "phase": (record or {}).get("phase"),
+            "unreadable": bool((record or {}).get("unreadable"))}
+        resolved["reason"] = (
+            "Recovering the durable parallel integration record for this batch "
+            f"(phase {(record or {}).get('phase') or 'unreadable'})")
+        return resolved
+    if _parallel_transaction_admitted(state, index):
+        resolved["mode"] = "parallel"
+        resolved["recovery"] = {"source": "admitted_lanes"}
+        resolved["reason"] = (
+            "Recovering writer lanes already admitted for this batch")
         return resolved
     if len(records) > resolved["permission_max"]:
         resolved["reason"] = (
@@ -14848,10 +15174,18 @@ def _parallel_batch_dir(run_dir, batch_index):
 
 
 def _checkout_content_digest(project):
-    """Writer-visible source identity without the checkout's absolute path."""
+    """Exact checkout identity: HEAD, bytes, file mode and index state.
+
+    A dry-run worktree and the canonical checkout are both applied with
+    ``git apply --index`` before their identities are compared, so staged and
+    unstaged trees of the same bytes are deliberately distinct here.  A writer
+    that stages, re-modes or otherwise changes the index without changing
+    worktree bytes can no longer masquerade as the pinned base.
+    """
     project = Path(project)
     head = git(project, ["rev-parse", "HEAD"]).decode().strip()
     states = worktree_states(project)
+    index_digest, index_error = _index_digest(project)
     files = {}
     for relative in sorted(states):
         path = project / relative
@@ -14861,20 +15195,28 @@ def _checkout_content_digest(project):
                 value = "link:" + os.readlink(path)
                 if target.is_file():
                     value += ":" + _sha256_file(target)
+                mode = format(path.lstat().st_mode & 0o7777, "o")
             elif path.is_file():
                 value = _sha256_file(path)
+                mode = format(path.lstat().st_mode & 0o7777, "o")
             elif not path.exists():
                 value = "deleted"
+                mode = None
             else:
                 value = "other"
+                mode = format(path.lstat().st_mode & 0o7777, "o")
         except OSError:
             value = "unreadable"
-        files[relative] = value
-    # Staging state is deliberately excluded: a dry-run worktree and the
-    # canonical checkout can carry identical writer-visible bytes with one
-    # unstaged and one staged index.  HEAD plus every changed/untracked file
-    # hash is the reproducible identity.
-    return {"head": head, "files": files}
+            mode = None
+        index_entry, _index_error = _index_entry(project, relative)
+        files[relative] = {
+            "value": value, "mode": mode,
+            "index": ({"kind": index_entry.get("kind"),
+                       "mode": index_entry.get("mode"),
+                       "sha256": index_entry.get("sha256")}
+                      if isinstance(index_entry, dict) else "unreadable")}
+    return {"head": head, "index": index_digest,
+            "index_error": index_error, "files": files}
 
 
 def _checkout_content_sha(project):
@@ -15007,8 +15349,18 @@ def _reconcile_parallel_lane_processes(run_dir, state):
             problems.append({"writer": writer_id,
                              "reason": "lane execution slot is missing"})
             continue
+        lane_state_path = Path(lane_dir) / "state.json"
+        if not lane_state_path.is_file():
+            # The lane slot writes state.json before its first model dispatch is
+            # even possible.  A missing slot therefore proves that no child was
+            # launched (e.g. process loss during startup) and the lane is safely
+            # retryable; an unreadable slot below is not.
+            lane["status"] = "interrupted"
+            lane.setdefault("recovery_note",
+                            "admitted lane was interrupted before its execution slot existed")
+            continue
         try:
-            lane_state = read_json(Path(lane_dir) / "state.json")
+            lane_state = read_json(lane_state_path)
         except (OSError, ValueError) as exc:
             problems.append({"writer": writer_id,
                              "reason": f"lane state is unreadable: {exc}"})
@@ -15081,16 +15433,20 @@ def _lane_resumable(lane):
 
 def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
                           worktree, lane_dir, base_head, base_snapshot, deadline,
-                          parent_attempt):
+                          parent_attempt, provenance=None):
     result_path = Path(lane_dir) / "lane-result.json"
 
     def finish(payload):
+        payload = {**payload, "provenance": provenance or {},
+                   "worktree": str(worktree)}
         try:
             atomic_json(result_path, json.loads(json.dumps(payload, default=str)))
         except (OSError, TypeError, ValueError) as exc:
             try:
                 atomic_json(result_path, {"ok": False,
-                                          "error": f"lane result write failed: {exc}"})
+                                          "error": f"lane result write failed: {exc}",
+                                          "provenance": provenance or {},
+                                          "worktree": str(worktree)})
             except (OSError, TypeError, ValueError):
                 pass
         return payload
@@ -15169,7 +15525,8 @@ def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
 def _parallel_progress(state, lanes, started_at):
     parallel = state.setdefault("parallel_writers", {})
     parallel["lanes"] = lanes
-    parallel["active"] = any(lane.get("status") in {"starting", "running"}
+    parallel["active"] = any(lane.get("status") in {"starting", "running",
+                                                    "validating"}
                              for lane in lanes.values())
     if started_at is not None:
         parallel["writers_elapsed_seconds"] = round(
@@ -15180,19 +15537,60 @@ def _parallel_progress(state, lanes, started_at):
 def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
     """Dry-run every patch in scratch, then apply the exact combined result."""
     record_path = _integration_record_path(run_dir, batch_index)
-    patches = [{"writer": writer_id, **(lane.get("patch") or {})}
-               for writer_id, lane in sorted(lanes.items())
-               if lane.get("status") == "complete" and lane.get("patch")]
-    if not patches:
-        raise RuntimeError("No completed writer patches are available to integrate")
-    manifest = {"version": 1, "batch_index": batch_index, "base_head": base_head,
-                "patches": patches, "created_at": now()}
     previous = None
     if record_path.is_file():
         try:
             previous = read_json(record_path)
         except (OSError, ValueError):
             previous = None
+    if isinstance(previous, dict) and not _integration_record_current(previous, state):
+        # A retained record from a superseded plan revision cannot authorize
+        # this transaction; preserve it on disk until the next write replaces it.
+        previous = None
+    patches = [{"writer": writer_id, **(lane.get("patch") or {}),
+                "paths": list(lane.get("changed_paths") or [])}
+               for writer_id, lane in sorted(lanes.items())
+               if lane.get("status") == "complete" and lane.get("patch")]
+    if not patches and isinstance(previous, dict):
+        # A recovered transaction can still be completed from its own durable
+        # patch manifest even when the in-memory lane inventory was lost.
+        patches = [item for item in previous.get("patches") or []
+                   if isinstance(item, dict) and item.get("path")]
+    if not patches:
+        raise RuntimeError("No completed writer patches are available to integrate")
+    writers = sorted({item.get("writer") for item in patches if item.get("writer")})
+    if len(writers) != len(patches):
+        raise RuntimeError(
+            "Parallel integration requires exactly one durable patch per writer")
+    if isinstance(previous, dict):
+        recorded_writers = sorted(previous.get("writers") or [])
+        if recorded_writers and recorded_writers != writers:
+            raise RuntimeError(
+                "Recorded parallel integration belongs to a different all-writer "
+                f"set ({recorded_writers}); refusing to merge {writers}. Inspect "
+                f"the preserved patches at {record_path}")
+        recorded_base = previous.get("base_head")
+        if recorded_base and recorded_base != base_head:
+            raise RuntimeError(
+                "Recorded parallel integration was prepared against a different "
+                f"pinned base ({recorded_base}); the writers started from "
+                f"{base_head}. Recover explicitly before any apply.")
+        recorded_patches = {item.get("writer"): item.get("sha256")
+                            for item in previous.get("patches") or []
+                            if isinstance(item, dict)}
+        current_patches = {item.get("writer"): item.get("sha256")
+                           for item in patches}
+        if recorded_patches and recorded_patches != current_patches:
+            raise RuntimeError(
+                "Recorded parallel integration patches no longer match the durable "
+                "lane artifacts; a changed patch cannot authorize integration")
+    manifest = {"version": 1, "batch_index": batch_index, "base_head": base_head,
+                "run_id": state.get("id"),
+                "plan_version": state.get("plan_version"),
+                "plan_revision": state.get("plan_revision", 0),
+                "amendment_epoch": state.get("amendment_epoch", 0),
+                "authority_epoch": state.get("authority_epoch", 0),
+                "writers": writers, "patches": patches, "created_at": now()}
     if isinstance(previous, dict) and previous.get("phase") == "complete":
         current = _checkout_content_sha(project)
         if current == previous.get("after_sha"):
@@ -15214,6 +15612,7 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
                 "identity; no automatic reset is allowed. Recovery patches and the "
                 f"expected identity are recorded at {record_path}")
         manifest = previous
+        manifest.update({"writers": writers, "patches": patches})
     before = _checkout_content_digest(project)
     if before["head"] != base_head:
         raise RuntimeError(
@@ -15232,7 +15631,9 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
                 raise RuntimeError(
                     f"Writer patch is missing or changed: {path}")
             _apply_writer_patch(scratch, path, check_only=True)
-            _apply_writer_patch(scratch, path)
+            # Apply to both index and worktree so the dry-run identity covers the
+            # exact tree/index state the canonical integration will produce.
+            _apply_writer_patch(scratch, path, index=True)
         expected_after = _checkout_content_sha(scratch)
     finally:
         _git_worktree_remove(project, scratch)
@@ -15253,26 +15654,251 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
             f"expected identity are recorded at {record_path}")
     manifest.update({"phase": "complete", "completed_at": now(),
                      "paths": sorted({path for lane in lanes.values()
-                                      for path in lane.get("changed_paths", [])})})
+                                      for path in lane.get("changed_paths", [])})
+                     or sorted({path for patch in patches
+                                for path in patch.get("paths", [])})})
     atomic_json(record_path, manifest)
     return manifest
 
 
 def _parallel_combined_report(state, resolved, lanes, integration):
     files = sorted({path for lane in lanes.values()
-                    for path in lane.get("changed_paths", [])})
+                    for path in lane.get("changed_paths", [])}
+                   or set(integration.get("paths") or []))
     evidence = [f"{writer_id}: {lane.get('patch', {}).get('path')} "
                 f"sha256={lane.get('patch', {}).get('sha256')}"
                 for writer_id, lane in sorted(lanes.items())
                 if lane.get("status") == "complete"]
+    if not evidence:
+        evidence = [f"{item.get('writer')}: {item.get('path')} "
+                    f"sha256={item.get('sha256')}"
+                    for item in integration.get("patches") or []
+                    if isinstance(item, dict)]
     evidence.append(f"integrated checkout identity {integration.get('after_sha')}")
+    writers = sorted(lanes) or list(integration.get("writers") or [])
     return {"contract_version": 2, "status": "complete",
             "summary": ("Supervisor integrated " +
-                        ", ".join(sorted(lanes)) +
+                        ", ".join(writers) +
                         " on one pinned base; combined source is ready for "
                         "independent verification and review."),
             "files": files, "tests": [], "evidence": evidence,
             "unknowns": [], "blocker": ""}
+
+
+def _lane_provenance(state, batch_index, record, base_head, attempt_id):
+    return {
+        "version": 1, "attempt_id": attempt_id,
+        "run_id": state.get("id"), "batch_index": int(batch_index),
+        "plan_version": state.get("plan_version"),
+        "plan_revision": state.get("plan_revision", 0),
+        "amendment_epoch": state.get("amendment_epoch", 0),
+        "authority_epoch": state.get("authority_epoch", 0),
+        "assignment": record.get("id"), "role": "implementer",
+        "base_head": base_head,
+    }
+
+
+def _lane_result_matches(lane, outcome):
+    expected = (lane or {}).get("intent") or {}
+    recorded = (outcome or {}).get("provenance") or {}
+    if not isinstance(expected, dict) or not isinstance(recorded, dict):
+        return False
+    return all(recorded.get(key) == value for key, value in expected.items())
+
+
+def _durable_lane_outcome(lane):
+    """Reuse a writer result that finished before parent reconciliation."""
+    if not isinstance(lane, dict) or not lane.get("lane_dir"):
+        return None
+    path = Path(lane["lane_dir"]) / "lane-result.json"
+    if not path.is_file():
+        return None
+    try:
+        outcome = read_json(path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(outcome, dict) or not outcome.get("ok"):
+        return None
+    if _lane_outcome_status(outcome) != "validating":
+        # A blocked/escalated report must be re-run after its correction; only a
+        # complete result that has not yet been validated is safe to reuse.
+        return None
+    if not _lane_result_matches(lane, outcome):
+        return None
+    return outcome
+
+
+def _lane_outcome_status(outcome):
+    if not isinstance(outcome, dict):
+        return "failed"
+    if not outcome.get("ok"):
+        return "interrupted" if outcome.get("interrupted") else "failed"
+    report = outcome.get("report") if isinstance(outcome.get("report"), dict) else {}
+    status = report.get("status")
+    if status == "complete":
+        return "validating"
+    if status == "blocked":
+        return "blocked"
+    if status == "needs_architect":
+        return "needs_architect"
+    return "invalid"
+
+
+def _validate_lane_outcome(run_dir, state, records, lanes, writer_id, outcome,
+                           base_head, batch_dir, batch_index):
+    """Promote a writer result only for proven complete, contained work."""
+    lane = lanes.setdefault(writer_id, {})
+    record = records.get(writer_id) or {}
+    lane_state = outcome.get("lane_state") or {}
+    job = outcome.get("job") or {}
+    if not _lane_result_matches(lane, outcome):
+        lane.update({"status": "invalid",
+                     "error": "durable lane result provenance does not match the "
+                              "admitted launch"})
+        return
+    if lane_state.get("active_job"):
+        lane.update({"status": "invalid",
+                     "error": "writer execution was not proven stopped before "
+                              "result promotion"})
+        return
+    report = outcome.get("report") if isinstance(outcome.get("report"), dict) else {}
+    status = report.get("status")
+    try:
+        changed = _writer_changed_paths(Path(lane["worktree"]), base_head)
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        lane.update({"status": "invalid", "error": str(exc)})
+        return
+    violations = [path for path in changed if not _writer_owns(record, path)]
+    attempt = int(lane.get("attempt") or 1)
+    try:
+        patch = _writer_patch(Path(lane["worktree"]), base_head,
+                              batch_dir / writer_id / f"writer-{attempt}.patch")
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        lane.update({"status": "invalid", "error": str(exc),
+                     "changed_paths": changed})
+        return
+    common = {"job_id": job.get("id"), "lane_run_id": lane_state.get("id"),
+              "report": report, "changed_paths": changed, "patch": patch,
+              "final_sha": _checkout_content_sha(Path(lane["worktree"])),
+              "finished_at": now()}
+    if status == "complete" and not violations:
+        lane.update({**common, "status": "complete",
+                     "milestone": report.get("summary")})
+        journal_event(run_dir, state, "parallel_writer_validated",
+                      assignment=writer_id, paths=changed[:40],
+                      patch_sha256=patch["sha256"])
+        return
+    if status in {"blocked", "needs_architect"}:
+        blocker = (report.get("blocker") or report.get("summary")
+                   or f"writer reported {status}")
+        if violations:
+            blocker += ("; also changed unowned paths: "
+                        + ", ".join(violations[:8]))
+        lane.update({**common, "status": status, "error": blocker,
+                     "milestone": report.get("summary") or blocker})
+        journal_event(run_dir, state, f"parallel_writer_{status}",
+                      assignment=writer_id, blocker=blocker,
+                      partial_paths=changed[:40], patch_sha256=patch["sha256"])
+        return
+    if violations:
+        lane.update({**common, "status": "invalid",
+                     "error": "writer changed unowned paths: "
+                              + ", ".join(violations[:8])})
+        journal_event(run_dir, state, "parallel_ownership_violation",
+                      assignment=writer_id, paths=violations[:20])
+        return
+    lane.update({**common, "status": "invalid",
+                 "error": f"writer returned unusable report status {status!r}"})
+
+
+def _finalize_parallel_integration(run_dir, state, cfg, project, batch_index,
+                                   resolved, lanes, integration, base_head,
+                                   started_at, integration_started,
+                                   integration_boundary, integration_job_id):
+    elapsed = round(time.monotonic() - integration_started, 2)
+    integration["elapsed_seconds"] = elapsed
+    state["parallel_integration"] = integration
+    if integration_boundary is not None:
+        try:
+            _record_batch_delta(
+                run_dir, state, project, integration_job_id, integration_boundary,
+                source_snapshot(project), phase="parallel-integration",
+                job={"id": integration_job_id, "role": "implementer",
+                     "kind": "parallel-integration"})
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+            journal_event(run_dir, state, "parallel_delta_unavailable",
+                          batch_index=batch_index, reason=str(exc))
+    parallel = state.setdefault("parallel_writers", {})
+    parallel.update({"batch_index": batch_index, "base_head": base_head,
+                     "resolved": resolved, "lanes": lanes,
+                     "active": False, "integrated": True,
+                     "timing": {"writers_wall_seconds": round(
+                                    time.monotonic() - started_at - elapsed, 2),
+                                "integration_seconds": elapsed,
+                                "sum_writer_seconds": round(sum(
+                                    lane.get("elapsed_seconds") or 0
+                                    for lane in lanes.values()), 2)}})
+    journal_event(run_dir, state, "parallel_batch_integrated",
+                  batch_index=batch_index,
+                  writers=sorted(lanes) or list(integration.get("writers") or []),
+                  integration_seconds=elapsed,
+                  writers_elapsed=parallel["timing"]["writers_wall_seconds"],
+                  after_sha=integration.get("after_sha"))
+    state["parallel_active"] = None
+    for lane in lanes.values():
+        worktree = lane.get("worktree")
+        if worktree:
+            _git_worktree_remove(project, worktree)
+            lane["worktree_removed"] = True
+    save(run_dir, state)
+    return _parallel_combined_report(state, resolved, lanes, integration)
+
+
+def _route_grant_required(route):
+    """Mirror the actual route policy instead of defaulting to 'grant needed'."""
+    if not isinstance(route, dict):
+        return False
+    provider = route.get("provider")
+    billing = route.get("billing")
+    if provider in {"codex", "claude"}:
+        return billing not in {"subscription"}
+    if provider == "opencode":
+        return billing not in {"go"}
+    return billing not in {None, "subscription"}
+
+
+def _parallel_grant_problem(state, run_dir, count):
+    """Refuse a fan-out the known grant/ledger cannot cover before launch."""
+    if count <= 0:
+        return None
+    route = ((state or {}).get("model_routes") or {}).get("implementer")
+    if not isinstance(route, dict) or not _route_grant_required(route):
+        return None
+    try:
+        authorization = route_authorization_status(
+            state, "implementer", route, run_dir=run_dir)
+    except (RuntimeError, ValueError) as exc:
+        authorization = {"authorized": False, "reason": str(exc)}
+    if not authorization.get("authorized"):
+        return {
+            "kind": "parallel_grant", "role": "implementer",
+            "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
+                      f"--role implementer --max-dispatches {count}",
+            "reason": authorization.get("reason")
+                      or "the writer route has no remaining authorized dispatch",
+            "resolution": "Authorize enough exact-route dispatches for the admitted "
+                          "writer set before launching any lane."}
+    remaining = authorization.get("remaining")
+    if isinstance(remaining, int) and remaining < count:
+        return {
+            "kind": "parallel_grant", "role": "implementer",
+            "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
+                      f"--role implementer --max-dispatches {count - remaining}",
+            "reason": f"{count} writer dispatches are admitted but only "
+                      f"{remaining} remain in the route grant ledger",
+            "resolution": "Increase the exact-route grant before launching any lane; "
+                          "no writer was started."}
+    return None
 
 
 def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
@@ -15291,25 +15917,60 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     if parallel.get("batch_index") != batch_index:
         parallel["lanes"] = {}
     lanes = parallel.setdefault("lanes", {})
-    # A crash after a complete integration but before the phase transition must
-    # not relaunch writers: the canonical checkout already contains the exact
-    # integrated bytes and the durable record proves it.
-    completed_record_path = _integration_record_path(run_dir, batch_index)
-    if completed_record_path.is_file():
-        try:
-            completed_record = read_json(completed_record_path)
-        except (OSError, ValueError):
-            completed_record = None
-        if (isinstance(completed_record, dict)
-                and completed_record.get("phase") == "complete"
-                and lanes
-                and all(_lane_resumable(lane)[0] or lane.get("worktree_removed")
-                        for lane in lanes.values() if isinstance(lane, dict))
-                and _checkout_content_sha(project) == completed_record.get("after_sha")):
-            state["parallel_integration"] = completed_record
-            save(run_dir, state)
-            return _parallel_combined_report(
-                state, resolved, lanes, completed_record)
+    parallel.update({"batch_index": batch_index, "base_head": base_head,
+                     "started_at": parallel.get("started_at") or now()})
+    integration_path, recovery_record = _integration_recovery_record(
+        run_dir, batch_index, state)
+    if integration_path is not None and (
+            not isinstance(recovery_record, dict)
+            or recovery_record.get("unreadable")):
+        pause_with(run_dir, state,
+                   "Parallel integration recovery is blocked: the durable record "
+                   f"{integration_path} is unreadable "
+                   f"({(recovery_record or {}).get('unreadable')}). Inspect the "
+                   "preserved patches before any retry.", "blocked")
+        return None
+    if isinstance(recovery_record, dict):
+        phase = recovery_record.get("phase")
+        if phase == "complete":
+            current = _checkout_content_sha(project)
+            if current == recovery_record.get("after_sha"):
+                state["parallel_integration"] = recovery_record
+                save(run_dir, state)
+                return _parallel_combined_report(
+                    state, resolved, lanes, recovery_record)
+            pause_with(run_dir, state,
+                       "Recorded parallel integration is complete but the canonical "
+                       "checkout no longer matches its exact tree/index identity. "
+                       "No writer will be relaunched; inspect the preserved patches "
+                       f"at {batch_dir} and reconcile explicitly.", "blocked")
+            return None
+        if recovery_record.get("before_sha") and recovery_record.get(
+                "after_sha"):
+            # Resolve the admitted transaction before any fresh dispatch.
+            integration_started = time.monotonic()
+            started_at = time.monotonic()
+            try:
+                integration = _parallel_integrate(
+                    run_dir, state, project, batch_index, lanes,
+                    recovery_record.get("base_head") or base_head)
+            except RuntimeError as exc:
+                state["parallel_integration"] = {
+                    "version": 1, "batch_index": batch_index,
+                    "phase": "interrupted_apply",
+                    "conflict": {"at": now(), "reason": str(exc),
+                                 "lane_artifacts": str(batch_dir)}}
+                pause_with(run_dir, state,
+                           "Parallel integration was interrupted with an "
+                           "unrecognized checkout identity; no writer was relaunched "
+                           "and no automatic reset was attempted. Recover from the "
+                           f"recorded patches: {exc}", "blocked")
+                return None
+            return _finalize_parallel_integration(
+                run_dir, state, cfg, project, batch_index, resolved, lanes,
+                integration, recovery_record.get("base_head") or base_head,
+                started_at, integration_started, None,
+                f"parallel-integration-{batch_index}")
     # Reconcile any previous lane attempts before launching anything again.
     problems = _reconcile_parallel_lane_processes(run_dir, state)
     if problems:
@@ -15319,22 +15980,41 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         return None
     state["parallel_active"] = None
     records = {record["id"]: record for record in resolved.get("writers", [])}
+    results = {}
     relaunch = []
     for writer_id, record in records.items():
         lane = lanes.get(writer_id)
         if lane and lane.get("batch_index") == batch_index:
-            ok, _reason = _lane_resumable(lane)
-            if ok:
-                continue
-            if lane.get("status") in {"starting", "running"}:
-                pause_with(run_dir, state,
-                           f"Writer {writer_id} is marked running but its process "
-                           "ownership is unproven; reconcile before retry", "uncertain")
-                return None
+            if (lane.get("plan_version") != state.get("plan_version")
+                    or lane.get("plan_revision", 0) != state.get("plan_revision", 0)
+                    or lane.get("amendment_epoch", 0)
+                    != state.get("amendment_epoch", 0)):
+                lane["stale_plan"] = True
+            else:
+                ok, _reason = _lane_resumable(lane)
+                if ok:
+                    continue
+                durable = _durable_lane_outcome(lane)
+                if durable is not None:
+                    results[writer_id] = durable
+                    lane["status"] = "collected"
+                    continue
         relaunch.append(writer_id)
+    grant_problem = _parallel_grant_problem(state, run_dir, len(relaunch))
+    if grant_problem:
+        preflight = state.get("permission_preflight")
+        if not isinstance(preflight, dict):
+            preflight = state["permission_preflight"] = {
+                "version": 1, "missing": [], "advisories": [], "checked_by": "supervisor"}
+        preflight.setdefault("missing", []).append(grant_problem)
+        preflight["ok"] = False
+        pause_with(run_dir, state,
+                   "Parallel dispatch blocked before any launch: "
+                   + grant_problem.get("reason", "insufficient route authority")
+                   + ". " + grant_problem.get("resolution", ""), "blocked")
+        return None
     started_at = time.monotonic()
     parent_attempt = _current_attempt()
-    results = {}
     threads = []
     for writer_id in relaunch:
         record = records[writer_id]
@@ -15357,15 +16037,6 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                                 "error": f"worktree setup failed: {exc}"}
             results[writer_id] = {"ok": False, "error": str(exc)}
             continue
-        lanes[writer_id] = {"status": "starting", "goal": record["goal"],
-                            "batch_index": batch_index, "worktree": str(worktree),
-                            "lane_dir": str(lane_dir),
-                            "base_head": base_head,
-                            "base_sha": _checkout_content_sha(worktree),
-                            "started_at": now(), "assignment": record}
-        journal_event(run_dir, state, "parallel_writer_started",
-                      assignment=writer_id, goal=record["goal"],
-                      worktree=str(worktree), base_head=base_head)
         # A stale result from another attempt must never be mistaken for this
         # launch's outcome if the thread dies before writing its own artifact.
         try:
@@ -15379,36 +16050,92 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                                 "error": f"stale lane result could not be cleared: {exc}"}
             results[writer_id] = {"ok": False, "error": str(exc)}
             continue
+        attempt_id = uuid.uuid4().hex
+        provenance = _lane_provenance(state, batch_index, record, base_head,
+                                      attempt_id)
+        previous = lanes.get(writer_id) or {}
+        previous_patches = list(previous.get("previous_patches") or [])
+        if previous.get("patch"):
+            previous_patches.append(previous["patch"])
+        lanes[writer_id] = {
+            "status": "starting", "goal": record["goal"],
+            "batch_index": batch_index, "worktree": str(worktree),
+            "lane_dir": str(lane_dir), "base_head": base_head,
+            "base_sha": _checkout_content_sha(worktree),
+            "plan_version": state.get("plan_version"),
+            "plan_revision": state.get("plan_revision", 0),
+            "amendment_epoch": state.get("amendment_epoch", 0),
+            "attempt": attempt, "attempt_id": attempt_id,
+            "intent": provenance, "previous_patches": previous_patches,
+            "started_at": now(), "assignment": record}
+        # Journal and persist the admitted intent before the thread (and thus any
+        # model child) exists, so a parent crash cannot hide a running lane.
+        atomic_json(lane_dir / "intent.json", provenance)
+        save(run_dir, state)
+        journal_event(run_dir, state, "parallel_writer_started",
+                      assignment=writer_id, goal=record["goal"],
+                      worktree=str(worktree), base_head=base_head,
+                      attempt_id=attempt_id, attempt=attempt)
         # Snapshot the parent once in the supervisor thread.  Lane threads must
         # never deepcopy a state dict the parent is concurrently mutating.
         lane_parent_state = copy.deepcopy(state)
 
         def target(writer_id=writer_id, record=record, worktree=worktree,
                    lane_dir=lane_dir, lane_base=lane_base,
-                   lane_parent_state=lane_parent_state):
+                   lane_parent_state=lane_parent_state,
+                   provenance=provenance):
             _parallel_lane_worker(
                 run_dir, lane_parent_state, cfg, project, batch, record, worktree,
-                lane_dir, base_head, lane_base, deadline, parent_attempt)
+                lane_dir, base_head, lane_base, deadline, parent_attempt,
+                provenance)
         thread = threading.Thread(target=target, name=f"writer-{writer_id}",
                                   daemon=True)
         threads.append((writer_id, thread))
         thread.start()
+    announced = set()
     while any(thread.is_alive() for _, thread in threads):
         for writer_id, thread in threads:
-            if not thread.is_alive():
-                continue
             lane = lanes.setdefault(writer_id, {})
-            started = lane.get("started_value")
-            if started is None:
-                lane["started_value"] = time.monotonic()
-                started = lane["started_value"]
-            lane["elapsed_seconds"] = round(time.monotonic() - started, 1)
-            lane["status"] = "running"
+            if thread.is_alive():
+                started = lane.get("started_value")
+                if started is None:
+                    lane["started_value"] = time.monotonic()
+                    started = lane["started_value"]
+                lane["elapsed_seconds"] = round(time.monotonic() - started, 1)
+                if lane.get("status") == "starting":
+                    lane["status"] = "running"
+            result_path = batch_dir / writer_id / "lane-result.json"
+            if writer_id in announced or not result_path.is_file():
+                continue
+            try:
+                observed = read_json(result_path)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(observed, dict):
+                continue
+            status = _lane_outcome_status(observed)
+            report = (observed.get("report")
+                      if isinstance(observed.get("report"), dict) else {})
+            lane["status"] = status
+            lane["milestone"] = (report.get("summary")
+                                 or observed.get("error") or status)
+            announced.add(writer_id)
+            _record_stage_milestone(
+                run_dir, state,
+                f"writer {writer_id} {status}"
+                + (f": {report.get('summary') or observed.get('error')}"
+                   if report.get("summary") or observed.get("error") else ""),
+                source="worker_reported", assignment=writer_id,
+                next_action="validate and integrate writer output")
+            journal_event(run_dir, state, "parallel_lane_observed",
+                          assignment=writer_id, status=status)
         _parallel_progress(state, lanes, started_at)
         save(run_dir, state)
         time.sleep(0.5)
     for writer_id, thread in threads:
         thread.join(timeout=5)
+        if writer_id in results:
+            continue
         lane = lanes.setdefault(writer_id, {})
         outcome = None
         # Read the per-lane result from its own durable execution slot.
@@ -15424,61 +16151,24 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         lane["elapsed_seconds"] = round(max(0.0, time.monotonic() - lane.get(
             "started_value", time.monotonic())), 1)
         lane.pop("started_value", None)
-        if lane.get("status") in {"starting", "running"}:
-            lane["status"] = "complete" if outcome.get("ok") else (
-                "interrupted" if outcome.get("interrupted") else "failed")
         journal_event(run_dir, state, "parallel_writer_finished",
-                      assignment=writer_id, status=lane.get("status"),
+                      assignment=writer_id,
+                      status=_lane_outcome_status(outcome),
                       error=outcome.get("error"))
-        _record_stage_milestone(
-            run_dir, state,
-            f"writer {writer_id} {lane.get('status')}"
-            + (f": {lane.get('error')}" if lane.get("error") else ""),
-            source="worker_reported", assignment=writer_id,
-            next_action="validate and integrate writer output")
     # A lane worker writes its durable result from a separate thread; collect
     # the in-memory holder for the lanes that produced it directly.
     for writer_id, outcome in list(results.items()):
         if not outcome:
             continue
         lane = lanes.setdefault(writer_id, {})
+        lane.setdefault("worktree", outcome.get("worktree"))
+        if not lane.get("worktree"):
+            lane.update({"status": "invalid",
+                         "error": "writer worktree was not recorded"})
+            continue
         if outcome.get("ok"):
-            report = outcome.get("report") or {}
-            job = outcome.get("job") or {}
-            lane_state = outcome.get("lane_state") or {}
-            lane_run_id = lane_state.get("id")
-            try:
-                changed = _writer_changed_paths(Path(lane["worktree"]), base_head)
-            except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
-                lane.update({"status": "invalid", "error": str(exc)})
-                continue
-            record = records[writer_id]
-            violations = [path for path in changed if not _writer_owns(record, path)]
-            if violations:
-                lane.update({"status": "invalid",
-                             "error": "writer changed unowned paths: "
-                                      + ", ".join(violations[:8]),
-                             "changed_paths": changed})
-                journal_event(run_dir, state, "parallel_ownership_violation",
-                              assignment=writer_id, paths=violations[:20])
-                continue
-            try:
-                patch = _writer_patch(Path(lane["worktree"]), base_head,
-                                      batch_dir / writer_id / "writer.patch")
-            except (OSError, subprocess.SubprocessError, ValueError,
-                    RuntimeError) as exc:
-                lane.update({"status": "invalid", "error": str(exc)})
-                continue
-            lane.update({"status": "complete",
-                         "job_id": job.get("id"), "lane_run_id": lane_run_id,
-                         "report": report, "changed_paths": changed,
-                         "patch": patch,
-                         "final_sha": _checkout_content_sha(Path(lane["worktree"])),
-                         "finished_at": now(),
-                         "milestone": report.get("summary")})
-            journal_event(run_dir, state, "parallel_writer_validated",
-                          assignment=writer_id, paths=changed[:40],
-                          patch_sha256=patch["sha256"])
+            _validate_lane_outcome(run_dir, state, records, lanes, writer_id,
+                                   outcome, base_head, batch_dir, batch_index)
         else:
             lane_state = outcome.get("lane_state") or {}
             lane.update({"status": ("interrupted"
@@ -15493,23 +16183,45 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     _parallel_progress(state, lanes, started_at)
     state["parallel_active"] = None
     save(run_dir, state)
-    # Preserve every lane.  Cancellation and any incomplete lane stop short of
-    # integration so a resume can reuse completed output without double apply.
-    if any(result.get("interrupted") for result in results.values()):
+    # Preserve every lane.  Cancellation, a permission block and an explicit
+    # escalation stop short of integration so a resume can reuse completed
+    # output without double apply.
+    blocked_lanes = {writer_id: lane for writer_id, lane in lanes.items()
+                     if lane.get("status") == "blocked"}
+    escalation = next((lane for lane in lanes.values()
+                       if lane.get("status") == "needs_architect"), None)
+    if isinstance(state.get("permission_blocked"), dict) or blocked_lanes:
+        blocked = state.get("permission_blocked")
+        if not isinstance(blocked, dict):
+            first_id = sorted(blocked_lanes)[0]
+            blocked = {"lane": first_id,
+                       "action": blocked_lanes[first_id].get("error") or "blocked",
+                       "reason": blocked_lanes[first_id].get("error") or "blocked",
+                       "report": blocked_lanes[first_id].get("report") or {}}
+            state["parallel_blocked"] = {**blocked, "at": now()}
+            state.setdefault("resolved_parallel_blocks", [])
+        state["status"] = "blocked"
+        state["pause_reason"] = (
+            f"Blocked: writer {blocked.get('lane') or ''} reported "
+            f"{blocked.get('action')}; completed sibling output is preserved and "
+            "will be reused on resume. Correct the blocker, then resume.")
+        save(run_dir, state)
+        journal_event(run_dir, state, "parallel_writer_blocked",
+                      lane=blocked.get("lane"), action=blocked.get("action"))
+        return None
+    if escalation is not None:
+        escalate_to_diagnose(
+            run_dir, state, escalation.get("report") or {},
+            source="parallel_writer_escalation",
+            reason="A parallel writer escalated a consequential "
+                   "cross-writer decision")
+        return None
+    if any(result.get("interrupted") for result in results.values()) or any(
+            lane.get("status") == "interrupted" for lane in lanes.values()):
         raise InterruptedError("Parallel writer execution was interrupted")
     incomplete = [writer_id for writer_id in records
                   if lanes.get(writer_id, {}).get("status") != "complete"]
     if incomplete:
-        reports = [lanes[writer_id].get("report") or {} for writer_id in records
-                   if lanes.get(writer_id, {}).get("status") == "complete"]
-        escalation = next((reports[index] for index in range(len(reports))
-                           if reports[index].get("status") == "needs_architect"), None)
-        if escalation is not None:
-            escalate_to_diagnose(
-                run_dir, state, escalation, source="parallel_writer_escalation",
-                reason="A parallel writer escalated a consequential "
-                       "cross-writer decision")
-            return None
         state.setdefault("parallel_fallback_batches", {})[str(batch_index)] = {
             "at": now(), "incomplete": incomplete,
             "reason": "one or more parallel writers did not complete safely"}
@@ -15536,17 +16248,6 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                                "Parallel integration failed after a writer failure: "
                                + str(exc), "blocked")
                 return None
-        blocked = state.get("permission_blocked")
-        if isinstance(blocked, dict):
-            state["status"] = "blocked"
-            state["pause_reason"] = (
-                f"Blocked: writer {blocked.get('lane') or ''} needs "
-                f"{blocked.get('action')}; completed sibling work is preserved and "
-                "integrated. Correct the scoped authority, then resume.")
-            save(run_dir, state)
-            journal_event(run_dir, state, "parallel_permission_blocked",
-                          lane=blocked.get("lane"), action=blocked.get("action"))
-            return None
         reason = ("Parallel writer(s) " + ", ".join(incomplete)
                   + " did not complete safely; completed work is preserved and "
                     "integrated. Single-writer recovery will finish the remaining "
@@ -15605,44 +16306,74 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                              reason="Parallel writer output could not be integrated "
                                     "without a design decision")
         return None
-    elapsed = round(time.monotonic() - integration_started, 2)
-    integration["elapsed_seconds"] = elapsed
-    state["parallel_integration"] = integration
-    if integration_boundary is not None:
-        try:
-            _record_batch_delta(
-                run_dir, state, project, integration_job_id, integration_boundary,
-                source_snapshot(project), phase="parallel-integration",
-                job={"id": integration_job_id, "role": "implementer",
-                     "kind": "parallel-integration"})
-        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
-            journal_event(run_dir, state, "parallel_delta_unavailable",
-                          batch_index=batch_index, reason=str(exc))
-    parallel = state.setdefault("parallel_writers", {})
-    parallel.update({"batch_index": batch_index, "base_head": base_head,
-                     "resolved": resolved, "lanes": lanes,
-                     "active": False,
-                     "timing": {"writers_wall_seconds": round(
-                                    time.monotonic() - started_at - elapsed, 2),
-                                "integration_seconds": elapsed,
-                                "sum_writer_seconds": round(sum(
-                                    lane.get("elapsed_seconds") or 0
-                                    for lane in lanes.values()), 2)}})
-    journal_event(run_dir, state, "parallel_batch_integrated",
-                  batch_index=batch_index, writers=sorted(lanes),
-                  integration_seconds=elapsed,
-                  writers_elapsed=parallel["timing"]["writers_wall_seconds"],
-                  after_sha=integration.get("after_sha"))
-    state["parallel_active"] = None
-    # Successful integration means lane worktrees are no longer needed.  The
-    # replayable patches and reports stay durable under the run directory.
-    for lane in lanes.values():
-        worktree = lane.get("worktree")
-        if worktree:
-            _git_worktree_remove(project, worktree)
-            lane["worktree_removed"] = True
-    save(run_dir, state)
-    return _parallel_combined_report(state, resolved, lanes, integration)
+    return _finalize_parallel_integration(
+        run_dir, state, cfg, project, batch_index, resolved, lanes, integration,
+        base_head, started_at, integration_started, integration_boundary,
+        integration_job_id)
+
+
+def _route_executable_problem(role, route):
+    provider = (route or {}).get("provider")
+    if provider not in {"codex", "claude", "opencode"}:
+        return {
+            "kind": "route_executable", "role": role,
+            "action": f"configure a supported provider (found {provider!r})",
+            "reason": "the pinned route provider has no known executable",
+            "resolution": "Switch the role to a supported reviewed route."}
+    found = shutil.which(provider, path=scrubbed_env().get("PATH"))
+    if not found:
+        return {
+            "kind": "route_executable", "role": role,
+            "action": f"install/offer the {provider} CLI",
+            "reason": f"the pinned {provider} route cannot start without its CLI",
+            "resolution": "Install the provider CLI or switch the role route before "
+                          "dispatch."}
+    return None
+
+
+def _check_executable_problem(argv, cfg):
+    if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+        return None
+    executable = argv[0]
+    env = scrubbed_env()
+    if "/" in executable:
+        candidate = Path(executable)
+        if not candidate.is_absolute():
+            return {
+                "action": "use an absolute path or a PATH-resolved executable",
+                "reason": f"relative executable {executable!r} is ambiguous under the "
+                          "check environment",
+                "resolution": "Change the planned argv to an absolute or PATH command."}
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return {
+                "action": f"provide an executable at {candidate}",
+                "reason": "the approved check executable does not exist or is not "
+                          "executable under the check environment",
+                "resolution": "Install it or correct the planned check argv."}
+        return None
+    if shutil.which(executable, path=env.get("PATH")) is None:
+        return {
+            "action": f"install/offer {executable} on the check PATH",
+            "reason": "the approved check executable cannot be resolved under the "
+                      "scrubbed check environment",
+            "resolution": "Install the executable or change the planned check argv."}
+    return None
+
+
+def _preflight_block_reason(preflight, prefix):
+    items = []
+    for item in (preflight or {}).get("missing") or []:
+        label = item.get("kind") or "decision"
+        role = item.get("role")
+        assignment = item.get("assignment")
+        scope = "/".join(value for value in (role, assignment) if value)
+        reason = item.get("reason") or "unresolved"
+        action = item.get("action")
+        detail = f"{label}{' (' + scope + ')' if scope else ''}: {reason}"
+        if action:
+            detail += f" — {action}"
+        items.append(detail)
+    return prefix + (" " + "; ".join(items[:8]) if items else "")
 
 
 def permission_preflight(state, cfg, project, plan=None):
@@ -15653,56 +16384,68 @@ def permission_preflight(state, cfg, project, plan=None):
     plan = plan if isinstance(plan, dict) else state.get("plan")
     missing = []
     advisories = []
+    routes = state.get("model_routes") or {}
     roles = {"architect", "implementer", "reviewer"}
     if state.get("require_explorer") or state.get("explorer_policy"):
         roles.add("explorer")
     for role in sorted(roles):
-        route = (state.get("model_routes") or {}).get(role)
+        route = routes.get(role)
         if not isinstance(route, dict):
             continue
+        executable = _route_executable_problem(role, route)
+        if executable:
+            missing.append(executable)
         billing = route.get("billing")
-        if billing in {"api", "subscription", "free", "local"}:
+        if not _route_grant_required(route):
+            # Default host subscription and OpenCode Go behavior needs no new
+            # grant question; that is the ordinary unattended path.
+            continue
+        try:
             try:
-                try:
-                    ledger_dir = run_path(state["id"]) if state.get("id") else None
-                except ValueError:
-                    ledger_dir = None
-                authorization = route_authorization_status(
-                    state, role, route, run_dir=ledger_dir)
-            except (RuntimeError, ValueError) as exc:
-                authorization = {"authorized": False, "reason": str(exc)}
-            if not authorization.get("authorized"):
-                missing.append({
-                    "kind": "route_grant", "role": role,
-                    "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
-                              f"--role {role}",
-                    "reason": authorization.get("reason") or (
-                        "route requires an explicit per-run grant"),
-                    "resolution": "Authorize the exact reviewed route before the "
-                                  "affected dispatch."})
+                ledger_dir = run_path(state["id"]) if state.get("id") else None
+            except ValueError:
+                ledger_dir = None
+            authorization = route_authorization_status(
+                state, role, route, run_dir=ledger_dir)
+        except (RuntimeError, ValueError) as exc:
+            authorization = {"authorized": False, "reason": str(exc)}
+        if not authorization.get("authorized"):
+            missing.append({
+                "kind": "route_grant", "role": role,
+                "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
+                          f"--role {role}",
+                "reason": authorization.get("reason") or (
+                    "route requires an explicit per-run grant"),
+                "resolution": "Authorize the exact reviewed route before the "
+                              "affected dispatch."})
     skills = (state.get("skill_assignments") or {})
-    for role, records in (skills.get("roles") or {}).items():
-        for record in records or []:
-            for tool in record.get("required_tools") or []:
-                if shutil.which(tool) is None:
-                    missing.append({
-                        "kind": "skill_tool", "role": role,
-                        "assignment": record.get("name"),
-                        "action": f"install/offer {tool}",
-                        "reason": f"skill {record.get('name')} requires {tool}",
-                        "resolution": "Provide the tool or remove that explicit "
-                                      "skill assignment; skill prose never grants it."})
-    for records in (skills.get("writers") or {}).values():
-        for record in records or []:
-            for tool in record.get("required_tools") or []:
-                if shutil.which(tool) is None:
-                    missing.append({
-                        "kind": "skill_tool", "role": "implementer",
-                        "assignment": record.get("name"),
-                        "action": f"install/offer {tool}",
-                        "reason": f"skill {record.get('name')} requires {tool}",
-                        "resolution": "Provide the tool or remove that explicit "
-                                      "skill assignment."})
+
+    def skill_records():
+        for role, records in (skills.get("roles") or {}).items():
+            for record in records or []:
+                yield role, record, routes.get(role)
+        for records in (skills.get("writers") or {}).values():
+            for record in records or []:
+                yield "implementer", record, routes.get("implementer")
+
+    for role, record, route in skill_records():
+        problem = _skill_tool_problem(role, record, route)
+        if problem:
+            missing.append({
+                "kind": "skill_tool", "role": role,
+                "assignment": record.get("name"), "action": "offer the required tool",
+                "reason": problem,
+                "resolution": "Provide a tool the exact role can use, or remove that "
+                              "explicit skill assignment; skill prose never grants it."})
+        artifact = _skill_artifact_problem(record)
+        if artifact:
+            missing.append({
+                "kind": "skill_artifact", "role": role,
+                "assignment": record.get("name"),
+                "action": "restore/re-resolve the pinned skill artifact",
+                "reason": artifact,
+                "resolution": "Start a new run with the intended skill content; a "
+                              "changed pinned copy cannot be delivered."})
     batches = (plan or {}).get("batches") if isinstance(plan, dict) else None
     if isinstance(batches, list):
         for index, batch in enumerate(batches):
@@ -15722,6 +16465,12 @@ def permission_preflight(state, cfg, project, plan=None):
                         "resolution": "Add a written operator-attributed exception "
                                       "in verification.command_policy, or change the "
                                       "planned argv."})
+                    continue
+                executable = _check_executable_problem(check, cfg)
+                if executable:
+                    missing.append({
+                        "kind": "check_executable", "role": "supervisor",
+                        "assignment": f"batch {index + 1}", **executable})
             writers = _writer_assignment_records(batch.get("writers"))
             if writers:
                 if len(writers) > _parallel_permission(state):
@@ -15739,11 +16488,34 @@ def permission_preflight(state, cfg, project, plan=None):
                         "assignment": f"batch {index + 1}", "reason": problem,
                         "resolution": "Commit/clean/reproduce the base or accept "
                                       "the documented one-writer fallback."})
+                if (len(writers) > 1
+                        and len(writers) <= _parallel_permission(state)
+                        and not problem and state.get("id")):
+                    try:
+                        ledger_dir = run_path(state["id"])
+                    except ValueError:
+                        ledger_dir = None
+                    required_count = len(writers)
+                    if index == state.get("batch_index", 0):
+                        lanes = ((state.get("parallel_writers") or {}).get("lanes")
+                                 or {})
+                        if lanes:
+                            required_count = sum(
+                                1 for writer in writers
+                                if not _lane_resumable(
+                                    lanes.get(writer["id"]) or {})[0])
+                    grant = (_parallel_grant_problem(
+                                 state, ledger_dir, required_count)
+                             if ledger_dir and required_count else None)
+                    if grant:
+                        missing.append({**grant,
+                                        "assignment": f"batch {index + 1}"})
     result = {"version": 1, "ok": not missing, "missing": missing,
               "advisories": advisories, "checked_at": now(),
               "checked_by": "supervisor",
-              "scope": ("routes/billing, role and writer skill tools, approved "
-                        "check argv policy, parallel worktree prerequisites")}
+              "scope": ("routes/billing/executables, role and writer skill tools and "
+                        "pinned artifacts, approved check argv policy and check "
+                        "executables, parallel worktree and grant prerequisites")}
     state["permission_preflight"] = result
     return result
 
@@ -15806,6 +16578,49 @@ def _detect_permission_prompt(raw, route=None):
                 "reason": _safe_progress_text(snippet, 220),
                 "source": "documented_plaintext"}
     return None
+
+
+def _unknown_permission_hint(raw):
+    """Conservative unknown-cause classification for unhandled prompt shapes."""
+    lowered = (raw or "")[-1200:].lower()
+    terms = ("permission required", "approval required", "authentication required",
+             "login required", "not logged in", "credential required",
+             "api key required", "authorization required")
+    for term in terms:
+        position = lowered.rfind(term)
+        if position < 0:
+            continue
+        tail = lowered[position:position + len(term) + 160]
+        line = tail.splitlines()[0] if tail else ""
+        if "test" in line and "permission" not in line:
+            continue
+        return {"action": "unrecognized authority/credential prompt",
+                "reason": _safe_progress_text(
+                    "provider output matches a prompt term but its structured "
+                    "shape is unknown; no authority was granted", 220),
+                "source": "unknown"}
+    return None
+
+
+def _prompt_signal_from_file(path, route=None):
+    """Bounded live read of an active child's stream; never blocks execution."""
+    try:
+        data = _read_tail_bytes(Path(path), 32 * 1024)
+    except OSError:
+        return None
+    if not data:
+        return None
+    return _detect_permission_prompt(data.decode("utf-8", errors="replace"), route)
+
+
+def _request_execution_pause(control_dir, reason):
+    """Ask siblings to stop without inventing a second control channel."""
+    try:
+        atomic_json(Path(control_dir) / "control.json",
+                    {"action": "pause", "requested_at": now(),
+                     "reason": _safe_progress_text(reason, 120)})
+    except OSError:
+        pass
 
 
 def _record_permission_blocked(run_dir, state, *, role, assignment, action,
@@ -16062,7 +16877,8 @@ def advance(run_dir, state, cfg, deadline=None):
             pause_with(run_dir, state, "Approved handoff source changed before implementation; obtain a current approved handoff")
             return
         batch = state["plan"]["batches"][state["batch_index"]]
-        resolved_parallel = resolve_parallel_batch(state, project, batch)
+        resolved_parallel = resolve_parallel_batch(
+            state, project, batch, run_dir=run_dir)
         state["parallel_resolution"] = resolved_parallel
         if resolved_parallel["mode"] == "parallel":
             available = [record["id"] for record in resolved_parallel["writers"]
@@ -16434,7 +17250,14 @@ def advance(run_dir, state, cfg, deadline=None):
                                 next_action="batch acceptance or correction")
         current = source_snapshot(project)
         try:
-            validate_acceptance_references(state, project, references)
+            validate_acceptance_references(
+                state, project,
+                ([state["verification"]] if single else references),
+                run_dir=run_dir, cfg=cfg,
+                required=[[str(item) for item in check]
+                          for check in state["plan"]["batches"][
+                              state["batch_index"]].get("checks", [])],
+                expected_batch_index=state.get("batch_index", 0))
         except ValueError as exc:
             _record_invalidated_decision(
                 state, reason=str(exc), kind="acceptance-evidence",
@@ -16491,7 +17314,11 @@ def advance(run_dir, state, cfg, deadline=None):
             for check in batch["checks"]:
                 if check not in unique:
                     unique.append(check)
-        combined = {"title": "feature integration", "checks": unique}
+        combined = {"title": "feature integration", "checks": unique,
+                    "repeat_checks": bool(
+                        state.get("fresh_verification_required")
+                        or any(batch.get("repeat_checks")
+                               for batch in state["plan"]["batches"]))}
         sources = [(entry.get("verification"), entry.get("index"))
                    for entry in state.get("accepted_batches", [])
                    if isinstance(entry, dict) and isinstance(entry.get("verification"), dict)]
@@ -16500,7 +17327,8 @@ def advance(run_dir, state, cfg, deadline=None):
             sources=sources, deadline=deadline)
         state["verification"] = {
             "path": evidence.get("path"), "passed": evidence.get("passed"),
-            "candidate_hash": evidence.get("after_hash"),
+            "candidate_hash": (evidence.get("after_hash")
+                               or evidence.get("candidate_hash")),
             "evidence_version": evidence.get("evidence_version"),
             "record_sha256": (
                 _sha256_file(Path(evidence["path"]))
@@ -16538,7 +17366,7 @@ def advance(run_dir, state, cfg, deadline=None):
                 state["verification"] = None
                 save(run_dir, state)
                 return
-        references = [evidence]
+        references = [state["verification"]]
         try:
             verdict = cached_decision_report(run_dir, state, "integration", references)
         except RuntimeError as exc:
@@ -16556,7 +17384,10 @@ def advance(run_dir, state, cfg, deadline=None):
                 deadline=deadline)
         consume_last(state)
         try:
-            validate_acceptance_references(state, project, references)
+            validate_acceptance_references(
+                state, project, references, run_dir=run_dir, cfg=cfg,
+                required=[[str(item) for item in check]
+                          for check in combined.get("checks", [])])
         except ValueError as exc:
             _record_invalidated_decision(
                 state, reason=str(exc), kind="integration-evidence",
@@ -18837,8 +19668,21 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                 "approved_at": approval["approved_at"]})
         state["status"] = "running"
         state["pause_reason"] = None
-        permission_preflight(state, config(), Path(state["project"]))
+        preflight = permission_preflight(state, config(), Path(state["project"]))
         save(folder, state)
+        if not preflight.get("ok"):
+            state["status"] = "blocked"
+            state["pause_reason"] = _preflight_block_reason(
+                preflight,
+                "Plan approved, but dispatch is blocked by known missing "
+                "authority/configuration:")
+            save(folder, state)
+            journal_event(folder, state, "plan_approved_blocked",
+                          plan_version=state.get("plan_version"),
+                          plan_revision=state.get("plan_revision", 0),
+                          amendment_epoch=state.get("amendment_epoch", 0),
+                          missing=len(preflight.get("missing") or []))
+            return False
         atomic_json(folder / "control.json", {"action": "run"})
         journal_event(folder, state, "plan_approved",
                       plan_version=state.get("plan_version"),
@@ -18891,11 +19735,28 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                 + json.dumps(lane_problems, ensure_ascii=False))
         ensure_checkout_lease(state, adopt_legacy=True)
         preflight = permission_preflight(state, config(), Path(state["project"]))
+        if not preflight.get("ok"):
+            state["status"] = "blocked"
+            state["pause_reason"] = _preflight_block_reason(
+                preflight,
+                "Resume not started: known authority/configuration is still "
+                "missing:")
+            save(folder, state)
+            journal_event(folder, state, "resume_blocked_preflight",
+                          missing=len(preflight.get("missing") or []))
+            return False
         blocked = state.get("permission_blocked")
-        if isinstance(blocked, dict) and preflight.get("ok"):
+        if isinstance(blocked, dict):
             blocked.update({"resolved_at": now(), "resolved_by": "resume_preflight"})
             state["permission_blocked"] = None
             state.setdefault("resolved_permission_blocks", []).append(blocked)
+        parallel_blocked = state.get("parallel_blocked")
+        if isinstance(parallel_blocked, dict):
+            parallel_blocked.update({"resolved_at": now(),
+                                     "resolved_by": "resume"})
+            state["parallel_blocked"] = None
+            state.setdefault("resolved_parallel_blocks", []).append(
+                parallel_blocked)
         state["status"] = "running"
         state["pause_reason"] = None
         save(folder, state)
@@ -20601,7 +21462,13 @@ def stage_run(run_id, expected_phase=None, on_admit=None):
             blocked = state.get("permission_blocked")
             if isinstance(blocked, dict):
                 error = state.get("pause_reason") or str(exc)
-                pause_with(folder, state, error, "blocked")
+                status = ("uncertain" if state.get("active_job")
+                          or state.get("active_check") else "blocked")
+                if status == "blocked":
+                    pause_with(folder, state, error, "blocked")
+                else:
+                    state["status"] = "uncertain"
+                    save(folder, state)
             else:
                 error = str(exc)
                 status = "uncertain" if state.get("active_job") or state.get("active_check") else (
@@ -20756,6 +21623,9 @@ def _parallel_status(state):
         "batch_index": parallel.get("batch_index"),
         "base_head": parallel.get("base_head"),
         "timing": parallel.get("timing"),
+        "integrated": bool(parallel.get("integrated")),
+        "blocked": state.get("parallel_blocked"),
+        "recovery": (state.get("parallel_resolution") or {}).get("recovery"),
         "integration_phase": ((state.get("parallel_integration") or {}).get("phase")
                               if isinstance(state.get("parallel_integration"), dict)
                               else None),
@@ -20815,6 +21685,7 @@ def status_run(run_id):
         "parallel_resolutions": state.get("parallel_resolutions"),
         "permission_preflight": state.get("permission_preflight"),
         "permission_blocked": state.get("permission_blocked"),
+        "parallel_blocked": state.get("parallel_blocked"),
         "plan_revision": state.get("plan_revision", 0),
         "plan_history": len(state.get("plan_history", [])),
         "accepted_history": len(state.get("accepted_history", [])),
@@ -20882,7 +21753,8 @@ def _recap_facts(folder, state):
             "accepted_history": len(state.get("accepted_history", [])),
             "parallel": _parallel_status(state),
             "permission_preflight": state.get("permission_preflight"),
-            "permission_blocked": state.get("permission_blocked")}
+            "permission_blocked": state.get("permission_blocked"),
+            "parallel_blocked": state.get("parallel_blocked")}
 
 
 def _recap_plan_detail_lines(state):
@@ -21000,9 +21872,11 @@ def recap_run(run_id, detail="quick"):
             "Permissions: " + (
                 "blocked: " + str((facts.get("permission_blocked") or {}).get(
                     "action")) if facts.get("permission_blocked")
-                else ("preflight ok" if (facts.get("permission_preflight") or {}).get("ok")
-                      else f"{(len((facts.get('permission_preflight') or {}).get('missing') or []))} "
-                           "known missing decision(s)")),
+                else ("writer blocked: " + str((facts.get("parallel_blocked") or {}).get(
+                    "action")) if facts.get("parallel_blocked")
+                      else ("preflight ok" if (facts.get("permission_preflight") or {}).get("ok")
+                            else f"{(len((facts.get('permission_preflight') or {}).get('missing') or []))} "
+                                 "known missing decision(s)"))),
             "Decisions: " + ("; ".join(decision_bits) if decision_bits else "none recorded"),
             "Outstanding: " + (str(state.get("pause_reason") or "; ".join(facts["unknowns"]) or
                                    (facts["findings"][0].get("claim") if facts["findings"] else "none recorded"))[:160]),

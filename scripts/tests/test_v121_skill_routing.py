@@ -133,5 +133,57 @@ class SkillRoutingTests(unittest.TestCase):
         self.assertIsNone(orc._skill_prompt_payload(state, "architect"))
 
 
+    def test_reviewer_shell_requirement_fails_visibly_but_writer_allows_it(self):
+        skill_text = ("---\nname: demo\nrequires:\n  - bash\n---\nRun shell.\n")
+        self.write_skill("demo", skill_text)
+        with self.assertRaisesRegex(ValueError, "read-only role reviewer"):
+            self.create_run({"reviewer": ["demo"]})
+        _run, _folder, state = self.create_run({"implementer": ["demo"]})
+        self.assertEqual(
+            state["skill_assignments"]["roles"]["implementer"][0]["required_tools"],
+            ["bash"])
+
+    def test_source_change_leaves_the_pinned_copy_and_missing_copy_is_visible(self):
+        folder = self.write_skill("demo", "original pinned text\n")
+        _run, _folder, state = self.create_run({"implementer": ["demo"]})
+        (folder / "SKILL.md").write_text("changed after start\n")
+        payload = orc._skill_prompt_payload(state, "implementer")
+        self.assertIn("original pinned text", payload["skills"][0]["instructions"])
+        self.assertNotIn("changed after start", payload["skills"][0]["instructions"])
+        pinned = Path(state["skill_assignments"]["roles"]["implementer"][0][
+            "instructions_path"])
+        pinned.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            orc._skill_prompt_payload(state, "implementer")
+        preflight = orc.permission_preflight(state, self.cfg, self.project)
+        self.assertTrue(any(item["kind"] == "skill_artifact"
+                            for item in preflight["missing"]),
+                        preflight["missing"])
+
+    def test_fresh_reviewer_request_is_read_only_and_scoped(self):
+        self.write_skill("review-only", "Read changed source and report findings.\n")
+        _run, _folder, state = self.create_run({"reviewer": ["review-only"]})
+        payload = orc._skill_prompt_payload(state, "reviewer")
+        self.assertEqual(payload["role"], "reviewer")
+        prompt = orc.render_prompt("reviewer", {"skills": payload, "task": "review"})
+        policy_at = prompt.index("Abdullah Orchestrator's reviewer role")
+        skill_at = prompt.index("Read changed source and report findings.")
+        task_at = prompt.index("Task and evidence:")
+        self.assertLess(policy_at, skill_at)
+        self.assertLess(skill_at, task_at)
+        self.assertIn("never grant permissions", prompt)
+
+    def test_writer_retry_keeps_the_same_pinned_skill_identity(self):
+        self.write_skill("lane", "lane instructions\n")
+        _run, folder, state = self.create_run({"writers": {"w1": ["lane"]}})
+        first = orc._skill_prompt_payload(state, "implementer", writer="w1")
+        reloaded = orc.read_json(folder / "state.json")
+        second = orc._skill_prompt_payload(reloaded, "implementer", writer="w1")
+        self.assertEqual([item["sha256"] for item in first["skills"]],
+                         [item["sha256"] for item in second["skills"]])
+        self.assertEqual(first["skills"][0]["instructions"],
+                         second["skills"][0]["instructions"])
+
+
 if __name__ == "__main__":
     unittest.main()
