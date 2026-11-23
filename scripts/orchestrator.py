@@ -3932,8 +3932,16 @@ def register_route_grant(run_dir, entry, *, cfg=None, deadline=None, cancel=None
     return entry
 
 
+def _reservation_metadata(metadata):
+    """Bounded, non-secret launch-attempt identity attached to a reservation."""
+    allowed = ("run_id", "batch_index", "lane", "attempt_id", "role_generation",
+               "job_id")
+    return {key: metadata[key] for key in allowed
+            if isinstance(metadata, dict) and metadata.get(key) is not None}
+
+
 def _reserve_in_ledger(run_dir, entry, reservation_id, role, route_sha, *,
-                       cfg=None, deadline=None, cancel=None):
+                       cfg=None, deadline=None, cancel=None, metadata=None):
     with grant_ledger_lock(run_dir, cfg=cfg, deadline=deadline, cancel=cancel):
         if cancel is not None and cancel():
             raise GrantWaitCancelled(
@@ -3946,14 +3954,33 @@ def _reserve_in_ledger(run_dir, entry, reservation_id, role, route_sha, *,
         if route_sha != grant.get("route_sha256"):
             raise RuntimeError("Route authorization grant does not match the selected route")
         reservations = grant.setdefault("reservations", [])
-        if any(item.get("id") == reservation_id for item in reservations
-               if isinstance(item, dict)):
+        existing = next((item for item in reservations
+                         if isinstance(item, dict)
+                         and item.get("id") == reservation_id), None)
+        if existing is not None:
+            if existing.get("state") == "launched":
+                raise RuntimeError(
+                    "Route authorization reservation was already launched; one "
+                    "exact dispatch per reservation is allowed")
+            if existing.get("id") in {item.get("id") for item in
+                                      grant.get("releases", [])
+                                      if isinstance(item, dict)}:
+                raise RuntimeError(
+                    "Route authorization reservation was released; a new exact "
+                    "grant is required")
+            # Reuse is idempotent, but the exact lane attempt is refreshed so
+            # recovery can prove which admitted launch owns this held slot.
+            for key, value in _reservation_metadata(metadata).items():
+                existing[key] = value
+            _save_grant_ledger(run_dir, ledger)
             return _grant_usage(grant), grant
         if _grant_usage(grant) >= int(grant.get("max_dispatches", 0)):
             raise RuntimeError("Route authorization grant is missing or exhausted")
         reservations.append({"id": reservation_id, "at": now(), "role": role,
                              "route_sha256": route_sha, "grant_id": grant["id"],
-                             "job_intent": "reserved_before_spawn"})
+                             "job_intent": "reserved_before_spawn",
+                             "state": "reserved",
+                             **_reservation_metadata(metadata)})
         _save_grant_ledger(run_dir, ledger)
         return _grant_usage(grant), grant
 
@@ -3977,13 +4004,96 @@ def _release_in_ledger(run_dir, entry, reservation_id, reason, *,
         if selected is None:
             return _grant_usage(grant), grant
         releases = grant.setdefault("releases", [])
+        if selected.get("state") == "launched":
+            # A launch may have consumed paid authority.  It is never refunded
+            # automatically; only reconciliation may resolve the containment.
+            return _grant_usage(grant), grant
         if not any(item.get("id") == selected["id"] for item in releases
                    if isinstance(item, dict)):
             releases.append({"id": selected["id"], "at": now(), "reason": reason,
                              "role": selected.get("role"),
                              "route_sha256": selected.get("route_sha256")})
+            selected["state"] = "released"
+            selected["released_at"] = now()
             _save_grant_ledger(run_dir, ledger)
         return _grant_usage(grant), grant
+
+
+def _mark_in_ledger_launched(run_dir, entry, reservation_id, role, route_sha, *,
+                             metadata=None, cfg=None, deadline=None, cancel=None):
+    """Record the exact pre-spawn launch intent durably.
+
+    ``reserved`` -> ``launched`` is one-way.  A supervisor crash after this
+    point retains the reservation as an uncertain launch; it can never be
+    silently refunded or replay the same admission.
+    """
+    with grant_ledger_lock(run_dir, cfg=cfg, deadline=deadline, cancel=cancel):
+        if cancel is not None and cancel():
+            raise GrantWaitCancelled(
+                "Run pause/cancel requested before recording the launch intent")
+        ledger = load_grant_ledger(run_dir, run_id=entry.get("run_id"))
+        grant = _ledger_grant(ledger, entry)
+        if route_sha != grant.get("route_sha256"):
+            raise RuntimeError("Route authorization grant does not match the selected route")
+        reservations = [item for item in grant.get("reservations", [])
+                        if isinstance(item, dict)]
+        selected = next((item for item in reservations
+                         if item.get("id") == reservation_id), None)
+        if selected is None:
+            raise RuntimeError(
+                "The exact preassigned route reservation is missing from the "
+                "durable ledger; refusing an unproven launch")
+        if selected.get("role") != role or selected.get("route_sha256") != route_sha:
+            raise RuntimeError(
+                "The route reservation does not belong to this exact role/route")
+        if selected.get("state") == "launched":
+            recorded = selected.get("job_id") or selected.get("attempt_id")
+            raise RuntimeError(
+                "Route reservation was already launched"
+                + (f" ({recorded})" if recorded else "")
+                + "; a retry needs separate exact-route authority")
+        if selected.get("state") == "released":
+            raise RuntimeError("Route reservation was released before launch")
+        selected.update({"state": "launched", "launched_at": now()})
+        selected.update(_reservation_metadata(metadata))
+        _save_grant_ledger(run_dir, ledger)
+        return _grant_usage(grant), grant
+
+
+def _held_lane_reservations(run_dir, state, role, route, *, batch_index=None):
+    """Held (reserved, unlaunched) reservations keyed by their admitted lane."""
+    if not isinstance(route, dict):
+        return {}
+    sha = route_authorization_sha(route)
+    current_generation = _role_generation(state, role)
+    ledger = load_grant_ledger(run_dir)
+    held = {}
+    released = set()
+    for grant in (ledger.get("grants") or {}).values():
+        if not isinstance(grant, dict):
+            continue
+        if grant.get("role") != role or grant.get("route_sha256") != sha:
+            continue
+        released.update(item.get("id") for item in grant.get("releases") or []
+                        if isinstance(item, dict))
+        for item in grant.get("reservations") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("state") != "reserved":
+                continue
+            if item.get("route_sha256") != sha or item.get("role") != role:
+                continue
+            if item.get("role_generation") not in (None, current_generation):
+                continue
+            if batch_index is not None and item.get("batch_index") not in (
+                    None, int(batch_index)):
+                continue
+            if item.get("id") in released:
+                continue
+            lane = item.get("lane")
+            if lane:
+                held[lane] = item
+    return held
 
 
 def _sync_grant_usage(state, run_dir=None):
@@ -4028,8 +4138,59 @@ def _sync_grant_usage(state, run_dir=None):
             for item in grant.get("releases", []) if isinstance(item, dict)]
 
 
-def route_authorization_status(state, role, route, *, run_dir=None):
-    """Return the active human grant matching role, run and exact route."""
+def _reservation_expectation_problem(reservation, expectation, state, role, sha,
+                                     generation, grant):
+    """Verify one held slot against the exact admitted launch identity."""
+    if not isinstance(reservation, dict):
+        return "the exact preassigned route reservation is missing from the ledger"
+    released = {item.get("id") for item in grant.get("releases", [])
+                if isinstance(item, dict)}
+    if reservation.get("id") in released or reservation.get("state") == "released":
+        return ("the exact preassigned route reservation was released; a new "
+                "grant is required")
+    if reservation.get("state") == "launched":
+        return ("the exact preassigned route reservation was already launched; "
+                "one dispatch per reservation is allowed")
+    if reservation.get("state") not in (None, "reserved"):
+        return "the exact preassigned route reservation has an unknown state"
+    if reservation.get("role") != role:
+        return "the route reservation belongs to a different role"
+    if reservation.get("route_sha256") != sha:
+        return "the route reservation belongs to a different route"
+    if reservation.get("role_generation") not in (None, generation):
+        return "the route reservation belongs to an earlier role generation"
+    expected_run = (state or {}).get("id")
+    recorded_run = reservation.get("run_id")
+    if recorded_run is not None and expected_run is not None:
+        # A parallel lane slot is addressed as "<parent run>--<writer>"; its
+        # paid reservation belongs to the parent run that authorized it.
+        if (recorded_run != expected_run
+                and not str(expected_run).startswith(str(recorded_run) + "--")):
+            return "the route reservation belongs to a different run"
+    for key, label in (("lane", "lane"), ("attempt_id", "lane attempt"),
+                       ("batch_index", "batch")):
+        expected = (expectation or {}).get(key)
+        if expected is None:
+            continue
+        recorded = reservation.get(key)
+        if recorded is None:
+            return ("the route reservation is not bound to the admitted "
+                    + label)
+        if str(recorded) != str(expected):
+            return ("the route reservation does not match the admitted "
+                    + label)
+    return None
+
+
+def route_authorization_status(state, role, route, *, run_dir=None,
+                               reservation=None):
+    """Return the active human grant matching role, run and exact route.
+
+    With ``reservation`` (an exact preassigned admission identity), only that
+    held slot may authorize the dispatch.  It must still match the run, role,
+    route, role generation and admitted lane attempt; a launched or released
+    slot is denied instead of silently consuming another.
+    """
     sha = route_authorization_sha(route)
     if route.get("provider") == "opencode":
         pinned = route.get("routing_fingerprint")
@@ -4045,10 +4206,12 @@ def route_authorization_status(state, role, route, *, run_dir=None):
         ledger_path = _grant_ledger_path(run_dir)
         if ledger_path.is_file():
             ledger = load_grant_ledger(run_dir)
+    reservation_problem = None
     for entry in reversed(state.get("route_authorizations", [])):
         if entry.get("role") != role or entry.get("route_sha256") != sha:
             continue
-        if entry.get("role_generation", 0) != _role_generation(state, role):
+        generation = _role_generation(state, role)
+        if entry.get("role_generation", 0) != generation:
             # A role switch invalidates grants issued for the earlier route
             # generation, even if an A→B→A switch returns to identical bytes.
             continue
@@ -4059,18 +4222,44 @@ def route_authorization_status(state, role, route, *, run_dir=None):
         maximum = int(entry.get("max_dispatches", 0))
         if isinstance(grant, dict):
             maximum = int(grant.get("max_dispatches", maximum))
+        if reservation is not None:
+            wanted = (reservation or {}).get("id")
+            if not wanted or not isinstance(grant, dict):
+                reservation_problem = reservation_problem or (
+                    "the exact preassigned route reservation is missing from the "
+                    "durable ledger")
+                continue
+            held = next((item for item in grant.get("reservations", [])
+                         if isinstance(item, dict)
+                         and item.get("id") == wanted), None)
+            problem = _reservation_expectation_problem(
+                held, reservation, state, role, sha, generation, grant)
+            if problem:
+                reservation_problem = reservation_problem or problem
+                continue
+            return {"required": True, "authorized": True, "route_sha256": sha,
+                    "grant_id": entry.get("id"),
+                    "reservation_id": wanted, "held": True,
+                    "remaining": maximum - used, "used": used,
+                    "max_dispatches": maximum,
+                    "attestation": entry.get("attestation")}
         if used < maximum:
             return {"required": True, "authorized": True, "route_sha256": sha,
                     "grant_id": entry.get("id"), "remaining": maximum - used,
                     "used": used, "max_dispatches": maximum,
                     "attestation": entry.get("attestation")}
+    if reservation is not None:
+        return {"required": True, "authorized": False, "route_sha256": sha,
+                "reason": reservation_problem or
+                "no held route reservation matches this exact admitted launch"}
     return {"required": True, "authorized": False, "route_sha256": sha,
             "reason": "no matching human authorization grant with remaining dispatches"}
 
 
 def route_preflight(role, route, cfg=None, project=None, state=None, *,
                     run_dir=None, deadline=None, prepared=None, cancel=None,
-                    dialect=None, ownership=None, version=None):
+                    dialect=None, ownership=None, version=None,
+                    reservation=None):
     """Classify billing and reject unapproved routing before any dispatch.
 
     This is a deterministic application-level policy check.  It neither proves
@@ -4120,11 +4309,16 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
             return result
         # Explicit API/usage billing for a strong host requires a human grant,
         # and an environment variable is never consent.
-        authorization = route_authorization_status(state, role, route, run_dir=run_dir)
+        authorization = route_authorization_status(
+            state, role, route, run_dir=run_dir, reservation=reservation)
         result["authorization"] = authorization
         if not authorization["authorized"]:
             result["reasons"].append(
-                "usage-billed strong route requires an explicit human `authorize-route` grant")
+                "usage-billed strong route requires an explicit human "
+                "`authorize-route` grant"
+                + (f": {authorization.get('reason')}"
+                   if reservation is not None and authorization.get("reason")
+                   else ""))
             return result
         result["ok"] = True
         return result
@@ -4221,7 +4415,7 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
     if billing in {"subscription", "free", "local"}:
         try:
             authorization = route_authorization_status(
-                state, role, route, run_dir=run_dir)
+                state, role, route, run_dir=run_dir, reservation=reservation)
         except RuntimeError as exc:
             result["reasons"].append(str(exc))
             return result
@@ -4229,7 +4423,10 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
         attestation = (authorization.get("attestation") or "").strip()
         if not authorization["authorized"]:
             result["reasons"].append(
-                f"{billing} route requires an explicit human `authorize-route` grant")
+                f"{billing} route requires an explicit human `authorize-route` grant"
+                + (f": {authorization.get('reason')}"
+                   if reservation is not None and authorization.get("reason")
+                   else ""))
             return result
         if not attestation:
             result["reasons"].append(
@@ -4252,14 +4449,18 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
         return result
     # api or unknown remote billing
     try:
-        authorization = route_authorization_status(state, role, route, run_dir=run_dir)
+        authorization = route_authorization_status(
+            state, role, route, run_dir=run_dir, reservation=reservation)
     except RuntimeError as exc:
         result["reasons"].append(str(exc))
         return result
     result["authorization"] = authorization
     if not authorization["authorized"]:
         result["reasons"].append(
-            "usage-billed worker route requires an explicit human `authorize-route` grant")
+            "usage-billed worker route requires an explicit human `authorize-route` grant"
+            + (f": {authorization.get('reason')}"
+               if reservation is not None and authorization.get("reason")
+               else ""))
         return result
     result["ok"] = not bool(observation.get("error"))
     if not result["ok"]:
@@ -4270,7 +4471,7 @@ def route_preflight(role, route, cfg=None, project=None, state=None, *,
 
 def reserve_route_grant(state, run_dir, role, route, *, reservation_id=None,
                         job_kind=None, cfg=None, deadline=None, cancel=None,
-                        state_dir=None):
+                        state_dir=None, metadata=None):
     """Atomically consume one grant before spawn; never auto-refund a crash.
 
     ``run_dir`` remains the shared grant-ledger location.  ``state_dir`` lets a
@@ -4295,7 +4496,7 @@ def reserve_route_grant(state, run_dir, role, route, *, reservation_id=None,
                 and entry.get("role_generation", 0) == _role_generation(state, role)):
             used, grant = _reserve_in_ledger(
                 run_dir, entry, reservation_id, role, sha, cfg=cfg,
-                deadline=deadline, cancel=cancel)
+                deadline=deadline, cancel=cancel, metadata=metadata)
             entry["used"] = used
             entry["last_reservation_id"] = reservation_id
             entry["last_job_kind"] = job_kind
@@ -4327,6 +4528,71 @@ def release_route_grant(state, run_dir, role, route, reason, *, reservation_id=N
                 "route_sha256": sha, "reservation_id": reservation_id})
             save(state_dir or run_dir, state)
             return entry
+    return None
+
+
+def _release_exact_held_reservation(state, run_dir, role, route, reservation_id,
+                                    expectation, reason, *, cfg=None,
+                                    deadline=None, state_dir=None):
+    """Refund only the exact held slot this launch was admitted to use."""
+    if not reservation_id:
+        return None
+    sha = route_authorization_sha(route)
+    generation = _role_generation(state, role)
+    for entry in reversed((state or {}).get("route_authorizations", [])):
+        if (entry.get("role") != role or entry.get("route_sha256") != sha
+                or entry.get("role_generation", 0) != generation):
+            continue
+        try:
+            ledger = load_grant_ledger(run_dir)
+        except RuntimeError:
+            return None
+        grant = (ledger.get("grants") or {}).get(entry.get("id"))
+        if not isinstance(grant, dict):
+            return None
+        held = next((item for item in grant.get("reservations", [])
+                     if isinstance(item, dict)
+                     and item.get("id") == reservation_id), None)
+        if _reservation_expectation_problem(
+                held, expectation, state, role, sha, generation, grant):
+            # A mismatched, released or already-launched slot is never refunded
+            # by this attempt.
+            return None
+        try:
+            return release_route_grant(
+                state, run_dir, role, route, reason,
+                reservation_id=reservation_id, cfg=cfg, deadline=deadline,
+                state_dir=state_dir)
+        except (RuntimeError, ValueError, GrantLedgerTimeout):
+            return None
+    return None
+
+
+def mark_route_grant_launched(state, run_dir, role, route, *, reservation_id,
+                              metadata=None, cfg=None, deadline=None):
+    """Durably mark the exact preassigned slot as launched before spawn."""
+    if not reservation_id or not isinstance(state, dict):
+        return None
+    sha = route_authorization_sha(route)
+    for entry in reversed(state.get("route_authorizations", [])):
+        if (entry.get("role") != role or entry.get("route_sha256") != sha
+                or entry.get("role_generation", 0) != _role_generation(state, role)):
+            continue
+        try:
+            ledger = load_grant_ledger(run_dir, run_id=entry.get("run_id"))
+        except RuntimeError:
+            continue
+        grant = (ledger.get("grants") or {}).get(entry.get("id"))
+        if not isinstance(grant, dict) or not any(
+                isinstance(item, dict) and item.get("id") == reservation_id
+                for item in grant.get("reservations", [])):
+            continue
+        used, grant = _mark_in_ledger_launched(
+            run_dir, entry, reservation_id, role, sha, metadata=metadata,
+            cfg=cfg, deadline=deadline)
+        entry["used"] = used
+        entry["last_launch_reservation_id"] = reservation_id
+        return entry
     return None
 
 
@@ -9719,7 +9985,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                deadline=None, decision_binding=None, route=None, grant_state=None,
                grant_dir=None, expected_source=None, dispatch_evidence=None,
                skill_assignment=None, control_dir=None, assignment=None,
-               grant_state_dir=None, grant_reservation_id=None):
+               grant_state_dir=None, grant_reservation_id=None,
+               grant_attempt_id=None):
     """Persist intent -> spawn -> observe; never replay a completed command.
 
     ``control_dir`` lets an isolated parallel-writer execution slot share the
@@ -9803,6 +10070,13 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     authoritative_dir = grant_dir or run_dir
     grant_state_dir = grant_state_dir or authoritative_dir
     ledger_reservation_id = grant_reservation_id or job_id
+    reservation_expectation = None
+    if grant_reservation_id:
+        reservation_expectation = {
+            "id": grant_reservation_id, "lane": assignment,
+            "attempt_id": grant_attempt_id,
+            "batch_index": ((state or {}).get("batch_index")
+                            if isinstance(state, dict) else None)}
     ownership = ({"run_dir": run_dir, "state": state, "role": role,
                   "stage": kind} if isinstance(state, dict) else None)
     launch = None
@@ -9848,7 +10122,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         role, route, cfg, project, authorization_state,
         run_dir=authoritative_dir, deadline=deadline, prepared=launch,
         cancel=(lambda: _run_cancel_requested(control_dir)),
-        ownership=ownership)
+        ownership=ownership, reservation=reservation_expectation)
     if not preflight["ok"]:
         archive.mkdir(parents=True, exist_ok=True)
         rejection_path = archive / f"preflight-{job_id}.json"
@@ -9860,6 +10134,16 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                      "active_job_created": False,
                      "model_calls_counted": False}
         atomic_json(rejection_path, rejection)
+        if grant_reservation_id:
+            # The exact preassigned slot belongs to a launch that was proven
+            # never attempted (a route/billing denial happened before spawn).
+            # Release only that held slot; a mismatched or launched slot and
+            # unrelated grants stay untouched.
+            _release_exact_held_reservation(
+                authorization_state, authoritative_dir, role, route,
+                ledger_reservation_id, reservation_expectation,
+                "preflight rejected before the admitted launch",
+                cfg=cfg, deadline=deadline, state_dir=grant_state_dir)
         if state is not None:
             state["preflight_rejection"] = {
                 **rejection, "path": str(rejection_path)}
@@ -9902,7 +10186,15 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 authorization_state, grant_dir or run_dir, role, route,
                 reservation_id=ledger_reservation_id, job_kind=kind, cfg=cfg,
                 deadline=deadline, state_dir=grant_state_dir,
-                cancel=(lambda: _run_cancel_requested(control_dir)))
+                cancel=(lambda: _run_cancel_requested(control_dir)),
+                metadata={"run_id": ((state or {}).get("parent_run_id")
+                                     or (state or {}).get("id")
+                                     if isinstance(state, dict) else None),
+                          "batch_index": ((state or {}).get("batch_index")
+                                          if isinstance(state, dict) else None),
+                          "lane": assignment,
+                          "attempt_id": grant_attempt_id,
+                          "role_generation": _role_generation(state, role)})
         except RuntimeError as exc:
             if isinstance(exc, GrantWaitCancelled):
                 reason_code = "grant_wait_cancelled"
@@ -10268,6 +10560,30 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
            "dispatch_evidence": dispatch_evidence,
            "review_packet_binding": review_packet,
            "continued_session": continuation}
+    if reservation is not None:
+        # Durable pre-spawn intent: after this point a crash retains the slot as
+        # an uncertain launch instead of refunding or replaying the admission.
+        marked = mark_route_grant_launched(
+            authorization_state, authoritative_dir, role, route,
+            reservation_id=ledger_reservation_id,
+            metadata={"run_id": ((state or {}).get("parent_run_id")
+                                 or (state or {}).get("id")
+                                 if isinstance(state, dict) else None),
+                      "batch_index": ((state or {}).get("batch_index")
+                                      if isinstance(state, dict) else None),
+                      "lane": assignment, "attempt_id": grant_attempt_id,
+                      "role_generation": _role_generation(state, role),
+                      "job_id": job_id},
+            cfg=cfg, deadline=deadline)
+        if marked is None:
+            raise RuntimeError(
+                "The exact paid launch intent could not be recorded durably; "
+                "refusing to spawn an unproven dispatch")
+        if state is not None:
+            journal_event(authoritative_dir, state, "route_grant_launched",
+                          job_id=job_id, role=role, kind=kind,
+                          reservation_id=ledger_reservation_id,
+                          lane=assignment, attempt_id=grant_attempt_id)
     if state is not None:
         state["active_job"] = job
         save(run_dir, state)
@@ -15203,6 +15519,104 @@ def _integration_recovery_record(run_dir, index, state=None):
     return path, record
 
 
+def _parallel_decision(state, project, records, index, run_dir=None):
+    """One explicit decision for what this batch may dispatch.
+
+    Durable recovery (an integration manifest or an admitted transaction) is
+    resolved before any plan-level single-writer fallback, so a pending fallback
+    or a dirty checkout cannot bypass containment.  Returns a dict with
+    ``mode`` (single/parallel), ``reason``, ``recovery`` and
+    ``required_launches`` for preflight accounting.
+    """
+    decision = {"mode": "single", "reason": None, "recovery": None,
+                "approved": len(records), "required_launches": 0}
+    if not records or len(records) <= 1:
+        return decision
+    try:
+        directory = (Path(run_dir) if run_dir is not None
+                     else (run_path(state["id"]) if (state or {}).get("id") else None))
+    except (ValueError, TypeError):
+        directory = None
+    record_path, record = (None, None)
+    if directory is not None:
+        record_path, record = _integration_recovery_record(directory, index, state)
+    if record_path is not None:
+        if isinstance(record, dict) and not record.get("unreadable"):
+            phase = record.get("phase")
+            mode = record.get("mode")
+            completed_sibling = (
+                phase == "sibling_recovery"
+                or (phase == "complete" and not _record_is_full_integration(
+                    record, {"writers": records}, state)))
+            if mode == "sibling_recovery" and completed_sibling:
+                decision.update({
+                    "mode": "single",
+                    "reason": (
+                        "A saved sibling-only parallel apply exists for this batch; "
+                        "continue with single-writer recovery from the preserved "
+                        "canonical changes and lane artifacts"),
+                    "recovery": {"source": "integration_record",
+                                 "path": str(record_path), "phase": phase,
+                                 "mode": mode}})
+                return decision
+        # A durable integration attempt for this exact batch is always resolved
+        # through the parallel recovery path, even if the canonical checkout is
+        # now divergent or dirty.  A fresh single writer must never be dispatched
+        # over an admitted transaction.
+        decision.update({
+            "mode": "parallel",
+            "recovery": {"source": "integration_record", "path": str(record_path),
+                         "phase": (record or {}).get("phase"),
+                         "unreadable": bool((record or {}).get("unreadable"))},
+            "reason": ("Recovering the durable parallel integration record for this "
+                       f"batch (phase {(record or {}).get('phase') or 'unreadable'})")})
+        return decision
+    if bool((state or {}).get("parallel_fallback_batches", {}).get(str(index))):
+        decision.update({
+            "mode": "single",
+            "reason": "A previous attempt for this batch required single-writer recovery"})
+        return decision
+    parallel = (state or {}).get("parallel_writers") or {}
+    if (isinstance(parallel, dict)
+            and _parallel_transaction_current(
+                parallel.get("transaction"), state, index)):
+        decision.update({
+            "mode": "parallel",
+            "recovery": {"source": "admitted_transaction"},
+            "reason": "Recovering the admitted parallel transaction for this batch",
+            "required_launches": len(records)})
+        return decision
+    if _parallel_transaction_admitted(state, index):
+        decision.update({
+            "mode": "parallel", "recovery": {"source": "admitted_lanes"},
+            "reason": "Recovering writer lanes already admitted for this batch",
+            "required_launches": len(records)})
+        return decision
+    for key in ("fallback_authorization", "worker_fallback_authorization"):
+        fallback = (state or {}).get(key)
+        if isinstance(fallback, dict) and fallback.get("role") == "implementer":
+            decision.update({
+                "mode": "single",
+                "reason": ("Parallel writers require one exact route; the implementer "
+                           "has a pending one-shot fallback authorization. Use the "
+                           "ordinary single-writer path or clear the pending fallback "
+                           "first")})
+            return decision
+    if len(records) > _parallel_permission(state):
+        decision.update({
+            "mode": "single",
+            "reason": (f"The plan requested {len(records)} writers but this run "
+                       f"permits {_parallel_permission(state)}; use one writer or "
+                       "start a new run with explicit parallel permission")})
+        return decision
+    source_problem = _parallel_source_problem(project) if project is not None else None
+    if source_problem:
+        decision.update({"mode": "single", "reason": source_problem})
+        return decision
+    decision.update({"mode": "parallel", "required_launches": len(records)})
+    return decision
+
+
 def resolve_parallel_batch(state, project, batch, batch_index=None, *, run_dir=None):
     """Choose parallel writers only after recovery, permission and source gates."""
     records = _writer_assignment_records(
@@ -15216,87 +15630,15 @@ def resolve_parallel_batch(state, project, batch, batch_index=None, *, run_dir=N
         return resolved
     if len(records) <= 1:
         # An explicit one-writer assignment is the ordinary single-writer path.
-        resolved["reason"] = None
         return resolved
-    if bool((state or {}).get("parallel_fallback_batches", {}).get(str(index))):
-        resolved["reason"] = (
-            "A previous attempt for this batch required single-writer recovery")
-        return resolved
-    for key in ("fallback_authorization", "worker_fallback_authorization"):
-        fallback = (state or {}).get(key)
-        if isinstance(fallback, dict) and fallback.get("role") == "implementer":
-            resolved["reason"] = (
-                "Parallel writers require one exact route; the implementer has a "
-                "pending one-shot fallback authorization. Use the ordinary "
-                "single-writer path or clear the pending fallback first")
-            return resolved
-    try:
-        directory = (Path(run_dir) if run_dir is not None
-                     else (run_path(state["id"]) if (state or {}).get("id") else None))
-    except (ValueError, TypeError):
-        directory = None
-    record_path, record = (None, None)
-    if directory is not None:
-        record_path, record = _integration_recovery_record(directory, index, state)
-    if record_path is not None:
-        if isinstance(record, dict) and not record.get("unreadable"):
-            phase = record.get("phase")
-            if (record.get("mode") == "sibling_recovery"
-                    or str(phase).startswith("sibling")
-                    or (phase == "complete"
-                        and not _record_is_full_integration(
-                            record, {"writers": records}, state))):
-                resolved["mode"] = "single"
-                resolved["reason"] = (
-                    "A saved sibling-only parallel apply exists for this batch; "
-                    "continue with single-writer recovery from the preserved "
-                    "canonical changes and lane artifacts")
-                if index == (state or {}).get("batch_index", 0) and not state.get(
-                        "correction"):
-                    state["correction"] = resolved["reason"]
-                resolved["recovery"] = {
-                    "source": "integration_record", "path": str(record_path),
-                    "phase": phase, "mode": record.get("mode")}
-                return resolved
-        # A durable integration attempt for this exact batch is always resolved
-        # through the parallel recovery path, even if the canonical checkout is
-        # now dirty.  A fresh single writer must never be dispatched over an
-        # admitted transaction.
-        resolved["mode"] = "parallel"
-        resolved["recovery"] = {
-            "source": "integration_record", "path": str(record_path),
-            "phase": (record or {}).get("phase"),
-            "unreadable": bool((record or {}).get("unreadable"))}
-        resolved["reason"] = (
-            "Recovering the durable parallel integration record for this batch "
-            f"(phase {(record or {}).get('phase') or 'unreadable'})")
-        return resolved
-    parallel = (state or {}).get("parallel_writers") or {}
-    if (isinstance(parallel, dict)
-            and _parallel_transaction_current(
-                parallel.get("transaction"), state, index)):
-        resolved["mode"] = "parallel"
-        resolved["recovery"] = {"source": "admitted_transaction"}
-        resolved["reason"] = (
-            "Recovering the admitted parallel transaction for this batch")
-        return resolved
-    if _parallel_transaction_admitted(state, index):
-        resolved["mode"] = "parallel"
-        resolved["recovery"] = {"source": "admitted_lanes"}
-        resolved["reason"] = (
-            "Recovering writer lanes already admitted for this batch")
-        return resolved
-    if len(records) > resolved["permission_max"]:
-        resolved["reason"] = (
-            f"The plan requested {len(records)} writers but this run permits "
-            f"{resolved['permission_max']}; use one writer or start a new run "
-            "with explicit parallel permission")
-        return resolved
-    source_problem = _parallel_source_problem(project)
-    if source_problem:
-        resolved["reason"] = source_problem
-        return resolved
-    resolved["mode"] = "parallel"
+    decision = _parallel_decision(state, project, records, index, run_dir)
+    resolved.update({"mode": decision["mode"], "reason": decision["reason"]})
+    if decision.get("recovery"):
+        resolved["recovery"] = decision["recovery"]
+    if (decision["mode"] == "single"
+            and (decision.get("recovery") or {}).get("source") == "integration_record"):
+        if index == (state or {}).get("batch_index", 0) and not state.get("correction"):
+            state["correction"] = decision["reason"]
     return resolved
 
 
@@ -15460,6 +15802,44 @@ def _parallel_lane_state_path(lane_dir):
     return Path(lane_dir) / "state.json"
 
 
+def _uncertain_parallel_lane_ids(state):
+    """Lanes whose execution identity is not proven stopped (public recovery)."""
+    parallel = (state or {}).get("parallel_writers") or {}
+    lanes = parallel.get("lanes") if isinstance(parallel, dict) else None
+    if not isinstance(lanes, dict):
+        return []
+    targets = []
+    for writer_id, lane in sorted(lanes.items()):
+        if not isinstance(lane, dict):
+            continue
+        status = lane.get("status")
+        active = lane.get("active_job")
+        if (status in {"uncertain", "starting", "running"}
+                or (isinstance(active, dict) and active)):
+            targets.append(writer_id)
+            continue
+        lane_dir = lane.get("lane_dir")
+        if not lane_dir:
+            continue
+        try:
+            lane_state = read_json(Path(lane_dir) / "state.json")
+        except (OSError, ValueError):
+            continue
+        if not isinstance(lane_state, dict):
+            continue
+        if isinstance(lane_state.get("active_job"), dict) and lane_state["active_job"]:
+            targets.append(writer_id)
+            continue
+        for job in lane_state.get("failed_jobs") or []:
+            if not isinstance(job, dict):
+                continue
+            if (job.get("status") in {"uncertain", "running", "dispatched"}
+                    or any(job_identity(job).values())):
+                targets.append(writer_id)
+                break
+    return targets
+
+
 def _reconcile_parallel_lane_processes(run_dir, state):
     """Prove every recorded lane execution stopped before retry/release.
 
@@ -15579,7 +15959,7 @@ def _lane_resumable(lane):
 def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
                           worktree, lane_dir, base_head, base_snapshot, deadline,
                           parent_attempt, provenance=None,
-                          grant_reservation_id=None):
+                          grant_reservation_id=None, grant_attempt_id=None):
     result_path = Path(lane_dir) / "lane-result.json"
 
     def finish(payload):
@@ -15599,6 +15979,7 @@ def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
 
     lane_state = copy.deepcopy(parent_state)
     lane_state["id"] = f"{parent_state.get('id') or 'run'}--{record['id']}"
+    lane_state["parent_run_id"] = parent_state.get("id")
     lane_state["status"] = "running"
     lane_state["phase"] = "implement"
     lane_state.pop("project_lease", None)
@@ -15653,7 +16034,8 @@ def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
             grant_state_dir=lane_dir,
             control_dir=run_dir, assignment=record["id"],
             skill_assignment=record["id"],
-            grant_reservation_id=grant_reservation_id)
+            grant_reservation_id=grant_reservation_id,
+            grant_attempt_id=grant_attempt_id)
         lane_state = read_json(_parallel_lane_state_path(lane_dir)) \
             if _parallel_lane_state_path(lane_dir).is_file() else lane_state
         return finish({"ok": True, "report": report, "job": job,
@@ -15699,7 +16081,7 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
                 "paths": list(lane.get("changed_paths") or [])}
                for writer_id, lane in sorted(lanes.items())
                if lane.get("status") == "complete" and lane.get("patch")]
-    if not patches and isinstance(previous, dict) and mode == "full":
+    if not patches and isinstance(previous, dict):
         # A recovered transaction can still be completed from its own durable
         # patch manifest even when the in-memory lane inventory was lost.
         patches = [item for item in previous.get("patches") or []
@@ -16064,10 +16446,11 @@ def _route_grant_required(route):
     return billing not in {None, "subscription"}
 
 
-def _parallel_grant_problem(state, run_dir, count):
+def _parallel_grant_problem(state, run_dir, count, *, held=0):
     """Refuse a fan-out the known grant/ledger cannot cover before launch."""
     if count <= 0:
         return None
+    held = max(0, int(held or 0))
     route = ((state or {}).get("model_routes") or {}).get("implementer")
     if not isinstance(route, dict) or not _route_grant_required(route):
         return None
@@ -16077,6 +16460,10 @@ def _parallel_grant_problem(state, run_dir, count):
     except (RuntimeError, ValueError) as exc:
         authorization = {"authorized": False, "reason": str(exc)}
     if not authorization.get("authorized"):
+        if held >= count:
+            # Already-held reservations cover these admitted lanes; no new
+            # grant is needed to restart a launch that was never attempted.
+            return None
         return {
             "kind": "parallel_grant", "role": "implementer",
             "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
@@ -16086,14 +16473,14 @@ def _parallel_grant_problem(state, run_dir, count):
             "resolution": "Authorize enough exact-route dispatches for the admitted "
                           "writer set before launching any lane."}
     remaining = authorization.get("remaining")
-    if isinstance(remaining, int) and remaining < count:
+    if isinstance(remaining, int) and remaining + held < count:
         return {
             "kind": "parallel_grant", "role": "implementer",
             "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
                       f"--role implementer --max-dispatches {count}",
             "reason": f"{count} writer dispatches are admitted but only "
-                      f"{remaining} remain in the active exact-route grant. A new "
-                      "grant is separate; request the full admitted count.",
+                      f"{remaining + held} remain in the active exact-route grant. A "
+                      "new grant is separate; request the full admitted count.",
             "resolution": "Authorize one exact-route grant covering all admitted "
                           "writers; admission does not combine multiple grants and "
                           "no writer was started."}
@@ -16160,18 +16547,23 @@ def _record_expected_writers(record):
                   if isinstance(item, str))
 
 
-def _record_is_full_integration(record, resolved, state=None):
-    if not isinstance(record, dict) or record.get("phase") != "complete":
+def _record_is_full_assignment(record, resolved, state=None):
+    """A durable manifest covers the complete approved writer set for this batch."""
+    if not isinstance(record, dict) or record.get("mode", "full") != "full":
         return False
     expected = _record_expected_writers(record)
-    approved = sorted(record["id"] for record in (resolved or {}).get("writers", []))
+    approved = sorted(item["id"] for item in (resolved or {}).get("writers", []))
     if expected:
         return bool(approved) and expected == approved
-    # Compatibility with a record written before expected_writers existed: it
-    # is full only when it covers every currently approved writer.
     recorded = sorted(item.get("writer") for item in record.get("patches") or []
                       if isinstance(item, dict) and item.get("writer"))
     return bool(approved) and recorded == approved
+
+
+def _record_is_full_integration(record, resolved, state=None):
+    if not isinstance(record, dict) or record.get("phase") != "complete":
+        return False
+    return _record_is_full_assignment(record, resolved, state)
 
 
 def _parallel_transaction_active(state, batch_index):
@@ -16185,8 +16577,14 @@ def _parallel_transaction_active(state, batch_index):
     return bool(isinstance(lanes, dict) and lanes)
 
 
-def _reserve_parallel_authority(state, run_dir, count, cfg, deadline, batch_index):
-    """Consume one run-ledger reservation per admitted lane before any launch."""
+def _reserve_parallel_authority(state, run_dir, count, cfg, deadline, batch_index,
+                                targets=None):
+    """Consume one run-ledger reservation per admitted lane before any launch.
+
+    ``targets`` binds each slot to the exact lane attempt it admits.  A held
+    reservation for the same lane (a parent loss after the group reservation but
+    before that lane ever launched) is reused rather than charged twice.
+    """
     if count <= 0:
         return [], None
     route = ((state or {}).get("model_routes") or {}).get("implementer")
@@ -16198,15 +16596,35 @@ def _reserve_parallel_authority(state, run_dir, count, cfg, deadline, batch_inde
             route = None
     if not isinstance(route, dict) or not _route_grant_required(route):
         return [], None
+    try:
+        held = _held_lane_reservations(
+            run_dir, state, "implementer", route, batch_index=batch_index)
+    except RuntimeError as exc:
+        return [], {
+            "kind": "parallel_grant", "role": "implementer",
+            "action": "inspect the route grant ledger before dispatching",
+            "reason": str(exc),
+            "resolution": "Repair or inspect the durable grant ledger; no writer "
+                          "was started."}
     group = uuid.uuid4().hex[:12]
     reservation_ids = []
+    generation = _role_generation(state, "implementer")
+    run_id = (state or {}).get("id")
     for index in range(count):
-        reservation_id = f"parallel-{batch_index}-{group}-{index + 1}"
+        target = targets[index] if targets and index < len(targets) else {}
+        lane = (target or {}).get("writer_id")
+        attempt = (target or {}).get("attempt_id")
+        reuse = held.get(lane) if lane else None
+        reservation_id = (reuse or {}).get("id") or (
+            f"parallel-{batch_index}-{group}-{index + 1}")
         try:
             reserve_route_grant(
                 state, run_dir, "implementer", route,
                 reservation_id=reservation_id, job_kind="parallel_writer",
-                cfg=cfg, deadline=deadline)
+                cfg=cfg, deadline=deadline,
+                metadata={"run_id": run_id, "batch_index": batch_index,
+                          "lane": lane, "attempt_id": attempt,
+                          "role_generation": generation})
         except (RuntimeError, ValueError) as exc:
             for reserved in reservation_ids:
                 try:
@@ -16225,8 +16643,58 @@ def _reserve_parallel_authority(state, run_dir, count, cfg, deadline, batch_inde
                               "writer count; no writer was started."}
         reservation_ids.append(reservation_id)
     journal_event(run_dir, state, "parallel_authority_reserved",
-                  batch_index=batch_index, reservations=reservation_ids)
+                  batch_index=batch_index, reservations=reservation_ids,
+                  reused=sorted(lane for lane, item in held.items()
+                                if item.get("id") in reservation_ids))
     return reservation_ids, None
+
+
+def _parallel_record_scope_problem(record, transaction, resolved):
+    """Validate a durable manifest against the approved set and transaction."""
+    if not isinstance(record, dict):
+        return "the durable parallel integration record is not an object"
+    approved = sorted(item["id"] for item in (resolved or {}).get("writers", []))
+    expected = _record_expected_writers(record)
+    if expected and approved and expected != approved:
+        return ("the recorded integration covers writers " + ", ".join(expected)
+                + " but the approved assignment is " + ", ".join(approved))
+    recorded_writers = sorted(item for item in record.get("writers") or []
+                              if isinstance(item, str))
+    outside = [item for item in recorded_writers if item not in approved]
+    if outside:
+        return ("the recorded integration includes writers outside the approved "
+                "assignment: " + ", ".join(outside))
+    intent = record.get("intent") or {}
+    if isinstance(transaction, dict) and isinstance(intent, dict) and intent:
+        for key in ("run_id", "batch_index", "plan_version", "plan_revision",
+                    "amendment_epoch", "base_head", "base_sha"):
+            if intent.get(key) != transaction.get(key):
+                return (f"the recorded integration intent no longer matches the "
+                        f"admitted transaction ({key})")
+    return None
+
+
+def _recorded_integration_boundary(run_dir, batch_index):
+    path = _parallel_batch_dir(run_dir, batch_index) / "integration-boundary.json"
+    if not path.is_file():
+        return None
+    try:
+        value = read_json(path)
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _parallel_canonical_identity(project, record):
+    """Classify the canonical checkout against the durable apply identities."""
+    current = _checkout_content_sha(project)
+    after = (record or {}).get("after_sha")
+    before = (record or {}).get("before_sha")
+    if after and current == after:
+        return "after", current
+    if before and current == before:
+        return "before", current
+    return "divergent", current
 
 
 def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
@@ -16268,6 +16736,15 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                       base_sha=transaction["base_sha"])
     integration_path, recovery_record = _integration_recovery_record(
         run_dir, batch_index, state)
+    # Prove every recorded lane execution stopped before deciding recovery or
+    # dispatching anything, including a checkout that already matches the after
+    # identity.
+    lane_problems = _reconcile_parallel_lane_processes(run_dir, state)
+    if lane_problems:
+        pause_with(run_dir, state,
+                   "Parallel writer execution is not proven stopped: " + json.dumps(
+                       lane_problems, ensure_ascii=False), "uncertain")
+        return None
     if integration_path is not None and (
             not isinstance(recovery_record, dict)
             or recovery_record.get("unreadable")):
@@ -16279,79 +16756,132 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         return None
     if isinstance(recovery_record, dict):
         phase = recovery_record.get("phase")
-        if phase == "complete":
-            if not _record_is_full_integration(recovery_record, resolved, state):
-                pause_with(run_dir, state,
-                           "The recorded parallel integration is not a proven full "
-                           "assignment apply; no verification or additional writer "
-                           "was started. Recover the remaining lanes explicitly.", "blocked")
-                return None
-            matches, detail = _canonical_matches_transaction(project, transaction)
-            current = _checkout_content_sha(project)
-            if current == recovery_record.get("after_sha"):
-                state["parallel_integration"] = recovery_record
-                save(run_dir, state)
-                return _parallel_combined_report(
-                    state, resolved, lanes, recovery_record)
+        mode = recovery_record.get("mode", "full")
+        approved_writers = [record["id"] for record in resolved.get("writers", [])]
+        scope_problem = _parallel_record_scope_problem(
+            recovery_record, transaction, resolved)
+        if scope_problem:
             pause_with(run_dir, state,
-                       "Recorded parallel integration is full but the canonical "
-                       "checkout no longer matches its exact integrated identity"
-                       + (f" ({detail})" if detail and not matches else "")
-                       + ". No writer will be relaunched; inspect the preserved "
-                       f"patches at {batch_dir} and reconcile explicitly.", "blocked")
-            return None
-        if recovery_record.get("mode") == "sibling_recovery" or str(phase).startswith(
-                "sibling"):
-            pause_with(run_dir, state,
-                       "A saved sibling-only apply exists for this batch. It cannot "
-                       "authorize verification and cannot be replayed as a full "
-                       "parallel integration; continue with the recorded "
-                       "single-writer recovery or reconcile the preserved patches.",
+                       "The recorded parallel integration cannot be resolved "
+                       f"safely: {scope_problem}. No writer was launched and no "
+                       "patch was applied; the preserved evidence is unchanged.",
                        "blocked")
             return None
-        if recovery_record.get("before_sha") and recovery_record.get(
-                "after_sha"):
-            matches, detail = _canonical_matches_transaction(project, transaction)
-            if not matches:
+        identity, _current = _parallel_canonical_identity(project, recovery_record)
+        if mode == "sibling_recovery" or str(phase).startswith("sibling"):
+            if phase in {"sibling_recovery", "complete"} and identity != "after":
                 pause_with(run_dir, state,
-                           "Parallel integration was previously prepared but the "
-                           f"canonical source changed: {detail}. No writer or apply "
-                           "was started; preserve the lanes and reconcile the "
-                           "admitted base before retry.", "blocked")
+                           "The recorded sibling-only apply is complete but the "
+                           "canonical checkout no longer matches its exact after "
+                           "identity. No writer was launched and no patch was "
+                           f"applied; preserved evidence remains at {batch_dir}.",
+                           "blocked")
                 return None
-            # Resolve the admitted transaction before any fresh dispatch.
-            integration_started = time.monotonic()
-            started_at = time.monotonic()
-            try:
-                integration = _parallel_integrate(
-                    run_dir, state, project, batch_index, lanes,
-                    recovery_record.get("base_head") or base_head,
-                    expected_writers=[record["id"] for record in resolved.get(
-                        "writers", [])], mode="full", transaction=transaction)
-            except RuntimeError as exc:
-                state["parallel_integration"] = {
-                    "version": 1, "batch_index": batch_index,
-                    "phase": "interrupted_apply",
-                    "conflict": {"at": now(), "reason": str(exc),
-                                 "lane_artifacts": str(batch_dir)}}
+            if identity == "divergent":
                 pause_with(run_dir, state,
-                           "Parallel integration was interrupted with an "
-                           "unrecognized checkout identity; no writer was relaunched "
-                           "and no automatic reset was attempted. Recover from the "
-                           f"recorded patches: {exc}", "blocked")
+                           "Sibling-only recovery was interrupted after changing the "
+                           "canonical checkout, and its identity matches neither the "
+                           "recorded before nor after state. No writer was launched "
+                           "and no patch was applied. Preserve the intermediate "
+                           f"evidence at {batch_dir} and reconcile explicitly before "
+                           "any retry or single-writer recovery.", "blocked")
                 return None
-            return _finalize_parallel_integration(
-                run_dir, state, cfg, project, batch_index, resolved, lanes,
-                integration, recovery_record.get("base_head") or base_head,
-                started_at, integration_started, None,
-                f"parallel-integration-{batch_index}")
-    # Reconcile any previous lane attempts before launching anything again.
-    problems = _reconcile_parallel_lane_processes(run_dir, state)
-    if problems:
-        pause_with(run_dir, state,
-                   "Parallel writer execution is not proven stopped: " + json.dumps(
-                       problems, ensure_ascii=False), "uncertain")
-        return None
+            reason = None
+            fallback = ((state.get("parallel_fallback_batches") or {}).get(
+                str(batch_index)) or {})
+            if isinstance(fallback, dict):
+                reason = fallback.get("reason")
+            if identity == "before" and phase != "complete":
+                # The recorded sibling apply had not started: continue exactly
+                # that apply, still without full-integration authority.
+                try:
+                    integration = _parallel_integrate(
+                        run_dir, state, project, batch_index, {},
+                        recovery_record.get("base_head") or base_head,
+                        expected_writers=approved_writers,
+                        mode="sibling_recovery", transaction=transaction)
+                except RuntimeError as exc:
+                    pause_with(run_dir, state,
+                               "Sibling-only parallel recovery could not complete: "
+                               + str(exc) + ". No writer was launched and the "
+                               "recorded patches remain preserved at "
+                               f"{batch_dir}.", "blocked")
+                    return None
+                state["parallel_integration"] = integration
+            else:
+                # The sibling apply finished (or is exactly at its recorded after
+                # identity): only finish bookkeeping, never re-apply.
+                manifest = dict(recovery_record)
+                if phase != "complete":
+                    manifest.update({"phase": "sibling_recovery",
+                                     "completed_at": now()})
+                    atomic_json(integration_path, manifest)
+                state["parallel_integration"] = manifest
+            save(run_dir, state)
+            reason = reason or (
+                "A saved sibling-only parallel apply exists for this batch; "
+                "continue with single-writer recovery from the preserved "
+                "canonical changes and lane artifacts")
+            if not state.get("correction"):
+                state["correction"] = reason
+            journal_event(run_dir, state, "parallel_sibling_recovery_resolved",
+                          batch_index=batch_index, identity=identity,
+                          phase=(state.get("parallel_integration") or {}).get("phase"))
+            handle_repair(run_dir, state, cfg, reason)
+            return None
+        if not _record_is_full_assignment(recovery_record, resolved, state):
+            pause_with(run_dir, state,
+                       "The recorded parallel integration is not a proven full "
+                       "assignment apply; no verification or additional writer "
+                       "was started. Recover the remaining lanes explicitly.",
+                       "blocked")
+            return None
+        if phase == "complete" and identity != "after":
+            pause_with(run_dir, state,
+                       "The recorded full parallel integration is complete but the "
+                       "canonical checkout no longer matches its exact after "
+                       "identity. No writer was launched and no patch was applied; "
+                       f"the preserved record remains at {integration_path}.",
+                       "blocked")
+            return None
+        if identity == "divergent":
+            pause_with(run_dir, state,
+                       "Parallel integration was interrupted with a canonical "
+                       "identity that no longer matches the recorded before or "
+                       "after state (the apply is partial or the checkout "
+                       "changed). No writer was launched and no patch was "
+                       "applied; preserved evidence remains at "
+                       f"{batch_dir}. Reconcile explicitly before any retry.",
+                       "blocked")
+            return None
+        # Exact before continues the recorded apply; exact after only finishes
+        # bookkeeping.  Neither selects a writer or applies a second time.
+        integration_started = time.monotonic()
+        started_at = time.monotonic()
+        boundary = _recorded_integration_boundary(run_dir, batch_index)
+        try:
+            integration = _parallel_integrate(
+                run_dir, state, project, batch_index, {},
+                recovery_record.get("base_head") or base_head,
+                expected_writers=approved_writers, mode="full",
+                transaction=transaction)
+        except RuntimeError as exc:
+            state["parallel_integration"] = {
+                "version": 1, "batch_index": batch_index,
+                "phase": "interrupted_apply",
+                "conflict": {"at": now(), "reason": str(exc),
+                             "lane_artifacts": str(batch_dir)}}
+            pause_with(run_dir, state,
+                       "Parallel integration recovery could not resolve the exact "
+                       "checkout identity; no writer was relaunched and no "
+                       "automatic reset was attempted. Recover from the recorded "
+                       f"patches: {exc}", "blocked")
+            return None
+        return _finalize_parallel_integration(
+            run_dir, state, cfg, project, batch_index, resolved, lanes,
+            integration, recovery_record.get("base_head") or base_head,
+            started_at, integration_started, boundary,
+            f"parallel-integration-{batch_index}")
     matches, detail = _canonical_matches_transaction(project, transaction)
     if not matches:
         pause_with(run_dir, state,
@@ -16464,7 +16994,10 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                          "attempt": attempt,
                          "parent_state": copy.deepcopy(state)})
     reservation_ids, grant_problem = _reserve_parallel_authority(
-        state, run_dir, len(prepared), cfg, deadline, batch_index)
+        state, run_dir, len(prepared), cfg, deadline, batch_index,
+        targets=[{"writer_id": item["writer_id"],
+                  "attempt_id": (item.get("provenance") or {}).get("attempt_id")}
+                 for item in prepared])
     if grant_problem:
         for item in prepared:
             lane = lanes.setdefault(item["writer_id"], {})
@@ -16504,7 +17037,8 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
             _parallel_lane_worker(
                 run_dir, lane_parent_state, cfg, project, batch, record, worktree,
                 lane_dir, base_head, lane_base, deadline, parent_attempt,
-                provenance, grant_reservation_id=reservation_id)
+                provenance, grant_reservation_id=reservation_id,
+                grant_attempt_id=(provenance or {}).get("attempt_id"))
         thread = threading.Thread(target=target, name=f"writer-{writer_id}",
                                   daemon=True)
         threads.append((writer_id, thread))
@@ -17000,45 +17534,65 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
                     scope_info.get("parallel")
                     and (scope_info.get("all_roles")
                          or index == (state or {}).get("batch_index", 0)))
-                if len(writers) > _parallel_permission(state):
-                    add({
-                        "kind": "parallel_permission", "role": "supervisor",
-                        "assignment": f"batch {index + 1}",
-                        "reason": f"{len(writers)} writers planned; run permits "
-                                  f"{_parallel_permission(state)}",
-                        "resolution": "Start a new run with explicit parallel "
-                                      "permission, or accept one writer."},
-                        parallel_blocking)
-                problem = _parallel_source_problem(project) if project else None
-                if problem:
-                    add({
-                        "kind": "parallel_source", "role": "supervisor",
-                        "assignment": f"batch {index + 1}", "reason": problem,
-                        "resolution": "Commit/clean/reproduce the base or accept "
-                                      "the documented one-writer fallback."},
-                        parallel_blocking)
-                if (len(writers) > 1
-                        and len(writers) <= _parallel_permission(state)
-                        and not problem and state.get("id")):
-                    try:
-                        ledger_dir = run_path(state["id"])
-                    except ValueError:
-                        ledger_dir = None
-                    required_count = len(writers)
-                    if index == state.get("batch_index", 0):
+                try:
+                    ledger_dir = run_path(state["id"]) if state.get("id") else None
+                except ValueError:
+                    ledger_dir = None
+                decision = _parallel_decision(
+                    state, project, writers, index, ledger_dir)
+                if decision["mode"] == "parallel":
+                    required_count = int(decision.get("required_launches") or 0)
+                    if (decision.get("recovery") or {}).get(
+                            "source") == "integration_record":
+                        # A recorded apply needs bookkeeping or completion, not a
+                        # new writer launch.
+                        required_count = 0
+                        held_count = 0
+                    else:
                         lanes = ((state.get("parallel_writers") or {}).get("lanes")
                                  or {})
-                        if lanes:
-                            required_count = sum(
-                                1 for writer in writers
-                                if not _lane_resumable(
-                                    lanes.get(writer["id"]) or {})[0])
+                        if lanes and index == (state or {}).get("batch_index", 0):
+                            pending = [writer for writer in writers
+                                       if not _lane_resumable(
+                                           lanes.get(writer["id"]) or {})[0]]
+                            required_count = len(pending)
+                            try:
+                                held = _held_lane_reservations(
+                                    ledger_dir, state, "implementer",
+                                    (state.get("model_routes") or {}).get(
+                                        "implementer") or {}, batch_index=index)
+                            except (RuntimeError, ValueError):
+                                held = {}
+                            held_count = sum(1 for writer in pending
+                                             if writer["id"] in held)
+                        else:
+                            held_count = 0
+                            if decision.get("recovery"):
+                                required_count = len(writers)
                     grant = (_parallel_grant_problem(
-                                 state, ledger_dir, required_count)
+                                 state, ledger_dir, required_count, held=held_count)
                              if ledger_dir and required_count else None)
                     if grant:
                         add({**grant, "assignment": f"batch {index + 1}"},
                             parallel_blocking)
+                elif decision.get("reason"):
+                    # The same resolver that implementation will use selects one
+                    # writer; report the approved fallback instead of demanding
+                    # parallel-only prerequisites.
+                    add({
+                        "kind": "parallel_single_fallback",
+                        "role": "supervisor",
+                        "assignment": f"batch {index + 1}",
+                        "reason": decision["reason"],
+                        "resolution": "Proceed with one ordinary writer; parallel "
+                                      "grants and worktrees are required only when "
+                                      "parallel dispatch is actually selected."},
+                        False)
+                    if ledger_dir is not None:
+                        journal_event(ledger_dir, state,
+                                      "parallel_plan_single_fallback",
+                                      batch_index=index,
+                                      reason=decision["reason"])
     result = {"version": 1, "ok": not missing, "missing": missing,
               "advisories": advisories, "checked_at": now(),
               "checked_by": "supervisor", "scope": "all" if scope_info.get(
@@ -20358,7 +20912,9 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
     if action == "reconcile":
         if state["status"] != "uncertain" and not (retry_verification and state["status"] == "running"):
             raise RuntimeError("Run is not in uncertain state")
-        if not state.get("active_job") and not state.get("active_check"):
+        lane_targets = _uncertain_parallel_lane_ids(state)
+        if (not state.get("active_job") and not state.get("active_check")
+                and not lane_targets):
             raise RuntimeError("No uncertain job/check identity to reconcile")
         for target, item in (("active_job", state.get("active_job") or {}),
                              ("active_check", state.get("active_check") or {})):
@@ -20404,6 +20960,24 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                 "at": now(), "interrupted_job": job, "dispatch": dispatch,
                 "original_verification": state["verification"], "previous_correction": state.get("correction"),
                 "candidate": source_snapshot(project), "action": "reverify after incomplete correction"})
+        if lane_targets:
+            lane_problems = _reconcile_parallel_lane_processes(folder, state)
+            if lane_problems:
+                raise RuntimeError(
+                    "Parallel writer execution is not proven stopped: "
+                    + json.dumps(lane_problems, ensure_ascii=False))
+            still_uncertain = [
+                writer_id for writer_id in lane_targets
+                if ((state.get("parallel_writers") or {}).get("lanes") or {}).get(
+                    writer_id, {}).get("status") == "uncertain"
+                or ((state.get("parallel_writers") or {}).get("lanes") or {}).get(
+                    writer_id, {}).get("active_job")]
+            if still_uncertain:
+                raise RuntimeError(
+                    "Parallel lane execution identity is still unproven for: "
+                    + ", ".join(sorted(still_uncertain)))
+            journal_event(folder, state, "parallel_lanes_reconciled",
+                          lanes=lane_targets)
         # User has inspected the exact log, working tree and session externally.
         reconciled_job = state.get("active_job") or {}
         if reconciled_job:
@@ -20435,10 +21009,19 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
             state["check_progress"] = None
             state["corrections"] = max(0, state.get("corrections", 0) - 1)
             state["correction"] = ""
-        state["pause_reason"] = "Reconciled by operator; approval required before resume"
+        pending = state.get("permission_blocked") or state.get("parallel_blocked")
+        state["pause_reason"] = (
+            "Reconciled by operator; approval required before resume"
+            + ("; the pending scoped authorization requirement is retained"
+               if isinstance(pending, dict) else ""))
+        if lane_targets:
+            state["pause_reason"] += (
+                "; proven-stopped lane(s) " + ", ".join(sorted(lane_targets))
+                + " will resume only unfinished work")
         save(folder, state)
         journal_event(folder, state, "reconciled", job=reconciled_job.get("id"),
-                      retry_session=state.get("retry_session"))
+                      retry_session=state.get("retry_session"),
+                      lanes=lane_targets)
         print("Reconciled. Check candidate source and resume when safe.")
 
 

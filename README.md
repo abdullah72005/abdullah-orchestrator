@@ -302,7 +302,7 @@ Inside the Codex/Claude chat, the skill drives nine MCP tools:
 | `orchestrator_interrupt` | Persist, terminate and verify an interruption. |
 | `orchestrator_amend` | Record a requirement/correction amendment and pause safely. |
 | `orchestrator_resume` | Mark a paused run runnable (does not execute a stage). |
-| `orchestrator_reconcile` | Clear an attempt only after containment proves it stopped. |
+| `orchestrator_reconcile` | Clear a parent job/check or lane-only attempt only after containment proves it stopped. |
 | `orchestrator_runs` | List recent runs for recovery from a new chat. |
 
 The stage loop is:
@@ -502,11 +502,16 @@ Parallel writing is a per-run permission, not an implicit model choice:
   component prefixes, completion criteria and the Implementer role. Pairwise
   overlap, duplicate IDs, unsafe paths and more than three writers fail before
   launch.
-- The effective count is the smallest of permission and plan. An explicit
-  one-writer assignment uses the ordinary single-writer path. A dirty,
+- The effective count is the smallest of permission and plan, and the same
+  resolver decision governs preflight, approval, resume and implementation. An
+  explicit one-writer assignment uses the ordinary single-writer path. A dirty,
   untracked, ignored-runtime, sparse, submodule-bearing or otherwise
-  unreproducible base selects one writer with a durable reason instead of
-  guessing.
+  unreproducible base, a proposal above the run's writer permission, or a pending
+  one-shot route fallback selects one writer with a durable reason. Plan approval
+  reports that approved single-writer fallback instead of blocking on
+  parallel-only worktree or grant prerequisites; those prerequisites are checked
+  only when parallel dispatch is actually selected. Missing authority on the
+  route that will actually run still blocks.
 - With permission, each writer gets an isolated Git worktree on the same pinned
   clean base, its own persisted execution slot/job artifacts and the existing
   route grant, quota, cancellation and containment controls. One transaction
@@ -518,8 +523,15 @@ Parallel writing is a per-run permission, not an implicit model choice:
   journaled and saved before the thread can launch; a durable result is only
   promoted when its provenance and stopped execution still match.
 - Authority for every admitted lane is reserved in the run-scoped ledger before
-  any model dispatch. An insufficient grant or a failed reservation produces
-  zero launches and releases reservations whose launch was never attempted.
+  any model dispatch. Each reservation carries its exact run, route, role
+  generation, batch and lane attempt. Route preflight admits that held slot
+  instead of searching for a second unused one, launch records the one-way
+  reserved→launched transition before spawn, and a launched slot is never
+  refunded automatically. Insufficient or wrong-scope authority produces zero
+  launches. A parent loss after the group reservation but before a lane launch
+  reuses the same held slot on resume rather than charging twice; a refusal that
+  proves the admitted launch was never attempted releases only that slot and
+  preserves unrelated grants.
 - A lane is promoted only for a `complete` report. A valid `blocked` report
   preserves its partial worktree/patch and exact report but never enters the
   verification candidate; a completed sibling is preserved for reuse and is not
@@ -528,24 +540,30 @@ Parallel writing is a per-run permission, not an implicit model choice:
   unfinished lanes, and an explicit one-writer plan stays on the ordinary path.
   Durable lane execution uncertainty is checked even when the parent label says
   failed; no cleanup, integration, fallback or replacement launch occurs until
-  the exact old execution is proven stopped.
+  the exact old execution is proven stopped. `orchestrator_reconcile` discovers
+  lane-only uncertainty even when no parent `active_job`/`active_check` exists,
+  proves every applicable lane execution stopped, keeps completed siblings, and
+  persists a paused resume point without clearing a pending scoped authorization
+  requirement.
 - The supervisor inspects actual tracked/untracked/rename/delete/mode and index
   changes, rejects unowned paths or HEAD changes, generates a binary patch per
   lane and proves a dry integration in scratch before touching the canonical
   checkout. A full integration is recorded with the exact approved writer set,
-  transaction intent and expected before/after tree/index identities. A
-  completed full apply advances to verification without another writer; an
-  unreadable, foreign or unrecognized intermediate identity blocks before any
-  model dispatch instead of resetting or applying twice. Interruption during
-  startup or collection is reconciled from durable lane records, so a completed
-  sibling is validated rather than relaunched.
+  transaction intent and expected before/after tree/index identities. Recovery
+  classifies the canonical identity against the durable manifest: exact after
+  finishes bookkeeping and full integration attribution with zero second applies
+  or dispatches, exact before continues that recorded apply, and an unrecognized
+  intermediate or divergent identity stays blocked with preserved evidence. A
+  pending single-writer or route fallback cannot bypass that recovery decision.
 - If one sibling fails after another completes, the completed patch is applied
   only as a separately identified sibling-only recovery after the single-writer
   intent is saved. That partial apply can never authorize verification; a crash
-  before the normal recovery save resumes through single-writer recovery. The
-  unfinished lane's worktree stays inspectable. Ownership conflicts, unplanned
-  dependencies or integration conflicts preserve every lane and route to strong
-  diagnosis.
+  after a sibling patch but before its durable apply record leaves a divergent
+  identity that blocks instead of dispatching a writer, while an exact before
+  identity continues only the sibling apply and a completed sibling apply resumes
+  through single-writer recovery. The unfinished lane's worktree stays
+  inspectable. Ownership conflicts, unplanned dependencies or integration
+  conflicts preserve every lane and route to strong diagnosis.
 - The combined canonical candidate then goes through supervisor checks, one
   fresh independent Reviewer and the strong Architect decision. Timing records
   lane wall/sum, integration and review separately; concurrent durations are
@@ -589,11 +607,12 @@ requirements, so an exhausted grant for an already-completed paid role is shown
 as deferred instead of stopping unrelated acceptance work. A parallel fan-out
 reserves one run-ledger reservation per admitted lane before any model dispatch;
 an insufficient grant or a failed reservation produces zero launches and
-releases reservations whose launch was never attempted. When a grant is short,
-the surfaced remedy requests one new exact-route grant for the full admitted
-count because admission does not combine multiple grants. `authorize-route`
-remains the human billing grant; `approve-plan`, fallback, destructive changes
-and deployment keep their existing gates.
+releases reservations whose launch was never attempted, while a held slot whose
+launch was never attempted is reused rather than charged again. When a grant is
+short, the surfaced remedy requests one new exact-route grant for the full
+admitted count because admission does not combine multiple grants.
+`authorize-route` remains the human billing grant; `approve-plan`, fallback,
+destructive changes and deployment keep their existing gates.
 
 An unexpected recognized structured permission/approval request, or a documented
 noninteractive credential prompt, is observed while the worker or supervisor
