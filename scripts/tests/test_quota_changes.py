@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from test_orchestrator import ControlTests, orc, dead_process_identity
@@ -21,7 +22,8 @@ class QuotaChanges(unittest.TestCase):
         self.state['verification'] = {
             'path': evidence['path'], 'passed': True,
             'candidate_hash': evidence['after_hash'],
-            'evidence_version': evidence['evidence_version']}
+            'evidence_version': evidence['evidence_version'],
+            'record_sha256': orc._sha256_file(Path(evidence['path']))}
         self.state['check_progress'] = None
         orc.save(self.rundir, self.state)
         return self.state['verification']
@@ -37,11 +39,14 @@ class QuotaChanges(unittest.TestCase):
         with patch.object(orc, 'run_checks', wraps=real_checks) as checks, \
                 patch.object(orc, 'strong_call', return_value=verdict) as strong:
             orc.advance(self.rundir, self.state, self.cfg)
-        self.assertTrue(checks.call_args.kwargs['final'])
+        checks.assert_not_called()
         self.assertEqual(strong.call_count, 1)
         self.assertEqual(self.state['status'], 'complete')
         self.assertEqual(len(self.state['accepted_batches']), 1)
         self.assertTrue(self.state['final_evidence']['final'])
+        self.assertTrue(self.state['final_evidence']['reuse'])
+        self.assertEqual(self.state['final_acceptance']['mode'],
+                         'reused_supervisor_verification')
 
     def test_explorer_requires_full_evidence(self):
         with self.assertRaises(ValueError):
@@ -203,7 +208,8 @@ class QuotaChanges(unittest.TestCase):
                 patch.object(orc, 'strong_call', return_value=verdict) as strong:
             orc.advance(self.rundir, self.state, self.cfg)
         self.assertEqual(strong.call_count, 1)
-        self.assertTrue(checks.call_args.kwargs['final'])
+        checks.assert_not_called()
+        self.assertTrue(self.state['final_evidence']['reuse'])
         self.assertEqual(self.state['status'], 'complete')
         self.assertEqual(self.state['final_verdict']['verdict'], 'approved')
 
