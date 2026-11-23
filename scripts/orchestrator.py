@@ -4588,33 +4588,32 @@ def _release_exact_held_reservation(state, run_dir, role, route, reservation_id,
         return None
     sha = route_authorization_sha(route)
     generation = _role_generation(state, role)
-    for entry in reversed((state or {}).get("route_authorizations", [])):
-        if (entry.get("role") != role or entry.get("route_sha256") != sha
-                or entry.get("role_generation", 0) != generation):
-            continue
-        try:
-            ledger = load_grant_ledger(run_dir)
-        except RuntimeError:
-            return None
-        grant = (ledger.get("grants") or {}).get(entry.get("id"))
-        if not isinstance(grant, dict):
-            return None
-        held = next((item for item in grant.get("reservations", [])
-                     if isinstance(item, dict)
-                     and item.get("id") == reservation_id), None)
-        if _reservation_expectation_problem(
-                held, expectation, state, role, sha, generation, grant):
-            # A mismatched, released or already-launched slot is never refunded
-            # by this attempt.
-            return None
-        try:
-            return release_route_grant(
-                state, run_dir, role, route, reason,
-                reservation_id=reservation_id, cfg=cfg, deadline=deadline,
-                state_dir=state_dir)
-        except (RuntimeError, ValueError, GrantLedgerTimeout):
-            return None
-    return None
+    owner = _grant_entry_owning_reservation(
+        state, run_dir, role, route, reservation_id)
+    if owner is None:
+        return None
+    try:
+        ledger = load_grant_ledger(run_dir)
+    except RuntimeError:
+        return None
+    grant = (ledger.get("grants") or {}).get(owner.get("id"))
+    if not isinstance(grant, dict):
+        return None
+    held = next((item for item in grant.get("reservations", [])
+                 if isinstance(item, dict)
+                 and item.get("id") == reservation_id), None)
+    if _reservation_expectation_problem(
+            held, expectation, state, role, sha, generation, grant):
+        # A mismatched, released or already-launched slot is never refunded
+        # by this attempt.
+        return None
+    try:
+        return release_route_grant(
+            state, run_dir, role, route, reason,
+            reservation_id=reservation_id, cfg=cfg, deadline=deadline,
+            state_dir=state_dir)
+    except (RuntimeError, ValueError, GrantLedgerTimeout):
+        return None
 
 
 def mark_route_grant_launched(state, run_dir, role, route, *, reservation_id,
@@ -15586,7 +15585,44 @@ def _parallel_sibling_acceptance(state, index):
     return accepted
 
 
-def _accept_parallel_sibling_recovery(state, index, record):
+def _sibling_single_attempt(state, acceptance):
+    """Return the first proven dispatch of the accepted sibling transition."""
+    if not isinstance(acceptance, dict) or not acceptance.get("after_snapshot"):
+        return None
+    expected = acceptance["after_snapshot"]
+    accepted_at = acceptance.get("at")
+    candidates = []
+    if isinstance((state or {}).get("active_job"), dict):
+        candidates.append(state["active_job"])
+    for key in ("completed_jobs", "failed_jobs"):
+        candidates.extend(item for item in (state or {}).get(key) or []
+                          if isinstance(item, dict))
+    for job in candidates:
+        if job.get("role") != "implementer" or job.get("kind") != "implementer":
+            continue
+        path = Path(job.get("path", ""))
+        try:
+            dispatch = read_json(path / "dispatch.json")
+        except (OSError, ValueError):
+            continue
+        if not isinstance(dispatch, dict):
+            continue
+        if signature(dispatch.get("source")) != expected:
+            continue
+        created = job.get("created_at") or dispatch.get("created_at")
+        if accepted_at and created and str(created) < str(accepted_at):
+            continue
+        launch_file = _job_launch_file(job)
+        proven = bool(_launch_identity(launch_file)) or any(
+            (path / name).exists()
+            for name in ("execution.json", "completion.json", "report.json"))
+        if proven:
+            return {"job_id": job.get("id"), "source": expected,
+                    "path": str(path), "created_at": created}
+    return None
+
+
+def _accept_parallel_sibling_recovery(state, index, record, project=None):
     """Persist the one accepted transition to source-bound single-writer work."""
     entry = {
         "version": 1, "at": now(), "batch_index": int(index),
@@ -15594,6 +15630,8 @@ def _accept_parallel_sibling_recovery(state, index, record):
         "plan_revision": state.get("plan_revision", 0),
         "amendment_epoch": state.get("amendment_epoch", 0),
         "after_sha": (record or {}).get("after_sha"),
+        "after_snapshot": (signature(source_snapshot(project))
+                           if project is not None else None),
         "record_phase": (record or {}).get("phase"),
         "mode": "sibling_single_writer",
     }
@@ -15632,27 +15670,39 @@ def _parallel_decision(state, project, records, index, run_dir=None):
                     record, {"writers": records}, state)))
             if mode == "sibling_recovery" and completed_sibling:
                 accepted = _parallel_sibling_acceptance(state, index)
-                if accepted is not None:
+                proven = (_sibling_single_attempt(state, accepted)
+                          if accepted is not None else None)
+                if proven is not None:
                     decision.update({
                         "mode": "single",
-                        "reason": ("A validated sibling-only parallel apply was "
-                                   "accepted; continue source-bound single-writer "
+                        "reason": ("A proven single-writer attempt for the accepted "
+                                   "sibling apply is source-bound; continue its "
                                    "recovery"),
                         "recovery": {"source": "accepted_sibling_recovery",
                                      "phase": phase,
-                                     "after_sha": accepted.get("after_sha")}})
+                                     "after_sha": accepted.get("after_sha"),
+                                     "attempt": proven}})
                     return decision
                 transaction = ((state or {}).get("parallel_writers") or {}).get(
                     "transaction")
                 problem = _parallel_record_scope_problem(
                     record, transaction, {"writers": records})
                 if problem is None and project is not None:
-                    identity, _current = _parallel_canonical_identity(
+                    _identity, current_sha = _parallel_canonical_identity(
                         project, record)
-                    if identity != "after":
+                    expected_sha = ((accepted or {}).get("after_sha")
+                                    or record.get("after_sha"))
+                    expected_snapshot = ((accepted or {}).get("after_snapshot"))
+                    if current_sha != expected_sha:
                         problem = (
                             "the canonical checkout no longer matches the recorded "
                             "sibling-only after identity")
+                    elif (expected_snapshot is not None
+                          and signature(source_snapshot(project))
+                          != expected_snapshot):
+                        problem = (
+                            "the canonical source provenance no longer matches the "
+                            "accepted sibling-only after identity")
                 if problem is not None:
                     decision.update({
                         "mode": "parallel",
@@ -17532,6 +17582,51 @@ def _preflight_pending_scope(state, plan, scope):
             "reason": f"pending stage {phase or 'unknown'}"}
 
 
+def _pending_fallback_route(state, role, cfg, project=None):
+    """Return the exact route a pending one-shot worker fallback will use.
+
+    The returned route is validated against the recorded consent but is never
+    consumed here.  A problem means the persisted authorization cannot select a
+    route safely.
+    """
+    state = state or {}
+    host_fallback = state.get("fallback_authorization")
+    if isinstance(host_fallback, dict) and host_fallback.get("role") == role:
+        settings = (state.get("host_fallback_route")
+                    or (cfg.get("fallback") or {}).get(state.get("host")) or {})
+        if not settings.get("model"):
+            return None, f"No authorized {state.get('host')} fallback model configured"
+        route = {"provider": state.get("host"), "model": settings["model"],
+                 "effort": settings.get("effort"), "billing": "subscription",
+                 "fallback": True}
+        recorded = host_fallback.get("route_sha256")
+        if recorded and recorded != route_authorization_sha(route):
+            return None, ("Host fallback authorization does not match the exact "
+                          "pinned effective route")
+        generation = _role_generation(state, role)
+        if (host_fallback.get("role_generation") is not None
+                and host_fallback.get("role_generation") != generation):
+            return None, ("Host fallback authorization belongs to an earlier role "
+                          "generation")
+        return route, None
+    worker = state.get("worker_fallback_authorization")
+    if isinstance(worker, dict) and worker.get("role") == role:
+        pinned = (state.get("model_routes") or {}).get(role)
+        configured = pinned.get("fallback_route") if isinstance(pinned, dict) else None
+        if not isinstance(configured, dict):
+            return None, f"No complete fallback route is configured for {role}"
+        if worker.get("route_sha256") != route_authorization_sha(configured):
+            return None, ("Worker fallback authorization does not match the "
+                          "configured exact route")
+        generation = _role_generation(state, role)
+        if (worker.get("role_generation") is not None
+                and worker.get("role_generation") != generation):
+            return None, ("Worker fallback authorization belongs to an earlier "
+                          "role generation")
+        return configured, None
+    return None, None
+
+
 def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
     """Group known missing decisions before they become invisible prompts."""
     state = state or {}
@@ -17577,22 +17672,79 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
         executable = _route_executable_problem(role, route)
         if executable:
             add(executable, blocking)
-        billing = route.get("billing")
+        parallel_relevant = False
+        if role == "implementer" and ledger_dir is not None:
+            parallel_relevant = any(
+                decision["mode"] == "parallel"
+                and (scope_info.get("all_roles")
+                     or index == (state or {}).get("batch_index", 0))
+                for index, decision in batch_decisions.items())
+        fallback_route, fallback_problem = (None, None)
+        if role == "implementer" and not parallel_relevant:
+            fallback_route, fallback_problem = _pending_fallback_route(
+                state, role, cfg, project)
+        if fallback_route is not None or fallback_problem is not None:
+            if fallback_problem is not None:
+                add({
+                    "kind": "fallback_authorization", "role": role,
+                    "action": "re-approve the exact configured fallback route",
+                    "reason": fallback_problem,
+                    "resolution": "Clear the stale one-shot consent and obtain "
+                                  "explicit approval for the exact route the pending "
+                                  "dispatch will use."}, blocking)
+                continue
+            fallback_executable = _route_executable_problem(role, fallback_route)
+            if fallback_executable:
+                add(fallback_executable, blocking)
+            if _route_grant_required(route):
+                try:
+                    primary_authorization = route_authorization_status(
+                        state, role, route, run_dir=ledger_dir)
+                except (RuntimeError, ValueError) as exc:
+                    primary_authorization = {"authorized": False,
+                                             "reason": str(exc)}
+                if not primary_authorization.get("authorized"):
+                    add({
+                        "kind": "route_grant", "role": role,
+                        "primary_deferred": True,
+                        "action": f"orchestrator.py authorize-route "
+                                  f"{state.get('id', '<run>')} --role {role}",
+                        "reason": primary_authorization.get("reason") or (
+                            "the pinned primary route has no remaining grant"),
+                        "resolution": "No action is required for the pending "
+                                      "dispatch: an approved one-shot fallback "
+                                      "selects a different exact route. The "
+                                      "unused primary remains advisory."}, False)
+            if _route_grant_required(fallback_route):
+                try:
+                    fallback_authorization = route_authorization_status(
+                        state, role, fallback_route, run_dir=ledger_dir)
+                except (RuntimeError, ValueError) as exc:
+                    fallback_authorization = {"authorized": False,
+                                              "reason": str(exc)}
+                if not fallback_authorization.get("authorized"):
+                    add({
+                        "kind": "route_grant", "role": role,
+                        "selected_route": "fallback",
+                        "action": f"orchestrator.py authorize-route "
+                                  f"{state.get('id', '<run>')} --role {role} "
+                                  "--fallback",
+                        "reason": fallback_authorization.get("reason") or (
+                            "the pending fallback route requires a matching "
+                            "exact-route grant"),
+                        "resolution": "Authorize the exact fallback route before "
+                                      "the one-shot dispatch; the approval itself "
+                                      "is not a billing grant."}, blocking)
+            continue
+        if parallel_relevant:
+            # Per-lane accounting below decides whether the exact held slots
+            # cover the next actual launches, and an exact integration
+            # checkpoint needs no new Implementer grant at all.
+            continue
         if not _route_grant_required(route):
             # Default host subscription and OpenCode Go behavior needs no new
             # grant question; that is the ordinary unattended path.
             continue
-        if role == "implementer" and ledger_dir is not None:
-            relevant = [
-                index for index, decision in batch_decisions.items()
-                if decision["mode"] == "parallel"
-                and (scope_info.get("all_roles")
-                     or index == (state or {}).get("batch_index", 0))]
-            if relevant:
-                # Per-lane accounting below decides whether the exact held
-                # slots cover the next actual launches, and an exact integration
-                # checkpoint needs no new Implementer grant at all.
-                continue
         try:
             authorization = route_authorization_status(
                 state, role, route, run_dir=ledger_dir)
@@ -17688,9 +17840,12 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
                         lanes = ((state.get("parallel_writers") or {}).get("lanes")
                                  or {})
                         if lanes and index == (state or {}).get("batch_index", 0):
-                            pending = [writer for writer in writers
-                                       if not _lane_resumable(
-                                           lanes.get(writer["id"]) or {})[0]]
+                            pending = [
+                                writer for writer in writers
+                                if not _lane_resumable(
+                                    lanes.get(writer["id"]) or {})[0]
+                                and _durable_lane_outcome(
+                                    lanes.get(writer["id"]) or {}) is None]
                             required_count = len(pending)
                             try:
                                 held = _held_lane_reservations(
@@ -18157,17 +18312,37 @@ def advance(run_dir, state, cfg, deadline=None):
         recovery = resolved_parallel.get("recovery") or {}
         if (resolved_parallel["mode"] == "single"
                 and recovery.get("source") == "integration_record"
-                and recovery.get("validated")
-                and _parallel_sibling_acceptance(state, state["batch_index"]) is None):
+                and recovery.get("validated")):
+            accepted = _parallel_sibling_acceptance(state, state["batch_index"])
+            proven = (_sibling_single_attempt(state, accepted)
+                      if accepted is not None else None)
             _record_path, sibling_record = _integration_recovery_record(
                 run_dir, state["batch_index"], state)
-            accepted = _accept_parallel_sibling_recovery(
-                state, state["batch_index"], sibling_record or {})
-            save(run_dir, state)
-            journal_event(run_dir, state, "parallel_sibling_recovery_accepted",
-                          batch_index=state["batch_index"],
-                          after_sha=accepted.get("after_sha"),
-                          phase=accepted.get("record_phase"))
+            if accepted is None or not accepted.get("after_snapshot"):
+                accepted = _accept_parallel_sibling_recovery(
+                    state, state["batch_index"], sibling_record or {}, project)
+                proven = None
+                save(run_dir, state)
+                journal_event(run_dir, state,
+                              "parallel_sibling_recovery_accepted",
+                              batch_index=state["batch_index"],
+                              after_sha=accepted.get("after_sha"),
+                              phase=accepted.get("record_phase"))
+            if proven is None:
+                current_sha = _checkout_content_sha(project)
+                current_source = source_snapshot(project)
+                if (current_sha != accepted.get("after_sha")
+                        or (accepted.get("after_snapshot") is not None
+                            and signature(current_source)
+                            != accepted.get("after_snapshot"))):
+                    pause_with(
+                        run_dir, state,
+                        "Sibling-only recovery was admitted but the canonical "
+                        "source changed before the first single-writer dispatch. "
+                        "No writer was launched; every edit and the approved "
+                        "sibling manifest are preserved. Restore the exact after "
+                        "identity or reconcile explicitly.", "blocked")
+                    return
         if resolved_parallel["mode"] == "parallel":
             available = [record["id"] for record in resolved_parallel["writers"]
                          if not _lane_resumable(

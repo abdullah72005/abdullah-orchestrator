@@ -914,6 +914,59 @@ class HeldAuthorityResumeTests(BoundaryBase):
         self.assertEqual(sorted(item["id"] for item in original["reservations"]),
                          held)
 
+    def test_collection_loss_with_finished_paid_lanes_resumes_without_new_grant(self):
+        primary = {"provider": "codex", "model": "fixture-primary",
+                   "effort": "low", "billing": "api"}
+        plan = self.plan([pw.writer("a", path="a.py"),
+                          pw.writer("b", path="b.py")])
+        grant = {"id": "collection-grant", "role": "implementer",
+                 "run_id": self.state["id"],
+                 "route_sha256": orc.route_authorization_sha(primary),
+                 "role_generation": 0, "used": 0, "max_dispatches": 2}
+        self.install_plan(plan, max_writers=2)
+        self.state["model_routes"] = {"implementer": primary}
+        self.state["route_authorizations"] = [grant]
+        orc.save(self.rundir, self.state)
+        batch = plan["batches"][0]
+        resolved = orc.resolve_parallel_batch(
+            self.state, self.project, batch, run_dir=self.rundir)
+        spawns = []
+        with patch.object(orc, "_spawn_guarded",
+                          side_effect=PaidLaunchBoundaryTests.transport(
+                              self, spawns)), \
+                patch.object(orc, "_validate_lane_outcome",
+                             side_effect=RuntimeError("simulated collection loss")):
+            with self.assertRaisesRegex(RuntimeError, "collection loss"):
+                orc.run_parallel_batch(
+                    self.rundir, self.state, self.cfg, self.project, batch,
+                    resolved, None)
+        self.assertEqual(len(spawns), 2)
+        self.state = orc.load(self.state["id"])[1]
+        for lane in self.state["parallel_writers"]["lanes"].values():
+            self.assertTrue((Path(lane["lane_dir"]) / "lane-result.json").is_file())
+            self.assertIsNotNone(orc._durable_lane_outcome(lane))
+        resumed = orc.resume_run(self.state["id"])
+        self.assertEqual(resumed["status"], "running",
+                         self.state.get("pause_reason"))
+        self.state = orc.load(self.state["id"])[1]
+        launches = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a finished paid lane was launched again")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 1\n")
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        self.assertEqual(orc._grant_usage(ledger["grants"]["collection-grant"]), 2)
+        self.assertTrue(all(item.get("state") == "launched" for item in
+                            ledger["grants"]["collection-grant"]["reservations"]))
+
     def test_exact_integration_checkpoint_resumes_without_a_new_grant(self):
         primary = {"provider": "codex", "model": "fixture-primary",
                    "effort": "low", "billing": "api"}
@@ -1070,6 +1123,59 @@ class SiblingSingleRecoveryTests(BoundaryBase):
                          orc._checkout_content_sha(self.project))
         return batch, record
 
+    def test_admission_marker_without_dispatch_rechecks_divergence(self):
+        batch, record = self.sibling_run()
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+
+        def refusal(*args, **kwargs):
+            raise RuntimeError("known preflight refusal before launch")
+
+        with patch.object(orc, "call_model", side_effect=refusal):
+            with self.assertRaisesRegex(RuntimeError, "preflight refusal"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.state = orc.load(self.state["id"])[1]
+        accepted = self.state["parallel_sibling_single"]["0"]
+        self.assertEqual(accepted["after_sha"], record["after_sha"])
+        self.assertIsNone(orc._sibling_single_attempt(self.state, accepted))
+        original = (self.project / "app.py").read_text()
+        (self.project / "app.py").write_text("value = 99\n")
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        launches = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a marker without a proven dispatch authorized edits")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("no longer matches", self.state["pause_reason"])
+        self.assertEqual((self.project / "app.py").read_text(), "value = 99\n")
+        # Restoring the exact recorded after identity safely continues once.
+        (self.project / "app.py").write_text(original)
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        starts = []
+
+        def finish(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            starts.append(kwargs.get("assignment"))
+            (Path(project) / "b.py").write_text("b = 2\n")
+            return report("b finished"), pw.writer_job(run_dir, "single")
+
+        with patch.object(orc, "call_model", side_effect=finish):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(starts, [None])
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+
     def test_finalized_divergent_sibling_record_blocks(self):
         batch, record = self.sibling_run()
         (self.project / "app.py").write_text("value = 99\n")
@@ -1122,32 +1228,37 @@ class SiblingSingleRecoveryTests(BoundaryBase):
         batch, record = self.sibling_run()
         self.state = orc.load(self.state["id"])[1]
         self.state["status"] = "running"
+        self.state["model_routes"] = {"implementer": {
+            "provider": "codex", "model": "fixture-primary", "effort": "low",
+            "billing": "subscription"}}
         orc.atomic_json(self.rundir / "control.json", {"action": "run"})
         orc.save(self.rundir, self.state)
-        sleeper = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(120)"],
-            start_new_session=True)
-        self.addCleanup(lambda: sleeper.kill() if sleeper.poll() is None else None)
-        identity = orc.process_identity(sleeper.pid) or {"pid": sleeper.pid}
         starts = []
 
-        def interrupted(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
-            starts.append(kwargs.get("assignment"))
-            (Path(project) / "b.py").write_text("b = 'partial'\n")
-            state["active_job"] = {
-                "id": "sibling-single-job", "role": "implementer",
-                "kind": "implementer", "status": "dispatched", **identity}
-            state["status"] = "uncertain"
-            orc.save(run_dir, state)
-            raise RuntimeError("simulated single-writer loss")
+        def failing_transport(command, cwd, env, log_stream, launch_file=None,
+                              stdin_data=None, error_stream=None,
+                              stdin_fifo=None):
+            (Path(cwd) / "b.py").write_text("b = 'partial'\n")
+            starts.append(command[command.index("--model") + 1])
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.exit(1)"],
+                start_new_session=True)
+            if launch_file:
+                orc.atomic_json(Path(launch_file),
+                                {"guard": orc.process_identity(proc.pid)})
+            return proc, None
 
-        with patch.object(orc, "call_model", side_effect=interrupted):
-            with self.assertRaisesRegex(RuntimeError, "single-writer loss"):
+        with patch.object(orc, "_spawn_guarded",
+                          side_effect=failing_transport):
+            with self.assertRaisesRegex(RuntimeError, "exited 1"):
                 orc.advance(self.rundir, self.state, self.cfg)
         self.state = orc.load(self.state["id"])[1]
         self.assertIn("parallel_sibling_single", self.state)
-        sleeper.terminate()
-        sleeper.wait(timeout=10)
+        accepted = self.state["parallel_sibling_single"]["0"]
+        self.assertIsNotNone(orc._sibling_single_attempt(self.state, accepted),
+                             "the real dispatch was not source-bound")
+        self.state["status"] = "uncertain"
+        orc.save(self.rundir, self.state)
         reconciled = orc.reconcile_run(self.state["id"])
         self.assertEqual(reconciled["status"], "paused")
         self.state = orc.load(self.state["id"])[1]
@@ -1163,10 +1274,190 @@ class SiblingSingleRecoveryTests(BoundaryBase):
         with patch.object(orc, "call_model", side_effect=finish):
             orc.advance(self.rundir, self.state, self.cfg)
         self.assertEqual(resumed, [None])
-        self.assertEqual(starts, [None])
+        self.assertEqual(starts, ["fixture-primary"])
         self.assertEqual(self.state["phase"], "verify",
                          self.state.get("pause_reason"))
         self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+
+
+class EffectiveRouteResumeTests(BoundaryBase):
+    """Public resume authorizes the route the pending single writer will use."""
+
+    def paused_after_fallback(self, primary, approve):
+        plan = self.plan([pw.writer("a", path="a.py"),
+                          pw.writer("b", path="b.py")])
+        self.install_plan(plan, max_writers=2, status="blocked")
+        self.state["model_routes"] = {"implementer": primary}
+        orc.save(self.rundir, self.state)
+        approve()
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "paused"
+        orc.atomic_json(self.rundir / "control.json", {"action": "pause"})
+        orc.save(self.rundir, self.state)
+        return plan
+
+    def test_unfunded_primary_with_approved_host_fallback_resumes(self):
+        primary = {"provider": "codex", "model": "fixture-primary",
+                   "effort": "low", "billing": "api"}
+        self.paused_after_fallback(
+            primary,
+            lambda: self.assertTrue(orc.modify_locked(
+                self.rundir, self.state, self.state["id"], "approve-fallback",
+                role="implementer")))
+        self.state = orc.load(self.state["id"])[1]
+        fallback_model = self.state["fallback_authorization"]["route"]["model"]
+        resumed = orc.resume_run(self.state["id"])
+        self.assertEqual(resumed["status"], "running",
+                         self.state.get("pause_reason"))
+        self.state = orc.load(self.state["id"])[1]
+        advisories = self.state["permission_preflight"]["advisories"]
+        self.assertTrue(any(item.get("role") == "implementer"
+                            and item.get("primary_deferred") for item in advisories),
+                        advisories)
+        self.assertFalse(any(item.get("kind") == "route_grant"
+                             and item.get("role") == "implementer"
+                             and not item.get("primary_deferred")
+                             for item in self.state["permission_preflight"]["missing"]))
+        self.state = orc.load(self.state["id"])[1]
+        seen = []
+        with patch.object(orc, "_spawn_guarded",
+                          side_effect=OneShotFallbackBoundaryTests.transport(
+                              self, seen)):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(seen, [fallback_model])
+        self.assertIsNone(self.state.get("fallback_authorization"))
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+
+    def test_missing_primary_grant_with_configured_worker_fallback_resumes(self):
+        primary = {"provider": "codex", "model": "fixture-primary",
+                   "effort": "low", "billing": "api",
+                   "fallback_route": {
+                       "provider": "codex", "model": "fixture-worker-fallback",
+                       "effort": "low", "billing": "subscription"}}
+        with patch.object(orc, "require_human_operator",
+                          return_value={"actor": "test", "method": "test"}):
+            self.paused_after_fallback(
+                primary,
+                lambda: orc.approve_worker_fallback_run(self.state["id"],
+                                                        "implementer"))
+        self.state = orc.load(self.state["id"])[1]
+        self.assertIsInstance(self.state.get("worker_fallback_authorization"),
+                              dict)
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        seen = []
+        with patch.object(orc, "_spawn_guarded",
+                          side_effect=OneShotFallbackBoundaryTests.transport(
+                              self, seen)):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(seen, ["fixture-worker-fallback"])
+        self.assertIsNone(self.state.get("worker_fallback_authorization"))
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+
+    def test_invalid_fallback_authorization_blocks_resume(self):
+        primary = {"provider": "codex", "model": "fixture-primary",
+                   "effort": "low", "billing": "api"}
+        self.paused_after_fallback(
+            primary,
+            lambda: self.assertTrue(orc.modify_locked(
+                self.rundir, self.state, self.state["id"], "approve-fallback",
+                role="implementer")))
+        self.state = orc.load(self.state["id"])[1]
+        self.state["fallback_authorization"]["route_sha256"] = "0" * 64
+        orc.save(self.rundir, self.state)
+        launches = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("an invalid fallback authorization dispatched")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            resumed = orc.resume_run(self.state["id"])
+        self.assertEqual(resumed["status"], "blocked")
+        self.assertEqual(launches, [])
+        self.state = orc.load(self.state["id"])[1]
+        missing = self.state["permission_preflight"]["missing"]
+        self.assertTrue(any(item.get("kind") == "fallback_authorization"
+                            for item in missing), missing)
+        self.assertIn("fallback_authorization", self.state["pause_reason"])
+        self.assertIsInstance(self.state.get("fallback_authorization"), dict)
+
+
+class OwnerGrantReleaseTests(BoundaryBase):
+    """Exact preflight cleanup releases through the slot's owning grant."""
+
+    def setup_grants(self):
+        route = {"provider": "codex", "model": "fixture-primary",
+                 "effort": "low", "billing": "unknown"}
+        plan = self.plan([pw.writer("a", path="a.py")])
+        older = {"id": "older-grant", "role": "implementer",
+                 "run_id": self.state["id"],
+                 "route_sha256": orc.route_authorization_sha(route),
+                 "role_generation": 0, "used": 0, "max_dispatches": 2}
+        newer = {"id": "newer-grant", "role": "implementer",
+                 "run_id": self.state["id"],
+                 "route_sha256": orc.route_authorization_sha(route),
+                 "role_generation": 0, "used": 0, "max_dispatches": 2}
+        self.install_plan(plan, max_writers=1)
+        self.state["model_routes"] = {"implementer": route}
+        self.state["route_authorizations"] = [older]
+        orc.register_route_grant(self.rundir, older)
+        orc.save(self.rundir, self.state)
+        ids, problem = orc._reserve_parallel_authority(
+            self.state, self.rundir, 1, self.cfg, None, 0,
+            targets=[{"writer_id": "a", "attempt_id": "attempt-a"}])
+        self.assertIsNone(problem)
+        # A newer same-route grant arrives after the slot is already held.
+        orc.register_route_grant(self.rundir, newer)
+        self.state["route_authorizations"].append(newer)
+        orc.save(self.rundir, self.state)
+        return route, ids[0]
+
+    def test_real_preflight_rejection_releases_the_older_held_slot(self):
+        route, reservation_id = self.setup_grants()
+        expectation = {"id": reservation_id, "lane": "a",
+                       "attempt_id": "attempt-a", "batch_index": 0}
+        lane_state = copy.deepcopy(self.state)
+        spawns = []
+
+        def must_not_spawn(*args, **kwargs):
+            spawns.append("child")
+            raise AssertionError("a child started after a preflight rejection")
+
+        with patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "preflight"):
+                orc.call_model(
+                    self.rundir, lane_state, self.cfg, "implementer",
+                    "implementer", "do work", self.project, route=route,
+                    assignment="a", grant_reservation_id=reservation_id,
+                    grant_attempt_id="attempt-a")
+        self.assertEqual(spawns, [])
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        older = ledger["grants"]["older-grant"]
+        newer = ledger["grants"]["newer-grant"]
+        self.assertEqual(orc._grant_usage(older), 0)
+        self.assertEqual(
+            [item["id"] for item in older["reservations"]], [reservation_id])
+        self.assertEqual(older["reservations"][0]["state"], "released")
+        self.assertEqual(orc._grant_usage(newer), 0)
+        self.assertEqual(newer["reservations"], [])
+
+    def test_exact_helper_resolves_the_owning_grant(self):
+        route, reservation_id = self.setup_grants()
+        expectation = {"id": reservation_id, "lane": "a",
+                       "attempt_id": "attempt-a", "batch_index": 0}
+        released = orc._release_exact_held_reservation(
+            self.state, self.rundir, "implementer", route, reservation_id,
+            expectation, "exact held rejection", cfg=self.cfg)
+        self.assertIsNotNone(released)
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        older = ledger["grants"]["older-grant"]
+        newer = ledger["grants"]["newer-grant"]
+        self.assertEqual(orc._grant_usage(older), 0)
+        self.assertEqual(older["reservations"][0]["state"], "released")
+        self.assertEqual(newer["reservations"], [])
 
 
 if __name__ == "__main__":
