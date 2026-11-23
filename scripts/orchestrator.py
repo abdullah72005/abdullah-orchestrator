@@ -14792,11 +14792,25 @@ def _parallel_source_problem(project):
         pass
     try:
         env_inputs = [path.name for path in project.glob(".env*") if path.is_file()]
-    except OSError as exc:
+    except OSError:
         env_inputs = []
     if env_inputs:
         return ("the starting checkout has local environment input that cannot be "
                 "copied safely: " + ", ".join(sorted(env_inputs)[:5]))
+    try:
+        ignored = [os.fsdecode(item) for item in git(
+            project, ["ls-files", "-o", "-i", "--exclude-standard", "-z"]
+        ).split(b"\0") if item]
+    except (OSError, subprocess.SubprocessError):
+        ignored = []
+    relevant_ignored = [
+        path for path in ignored
+        if not ("__pycache__" in Path(path).parts
+                and path.endswith((".pyc", ".pyo")))]
+    if relevant_ignored:
+        return ("the starting checkout has ignored local/runtime input that a "
+                "fresh worktree cannot reproduce: "
+                + ", ".join(sorted(relevant_ignored)[:5]))
     return None
 
 

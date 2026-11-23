@@ -222,6 +222,18 @@ class ParallelWriterTests(unittest.TestCase):
         self.assertIn("dirty", resolved["reason"])
         self.assertEqual((self.project / "untracked.txt").read_text(), "user work\n")
 
+    def test_ignored_runtime_input_selects_one_writer(self):
+        (self.project / ".gitignore").write_text("local.cache\n")
+        (self.project / "local.cache").write_text("ignored runtime input\n")
+        orc.git(self.project, ["add", ".gitignore"])
+        orc.git(self.project, ["commit", "-qm", "ignore local cache"])
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        self.assertEqual(resolved["mode"], "single")
+        self.assertIn("ignored local/runtime input", resolved["reason"])
+        self.assertEqual((self.project / "local.cache").read_text(),
+                         "ignored runtime input\n")
+
     def test_overlap_duplicate_and_unsafe_paths_fail_before_launch(self):
         with self.assertRaisesRegex(ValueError, "overlapping"):
             orc._writer_assignment_records([
