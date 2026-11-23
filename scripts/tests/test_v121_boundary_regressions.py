@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1458,6 +1459,283 @@ class OwnerGrantReleaseTests(BoundaryBase):
         self.assertEqual(orc._grant_usage(older), 0)
         self.assertEqual(older["reservations"][0]["state"], "released")
         self.assertEqual(newer["reservations"], [])
+
+
+class WriterSourceBindingTests(BoundaryBase):
+    """The first single writer is bound to the validated sibling source."""
+
+    def prepare_sibling(self):
+        SiblingSingleRecoveryTests.sibling_run(self)
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "running"
+        self.state["model_routes"] = {
+            "implementer": {"provider": "codex", "model": "fixture-primary",
+                            "effort": "low", "billing": "subscription"}}
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+
+    def assert_blocked_before_any_child(self, reason_code):
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertFalse(self.state.get("active_job"))
+        self.assertEqual(self.state["preflight_rejection"]["reason_code"],
+                         reason_code)
+        self.assertFalse(self.state["preflight_rejection"]["active_job_created"])
+        self.assertFalse(self.state["preflight_rejection"]["model_calls_counted"])
+
+    def test_source_change_before_prompt_capture_blocks_first_writer(self):
+        self.prepare_sibling()
+        record_path = orc._integration_record_path(self.rundir, 0)
+        manifest_before = orc._sha256_file(record_path)
+        real_journal = orc.journal_event
+        mutated = []
+
+        def mutate_at_fallback(run_dir, state, event, **values):
+            result = real_journal(run_dir, state, event, **values)
+            if event == "parallel_plan_single_fallback" and not mutated:
+                mutated.append(True)
+                (self.project / "app.py").write_text("value = 99\n")
+            return result
+
+        def must_not_spawn(*args, **kwargs):
+            raise AssertionError("a writer child started on a drifted source")
+
+        with patch.object(orc, "journal_event", side_effect=mutate_at_fallback), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "candidate changed before launch"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assert_blocked_before_any_child("candidate_changed_before_dispatch")
+        self.assertEqual((self.project / "app.py").read_text(), "value = 99\n")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual(orc._sha256_file(record_path), manifest_before)
+        accepted = self.state["parallel_sibling_single"]["0"]
+        self.assertEqual(orc.signature(accepted["after_source"]),
+                         accepted["after_snapshot"])
+        self.assertNotEqual(orc.signature(accepted["after_source"]),
+                            orc.signature(orc.source_snapshot(self.project)))
+
+    def test_source_change_after_prompt_construction_blocks(self):
+        self.prepare_sibling()
+        real_prompt = orc.prompt_request
+        mutated = []
+
+        def prompt_with_edit(kind, context):
+            if kind == "implementer" and not mutated:
+                mutated.append(True)
+                (self.project / "notes.txt").write_text("external\n")
+            return real_prompt(kind, context)
+
+        def must_not_spawn(*args, **kwargs):
+            raise AssertionError("a writer child started after prompt construction")
+
+        with patch.object(orc, "prompt_request",
+                          side_effect=prompt_with_edit), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "candidate changed before launch"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assert_blocked_before_any_child("candidate_changed_before_dispatch")
+        self.assertEqual((self.project / "notes.txt").read_text(), "external\n")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+
+    def test_exact_sibling_source_continues_with_the_same_dispatch_source(self):
+        self.prepare_sibling()
+        seen = []
+        with patch.object(
+                orc, "_spawn_guarded",
+                side_effect=OneShotFallbackBoundaryTests.transport(self, seen)):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(seen, ["fixture-primary"])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        accepted = self.state["parallel_sibling_single"]["0"]
+        job = self.state["completed_jobs"][-1]
+        self.assertEqual(job["role"], "implementer")
+        dispatch = orc.read_json(Path(job["path"]) / "dispatch.json")
+        self.assertEqual(orc.signature(dispatch["source"]),
+                         accepted["after_snapshot"])
+        self.assertEqual(orc.signature(dispatch["source"]),
+                         orc.signature(accepted["after_source"]))
+
+
+class StoppedWriterSourceTests(BoundaryBase):
+    """A correction retry continues only the last attributable source boundary."""
+
+    def prepare_sibling(self):
+        WriterSourceBindingTests.prepare_sibling(self)
+
+    def failing_transport(self, attempts):
+        def failing(command, cwd, env, log_stream, launch_file=None,
+                    stdin_data=None, error_stream=None, stdin_fifo=None):
+            (Path(cwd) / "b.py").write_text("b = 'partial'\n")
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.exit(1)"],
+                start_new_session=True)
+            if launch_file:
+                orc.atomic_json(Path(launch_file),
+                                {"guard": orc.process_identity(proc.pid)})
+            attempts.append(command[command.index("--model") + 1])
+            return proc, None
+        return failing
+
+    def finishing_transport(self, starts):
+        def finishing(command, cwd, env, log_stream, launch_file=None,
+                      stdin_data=None, error_stream=None, stdin_fifo=None):
+            (Path(cwd) / "b.py").write_text("b = 2\n")
+            out = command[command.index("--output-last-message") + 1]
+            Path(out).write_text(json.dumps(report("b finished")))
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(0.3)"],
+                start_new_session=True)
+            if launch_file:
+                orc.atomic_json(Path(launch_file),
+                                {"guard": orc.process_identity(proc.pid)})
+            starts.append(command[command.index("--model") + 1])
+            return proc, None
+        return finishing
+
+    def test_external_edit_after_reconcile_blocks_and_unchanged_partial_resumes(self):
+        self.prepare_sibling()
+        original_app = (self.project / "app.py").read_text()
+        attempts = []
+        with patch.object(orc, "_spawn_guarded",
+                          side_effect=self.failing_transport(attempts)):
+            with self.assertRaisesRegex(RuntimeError, "exited 1"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(attempts, ["fixture-primary"])
+        self.assertEqual((self.project / "b.py").read_text(), "b = 'partial'\n")
+        self.assertIn("writer_source_boundaries", self.state)
+        self.assertEqual(self.state["writer_source_boundaries"]["0"]["phase"],
+                         "failure")
+        self.state["status"] = "uncertain"
+        orc.save(self.rundir, self.state)
+        reconciled = orc.reconcile_run(self.state["id"])
+        self.assertEqual(reconciled["status"], "paused")
+        self.state = orc.load(self.state["id"])[1]
+        boundary = self.state["writer_source_boundaries"]["0"]
+        self.assertEqual(boundary["phase"], "reconciliation")
+        self.assertEqual(orc.signature(boundary["source"]),
+                         orc.signature(orc.source_snapshot(self.project)))
+
+        # An external edit after the reconciliation evidence cannot be
+        # attributed to the stopped attempt and must not reach a writer.
+        (self.project / "app.py").write_text("value = 99\n")
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        starts = []
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a writer launched over an unattributed edit")
+
+        with patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(starts, [])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("changed after the last attributable writer boundary",
+                      self.state["pause_reason"])
+        self.assertEqual((self.project / "app.py").read_text(), "value = 99\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 'partial'\n")
+        self.assertEqual(orc.signature(self.state["writer_source_boundaries"]["0"]["source"]),
+                         boundary["signature"])
+
+        # Restoring the exact boundary (including the partial worker output)
+        # permits one replacement writer from that same source.
+        (self.project / "app.py").write_text(original_app)
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        resumed = []
+        with patch.object(orc, "_spawn_guarded",
+                          side_effect=self.finishing_transport(resumed)):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(resumed, ["fixture-primary"])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+        restored = [job for job in self.state["completed_jobs"]
+                    if job.get("role") == "implementer"][-1]
+        dispatch = orc.read_json(Path(restored["path"]) / "dispatch.json")
+        self.assertEqual(orc.signature(dispatch["source"]),
+                         boundary["signature"])
+
+
+class EffectiveRouteExecutableTests(BoundaryBase):
+    """Preflight checks the executable for the route the stage will select."""
+
+    def paused_after_fallback(self, primary):
+        EffectiveRouteResumeTests.paused_after_fallback(
+            self, primary,
+            lambda: self.assertTrue(orc.modify_locked(
+                self.rundir, self.state, self.state["id"], "approve-fallback",
+                role="implementer")))
+
+    def which_without(self, missing):
+        real = shutil.which
+
+        def fake(command, path=None):
+            if command in missing:
+                return None
+            return real(command, path=path)
+        return fake
+
+    def test_missing_unused_primary_cli_does_not_block_selected_fallback(self):
+        self.paused_after_fallback({"provider": "opencode",
+                                    "model": "opencode-go/x",
+                                    "effort": "low", "billing": "go"})
+        self.state = orc.load(self.state["id"])[1]
+        fallback_model = self.state["fallback_authorization"]["route"]["model"]
+        with patch.object(orc.shutil, "which",
+                          side_effect=self.which_without({"opencode"})):
+            resumed = orc.resume_run(self.state["id"])
+        self.assertEqual(resumed["status"], "running",
+                         self.state.get("pause_reason"))
+        self.state = orc.load(self.state["id"])[1]
+        preflight = self.state["permission_preflight"]
+        self.assertTrue(any(item.get("kind") == "route_executable"
+                            and item.get("role") == "implementer"
+                            and item.get("primary_deferred")
+                            for item in preflight["advisories"]), preflight)
+        self.assertFalse(any(item.get("kind") == "route_executable"
+                             for item in preflight["missing"]), preflight)
+        seen = []
+        with patch.object(orc.shutil, "which",
+                          side_effect=self.which_without({"opencode"})), \
+                patch.object(orc, "_spawn_guarded",
+                             side_effect=OneShotFallbackBoundaryTests.transport(
+                                 self, seen)):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(seen, [fallback_model])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertIsNone(self.state.get("fallback_authorization"))
+
+    def test_missing_selected_fallback_cli_blocks_resume(self):
+        self.paused_after_fallback({"provider": "opencode",
+                                    "model": "opencode-go/x",
+                                    "effort": "low", "billing": "go"})
+        with patch.object(orc.shutil, "which",
+                          side_effect=self.which_without({"opencode", "codex"})):
+            resumed = orc.resume_run(self.state["id"])
+        self.assertEqual(resumed["status"], "blocked")
+        self.state = orc.load(self.state["id"])[1]
+        missing = self.state["permission_preflight"]["missing"]
+        self.assertTrue(any(item.get("kind") == "route_executable"
+                            and item.get("role") == "implementer"
+                            and item.get("selected_route") == "fallback"
+                            for item in missing), missing)
+        self.assertIn("route_executable", self.state["pause_reason"])
+        self.assertIsInstance(self.state.get("fallback_authorization"), dict)
 
 
 if __name__ == "__main__":

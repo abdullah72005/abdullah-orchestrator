@@ -577,12 +577,19 @@ Parallel writing is a per-run permission, not an implicit model choice:
   identity continues only the sibling apply. A finalized sibling manifest is
   revalidated against its scope, intent and exact canonical after/source identity
   before its first single-writer correction is admitted, and the admission marker
-  alone never bypasses that check on a later retry. A preflight refusal or missing
+  alone never bypasses that check on a later retry. The first single writer's
+  prompt and expected dispatch source are frozen from that same validated sibling
+  snapshot and bound to the manifest digest, so an edit during context
+  construction, preflight or launch admission blocks before any child starts
+  while preserving the worktree and manifest. A preflight refusal or missing
   launch is not a proven attempt; external divergence stays blocked. Once an
   attempt has a durable source-bound job/launch, its continuation remains tied to
-  the approved batch, revision, epoch and sibling manifest, so its own edits and
-  an interrupted authorized correction resume through existing source-bound
-  recovery. The unfinished lane's worktree stays inspectable. Ownership
+  the approved batch, revision, epoch and sibling manifest. The next writer starts
+  from the last exact source boundary recorded by that attempt's failure,
+  completion or operator reconciliation evidence; an edit after that boundary
+  requires explicit reconciliation, while unchanged partial worker output
+  resumes through the ordinary source-bound gate. The unfinished lane's worktree
+  stays inspectable. Ownership
   conflicts, unplanned dependencies or integration conflicts preserve every lane
   and route to strong diagnosis.
 - The combined canonical candidate then goes through supervisor checks, one
@@ -625,7 +632,10 @@ executables under the check environment, role/writer skill tools and pinned
 artifacts, approved check argv policy and parallel worktree/grant prerequisites.
 Plan approval checks the whole approved run; resume blocks only on pending stage
 requirements, so an exhausted grant for an already-completed paid role is shown
-as deferred instead of stopping unrelated acceptance work. A parallel fan-out
+as deferred instead of stopping unrelated acceptance work. The effective route is
+resolved before capabilities are checked: an approved one-shot fallback owns the
+blocking executable, grant and skill-tool checks for the pending stage, while an
+unused primary's missing CLI or exhausted grant is advisory. A parallel fan-out
 reserves one run-ledger reservation per admitted lane before any model dispatch;
 an insufficient grant or a failed reservation produces zero launches and
 releases reservations whose launch was never attempted, while a held slot whose

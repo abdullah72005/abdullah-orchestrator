@@ -10836,6 +10836,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 _record_batch_delta(run_dir, state, project, job_id, boundary,
                                     final_snapshot, job=job,
                                     phase="completion")
+                _record_writer_source_boundary(
+                    state, job, final_snapshot, phase="completion")
             job["status"] = "complete"
             state.setdefault("completed_jobs", []).append(job)
             state["active_job"] = None
@@ -10923,6 +10925,10 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 completion = None
             _record_batch_delta(run_dir, state, project, job_id, boundary,
                                 completion, job=job, phase="failure")
+            _record_writer_source_boundary(
+                state, job, completion, phase="failure",
+                index=(boundary.get("batch_index")
+                       if isinstance(boundary, dict) else None))
         if kind in READ_ONLY_STAGE_KINDS and mutation.get("mutated"):
             job["source_mutation"] = mutation
             job["source_mutation"]["containment"] = inspection
@@ -15585,20 +15591,24 @@ def _parallel_sibling_acceptance(state, index):
     return accepted
 
 
-def _sibling_single_attempt(state, acceptance):
+def _sibling_single_attempt(state, acceptance, index=None):
     """Return the first proven dispatch of the accepted sibling transition."""
     if not isinstance(acceptance, dict) or not acceptance.get("after_snapshot"):
         return None
     expected = acceptance["after_snapshot"]
     accepted_at = acceptance.get("at")
+    state = state or {}
     candidates = []
-    if isinstance((state or {}).get("active_job"), dict):
+    if isinstance(state.get("active_job"), dict):
         candidates.append(state["active_job"])
     for key in ("completed_jobs", "failed_jobs"):
-        candidates.extend(item for item in (state or {}).get(key) or []
+        candidates.extend(item for item in state.get(key) or []
                           if isinstance(item, dict))
     for job in candidates:
         if job.get("role") != "implementer" or job.get("kind") != "implementer":
+            continue
+        if job.get("authority_epoch") not in (None,
+                                              state.get("authority_epoch", 0)):
             continue
         path = Path(job.get("path", ""))
         try:
@@ -15609,6 +15619,14 @@ def _sibling_single_attempt(state, acceptance):
             continue
         if signature(dispatch.get("source")) != expected:
             continue
+        boundary = dispatch.get("batch_boundary")
+        if isinstance(boundary, dict):
+            if (index is not None and boundary.get("batch_index") is not None
+                    and int(boundary["batch_index"]) != int(index)):
+                continue
+            if (boundary.get("plan_version") not in (None,
+                                                     state.get("plan_version"))):
+                continue
         created = job.get("created_at") or dispatch.get("created_at")
         if accepted_at and created and str(created) < str(accepted_at):
             continue
@@ -15622,17 +15640,192 @@ def _sibling_single_attempt(state, acceptance):
     return None
 
 
-def _accept_parallel_sibling_recovery(state, index, record, project=None):
-    """Persist the one accepted transition to source-bound single-writer work."""
+WRITER_SOURCE_BOUNDARY_VERSION = 1
+
+
+def _source_identity_view(snapshot):
+    """Return the snapshot subset whose ``signature`` equals the full identity.
+
+    Prompt construction and the launch-time source gate need the same exact
+    source without re-observing the live checkout, so only the identity fields
+    are retained.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    view = {"path": snapshot.get("path"), "git_head": snapshot.get("git_head"),
+            "changed": copy.deepcopy(snapshot.get("changed") or {})}
+    if snapshot.get("staged_sha256"):
+        view["staged_sha256"] = snapshot["staged_sha256"]
+    runtime = snapshot.get("runtime_inputs")
+    if isinstance(runtime, dict):
+        view["runtime_inputs"] = copy.deepcopy(runtime)
+    return view
+
+
+def _manifest_file_sha(path):
+    if path is None:
+        return None
+    try:
+        return _sha256_file(Path(path))
+    except OSError:
+        return None
+
+
+def _sibling_manifest_binding_problem(accepted, record_path, record):
+    """Reject an accepted sibling source that no longer matches its manifest."""
+    if not isinstance(accepted, dict) or record_path is None:
+        return "the accepted sibling manifest path is unavailable"
+    if accepted.get("after_sha") != (record or {}).get("after_sha"):
+        return "the accepted sibling after identity no longer matches its manifest"
+    if (accepted.get("record_phase") is not None
+            and accepted.get("record_phase") != (record or {}).get("phase")):
+        return "the accepted sibling manifest phase changed after acceptance"
+    recorded_path = accepted.get("record_path")
+    if recorded_path is not None:
+        try:
+            same_path = (Path(recorded_path).resolve()
+                         == Path(record_path).resolve())
+        except (OSError, ValueError):
+            same_path = False
+        if not same_path:
+            return "the accepted sibling manifest belongs to another path"
+    recorded_sha = accepted.get("record_sha256")
+    if recorded_sha is not None:
+        actual = _manifest_file_sha(record_path)
+        if actual is None:
+            return "the accepted sibling manifest is unreadable"
+        if actual != recorded_sha:
+            return "the accepted sibling manifest changed after acceptance"
+    return None
+
+
+def _bind_accepted_sibling_source(accepted, current, record_path):
+    """Freeze the validated sibling snapshot for prompt and launch admission."""
+    view = accepted.get("after_source")
+    if not isinstance(view, dict):
+        view = _source_identity_view(current)
+        accepted["after_source"] = view
+    expected = accepted.get("after_snapshot") or signature(view)
+    if not isinstance(view, dict) or signature(view) != expected:
+        return None, ("the accepted sibling source binding no longer matches its "
+                      "validated after identity")
+    if accepted.get("record_path") is None and record_path is not None:
+        accepted["record_path"] = str(record_path)
+        accepted["record_sha256"] = _manifest_file_sha(record_path)
+    return {"source": view, "signature": expected,
+            "origin": "accepted_sibling_manifest"}, None
+
+
+def _record_writer_source_boundary(state, job, snapshot, *, phase, index=None):
+    """Persist the last exact source identity attributable to one writer attempt."""
+    view = _source_identity_view(snapshot)
+    if (state is None or view is None or not isinstance(job, dict)
+            or not job.get("id")):
+        return None
+    index = state.get("batch_index", 0) if index is None else index
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        index = int(state.get("batch_index", 0))
+    entry = {"version": WRITER_SOURCE_BOUNDARY_VERSION,
+             "job_id": job.get("id"), "phase": phase, "batch_index": index,
+             "plan_version": state.get("plan_version"),
+             "plan_revision": state.get("plan_revision", 0),
+             "amendment_epoch": state.get("amendment_epoch", 0),
+             "signature": signature(view), "source": view,
+             "recorded_at": now()}
+    job["source_boundary"] = copy.deepcopy(entry)
+    state.setdefault("writer_source_boundaries", {})[str(index)] = entry
+    return entry
+
+
+def _attempt_batch_index(state, job):
+    """Best exact batch index for one attempt, without inventing one."""
+    recorded = (job or {}).get("source_boundary")
+    if isinstance(recorded, dict) and recorded.get("batch_index") is not None:
+        return int(recorded["batch_index"])
+    if isinstance(job, dict) and job.get("path"):
+        path = Path(job["path"])
+        local = _safe_read(path / "batch-boundary.json")
+        if isinstance(local, dict) and local.get("batch_index") is not None:
+            return int(local["batch_index"])
+        dispatch = _safe_read(path / "dispatch.json")
+        if isinstance(dispatch, dict):
+            boundary = dispatch.get("batch_boundary")
+            if isinstance(boundary, dict) and boundary.get("batch_index") is not None:
+                return int(boundary["batch_index"])
+    return int((state or {}).get("batch_index", 0))
+
+
+def _attempt_was_launched(job):
+    """Distinguish an admitted-but-unlaunched job from a real child attempt."""
+    if not isinstance(job, dict) or not job.get("id"):
+        return False
+    launch_file = _job_launch_file(job)
+    if launch_file and _launch_identity(launch_file):
+        return True
+    if not job.get("path"):
+        return False
+    path = Path(job["path"])
+    return any((path / name).exists()
+               for name in ("execution.json", "completion.json", "failure.json"))
+
+
+def _writer_source_boundary(state, index):
+    """Load the current batch's last trustworthy writer source boundary."""
+    entry = ((state or {}).get("writer_source_boundaries") or {}).get(str(index))
+    if not isinstance(entry, dict):
+        return None
+    state = state or {}
+    if entry.get("plan_version") not in (None, state.get("plan_version")):
+        return None
+    if (entry.get("plan_revision") is not None
+            and int(entry["plan_revision"])
+            != int(state.get("plan_revision", 0))):
+        return None
+    if (entry.get("amendment_epoch") is not None
+            and int(entry["amendment_epoch"])
+            != int(state.get("amendment_epoch", 0))):
+        return None
+    source = entry.get("source")
+    if not isinstance(source, dict) or signature(source) != entry.get("signature"):
+        return None
+    return entry
+
+
+def _stopped_attempt_source_binding(state, index, *, current):
+    """Return the exact boundary the next writer may start from, or a refusal."""
+    recorded = _writer_source_boundary(state, index)
+    if recorded is None:
+        return None, ("No exact source boundary was captured for the stopped "
+                      "writer attempt; inspect and reconcile its source before "
+                      "another dispatch.")
+    if signature(current) != recorded.get("signature"):
+        return None, (
+            "The canonical source changed after the last attributable writer "
+            "boundary for this batch. No writer was launched; every edit and the "
+            "preserved attempt evidence remain. Restore the exact boundary "
+            "identity or reconcile the external edits explicitly before dispatch.")
+    return {"source": recorded["source"], "signature": recorded["signature"],
+            "origin": "writer_%s_boundary" % (recorded.get("phase") or "attempt")}, None
+
+
+def _accept_parallel_sibling_recovery(state, index, record, project=None,
+                                      record_path=None):
+    """Persist the one accepted transition bound to its exact sibling manifest."""
+    snapshot = source_snapshot(project) if project is not None else None
     entry = {
         "version": 1, "at": now(), "batch_index": int(index),
         "plan_version": state.get("plan_version"),
         "plan_revision": state.get("plan_revision", 0),
         "amendment_epoch": state.get("amendment_epoch", 0),
         "after_sha": (record or {}).get("after_sha"),
-        "after_snapshot": (signature(source_snapshot(project))
-                           if project is not None else None),
+        "after_snapshot": (signature(snapshot)
+                           if snapshot is not None else None),
+        "after_source": _source_identity_view(snapshot),
         "record_phase": (record or {}).get("phase"),
+        "record_path": (str(record_path) if record_path is not None else None),
+        "record_sha256": _manifest_file_sha(record_path),
         "mode": "sibling_single_writer",
     }
     state.setdefault("parallel_sibling_single", {})[str(index)] = entry
@@ -15670,7 +15863,7 @@ def _parallel_decision(state, project, records, index, run_dir=None):
                     record, {"writers": records}, state)))
             if mode == "sibling_recovery" and completed_sibling:
                 accepted = _parallel_sibling_acceptance(state, index)
-                proven = (_sibling_single_attempt(state, accepted)
+                proven = (_sibling_single_attempt(state, accepted, index)
                           if accepted is not None else None)
                 if proven is not None:
                     decision.update({
@@ -17664,14 +17857,12 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
     roles = {"architect", "implementer", "reviewer"}
     if state.get("require_explorer") or state.get("explorer_policy"):
         roles.add("explorer")
+    effective_routes = {}
     for role in sorted(roles):
         route = routes.get(role)
         if not isinstance(route, dict):
             continue
         blocking = pending_role(role)
-        executable = _route_executable_problem(role, route)
-        if executable:
-            add(executable, blocking)
         parallel_relevant = False
         if role == "implementer" and ledger_dir is not None:
             parallel_relevant = any(
@@ -17683,6 +17874,31 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
         if role == "implementer" and not parallel_relevant:
             fallback_route, fallback_problem = _pending_fallback_route(
                 state, role, cfg, project)
+        # Resolve the exact route this pending stage will use before checking
+        # capabilities.  An unused primary is advisory; the selected fallback
+        # owns the blocking executable and grant checks.
+        effective_routes[role] = (fallback_route if isinstance(fallback_route, dict)
+                                  else route)
+        unused_primary = (fallback_route is not None
+                          or fallback_problem is not None)
+        if unused_primary:
+            primary_executable = _route_executable_problem(role, route)
+            if primary_executable:
+                add({**primary_executable, "primary_deferred": True,
+                     "selected_route": ("fallback" if fallback_route is not None
+                                        else None),
+                     "resolution": (
+                         "No action is required for the pending dispatch: an "
+                         "approved one-shot fallback selects a different exact "
+                         "route. The unused primary remains advisory."
+                         if fallback_route is not None else
+                         "No action is required until the pending fallback "
+                         "consent is corrected; the unused primary remains "
+                         "advisory.")}, False)
+        else:
+            executable = _route_executable_problem(role, route)
+            if executable:
+                add(executable, blocking)
         if fallback_route is not None or fallback_problem is not None:
             if fallback_problem is not None:
                 add({
@@ -17695,7 +17911,8 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
                 continue
             fallback_executable = _route_executable_problem(role, fallback_route)
             if fallback_executable:
-                add(fallback_executable, blocking)
+                add({**fallback_executable, "selected_route": "fallback"},
+                    blocking)
             if _route_grant_required(route):
                 try:
                     primary_authorization = route_authorization_status(
@@ -17764,10 +17981,12 @@ def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
     def skill_records():
         for role, records in (skills.get("roles") or {}).items():
             for record in records or []:
-                yield role, record, routes.get(role)
+                yield role, record, effective_routes.get(role) or routes.get(role)
         for records in (skills.get("writers") or {}).values():
             for record in records or []:
-                yield "implementer", record, routes.get("implementer")
+                yield ("implementer", record,
+                       effective_routes.get("implementer")
+                       or routes.get("implementer"))
 
     for role, record, route in skill_records():
         blocking = pending_role(role)
@@ -18305,32 +18524,45 @@ def advance(run_dir, state, cfg, deadline=None):
                 and signature(state["baseline"]) != signature(source_snapshot(project))):
             pause_with(run_dir, state, "Approved handoff source changed before implementation; obtain a current approved handoff")
             return
-        batch = state["plan"]["batches"][state["batch_index"]]
+        batch_index = state["batch_index"]
+        batch = state["plan"]["batches"][batch_index]
         resolved_parallel = resolve_parallel_batch(
             state, project, batch, run_dir=run_dir)
         state["parallel_resolution"] = resolved_parallel
         recovery = resolved_parallel.get("recovery") or {}
+        source_binding = None
         if (resolved_parallel["mode"] == "single"
                 and recovery.get("source") == "integration_record"
                 and recovery.get("validated")):
-            accepted = _parallel_sibling_acceptance(state, state["batch_index"])
-            proven = (_sibling_single_attempt(state, accepted)
+            accepted = _parallel_sibling_acceptance(state, batch_index)
+            proven = (_sibling_single_attempt(state, accepted, batch_index)
                       if accepted is not None else None)
             _record_path, sibling_record = _integration_recovery_record(
-                run_dir, state["batch_index"], state)
+                run_dir, batch_index, state)
             if accepted is None or not accepted.get("after_snapshot"):
                 accepted = _accept_parallel_sibling_recovery(
-                    state, state["batch_index"], sibling_record or {}, project)
+                    state, batch_index, sibling_record or {}, project,
+                    record_path=_record_path)
                 proven = None
                 save(run_dir, state)
                 journal_event(run_dir, state,
                               "parallel_sibling_recovery_accepted",
-                              batch_index=state["batch_index"],
+                              batch_index=batch_index,
                               after_sha=accepted.get("after_sha"),
                               phase=accepted.get("record_phase"))
+            manifest_problem = _sibling_manifest_binding_problem(
+                accepted, _record_path, sibling_record or {})
+            if manifest_problem:
+                pause_with(
+                    run_dir, state,
+                    "Sibling-only recovery was admitted but its exact completed "
+                    "manifest can no longer be validated: " + manifest_problem
+                    + ". No writer was launched; every edit, attempt evidence "
+                    "and the approved sibling manifest are preserved.", "blocked")
+                return
+            current_source = source_snapshot(project)
             if proven is None:
                 current_sha = _checkout_content_sha(project)
-                current_source = source_snapshot(project)
                 if (current_sha != accepted.get("after_sha")
                         or (accepted.get("after_snapshot") is not None
                             and signature(current_source)
@@ -18343,6 +18575,38 @@ def advance(run_dir, state, cfg, deadline=None):
                         "sibling manifest are preserved. Restore the exact after "
                         "identity or reconcile explicitly.", "blocked")
                     return
+                needs_binding = not isinstance(accepted.get("after_source"), dict)
+                source_binding, binding_problem = _bind_accepted_sibling_source(
+                    accepted, current_source, _record_path)
+                if binding_problem:
+                    pause_with(run_dir, state, binding_problem, "blocked")
+                    return
+                if needs_binding or accepted.get("record_path") is None:
+                    save(run_dir, state)
+            else:
+                source_binding, binding_problem = _stopped_attempt_source_binding(
+                    state, batch_index, current=current_source)
+                if binding_problem:
+                    pause_with(run_dir, state, binding_problem, "blocked")
+                    return
+        elif resolved_parallel["mode"] == "single":
+            recorded_boundary = _writer_source_boundary(state, batch_index)
+            if recorded_boundary is not None:
+                current_source = source_snapshot(project)
+                if signature(current_source) != recorded_boundary.get("signature"):
+                    pause_with(
+                        run_dir, state,
+                        "The canonical source changed after the last attributable "
+                        "writer boundary for this batch. No writer was launched; "
+                        "every edit and the preserved attempt evidence remain. "
+                        "Restore the exact boundary identity or reconcile the "
+                        "external edits explicitly before dispatch.", "blocked")
+                    return
+                source_binding = {
+                    "source": recorded_boundary["source"],
+                    "signature": recorded_boundary["signature"],
+                    "origin": "writer_%s_boundary" % (
+                        recorded_boundary.get("phase") or "attempt")}
         if resolved_parallel["mode"] == "parallel":
             available = [record["id"] for record in resolved_parallel["writers"]
                          if not _lane_resumable(
@@ -18378,11 +18642,14 @@ def advance(run_dir, state, cfg, deadline=None):
                 "reason": resolved_parallel["reason"]})
         requirements = user_requirements(state)
         correction = state.get("correction", "") or fallback_reason or ""
+        prompt_source = (source_binding["source"] if source_binding is not None
+                         else source_snapshot(project))
         context = {
-            "project": str(project), "run_id": state["id"], "batch_index": state["batch_index"],
+            "project": str(project), "run_id": state["id"], "batch_index": batch_index,
             "approved_plan_version": state["plan_version"], "batch": batch,
             "requirements": requirements,
-            "invariants": state["plan"].get("invariants", []), "source": source_snapshot(project),
+            "invariants": state["plan"].get("invariants", []),
+            "source": prompt_source,
             "approved_handoff": strip_duplicate_requirements(state.get("approved_handoff"), requirements),
             "prior_attempt": state.get("implementation"), "correction": correction,
             "exploration": state.get("exploration"),
@@ -18412,7 +18679,7 @@ def advance(run_dir, state, cfg, deadline=None):
             report, job = call_model(run_dir, state, cfg, "implementer", "implementer",
                                      prompt_request("implementer", context), project,
                                      deadline=deadline,
-                                     expected_source=context["source"])
+                                     expected_source=prompt_source)
         else:
             job = state["completed_jobs"][-1]
         state["implementation"] = report
@@ -18990,6 +19257,10 @@ def recover_finished_dispatch(run_dir, state):
             run_dir, state, Path(state["project"]), job.get("id"), boundary,
             final_snapshot, job=job, phase="recovered-dispatch",
             forced_problem=boundary_problem)
+        _record_writer_source_boundary(
+            state, job, final_snapshot, phase="recovered-dispatch",
+            index=(boundary.get("batch_index")
+                   if isinstance(boundary, dict) else None))
     elif job.get("kind") == "reviewer":
         # Restore the producing packet identity/verification binding so a
         # still-current recovered review can be consumed without another model
@@ -21305,6 +21576,21 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                           lanes=lane_targets)
         # User has inspected the exact log, working tree and session externally.
         reconciled_job = state.get("active_job") or {}
+        if (reconciled_job
+                and reconciled_job.get("role") == "implementer"
+                and reconciled_job.get("kind") == "implementer"
+                and _attempt_was_launched(reconciled_job)):
+            # Reconciliation is the explicit operator boundary: freeze the exact
+            # source the next writer may continue from.  An edit made after this
+            # evidence is not attributable to the stopped attempt.
+            try:
+                reconciled_source = source_snapshot(Path(state["project"]))
+            except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+                reconciled_source = None
+            _record_writer_source_boundary(
+                state, reconciled_job, reconciled_source,
+                phase="reconciliation",
+                index=_attempt_batch_index(state, reconciled_job))
         if reconciled_job:
             failures = state.setdefault("failed_jobs", [])
             if not any(job.get("id") == reconciled_job.get("id") for job in failures):
