@@ -15319,13 +15319,12 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         return None
     state["parallel_active"] = None
     records = {record["id"]: record for record in resolved.get("writers", [])}
-    reusable, relaunch = {}, []
+    relaunch = []
     for writer_id, record in records.items():
         lane = lanes.get(writer_id)
         if lane and lane.get("batch_index") == batch_index:
-            ok, reason = _lane_resumable(lane)
+            ok, _reason = _lane_resumable(lane)
             if ok:
-                reusable[writer_id] = lane
                 continue
             if lane.get("status") in {"starting", "running"}:
                 pause_with(run_dir, state,
@@ -15367,6 +15366,19 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         journal_event(run_dir, state, "parallel_writer_started",
                       assignment=writer_id, goal=record["goal"],
                       worktree=str(worktree), base_head=base_head)
+        # A stale result from another attempt must never be mistaken for this
+        # launch's outcome if the thread dies before writing its own artifact.
+        try:
+            (lane_dir / "lane-result.json").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            lanes[writer_id] = {"status": "failed", "goal": record["goal"],
+                                "batch_index": batch_index,
+                                "lane_dir": str(lane_dir),
+                                "error": f"stale lane result could not be cleared: {exc}"}
+            results[writer_id] = {"ok": False, "error": str(exc)}
+            continue
         # Snapshot the parent once in the supervisor thread.  Lane threads must
         # never deepcopy a state dict the parent is concurrently mutating.
         lane_parent_state = copy.deepcopy(state)
@@ -15399,8 +15411,7 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         thread.join(timeout=5)
         lane = lanes.setdefault(writer_id, {})
         outcome = None
-        # The target closure stores only the last result in `holder`; recover the
-        # per-lane result from the durable lane result artifact instead.
+        # Read the per-lane result from its own durable execution slot.
         result_path = batch_dir / writer_id / "lane-result.json"
         if result_path.is_file():
             try:
