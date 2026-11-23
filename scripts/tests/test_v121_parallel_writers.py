@@ -6,8 +6,10 @@ observable.
 """
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
@@ -504,6 +506,7 @@ class ParallelWriterRecoveryTests(unittest.TestCase):
         lane_dir.mkdir(parents=True, exist_ok=True)
         worktree = orc.create_writer_worktree(
             self.project, lane_dir / "worktree", base_head)
+        lane_base_sha = orc._checkout_content_sha(worktree)
         provenance = orc._lane_provenance(
             self.state, 0, records["a"], base_head, "attempt-crash")
         fake = self.fake_model({"a": {"a.py": "a = 1\n"}})
@@ -521,6 +524,7 @@ class ParallelWriterRecoveryTests(unittest.TestCase):
                 "status": "running", "batch_index": 0,
                 "worktree": str(worktree), "lane_dir": str(lane_dir),
                 "base_head": base_head,
+                "base_sha": lane_base_sha,
                 "plan_version": self.state["plan_version"], "plan_revision": 1,
                 "amendment_epoch": 0, "attempt": 1, "intent": provenance,
                 "assignment": records["a"]}}}
@@ -654,6 +658,200 @@ class ParallelWriterRecoveryTests(unittest.TestCase):
         self.assertEqual(self.state["phase"], "verify")
         self.assertFalse(orc._integration_record_path(self.rundir, 0).exists())
         self.assertNotIn("parallel_writers", self.state)
+
+    def test_source_change_before_resume_preserves_lanes_and_blocks_dispatch(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        base_head = orc.git(self.project, ["rev-parse", "HEAD"]).decode().strip()
+
+        def first(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            writer_id = kwargs.get("assignment")
+            project = Path(project)
+            if writer_id == "a":
+                (project / "a.py").write_text("a = 1\n")
+                return report("a finished"), writer_job(run_dir, "a")
+            (project / "b.py").write_text("b = 'partial'\n")
+            return blocked_report(), writer_job(run_dir, "b")
+
+        with patch.object(orc, "call_model", side_effect=first):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.state["status"], "blocked")
+        # An operator commit changes the canonical source while the transaction
+        # is still admitted. No lane may be reused or launched against it.
+        (self.project / "app.py").write_text("value = 99\n")
+        orc.git(self.project, ["add", "app.py"])
+        orc.git(self.project, ["commit", "-qm", "operator source change"])
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        calls = []
+
+        def must_not_run(*args, **kwargs):
+            calls.append("model")
+            raise AssertionError("a writer ran against a changed canonical source")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("source changed", self.state["pause_reason"])
+        self.assertEqual((self.project / "app.py").read_text(), "value = 99\n")
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertTrue(Path(self.state["parallel_writers"]["lanes"]["a"][
+                                 "worktree"]).is_dir())
+        # Restoring the admitted base reuses the completed lane and launches only
+        # the blocked one.
+        orc.git(self.project, ["reset", "--hard", base_head])
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        resumed = self.fake_model({"b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=resumed):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(resumed.starts, ["b"])
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+
+    def test_source_change_while_waiting_to_apply_blocks_before_verification(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        base_head = orc.git(self.project, ["rev-parse", "HEAD"]).decode().strip()
+
+        def fake(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            writer_id = kwargs.get("assignment")
+            project = Path(project)
+            if writer_id == "a":
+                (project / "a.py").write_text("a = 1\n")
+                return report("a finished"), writer_job(run_dir, "a")
+            (project / "b.py").write_text("b = 2\n")
+            if writer_id == "b":
+                (self.project / "shared.txt").write_text("operator change\n")
+                orc.git(self.project, ["add", "shared.txt"])
+                orc.git(self.project, ["commit", "-qm", "change before apply"])
+            return report("b finished"), writer_job(run_dir, "b")
+
+        with patch.object(orc, "call_model", side_effect=fake):
+            result = orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch, resolved,
+                None)
+        self.assertIsNone(result)
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertIn("source changed", self.state["pause_reason"])
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+        # Both completed lanes are still durable; restoring the admitted base
+        # integrates them without another model call.
+        orc.git(self.project, ["reset", "--hard", base_head])
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        calls = []
+
+        def must_not_run(*args, **kwargs):
+            calls.append("model")
+            raise AssertionError("a completed lane was dispatched again")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            result = orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch, resolved,
+                None)
+        self.assertIsNotNone(result)
+        self.assertEqual(calls, [])
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+
+    def test_sibling_only_apply_crash_never_advances_to_verification(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        failing = self.fake_model({"a": {"a.py": "a = 1\n"}}, fail={"b"})
+        with patch.object(orc, "call_model", side_effect=failing):
+            orc.advance(self.rundir, self.state, self.cfg)
+        # Canonical contains the completed sibling and the durable record says
+        # sibling_recovery, not full integration.
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        record = orc.read_json(orc._integration_record_path(self.rundir, 0))
+        self.assertEqual(record["phase"], "sibling_recovery")
+        self.assertEqual(record["mode"], "sibling_recovery")
+        self.assertEqual(record["expected_writers"], ["a", "b"])
+        self.assertEqual(record["writers"], ["a"])
+        # Simulate process loss after apply and before handle_repair saved the
+        # fallback marker.
+        self.state.pop("parallel_fallback_batches", None)
+        self.state["correction"] = ""
+        self.state["corrections"] = 0
+        self.state["phase"] = "implement"
+        self.state["status"] = "running"
+        orc.save(self.rundir, self.state)
+        single = []
+
+        def finish_single(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            single.append(kwargs.get("assignment"))
+            (Path(project) / "b.py").write_text("b = 2\n")
+            return report("b finished"), writer_job(run_dir, "single")
+
+        with patch.object(orc, "call_model", side_effect=finish_single):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(single, [None])
+        self.assertEqual(self.state["phase"], "verify",
+                         "a sibling-only apply authorised verification")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+
+    def test_uncertain_lane_blocks_resume_until_exact_execution_stops(self):
+        batch, resolved = self.prepare([writer("a", path="a.py"),
+                                        writer("b", path="b.py")])
+        lane_dir = orc._parallel_batch_dir(self.rundir, 0) / "a"
+        lane_dir.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(120)"],
+                                start_new_session=True)
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        identity = orc.process_identity(proc.pid) or {"pid": proc.pid}
+        active = {"id": "old-lane-job", "role": "implementer",
+                  "kind": "implementer", "status": "uncertain",
+                  **identity}
+        lane_state = copy.deepcopy(self.state)
+        lane_state.update({"id": "test-run00--a", "phase": "implement",
+                           "status": "running", "active_job": active,
+                           "active_check": None, "parallel_writers": None})
+        orc.atomic_json(lane_dir / "state.json", lane_state)
+        self.state["parallel_writers"] = {
+            "batch_index": 0, "lanes": {"a": {
+                "status": "failed", "batch_index": 0,
+                "lane_dir": str(lane_dir),
+                "plan_version": self.state["plan_version"], "plan_revision": 1,
+                "amendment_epoch": 0, "attempt": 1}}}
+        self.state["permission_blocked"] = {
+            "version": 1, "role": "implementer", "assignment": "a",
+            "action": "credential required", "reason": "provider prompt",
+            "cause": "recognized", "resume_step": "correct and resume",
+            "raw_text_persisted": False}
+        self.state["status"] = "blocked"
+        orc.save(self.rundir, self.state)
+        before = orc._checkout_content_sha(self.project)
+        calls = []
+
+        def must_not_run(*args, **kwargs):
+            calls.append("model")
+            raise AssertionError("a replacement writer started while old execution lived")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            with self.assertRaisesRegex(RuntimeError, "not proven stopped"):
+                orc.resume_run(self.state["id"])
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(orc._checkout_content_sha(self.project), before)
+        self.assertFalse((self.project / "a.py").exists())
+        proc.terminate()
+        proc.wait(timeout=10)
+        self.assertTrue(orc.modify_locked(self.rundir, self.state,
+                                          self.state["id"], "resume"))
+        resumed = self.fake_model({"a": {"a.py": "a = 1\n"},
+                                   "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=resumed):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(resumed.starts, ["a", "b"])
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
 
     def test_fast_lane_completion_is_observed_before_a_quiet_sibling(self):
         batch, resolved = self.prepare([writer("a", path="a.py"),

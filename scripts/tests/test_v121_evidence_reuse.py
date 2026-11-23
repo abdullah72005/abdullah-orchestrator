@@ -133,9 +133,12 @@ class EvidenceReuseTests(unittest.TestCase):
         strong.assert_called_once()
         self.assertEqual(self.invocations(counter), 2)
         self.assertEqual(self.state["final_acceptance"]["mode"], "executed")
-        self.assertTrue(any("log bytes changed" in reason
-                            for reason in self.state["final_acceptance"]["reasons"]))
-        self.assertEqual(self.state["status"], "complete")
+        # The formal batch record is also part of the Architect decision. Its
+        # changed log cannot be laundered by the fresh final repeat.
+        self.assertNotEqual(self.state["status"], "complete")
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertIsNone(self.state["verification"])
+        self.assertIn("changed", self.state["pause_reason"])
 
     def test_repeat_requirement_forces_another_execution(self):
         check, counter = self.counting_check("repeat")
@@ -263,9 +266,49 @@ class EvidenceReuseTests(unittest.TestCase):
         strong.assert_called_once()
         self.assertEqual(self.invocations(counter), 2)
         self.assertEqual(self.state["final_acceptance"]["mode"], "executed")
-        self.assertTrue(any("missing" in reason
-                            for reason in self.state["final_acceptance"]["reasons"]))
-        self.assertEqual(self.state["status"], "complete")
+        self.assertNotEqual(self.state["status"], "complete")
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertIn("missing", self.state["pause_reason"])
+
+    def test_changed_formal_log_is_refused_before_reviewer_admission(self):
+        check, counter = self.counting_check("review-log")
+        plan = self.plan([batch("one", [check])])
+        self.prepare(plan, phase="review", review=False)
+        _reference, evidence = self.verify(plan["batches"][0])
+        log = Path(evidence["commands"][0]["log"])
+        log.write_text(log.read_text() + "changed before review\n")
+        with patch.object(orc, "call_model") as model:
+            orc.advance(self.rundir, self.state, self.cfg)
+        model.assert_not_called()
+        self.assertIn(self.state["phase"], {"review", "verify"})
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("log", (self.state.get("pause_reason") or "").lower())
+        self.assertEqual(self.invocations(counter), 1)
+
+    def test_repeat_log_change_during_final_decision_cannot_complete(self):
+        check, counter = self.counting_check("repeat-decision-log")
+        plan = self.plan([batch("one", [check], repeat_checks=True)])
+        self.prepare(plan)
+        _reference, evidence = self.verify(plan["batches"][0])
+        log = Path(evidence["commands"][0]["log"])
+
+        def approve(_run_dir, state, _cfg, _kind, extra=None, **kwargs):
+            log.write_text(log.read_text() + "changed during repeat decision\n")
+            references = ([state["single_batch_verification"],
+                           state["verification"]]
+                          if state.get("single_batch_verification")
+                          else [state["verification"]])
+            state["decision_binding"] = orc.make_decision_binding(
+                state, self.project, references)
+            return verdict()
+
+        with patch.object(orc, "strong_call", side_effect=approve):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(self.invocations(counter), 2)
+        self.assertEqual(self.state["final_acceptance"]["mode"], "executed")
+        self.assertNotEqual(self.state["status"], "complete")
+        self.assertEqual(self.state["phase"], "verify")
+        self.assertIn("changed", self.state["pause_reason"])
 
     def test_derived_reuse_record_revalidates_its_original_records(self):
         check, _counter = self.counting_check("derived-source")

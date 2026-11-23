@@ -64,7 +64,8 @@ class AcceptanceIntegrityTests(unittest.TestCase):
             self.state["verification"] = {
                 "path": evidence["path"], "passed": True,
                 "candidate_hash": evidence["after_hash"],
-                "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION}
+                "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION,
+                "record_sha256": orc._sha256_file(Path(evidence["path"]))}
             self.state["check_progress"] = None
             orc.save(self.rundir, self.state)
             return evidence
@@ -180,7 +181,8 @@ class AcceptanceIntegrityTests(unittest.TestCase):
         strong.assert_not_called()
         self.assertEqual(self.state["phase"], "verify")
         self.assertIsNone(self.state["verification"])
-        self.assertEqual(self.state["invalidated_decisions"][-1]["kind"], "decision")
+        self.assertEqual(self.state["invalidated_decisions"][-1]["kind"],
+                         "acceptance-evidence")
 
     def test_new_verification_record_requires_a_new_decision(self):
         plan = make_plan(2)
@@ -193,7 +195,8 @@ class AcceptanceIntegrityTests(unittest.TestCase):
         self.state["verification"] = {
             "path": new_evidence["path"], "passed": True,
             "candidate_hash": new_evidence["after_hash"],
-            "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION}
+            "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION,
+            "record_sha256": orc._sha256_file(Path(new_evidence["path"]))}
         orc.save(self.rundir, self.state)
         with patch.object(orc, "strong_call") as strong:
             orc.advance(self.rundir, self.state, self.cfg)
@@ -203,15 +206,16 @@ class AcceptanceIntegrityTests(unittest.TestCase):
 
     def test_unchanged_bound_recovery_consumes_without_duplicate_model_call(self):
         plan = make_plan(1)
-        batch_ref = self.prepare(plan)
-        self.state["single_batch_verification"] = dict(batch_ref)
+        self.prepare(plan)
+        self.state["single_batch_verification"] = dict(self.state["verification"])
         final = orc.run_checks(self.rundir, self.state, self.cfg, self.project,
                                {"title": "feature integration",
                                 "checks": plan["batches"][0]["checks"]}, final=True)
         self.state["verification"] = {
             "path": final["path"], "passed": True,
             "candidate_hash": final["after_hash"],
-            "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION}
+            "evidence_version": orc.VERIFICATION_EVIDENCE_VERSION,
+            "record_sha256": orc._sha256_file(Path(final["path"]))}
         references = [self.state["single_batch_verification"],
                       self.state["verification"]]
         self.add_decision_job(self.verdict(), references)
@@ -219,7 +223,8 @@ class AcceptanceIntegrityTests(unittest.TestCase):
         with patch.object(orc, "strong_call") as strong:
             orc.advance(self.rundir, self.state, self.cfg)
         strong.assert_not_called()
-        self.assertEqual(self.state["status"], "complete")
+        self.assertEqual(self.state["status"], "complete",
+                         self.state.get("pause_reason"))
         self.assertEqual(self.state["final_verdict"]["verdict"], "approved")
         self.assertTrue(self.state["accepted_batches"][0]["decision_binding"])
 

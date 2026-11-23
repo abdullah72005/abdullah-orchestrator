@@ -180,6 +180,8 @@ class ReliabilityRepair(ControlTests):
         plan = {'batches': [{'title': 'one', 'checks': [['true']]}]}
         modern = copy.deepcopy(ev)
         modern['evidence_version'] = orc.VERIFICATION_EVIDENCE_VERSION
+        for command in modern['commands']:
+            command['log_sha256'] = orc._sha256_file(Path(command['log']))
         modern['plan_version'] = orc.content_hash(plan)
         modern['provenance'] = {
             'version': orc.SOURCE_PROVENANCE_VERSION, 'source': snap,

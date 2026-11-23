@@ -173,6 +173,43 @@ class SkillRoutingTests(unittest.TestCase):
         self.assertLess(skill_at, task_at)
         self.assertIn("never grant permissions", prompt)
 
+    def test_implementer_tool_requirement_matches_the_effective_adapter(self):
+        record = {"name": "needs-agent", "required_tools": ["subagent"]}
+        opencode = {"provider": "opencode", "billing": "go"}
+        codex = {"provider": "codex", "billing": "subscription"}
+        self.assertIn("denies", orc._skill_tool_problem(
+            "implementer", record, opencode, dialect="v2"))
+        self.assertIsNone(orc._skill_tool_problem(
+            "implementer", record, codex, dialect=None))
+        self.assertIn("denies", orc._skill_tool_problem(
+            "implementer", {"name": "needs-agent", "required_tools": ["task"]},
+            opencode, dialect="v1"))
+        self.write_skill(
+            "agent-skill",
+            "---\nname: agent-skill\nrequires:\n  - subagent\n---\nDelegate.\n")
+        with self.assertRaisesRegex(ValueError, "adapter profile denies"):
+            self.create_run({"implementer": ["agent-skill"]})
+
+    def test_missing_artifact_is_blocking_only_for_the_pending_role(self):
+        self.write_skill("demo", "pinned\n")
+        _run, _folder, state = self.create_run({"implementer": ["demo"]})
+        pinned = Path(state["skill_assignments"]["roles"]["implementer"][0][
+            "instructions_path"])
+        pinned.unlink()
+        state["phase"] = "implement"
+        blocking = orc.permission_preflight(state, self.cfg, self.project,
+                                            scope="pending")
+        self.assertTrue(any(item["kind"] == "skill_artifact"
+                            for item in blocking["missing"]))
+        state["phase"] = "accept"
+        deferred = orc.permission_preflight(state, self.cfg, self.project,
+                                            scope="pending")
+        self.assertFalse(any(item["kind"] == "skill_artifact"
+                             for item in deferred["missing"]))
+        self.assertTrue(any(item["kind"] == "skill_artifact"
+                            and item.get("deferred")
+                            for item in deferred["advisories"]))
+
     def test_writer_retry_keeps_the_same_pinned_skill_identity(self):
         self.write_skill("lane", "lane instructions\n")
         _run, folder, state = self.create_run({"writers": {"w1": ["lane"]}})

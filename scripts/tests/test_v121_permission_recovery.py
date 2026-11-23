@@ -164,8 +164,15 @@ class PermissionPreflightTests(unittest.TestCase):
         self.assertEqual(starts, [])
         self.assertEqual(self.state["status"], "blocked")
         self.assertIn("no writer was started", self.state["pause_reason"])
-        self.assertFalse(any((orr := orc._parallel_batch_dir(self.rundir, 0) / wid)
-                             .exists() for wid in ("a", "b")))
+        for writer_id in ("a", "b"):
+            lane = self.state["parallel_writers"]["lanes"].get(writer_id) or {}
+            self.assertNotEqual(lane.get("status"), "complete")
+            self.assertFalse(
+                (orc._parallel_batch_dir(self.rundir, 0) / writer_id /
+                 "lane-result.json").exists())
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        self.assertEqual(orc._grant_usage(ledger["grants"]["grant-1"]), 0,
+                         "a reservation whose launch was never attempted was not released")
 
     def test_plan_approval_and_resume_stop_on_known_missing_items(self):
         plan = {"contract_version": 2, "status": "complete", "summary": "plan",
@@ -265,6 +272,124 @@ class PermissionPreflightTests(unittest.TestCase):
         self.assertEqual(hint["source"], "unknown")
         self.assertEqual(hint["action"], "unrecognized authority/credential prompt")
         self.assertIsNone(orc._unknown_permission_hint("tests passed\n"))
+
+    def test_parallel_grant_remedy_requests_one_full_grant(self):
+        route = {"provider": "opencode", "model": "opencode-go/x", "effort": "low",
+                 "billing": "api", "routing_fingerprint": "d" * 64}
+        self.state["model_routes"] = {"implementer": route}
+        self.state["route_authorizations"] = [{
+            "id": "grant-1", "role": "implementer",
+            "route_sha256": orc.route_authorization_sha(route),
+            "role_generation": 0, "used": 0, "max_dispatches": 1}]
+        problem = orc._parallel_grant_problem(self.state, self.rundir, 2)
+        self.assertIn("--max-dispatches 2", problem["action"])
+        self.assertIn("new grant is separate", problem["reason"])
+
+    def test_pending_preflight_defers_completed_paid_reviewer(self):
+        plan = {"contract_version": 2, "status": "complete", "summary": "plan",
+                "invariants": ["Keep behavior"],
+                "batches": [{"title": "feature", "goal": "change",
+                             "acceptance": ["works"],
+                             "checks": [[sys.executable, "-c", "raise SystemExit(0)"]],
+                             "risk": "ordinary", "verification_purpose": None,
+                             "repeat_checks": None, "writers": None}],
+                "blocker": "", "required_exploration": {
+                    "job_id": "", "scope_satisfied": True}}
+        reviewer = {"provider": "opencode", "model": "opencode-go/x",
+                    "effort": "high", "billing": "api",
+                    "routing_fingerprint": "e" * 64}
+        self.state.update({
+            "phase": "accept", "plan": plan,
+            "plan_version": orc.content_hash(plan), "plan_revision": 1,
+            "model_routes": {
+                "architect": {"provider": "codex", "model": "gpt",
+                              "effort": "high", "billing": "subscription"},
+                "reviewer": reviewer},
+            "verification": {"path": "/tmp/unused", "passed": True}})
+        all_scope = orc.permission_preflight(self.state, self.cfg, self.project,
+                                             plan=plan, scope="all")
+        self.assertFalse(all_scope["ok"])
+        pending = orc.permission_preflight(self.state, self.cfg, self.project,
+                                           plan=plan, scope="pending")
+        self.assertTrue(pending["ok"], pending["missing"])
+        self.assertTrue(any(item.get("role") == "reviewer"
+                            and item.get("deferred")
+                            for item in pending["advisories"]))
+        self.state["status"] = "blocked"
+        orc.save(self.rundir, self.state)
+        self.assertTrue(orc.modify_locked(self.rundir, self.state,
+                                          self.state["id"], "resume"))
+        self.assertEqual(self.state["status"], "running")
+
+    def test_preapproved_implement_path_scopes_pending_grant(self):
+        self.state.update({
+            "phase": "implement", "plan_approval": False,
+            "model_routes": {"implementer": {
+                "provider": "opencode", "model": "opencode-go/x",
+                "effort": "low", "billing": "api",
+                "routing_fingerprint": "f" * 64}}})
+        preflight = orc.permission_preflight(
+            self.state, self.cfg, self.project, scope="pending")
+        self.assertFalse(preflight["ok"])
+        self.assertTrue(any(item["kind"] == "route_grant"
+                            and item["role"] == "implementer"
+                            for item in preflight["missing"]))
+
+    def test_full_parallel_reservation_is_idempotent(self):
+        route = {"provider": "opencode", "model": "opencode-go/x", "effort": "low",
+                 "billing": "api", "routing_fingerprint": "1" * 64}
+        self.state["model_routes"] = {"implementer": route}
+        self.state["route_authorizations"] = [{
+            "id": "grant-reserve", "role": "implementer",
+            "route_sha256": orc.route_authorization_sha(route),
+            "role_generation": 0, "used": 0, "max_dispatches": 2}]
+        ids, problem = orc._reserve_parallel_authority(
+            self.state, self.rundir, 2, self.cfg, None, 0)
+        self.assertIsNone(problem)
+        self.assertEqual(len(ids), 2)
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        grant = ledger["grants"]["grant-reserve"]
+        self.assertEqual(orc._grant_usage(grant), 2)
+        # The lane's own reservation replays the same exact id without a second
+        # unit of authority being consumed.
+        orc.reserve_route_grant(self.state, self.rundir, "implementer", route,
+                                reservation_id=ids[0], job_kind="parallel_writer",
+                                cfg=self.cfg)
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        self.assertEqual(orc._grant_usage(
+            ledger["grants"]["grant-reserve"]), 2)
+
+    def test_prompt_metadata_never_persists_private_sentinel_text(self):
+        sentinel = "PRIVATE-SENTINEL-7f3"
+        structured = orc._detect_permission_prompt(json.dumps({
+            "type": "permission", "permission": "bash",
+            "action": sentinel, "reason": sentinel, "message": sentinel}))
+        self.assertEqual(structured["action"], "permission request: bash")
+        self.assertNotIn(sentinel, structured["action"])
+        self.assertNotIn(sentinel, structured["reason"])
+        plain = orc._detect_permission_prompt(
+            f"Error: authentication required. {sentinel}\n", None)
+        self.assertEqual(plain["action"], "authentication required")
+        self.assertNotIn(sentinel, plain["action"] + plain["reason"])
+        record = orc._record_permission_blocked(
+            self.rundir, self.state, role="implementer", assignment="a",
+            action=structured["action"], reason=structured["reason"])
+        self.assertNotIn(sentinel, json.dumps(record))
+        self.assertEqual(record["action"], "permission request: bash")
+        status = orc.status_run(self.state["id"])
+        recap = orc.recap_run(self.state["id"], detail="quick")
+        journal = orc.journal_tail_bounded(self.rundir, 100)
+        payload = orc.stage_payload(self.rundir, self.state, "implement",
+                                    "implementer", "task", "expected", 1.0)
+        for value in (status, recap, journal, payload):
+            self.assertNotIn(sentinel, json.dumps(value))
+
+    def test_unrelated_normal_output_is_not_a_permission_block(self):
+        for text in ("authentication required for the API connect path is covered\n",
+                     "tests: authentication required\n",
+                     "The permission model is documented in the README.\n",
+                     "permission denied opening /etc/shadow in the sandbox test\n"):
+            self.assertIsNone(orc._detect_permission_prompt(text, None), text)
 
     def test_permission_block_propagates_to_running_siblings(self):
         plan = {"contract_version": 2, "status": "complete", "summary": "plan",

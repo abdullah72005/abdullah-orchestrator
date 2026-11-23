@@ -534,14 +534,20 @@ class ReviewRecoveryTests(unittest.TestCase):
                 path.unlink()
             elif name == "corrupt":
                 path.write_text("{not json")
-            elif name == "failed":
-                record = json.loads(path.read_text())
-                record["passed"] = False
-                path.write_text(json.dumps(record))
+                state["verification"]["record_sha256"] = orc._sha256_file(path)
+                orc.save(self.rundir, state)
             else:
                 record = json.loads(path.read_text())
-                record["provenance"]["source"]["provenance_complete"] = False
+                if name == "failed":
+                    record["passed"] = False
+                else:
+                    record["provenance"]["source"]["provenance_complete"] = False
                 path.write_text(json.dumps(record))
+                # Isolate semantic validation from byte-tamper detection: the
+                # reference is updated as a supervisor-shaped record so the
+                # specific semantic rejection is exercised.
+                state["verification"]["record_sha256"] = orc._sha256_file(path)
+                orc.save(self.rundir, state)
             with patch.object(orc, "call_model",
                               side_effect=AssertionError("unexpected model")) as model:
                 self.stage("review")
@@ -752,6 +758,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         if remove_reference:
             record["commands"][0].pop("log")
             record_path.write_text(json.dumps(record))
+            state["verification"]["record_sha256"] = orc._sha256_file(record_path)
+            orc.save(self.rundir, state)
         elif delete:
             log.unlink()
         return record_path, log

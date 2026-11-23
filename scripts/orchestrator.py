@@ -7159,13 +7159,50 @@ def _skill_tool_capability(tool):
     return None
 
 
-def _skill_tool_problem(role, record, route=None):
-    """Reject a configured skill tool the exact role cannot actually be offered.
+def _skill_tool_action(tool, dialect=None):
+    name = str(tool or "").strip().lower()
+    capability = _skill_tool_capability(name)
+    if capability == "read_only":
+        return "read"
+    if capability == "shell":
+        return "shell" if dialect == "v2" else "bash"
+    if capability == "edit":
+        return "edit"
+    if capability == "subagent":
+        return "subagent" if dialect == "v2" else "task"
+    if capability == "network":
+        return "websearch" if name == "websearch" else "webfetch"
+    return None
 
-    Reviewers and Explorers are read-only on every supported adapter (Codex
-    read-only sandbox, Claude plan mode, OpenCode explicit deny rules), so a
-    skill that requires shell/edit/network/subagent access from one of them is
-    visible configuration failure rather than a silent no-op in the prompt.
+
+def _adapter_offers_action(role, route, dialect, action):
+    if not isinstance(route, dict) or not route:
+        return True
+    provider = route.get("provider")
+    if provider in {"codex", "claude"}:
+        # Codex/Claude give Architect and Implementer full access; the read-only
+        # roles were already rejected before this check.
+        return True
+    if provider != "opencode":
+        return False
+    profile = opencode_profile(role, dialect if dialect in {"v1", "v2"} else "v2")
+    if dialect == "v1":
+        permission = profile.get("permission") or {}
+        value = permission.get(action, permission.get("*"))
+        if isinstance(value, dict):
+            value = value.get("*")
+        return value == "allow"
+    rules = profile.get("permissions") or []
+    return v2_effective_permission(rules, action, "*") == "allow"
+
+
+def _skill_tool_problem(role, record, route=None, *, dialect=None):
+    """Reject a configured skill tool the exact role/adapter cannot offer.
+
+    Reviewers and Explorers are read-only on every supported adapter.  An
+    Implementer is not automatically full-access: OpenCode explicitly denies
+    subagent, network and some shell actions, so a skill requiring them must
+    fail before dispatch instead of silently degrading.
     """
     provider = (route or {}).get("provider") if isinstance(route, dict) else None
     read_only = str(role or "").lower() in SKILL_READ_ONLY_ROLES
@@ -7187,6 +7224,14 @@ def _skill_tool_problem(role, record, route=None):
             return (f"skill {record.get('name')} requires {tool} ({capability}), "
                     f"which cannot be offered to read-only role {role}"
                     + (f" on provider {provider}" if provider else ""))
+        if read_only:
+            continue
+        action = _skill_tool_action(tool, dialect)
+        if action is not None and not _adapter_offers_action(
+                role, route, dialect, action):
+            return (f"skill {record.get('name')} requires {tool} ({action}), which "
+                    f"the effective {provider or 'selected'} adapter profile denies "
+                    f"for role {role}")
     return None
 
 
@@ -7233,7 +7278,7 @@ def _skill_names(value, label):
     return [_skill_name(item, label) for item in value]
 
 
-def resolve_skill_assignments(project, cfg, request):
+def resolve_skill_assignments(project, cfg, request, routes=None, dialect=None):
     """Resolve the explicit start-time skill input into durable mappings.
 
     The input is a small object: one array per role and an optional ``writers``
@@ -7275,7 +7320,10 @@ def resolve_skill_assignments(project, cfg, request):
         total = 0
         for name in names:
             record = resolve_skill_reference(name, cfg=cfg, project=project)
-            problem = _skill_tool_problem(role, record)
+            problem = _skill_tool_problem(
+                role, record,
+                (routes or {}).get(role) if isinstance(routes, dict) else None,
+                dialect=dialect)
             if problem:
                 raise ValueError(problem)
             total += record["bytes"] + sum(item["bytes"] for item in record["resources"])
@@ -9671,7 +9719,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                deadline=None, decision_binding=None, route=None, grant_state=None,
                grant_dir=None, expected_source=None, dispatch_evidence=None,
                skill_assignment=None, control_dir=None, assignment=None,
-               grant_state_dir=None):
+               grant_state_dir=None, grant_reservation_id=None):
     """Persist intent -> spawn -> observe; never replay a completed command.
 
     ``control_dir`` lets an isolated parallel-writer execution slot share the
@@ -9754,6 +9802,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 "High route or explicitly configure and authorize a High fallback.")
     authoritative_dir = grant_dir or run_dir
     grant_state_dir = grant_state_dir or authoritative_dir
+    ledger_reservation_id = grant_reservation_id or job_id
     ownership = ({"run_dir": run_dir, "state": state, "role": role,
                   "stage": kind} if isinstance(state, dict) else None)
     launch = None
@@ -9851,7 +9900,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         try:
             reservation = reserve_route_grant(
                 authorization_state, grant_dir or run_dir, role, route,
-                reservation_id=job_id, job_kind=kind, cfg=cfg,
+                reservation_id=ledger_reservation_id, job_kind=kind, cfg=cfg,
                 deadline=deadline, state_dir=grant_state_dir,
                 cancel=(lambda: _run_cancel_requested(control_dir)))
         except RuntimeError as exc:
@@ -9907,7 +9956,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             try:
                 release_route_grant(
                     authorization_state, authoritative_dir, role, route,
-                    "candidate changed before dispatch", reservation_id=job_id,
+                    "candidate changed before dispatch", reservation_id=ledger_reservation_id,
                     cfg=cfg, deadline=deadline, state_dir=grant_state_dir)
             except GrantLedgerTimeout:
                 pass
@@ -10005,7 +10054,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 release_route_grant(
                     authorization_state, authoritative_dir, role, route,
                     "handoff context refused before launch",
-                    reservation_id=job_id, cfg=cfg, deadline=deadline,
+                    reservation_id=ledger_reservation_id, cfg=cfg, deadline=deadline,
                     state_dir=grant_state_dir)
             except GrantLedgerTimeout:
                 pass
@@ -10031,7 +10080,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 release_route_grant(
                     authorization_state, authoritative_dir, role, route,
                     "inspection ownership unproven before launch",
-                    reservation_id=job_id, cfg=cfg, deadline=deadline,
+                    reservation_id=ledger_reservation_id, cfg=cfg, deadline=deadline,
                     state_dir=grant_state_dir)
             except GrantLedgerTimeout:
                 pass
@@ -10064,7 +10113,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             try:
                 release_route_grant(
                     authorization_state, authoritative_dir, role, route,
-                    str(exc), reservation_id=job_id, cfg=cfg, deadline=deadline,
+                    str(exc), reservation_id=ledger_reservation_id, cfg=cfg, deadline=deadline,
                     state_dir=grant_state_dir)
             except GrantLedgerTimeout:
                 pass
@@ -10074,7 +10123,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             try:
                 release_route_grant(
                     authorization_state, authoritative_dir, role, route,
-                    "route identity drift before launch", reservation_id=job_id,
+                    "route identity drift before launch", reservation_id=ledger_reservation_id,
                     cfg=cfg, deadline=deadline, state_dir=grant_state_dir)
             except GrantLedgerTimeout:
                 pass
@@ -10104,7 +10153,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                 release_route_grant(
                     authorization_state, authoritative_dir, role, route,
                     "whole-stage deadline expired before launch",
-                    reservation_id=job_id, cfg=cfg, deadline=deadline,
+                    reservation_id=ledger_reservation_id, cfg=cfg, deadline=deadline,
                     state_dir=grant_state_dir)
             except GrantLedgerTimeout:
                 pass
@@ -10137,7 +10186,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                     release_route_grant(
                         authorization_state, authoritative_dir, role, route,
                         "review packet invalid before launch",
-                        reservation_id=job_id, cfg=cfg, deadline=deadline,
+                        reservation_id=ledger_reservation_id, cfg=cfg, deadline=deadline,
                     state_dir=grant_state_dir)
                 except GrantLedgerTimeout:
                     pass
@@ -10186,7 +10235,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
             try:
                 release_route_grant(
                     authorization_state, authoritative_dir, role, route,
-                    "transport refused before launch", reservation_id=job_id,
+                    "transport refused before launch", reservation_id=ledger_reservation_id,
                     cfg=cfg, deadline=deadline, state_dir=grant_state_dir)
             except GrantLedgerTimeout:
                 pass
@@ -10547,7 +10596,7 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
                         release_route_grant(
                             authorization_state, authoritative_dir, role, route,
                             "unexpected E2BIG before launch",
-                            reservation_id=job_id, cfg=cfg, deadline=deadline,
+                            reservation_id=ledger_reservation_id, cfg=cfg, deadline=deadline,
                             state_dir=grant_state_dir)
                     except GrantLedgerTimeout:
                         pass
@@ -14208,6 +14257,21 @@ def verification_evidence_package(reference, current, *, run_id=None,
         success = command.get("returncode") == 0
         log = _bounded_log_text(command["log"], success=success,
                                 limit=log_limit, failure_limit=failure_log_limit)
+        recorded_log = command.get("log_sha256")
+        if evidence_version >= VERIFICATION_EVIDENCE_VERSION and not recorded_log:
+            raise VerificationEvidenceRejected(
+                "Verification command log has no supervisor-recorded digest",
+                code="evidence_incomplete",
+                details={"verification_sha256": record_sha,
+                         "log": str(command.get("log"))})
+        if recorded_log and log["sha256"] != recorded_log:
+            raise VerificationEvidenceRejected(
+                "Verification command log bytes changed after the supervisor "
+                "recorded them; a recomputed digest cannot replace the recorded "
+                "authority",
+                code="log_bytes_changed",
+                details={"verification_sha256": record_sha,
+                         "log": str(command.get("log"))})
         commands.append({
             "argv": command.get("argv"),
             "returncode": command.get("returncode"),
@@ -14449,6 +14513,17 @@ def verification_evidence_integrity(reference):
         return VerificationEvidenceRejected(
             f"Verification record is unreadable: {path}: not a JSON object",
             code="record_unreadable", details={"record": str(path)})
+    try:
+        record_sha = _sha256_file(path)
+    except OSError as exc:
+        return VerificationEvidenceRejected(
+            f"Verification record is unreadable: {path}: {exc}",
+            code="record_unreadable", details={"record": str(path)})
+    if reference.get("record_sha256") and reference.get("record_sha256") != record_sha:
+        return VerificationEvidenceRejected(
+            "Verification record bytes changed since the supervisor recorded them",
+            code="record_bytes_changed", details={"record": str(path)})
+    evidence_version = int(evidence.get("evidence_version", 1) or 1)
     commands = evidence.get("commands")
     if not isinstance(commands, list) or not commands:
         return VerificationEvidenceRejected(
@@ -14472,6 +14547,26 @@ def verification_evidence_integrity(reference):
                 f"Verification log is unreadable: {log}: {exc}",
                 code="log_unreadable",
                 details={"record": str(path), "log": str(log)})
+        recorded = command.get("log_sha256")
+        if evidence_version >= VERIFICATION_EVIDENCE_VERSION and not recorded:
+            return VerificationEvidenceRejected(
+                "Verification command log has no supervisor-recorded digest",
+                code="evidence_incomplete",
+                details={"record": str(path), "log": str(log)})
+        if recorded:
+            try:
+                current = _sha256_file(log)
+            except OSError as exc:
+                return VerificationEvidenceRejected(
+                    f"Verification log is unreadable: {log}: {exc}",
+                    code="log_unreadable",
+                    details={"record": str(path), "log": str(log)})
+            if current != recorded:
+                return VerificationEvidenceRejected(
+                    "Verification log bytes changed after the supervisor recorded "
+                    "them",
+                    code="log_bytes_changed",
+                    details={"record": str(path), "log": str(log)})
     return None
 
 
@@ -15127,6 +15222,14 @@ def resolve_parallel_batch(state, project, batch, batch_index=None, *, run_dir=N
         resolved["reason"] = (
             "A previous attempt for this batch required single-writer recovery")
         return resolved
+    for key in ("fallback_authorization", "worker_fallback_authorization"):
+        fallback = (state or {}).get(key)
+        if isinstance(fallback, dict) and fallback.get("role") == "implementer":
+            resolved["reason"] = (
+                "Parallel writers require one exact route; the implementer has a "
+                "pending one-shot fallback authorization. Use the ordinary "
+                "single-writer path or clear the pending fallback first")
+            return resolved
     try:
         directory = (Path(run_dir) if run_dir is not None
                      else (run_path(state["id"]) if (state or {}).get("id") else None))
@@ -15136,6 +15239,25 @@ def resolve_parallel_batch(state, project, batch, batch_index=None, *, run_dir=N
     if directory is not None:
         record_path, record = _integration_recovery_record(directory, index, state)
     if record_path is not None:
+        if isinstance(record, dict) and not record.get("unreadable"):
+            phase = record.get("phase")
+            if (record.get("mode") == "sibling_recovery"
+                    or str(phase).startswith("sibling")
+                    or (phase == "complete"
+                        and not _record_is_full_integration(
+                            record, {"writers": records}, state))):
+                resolved["mode"] = "single"
+                resolved["reason"] = (
+                    "A saved sibling-only parallel apply exists for this batch; "
+                    "continue with single-writer recovery from the preserved "
+                    "canonical changes and lane artifacts")
+                if index == (state or {}).get("batch_index", 0) and not state.get(
+                        "correction"):
+                    state["correction"] = resolved["reason"]
+                resolved["recovery"] = {
+                    "source": "integration_record", "path": str(record_path),
+                    "phase": phase, "mode": record.get("mode")}
+                return resolved
         # A durable integration attempt for this exact batch is always resolved
         # through the parallel recovery path, even if the canonical checkout is
         # now dirty.  A fresh single writer must never be dispatched over an
@@ -15148,6 +15270,15 @@ def resolve_parallel_batch(state, project, batch, batch_index=None, *, run_dir=N
         resolved["reason"] = (
             "Recovering the durable parallel integration record for this batch "
             f"(phase {(record or {}).get('phase') or 'unreadable'})")
+        return resolved
+    parallel = (state or {}).get("parallel_writers") or {}
+    if (isinstance(parallel, dict)
+            and _parallel_transaction_current(
+                parallel.get("transaction"), state, index)):
+        resolved["mode"] = "parallel"
+        resolved["recovery"] = {"source": "admitted_transaction"}
+        resolved["reason"] = (
+            "Recovering the admitted parallel transaction for this batch")
         return resolved
     if _parallel_transaction_admitted(state, index):
         resolved["mode"] = "parallel"
@@ -15341,13 +15472,14 @@ def _reconcile_parallel_lane_processes(run_dir, state):
     if not isinstance(lanes, dict):
         return problems
     for writer_id, lane in sorted(lanes.items()):
-        if not isinstance(lane, dict) or lane.get("status") not in {
-                "starting", "running", "uncertain"}:
+        if not isinstance(lane, dict):
             continue
+        status = lane.get("status")
         lane_dir = lane.get("lane_dir")
         if not lane_dir:
-            problems.append({"writer": writer_id,
-                             "reason": "lane execution slot is missing"})
+            if status in {"starting", "running", "uncertain"}:
+                problems.append({"writer": writer_id,
+                                 "reason": "lane execution slot is missing"})
             continue
         lane_state_path = Path(lane_dir) / "state.json"
         if not lane_state_path.is_file():
@@ -15355,37 +15487,50 @@ def _reconcile_parallel_lane_processes(run_dir, state):
             # even possible.  A missing slot therefore proves that no child was
             # launched (e.g. process loss during startup) and the lane is safely
             # retryable; an unreadable slot below is not.
-            lane["status"] = "interrupted"
-            lane.setdefault("recovery_note",
-                            "admitted lane was interrupted before its execution slot existed")
+            if status in {"starting", "running", "uncertain"}:
+                lane["status"] = "interrupted"
+                lane.setdefault("recovery_note",
+                                "admitted lane was interrupted before its execution slot existed")
             continue
         try:
             lane_state = read_json(lane_state_path)
         except (OSError, ValueError) as exc:
             problems.append({"writer": writer_id,
                              "reason": f"lane state is unreadable: {exc}"})
+            lane["status"] = "uncertain"
             continue
         active = lane_state.get("active_job") or {}
         if not isinstance(active, dict) or not active:
-            failed = lane_state.get("failed_jobs") or []
-            if not failed:
-                # Nothing was ever launched or the slot already finished.
-                lane["status"] = "interrupted"
+            failed = [item for item in lane_state.get("failed_jobs") or []
+                      if isinstance(item, dict)]
+            uncertain_failed = [item for item in failed
+                                if item.get("status") in {"uncertain", "running",
+                                                          "dispatched"}
+                                or any(job_identity(item).values())]
+            if not uncertain_failed:
+                # Nothing is recorded as launched or uncertain.
+                if status in {"starting", "running", "uncertain"}:
+                    lane["status"] = "interrupted"
                 continue
-            active = failed[-1]
+            active = uncertain_failed[-1]
         try:
             inspection = inspect_execution(
                 active, run_id=lane_state.get("id"), include_run=True)
         except (OSError, ValueError, RuntimeError) as exc:
             problems.append({"writer": writer_id, "reason": str(exc)})
+            lane["status"] = "uncertain"
             continue
         if not inspection["stopped"]:
             problems.append({"writer": writer_id,
                              "reason": _containment_detail(inspection),
                              "survivors": inspection.get("survivors", [])})
             lane["status"] = "uncertain"
+            lane["active_job"] = active
         else:
-            lane["status"] = "interrupted"
+            lane["execution_stopped"] = True
+            lane.pop("active_job", None)
+            if status in {"starting", "running", "uncertain"}:
+                lane["status"] = "interrupted"
     return problems
 
 
@@ -15433,7 +15578,8 @@ def _lane_resumable(lane):
 
 def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
                           worktree, lane_dir, base_head, base_snapshot, deadline,
-                          parent_attempt, provenance=None):
+                          parent_attempt, provenance=None,
+                          grant_reservation_id=None):
     result_path = Path(lane_dir) / "lane-result.json"
 
     def finish(payload):
@@ -15506,7 +15652,8 @@ def _parallel_lane_worker(run_dir, parent_state, cfg, project, batch, record,
             grant_state=lane_state, grant_dir=run_dir,
             grant_state_dir=lane_dir,
             control_dir=run_dir, assignment=record["id"],
-            skill_assignment=record["id"])
+            skill_assignment=record["id"],
+            grant_reservation_id=grant_reservation_id)
         lane_state = read_json(_parallel_lane_state_path(lane_dir)) \
             if _parallel_lane_state_path(lane_dir).is_file() else lane_state
         return finish({"ok": True, "report": report, "job": job,
@@ -15534,7 +15681,8 @@ def _parallel_progress(state, lanes, started_at):
     return parallel
 
 
-def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
+def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, *,
+                        expected_writers=None, mode="full", transaction=None):
     """Dry-run every patch in scratch, then apply the exact combined result."""
     record_path = _integration_record_path(run_dir, batch_index)
     previous = None
@@ -15551,7 +15699,7 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
                 "paths": list(lane.get("changed_paths") or [])}
                for writer_id, lane in sorted(lanes.items())
                if lane.get("status") == "complete" and lane.get("patch")]
-    if not patches and isinstance(previous, dict):
+    if not patches and isinstance(previous, dict) and mode == "full":
         # A recovered transaction can still be completed from its own durable
         # patch manifest even when the in-memory lane inventory was lost.
         patches = [item for item in previous.get("patches") or []
@@ -15562,6 +15710,19 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
     if len(writers) != len(patches):
         raise RuntimeError(
             "Parallel integration requires exactly one durable patch per writer")
+    expected = (sorted(expected_writers) if expected_writers is not None
+                else sorted(writers))
+    if mode == "full":
+        if not expected:
+            raise RuntimeError(
+                "Full parallel integration requires the exact approved writer set")
+        if writers != expected:
+            raise RuntimeError(
+                "Not every approved writer has a validated patch; a partial apply "
+                f"({writers}) cannot authorize verification of {expected}")
+    elif not set(writers) <= set(expected):
+        raise RuntimeError(
+            "Sibling recovery patch set is outside the approved writer assignment")
     if isinstance(previous, dict):
         recorded_writers = sorted(previous.get("writers") or [])
         if recorded_writers and recorded_writers != writers:
@@ -15575,6 +15736,20 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
                 "Recorded parallel integration was prepared against a different "
                 f"pinned base ({recorded_base}); the writers started from "
                 f"{base_head}. Recover explicitly before any apply.")
+        recorded_intent = previous.get("intent") or {}
+        if transaction is not None and recorded_intent:
+            for key in ("run_id", "batch_index", "plan_version", "plan_revision",
+                        "amendment_epoch", "base_head", "base_sha"):
+                if recorded_intent.get(key) != transaction.get(key):
+                    raise RuntimeError(
+                        "Recorded parallel integration intent no longer matches the "
+                        f"admitted transaction ({key}); no apply was attempted")
+        if previous.get("mode") == "full" and mode != "full":
+            raise RuntimeError(
+                "A full integration record cannot be downgraded to sibling recovery")
+        if previous.get("phase") == "sibling_recovery" and mode == "full":
+            raise RuntimeError(
+                "A saved sibling-only apply cannot be replayed as a full integration")
         recorded_patches = {item.get("writer"): item.get("sha256")
                             for item in previous.get("patches") or []
                             if isinstance(item, dict)}
@@ -15590,8 +15765,11 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
                 "plan_revision": state.get("plan_revision", 0),
                 "amendment_epoch": state.get("amendment_epoch", 0),
                 "authority_epoch": state.get("authority_epoch", 0),
+                "mode": mode, "expected_writers": expected,
+                "intent": (dict(transaction) if isinstance(transaction, dict) else None),
                 "writers": writers, "patches": patches, "created_at": now()}
-    if isinstance(previous, dict) and previous.get("phase") == "complete":
+    if isinstance(previous, dict) and previous.get("phase") == "complete" \
+            and previous.get("mode", "full") == "full":
         current = _checkout_content_sha(project)
         if current == previous.get("after_sha"):
             return previous
@@ -15612,7 +15790,10 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
                 "identity; no automatic reset is allowed. Recovery patches and the "
                 f"expected identity are recorded at {record_path}")
         manifest = previous
-        manifest.update({"writers": writers, "patches": patches})
+        manifest.update({"writers": writers, "patches": patches, "mode": mode,
+                         "expected_writers": expected,
+                         "intent": (dict(transaction)
+                                    if isinstance(transaction, dict) else None)})
     before = _checkout_content_digest(project)
     if before["head"] != base_head:
         raise RuntimeError(
@@ -15652,7 +15833,10 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head):
             "Canonical integration does not match the dry-run identity. The index "
             "and worktree were left intact for inspection; recovery patches and "
             f"expected identity are recorded at {record_path}")
-    manifest.update({"phase": "complete", "completed_at": now(),
+    phase = "complete" if mode == "full" else "sibling_recovery"
+    manifest.update({"phase": phase, "completed_at": now(),
+                     "remaining_writers": (sorted(set(expected) - set(writers))
+                                           if mode == "full" else []),
                      "paths": sorted({path for lane in lanes.values()
                                       for path in lane.get("changed_paths", [])})
                      or sorted({path for patch in patches
@@ -15745,7 +15929,7 @@ def _lane_outcome_status(outcome):
 
 
 def _validate_lane_outcome(run_dir, state, records, lanes, writer_id, outcome,
-                           base_head, batch_dir, batch_index):
+                           base_head, batch_dir, batch_index, transaction=None):
     """Promote a writer result only for proven complete, contained work."""
     lane = lanes.setdefault(writer_id, {})
     record = records.get(writer_id) or {}
@@ -15755,6 +15939,13 @@ def _validate_lane_outcome(run_dir, state, records, lanes, writer_id, outcome,
         lane.update({"status": "invalid",
                      "error": "durable lane result provenance does not match the "
                               "admitted launch"})
+        return
+    if transaction is not None and (
+            lane.get("base_head") != transaction.get("base_head")
+            or lane.get("base_sha") != transaction.get("base_sha")):
+        lane.update({"status": "invalid",
+                     "error": "writer lane base does not match the admitted "
+                              "transaction source"})
         return
     if lane_state.get("active_job"):
         lane.update({"status": "invalid",
@@ -15829,6 +16020,12 @@ def _finalize_parallel_integration(run_dir, state, cfg, project, batch_index,
             journal_event(run_dir, state, "parallel_delta_unavailable",
                           batch_index=batch_index, reason=str(exc))
     parallel = state.setdefault("parallel_writers", {})
+    transaction = parallel.get("transaction")
+    if isinstance(transaction, dict):
+        transaction = dict(transaction)
+        transaction["integrated_at"] = now()
+        transaction["integrated_sha"] = integration.get("after_sha")
+        parallel["transaction"] = transaction
     parallel.update({"batch_index": batch_index, "base_head": base_head,
                      "resolved": resolved, "lanes": lanes,
                      "active": False, "integrated": True,
@@ -15893,12 +16090,143 @@ def _parallel_grant_problem(state, run_dir, count):
         return {
             "kind": "parallel_grant", "role": "implementer",
             "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
-                      f"--role implementer --max-dispatches {count - remaining}",
+                      f"--role implementer --max-dispatches {count}",
             "reason": f"{count} writer dispatches are admitted but only "
-                      f"{remaining} remain in the route grant ledger",
-            "resolution": "Increase the exact-route grant before launching any lane; "
+                      f"{remaining} remain in the active exact-route grant. A new "
+                      "grant is separate; request the full admitted count.",
+            "resolution": "Authorize one exact-route grant covering all admitted "
+                          "writers; admission does not combine multiple grants and "
                           "no writer was started."}
     return None
+
+
+def _parallel_transaction_current(transaction, state, batch_index):
+    if not isinstance(transaction, dict):
+        return False
+    return (transaction.get("run_id") in (None, (state or {}).get("id"))
+            and transaction.get("batch_index") == batch_index
+            and transaction.get("plan_version") in (None, (state or {}).get("plan_version"))
+            and int(transaction.get("plan_revision", 0)) == int(
+                (state or {}).get("plan_revision", 0))
+            and int(transaction.get("amendment_epoch", 0)) == int(
+                (state or {}).get("amendment_epoch", 0)))
+
+
+def _parallel_transaction(state, project, batch_index, base_snapshot):
+    """Return the one admitted source identity for this plan/batch.
+
+    It is created once, before any lane exists, and never replaced by a later
+    canonical HEAD.  A changed checkout is a reconciliation error, not a new
+    transaction.
+    """
+    parallel = state.setdefault("parallel_writers", {})
+    transaction = parallel.get("transaction")
+    if _parallel_transaction_current(transaction, state, batch_index):
+        return transaction, False
+    snapshot = base_snapshot or source_snapshot(project)
+    transaction = {
+        "version": 1, "run_id": state.get("id"),
+        "batch_index": batch_index,
+        "plan_version": state.get("plan_version"),
+        "plan_revision": state.get("plan_revision", 0),
+        "amendment_epoch": state.get("amendment_epoch", 0),
+        "base_head": git(project, ["rev-parse", "HEAD"]).decode().strip(),
+        "base_sha": _checkout_content_sha(project),
+        "base_signature": signature(snapshot),
+        "admitted_at": now(),
+    }
+    parallel["transaction"] = transaction
+    return transaction, True
+
+
+def _canonical_matches_transaction(project, transaction):
+    if not isinstance(transaction, dict):
+        return False, "no admitted transaction identity is recorded"
+    try:
+        head = git(project, ["rev-parse", "HEAD"]).decode().strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"the canonical HEAD is unreadable: {exc}"
+    if head != transaction.get("base_head"):
+        return False, (f"the canonical HEAD moved from the admitted "
+                       f"{transaction.get('base_head')} to {head}")
+    current = _checkout_content_sha(project)
+    if current != transaction.get("base_sha"):
+        return False, ("the canonical tree/index changed after writer admission")
+    return True, None
+
+
+def _record_expected_writers(record):
+    return sorted(item for item in (record or {}).get("expected_writers") or []
+                  if isinstance(item, str))
+
+
+def _record_is_full_integration(record, resolved, state=None):
+    if not isinstance(record, dict) or record.get("phase") != "complete":
+        return False
+    expected = _record_expected_writers(record)
+    approved = sorted(record["id"] for record in (resolved or {}).get("writers", []))
+    if expected:
+        return bool(approved) and expected == approved
+    # Compatibility with a record written before expected_writers existed: it
+    # is full only when it covers every currently approved writer.
+    recorded = sorted(item.get("writer") for item in record.get("patches") or []
+                      if isinstance(item, dict) and item.get("writer"))
+    return bool(approved) and recorded == approved
+
+
+def _parallel_transaction_active(state, batch_index):
+    parallel = (state or {}).get("parallel_writers")
+    if not isinstance(parallel, dict):
+        return False
+    transaction = parallel.get("transaction")
+    if not _parallel_transaction_current(transaction, state, batch_index):
+        return False
+    lanes = parallel.get("lanes")
+    return bool(isinstance(lanes, dict) and lanes)
+
+
+def _reserve_parallel_authority(state, run_dir, count, cfg, deadline, batch_index):
+    """Consume one run-ledger reservation per admitted lane before any launch."""
+    if count <= 0:
+        return [], None
+    route = ((state or {}).get("model_routes") or {}).get("implementer")
+    if not isinstance(route, dict):
+        try:
+            route = model_route(cfg, state.get("host"), "implementer",
+                                project=Path(state["project"]))
+        except (OSError, ValueError, RuntimeError):
+            route = None
+    if not isinstance(route, dict) or not _route_grant_required(route):
+        return [], None
+    group = uuid.uuid4().hex[:12]
+    reservation_ids = []
+    for index in range(count):
+        reservation_id = f"parallel-{batch_index}-{group}-{index + 1}"
+        try:
+            reserve_route_grant(
+                state, run_dir, "implementer", route,
+                reservation_id=reservation_id, job_kind="parallel_writer",
+                cfg=cfg, deadline=deadline)
+        except (RuntimeError, ValueError) as exc:
+            for reserved in reservation_ids:
+                try:
+                    release_route_grant(
+                        state, run_dir, "implementer", route,
+                        "parallel launch never attempted",
+                        reservation_id=reserved, cfg=cfg, deadline=deadline)
+                except (RuntimeError, ValueError, GrantLedgerTimeout):
+                    pass
+            return [], {
+                "kind": "parallel_grant", "role": "implementer",
+                "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
+                          f"--role implementer --max-dispatches {count}",
+                "reason": f"could not reserve {count} admitted writer dispatches: {exc}",
+                "resolution": "Provide one exact-route grant covering the full admitted "
+                              "writer count; no writer was started."}
+        reservation_ids.append(reservation_id)
+    journal_event(run_dir, state, "parallel_authority_reserved",
+                  batch_index=batch_index, reservations=reservation_ids)
+    return reservation_ids, None
 
 
 def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
@@ -15911,14 +16239,33 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     batch_index = int(state.get("batch_index", 0))
     batch_dir = _parallel_batch_dir(run_dir, batch_index)
     batch_dir.mkdir(parents=True, exist_ok=True)
-    base_head = git(project, ["rev-parse", "HEAD"]).decode().strip()
-    base_snapshot = source_snapshot(project)
+    initial_snapshot = source_snapshot(project)
     parallel = state.setdefault("parallel_writers", {})
     if parallel.get("batch_index") != batch_index:
         parallel["lanes"] = {}
     lanes = parallel.setdefault("lanes", {})
+    if (lanes
+            and not _parallel_transaction_current(
+                parallel.get("transaction"), state, batch_index)
+            and worktree_states(project)):
+        pause_with(run_dir, state,
+                   "Admitted writer lanes exist without a recorded transaction "
+                   "source and the canonical checkout is not clean. No lane was "
+                   "reused or launched; reconcile the preserved outputs and "
+                   "checkout before retry.", "blocked")
+        return None
+    transaction, created = _parallel_transaction(
+        state, project, batch_index, initial_snapshot)
+    base_head = transaction["base_head"]
+    base_snapshot = initial_snapshot
     parallel.update({"batch_index": batch_index, "base_head": base_head,
+                     "transaction": transaction,
                      "started_at": parallel.get("started_at") or now()})
+    if created:
+        save(run_dir, state)
+        journal_event(run_dir, state, "parallel_transaction_admitted",
+                      batch_index=batch_index, base_head=base_head,
+                      base_sha=transaction["base_sha"])
     integration_path, recovery_record = _integration_recovery_record(
         run_dir, batch_index, state)
     if integration_path is not None and (
@@ -15933,6 +16280,13 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     if isinstance(recovery_record, dict):
         phase = recovery_record.get("phase")
         if phase == "complete":
+            if not _record_is_full_integration(recovery_record, resolved, state):
+                pause_with(run_dir, state,
+                           "The recorded parallel integration is not a proven full "
+                           "assignment apply; no verification or additional writer "
+                           "was started. Recover the remaining lanes explicitly.", "blocked")
+                return None
+            matches, detail = _canonical_matches_transaction(project, transaction)
             current = _checkout_content_sha(project)
             if current == recovery_record.get("after_sha"):
                 state["parallel_integration"] = recovery_record
@@ -15940,20 +16294,40 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                 return _parallel_combined_report(
                     state, resolved, lanes, recovery_record)
             pause_with(run_dir, state,
-                       "Recorded parallel integration is complete but the canonical "
-                       "checkout no longer matches its exact tree/index identity. "
-                       "No writer will be relaunched; inspect the preserved patches "
-                       f"at {batch_dir} and reconcile explicitly.", "blocked")
+                       "Recorded parallel integration is full but the canonical "
+                       "checkout no longer matches its exact integrated identity"
+                       + (f" ({detail})" if detail and not matches else "")
+                       + ". No writer will be relaunched; inspect the preserved "
+                       f"patches at {batch_dir} and reconcile explicitly.", "blocked")
+            return None
+        if recovery_record.get("mode") == "sibling_recovery" or str(phase).startswith(
+                "sibling"):
+            pause_with(run_dir, state,
+                       "A saved sibling-only apply exists for this batch. It cannot "
+                       "authorize verification and cannot be replayed as a full "
+                       "parallel integration; continue with the recorded "
+                       "single-writer recovery or reconcile the preserved patches.",
+                       "blocked")
             return None
         if recovery_record.get("before_sha") and recovery_record.get(
                 "after_sha"):
+            matches, detail = _canonical_matches_transaction(project, transaction)
+            if not matches:
+                pause_with(run_dir, state,
+                           "Parallel integration was previously prepared but the "
+                           f"canonical source changed: {detail}. No writer or apply "
+                           "was started; preserve the lanes and reconcile the "
+                           "admitted base before retry.", "blocked")
+                return None
             # Resolve the admitted transaction before any fresh dispatch.
             integration_started = time.monotonic()
             started_at = time.monotonic()
             try:
                 integration = _parallel_integrate(
                     run_dir, state, project, batch_index, lanes,
-                    recovery_record.get("base_head") or base_head)
+                    recovery_record.get("base_head") or base_head,
+                    expected_writers=[record["id"] for record in resolved.get(
+                        "writers", [])], mode="full", transaction=transaction)
             except RuntimeError as exc:
                 state["parallel_integration"] = {
                     "version": 1, "batch_index": batch_index,
@@ -15978,6 +16352,22 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                    "Parallel writer execution is not proven stopped: " + json.dumps(
                        problems, ensure_ascii=False), "uncertain")
         return None
+    matches, detail = _canonical_matches_transaction(project, transaction)
+    if not matches:
+        pause_with(run_dir, state,
+                   "The admitted parallel source changed before resume: "
+                   + (detail or "unknown identity change")
+                   + ". Every lane output is preserved; no writer was launched and "
+                   "no patch was applied. Restore/reconcile the admitted base "
+                   f"({base_head}) explicitly before retry.", "blocked")
+        return None
+    base_snapshot = source_snapshot(project)
+    if signature(base_snapshot) != transaction.get("base_signature"):
+        pause_with(run_dir, state,
+                   "The canonical source provenance changed since writer admission; "
+                   "no writer was launched and no patch was applied. Restore or "
+                   "start a new run against a reproducible base.", "blocked")
+        return None
     state["parallel_active"] = None
     records = {record["id"]: record for record in resolved.get("writers", [])}
     results = {}
@@ -15991,31 +16381,23 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                     != state.get("amendment_epoch", 0)):
                 lane["stale_plan"] = True
             else:
-                ok, _reason = _lane_resumable(lane)
-                if ok:
-                    continue
-                durable = _durable_lane_outcome(lane)
-                if durable is not None:
-                    results[writer_id] = durable
-                    lane["status"] = "collected"
-                    continue
+                if (lane.get("base_head") != transaction.get("base_head")
+                        or lane.get("base_sha") != transaction.get("base_sha")):
+                    lane["base_mismatch"] = True
+                else:
+                    ok, _reason = _lane_resumable(lane)
+                    if ok:
+                        continue
+                    durable = _durable_lane_outcome(lane)
+                    if durable is not None:
+                        results[writer_id] = durable
+                        lane["status"] = "collected"
+                        continue
         relaunch.append(writer_id)
-    grant_problem = _parallel_grant_problem(state, run_dir, len(relaunch))
-    if grant_problem:
-        preflight = state.get("permission_preflight")
-        if not isinstance(preflight, dict):
-            preflight = state["permission_preflight"] = {
-                "version": 1, "missing": [], "advisories": [], "checked_by": "supervisor"}
-        preflight.setdefault("missing", []).append(grant_problem)
-        preflight["ok"] = False
-        pause_with(run_dir, state,
-                   "Parallel dispatch blocked before any launch: "
-                   + grant_problem.get("reason", "insufficient route authority")
-                   + ". " + grant_problem.get("resolution", ""), "blocked")
-        return None
     started_at = time.monotonic()
     parent_attempt = _current_attempt()
     threads = []
+    prepared = []
     for writer_id in relaunch:
         record = records[writer_id]
         lane_dir = batch_dir / writer_id
@@ -16061,7 +16443,7 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
             "status": "starting", "goal": record["goal"],
             "batch_index": batch_index, "worktree": str(worktree),
             "lane_dir": str(lane_dir), "base_head": base_head,
-            "base_sha": _checkout_content_sha(worktree),
+            "base_sha": transaction["base_sha"],
             "plan_version": state.get("plan_version"),
             "plan_revision": state.get("plan_revision", 0),
             "amendment_epoch": state.get("amendment_epoch", 0),
@@ -16072,22 +16454,57 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         # model child) exists, so a parent crash cannot hide a running lane.
         atomic_json(lane_dir / "intent.json", provenance)
         save(run_dir, state)
-        journal_event(run_dir, state, "parallel_writer_started",
+        journal_event(run_dir, state, "parallel_writer_prepared",
                       assignment=writer_id, goal=record["goal"],
                       worktree=str(worktree), base_head=base_head,
                       attempt_id=attempt_id, attempt=attempt)
-        # Snapshot the parent once in the supervisor thread.  Lane threads must
-        # never deepcopy a state dict the parent is concurrently mutating.
-        lane_parent_state = copy.deepcopy(state)
+        prepared.append({"writer_id": writer_id, "record": record,
+                         "worktree": worktree, "lane_dir": lane_dir,
+                         "lane_base": lane_base, "provenance": provenance,
+                         "attempt": attempt,
+                         "parent_state": copy.deepcopy(state)})
+    reservation_ids, grant_problem = _reserve_parallel_authority(
+        state, run_dir, len(prepared), cfg, deadline, batch_index)
+    if grant_problem:
+        for item in prepared:
+            lane = lanes.setdefault(item["writer_id"], {})
+            if lane.get("status") in {"starting", "running"}:
+                lane.update({"status": "interrupted",
+                             "recovery_note": ("launch was never attempted because "
+                                               "authority reservation failed")})
+        preflight = state.get("permission_preflight")
+        if not isinstance(preflight, dict):
+            preflight = state["permission_preflight"] = {
+                "version": 1, "missing": [], "advisories": [], "checked_by": "supervisor"}
+        preflight.setdefault("missing", []).append(grant_problem)
+        preflight["ok"] = False
+        pause_with(run_dir, state,
+                   "Parallel dispatch blocked before any launch: "
+                   + grant_problem.get("reason", "insufficient route authority")
+                   + ". " + grant_problem.get("resolution", ""), "blocked")
+        return None
+    for index, item in enumerate(prepared):
+        writer_id = item["writer_id"]
+        record = item["record"]
+        worktree = item["worktree"]
+        lane_dir = item["lane_dir"]
+        lane_base = item["lane_base"]
+        provenance = item["provenance"]
+        lane = lanes.setdefault(writer_id, {})
+        if index < len(reservation_ids):
+            lane["grant_reservation_id"] = reservation_ids[index]
+        save(run_dir, state)
 
         def target(writer_id=writer_id, record=record, worktree=worktree,
                    lane_dir=lane_dir, lane_base=lane_base,
-                   lane_parent_state=lane_parent_state,
-                   provenance=provenance):
+                   lane_parent_state=item["parent_state"],
+                   provenance=provenance,
+                   reservation_id=(reservation_ids[index]
+                                   if index < len(reservation_ids) else None)):
             _parallel_lane_worker(
                 run_dir, lane_parent_state, cfg, project, batch, record, worktree,
                 lane_dir, base_head, lane_base, deadline, parent_attempt,
-                provenance)
+                provenance, grant_reservation_id=reservation_id)
         thread = threading.Thread(target=target, name=f"writer-{writer_id}",
                                   daemon=True)
         threads.append((writer_id, thread))
@@ -16155,6 +16572,18 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                       assignment=writer_id,
                       status=_lane_outcome_status(outcome),
                       error=outcome.get("error"))
+        if writer_id not in announced:
+            announced.add(writer_id)
+            status = _lane_outcome_status(outcome)
+            lane["milestone"] = (outcome.get("report") or {}).get("summary") or status
+            _record_stage_milestone(
+                run_dir, state,
+                f"writer {writer_id} {status}"
+                + (f": {(outcome.get('report') or {}).get('summary') or outcome.get('error')}"
+                   if (outcome.get('report') or {}).get("summary")
+                   or outcome.get("error") else ""),
+                source="worker_reported", assignment=writer_id,
+                next_action="validate and integrate writer output")
     # A lane worker writes its durable result from a separate thread; collect
     # the in-memory holder for the lanes that produced it directly.
     for writer_id, outcome in list(results.items()):
@@ -16168,14 +16597,20 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
             continue
         if outcome.get("ok"):
             _validate_lane_outcome(run_dir, state, records, lanes, writer_id,
-                                   outcome, base_head, batch_dir, batch_index)
+                                   outcome, base_head, batch_dir, batch_index,
+                                   transaction)
         else:
             lane_state = outcome.get("lane_state") or {}
-            lane.update({"status": ("interrupted"
-                                    if outcome.get("interrupted")
+            active = lane_state.get("active_job")
+            active_status = (active or {}).get("status") if isinstance(active, dict) else None
+            uncertain = bool(isinstance(active, dict) and active) or active_status in {
+                "running", "dispatched", "uncertain"}
+            lane.update({"status": ("uncertain" if uncertain else
+                                    "interrupted" if outcome.get("interrupted")
                                     else "failed"),
                          "error": outcome.get("error"),
                          "lane_run_id": lane_state.get("id"),
+                         "active_job": active,
                          "finished_at": now()})
             blocked = lane_state.get("permission_blocked")
             if isinstance(blocked, dict):
@@ -16183,6 +16618,18 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     _parallel_progress(state, lanes, started_at)
     state["parallel_active"] = None
     save(run_dir, state)
+    uncertain_lanes = {writer_id: lane for writer_id, lane in lanes.items()
+                       if lane.get("status") == "uncertain"
+                       or (isinstance(lane.get("active_job"), dict)
+                           and lane.get("active_job"))}
+    if uncertain_lanes:
+        pause_with(run_dir, state,
+                   "Parallel writer containment is unproven for: "
+                   + ", ".join(sorted(uncertain_lanes))
+                   + ". Preserve every output and reconcile the exact execution "
+                   "identity before any cleanup, integration, fallback or retry.",
+                   "uncertain")
+        return None
     # Preserve every lane.  Cancellation, a permission block and an explicit
     # escalation stop short of integration so a resume can reuse completed
     # output without double apply.
@@ -16222,9 +16669,22 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     incomplete = [writer_id for writer_id in records
                   if lanes.get(writer_id, {}).get("status") != "complete"]
     if incomplete:
+        fallback_reason = (
+            "Parallel writer(s) " + ", ".join(incomplete)
+            + " did not complete safely; completed work is preserved and "
+              "integrated as a separately recorded sibling-only recovery. "
+              "Single-writer recovery will finish the remaining scope from the "
+              "preserved lane artifacts.")
         state.setdefault("parallel_fallback_batches", {})[str(batch_index)] = {
             "at": now(), "incomplete": incomplete,
-            "reason": "one or more parallel writers did not complete safely"}
+            "reason": fallback_reason}
+        if not state.get("correction"):
+            state["correction"] = fallback_reason
+        # Persist the recovery intent *before* applying a sibling-only patch so a
+        # crash cannot leave a partial apply that looks like a full integration.
+        save(run_dir, state)
+        journal_event(run_dir, state, "parallel_fallback_admitted",
+                      batch_index=batch_index, incomplete=incomplete)
         # Integrate successfully completed siblings so their work is durable.
         completed = {writer_id: lane for writer_id, lane in lanes.items()
                      if lane.get("status") == "complete"
@@ -16232,27 +16692,34 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         if completed:
             integration_path = _integration_record_path(run_dir, batch_index)
             pre_integration_sha = _checkout_content_sha(project)
+            matches, detail = _canonical_matches_transaction(project, transaction)
+            if not matches:
+                pause_with(run_dir, state,
+                           "The canonical source changed before sibling recovery: "
+                           + (detail or "unknown identity change")
+                           + ". Every lane is preserved and no apply was attempted.",
+                           "blocked")
+                return None
             try:
                 if not integration_path.is_file():
-                    _parallel_integrate(run_dir, state, project, batch_index,
-                                        completed, base_head)
+                    _parallel_integrate(
+                        run_dir, state, project, batch_index, completed, base_head,
+                        expected_writers=[record["id"] for record in records.values()],
+                        mode="sibling_recovery", transaction=transaction)
                 state["parallel_integration"] = read_json(integration_path)
             except RuntimeError as exc:
                 if _checkout_content_sha(project) != pre_integration_sha:
                     pause_with(run_dir, state,
-                               "Parallel integration was interrupted after changing "
-                               "the canonical checkout; inspect the recorded recovery "
-                               "patches before any retry: " + str(exc), "blocked")
+                               "Parallel sibling recovery was interrupted after "
+                               "changing the canonical checkout; inspect the recorded "
+                               "recovery patches before any retry: " + str(exc),
+                               "blocked")
                 else:
                     pause_with(run_dir, state,
-                               "Parallel integration failed after a writer failure: "
-                               + str(exc), "blocked")
+                               "Parallel sibling recovery failed after a writer "
+                               "failure: " + str(exc), "blocked")
                 return None
-        reason = ("Parallel writer(s) " + ", ".join(incomplete)
-                  + " did not complete safely; completed work is preserved and "
-                    "integrated. Single-writer recovery will finish the remaining "
-                    "scope from the preserved lane artifacts.")
-        handle_repair(run_dir, state, cfg, reason)
+        handle_repair(run_dir, state, cfg, fallback_reason)
         return None
     # All writers completed: dry-run and apply one combined integration.
     integration_started = time.monotonic()
@@ -16272,9 +16739,19 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         except (OSError, subprocess.SubprocessError, ValueError):
             integration_boundary = None
     pre_integration_sha = _checkout_content_sha(project)
+    matches, detail = _canonical_matches_transaction(project, transaction)
+    if not matches:
+        pause_with(run_dir, state,
+                   "The canonical source changed while the writers were completing: "
+                   + (detail or "unknown identity change")
+                   + ". All lane output is preserved; no integration or verification "
+                   "was started. Reconcile the admitted base before retry.", "blocked")
+        return None
     try:
-        integration = _parallel_integrate(run_dir, state, project, batch_index,
-                                          lanes, base_head)
+        integration = _parallel_integrate(
+            run_dir, state, project, batch_index, lanes, base_head,
+            expected_writers=[record["id"] for record in records.values()],
+            mode="full", transaction=transaction)
     except RuntimeError as exc:
         if _checkout_content_sha(project) != pre_integration_sha:
             state["parallel_integration"] = {
@@ -16376,7 +16853,34 @@ def _preflight_block_reason(preflight, prefix):
     return prefix + (" " + "; ".join(items[:8]) if items else "")
 
 
-def permission_preflight(state, cfg, project, plan=None):
+def _preflight_pending_scope(state, plan, scope):
+    """Which requirements actually block the next transition.
+
+    ``all`` is used when approving a plan or recording a fresh run; ``pending``
+    is used by resume so a completed paid role or a later batch is visible but
+    cannot block unrelated remaining work.
+    """
+    if scope == "all":
+        return {"all_roles": True, "checks": True, "parallel": True,
+                "reason": "whole approved run"}
+    phase = (state or {}).get("phase")
+    roles = set()
+    stage_role = (STAGES.get(phase) or {}).get("role")
+    if stage_role:
+        roles.add(stage_role)
+    checks = phase in {"plan", "implement", "verify"}
+    if phase in {"accept", "integrate"}:
+        batches = (plan or {}).get("batches") or []
+        checks = bool(state.get("fresh_verification_required")
+                      or any(batch.get("repeat_checks")
+                             for batch in batches if isinstance(batch, dict)))
+    parallel = phase in {"plan", "implement"}
+    return {"all_roles": False, "roles": sorted(roles), "checks": checks,
+            "parallel": parallel,
+            "reason": f"pending stage {phase or 'unknown'}"}
+
+
+def permission_preflight(state, cfg, project, plan=None, *, scope="all"):
     """Group known missing decisions before they become invisible prompts."""
     state = state or {}
     cfg = cfg or config()
@@ -16384,6 +16888,16 @@ def permission_preflight(state, cfg, project, plan=None):
     plan = plan if isinstance(plan, dict) else state.get("plan")
     missing = []
     advisories = []
+    scope_info = _preflight_pending_scope(state, plan, scope)
+
+    def pending_role(role):
+        return scope_info["all_roles"] or role in scope_info.get("roles", set())
+
+    def add(item, blocking):
+        if blocking:
+            missing.append(item)
+        else:
+            advisories.append({**item, "deferred": True, "blocking": False})
     routes = state.get("model_routes") or {}
     roles = {"architect", "implementer", "reviewer"}
     if state.get("require_explorer") or state.get("explorer_policy"):
@@ -16392,9 +16906,10 @@ def permission_preflight(state, cfg, project, plan=None):
         route = routes.get(role)
         if not isinstance(route, dict):
             continue
+        blocking = pending_role(role)
         executable = _route_executable_problem(role, route)
         if executable:
-            missing.append(executable)
+            add(executable, blocking)
         billing = route.get("billing")
         if not _route_grant_required(route):
             # Default host subscription and OpenCode Go behavior needs no new
@@ -16410,14 +16925,14 @@ def permission_preflight(state, cfg, project, plan=None):
         except (RuntimeError, ValueError) as exc:
             authorization = {"authorized": False, "reason": str(exc)}
         if not authorization.get("authorized"):
-            missing.append({
+            add({
                 "kind": "route_grant", "role": role,
                 "action": f"orchestrator.py authorize-route {state.get('id', '<run>')} "
                           f"--role {role}",
                 "reason": authorization.get("reason") or (
                     "route requires an explicit per-run grant"),
                 "resolution": "Authorize the exact reviewed route before the "
-                              "affected dispatch."})
+                              "affected dispatch."}, blocking)
     skills = (state.get("skill_assignments") or {})
 
     def skill_records():
@@ -16429,65 +16944,79 @@ def permission_preflight(state, cfg, project, plan=None):
                 yield "implementer", record, routes.get("implementer")
 
     for role, record, route in skill_records():
-        problem = _skill_tool_problem(role, record, route)
+        blocking = pending_role(role)
+        problem = _skill_tool_problem(role, record, route,
+                                      dialect=((state.get("route_selection") or {}).get(
+                                          "dialect")))
         if problem:
-            missing.append({
+            add({
                 "kind": "skill_tool", "role": role,
                 "assignment": record.get("name"), "action": "offer the required tool",
                 "reason": problem,
                 "resolution": "Provide a tool the exact role can use, or remove that "
-                              "explicit skill assignment; skill prose never grants it."})
+                              "explicit skill assignment; skill prose never grants it."},
+                blocking)
         artifact = _skill_artifact_problem(record)
         if artifact:
-            missing.append({
+            add({
                 "kind": "skill_artifact", "role": role,
                 "assignment": record.get("name"),
                 "action": "restore/re-resolve the pinned skill artifact",
                 "reason": artifact,
                 "resolution": "Start a new run with the intended skill content; a "
-                              "changed pinned copy cannot be delivered."})
+                              "changed pinned copy cannot be delivered."}, blocking)
     batches = (plan or {}).get("batches") if isinstance(plan, dict) else None
     if isinstance(batches, list):
         for index, batch in enumerate(batches):
             if not isinstance(batch, dict):
                 continue
             checks = batch.get("checks") or []
+            checks_blocking = bool(
+                scope_info.get("checks")
+                and (scope_info.get("all_roles")
+                     or index == (state or {}).get("batch_index", 0)))
             for check in checks:
                 if not isinstance(check, list) or not check:
                     continue
                 policy = verification_command_policy(check, cfg, project=project)
                 if not policy.get("allowed"):
-                    missing.append({
+                    add({
                         "kind": "check_policy", "role": "supervisor",
                         "assignment": f"batch {index + 1}",
                         "action": "approve an explicit scoped command-policy exception",
                         "reason": ", ".join(policy.get("rejected_reasons") or ["rejected"]),
                         "resolution": "Add a written operator-attributed exception "
                                       "in verification.command_policy, or change the "
-                                      "planned argv."})
+                                      "planned argv."}, checks_blocking)
                     continue
                 executable = _check_executable_problem(check, cfg)
                 if executable:
-                    missing.append({
-                        "kind": "check_executable", "role": "supervisor",
-                        "assignment": f"batch {index + 1}", **executable})
+                    add({"kind": "check_executable", "role": "supervisor",
+                         "assignment": f"batch {index + 1}", **executable},
+                        checks_blocking)
             writers = _writer_assignment_records(batch.get("writers"))
             if writers:
+                parallel_blocking = bool(
+                    scope_info.get("parallel")
+                    and (scope_info.get("all_roles")
+                         or index == (state or {}).get("batch_index", 0)))
                 if len(writers) > _parallel_permission(state):
-                    advisories.append({
+                    add({
                         "kind": "parallel_permission", "role": "supervisor",
                         "assignment": f"batch {index + 1}",
                         "reason": f"{len(writers)} writers planned; run permits "
                                   f"{_parallel_permission(state)}",
                         "resolution": "Start a new run with explicit parallel "
-                                      "permission, or accept one writer."})
+                                      "permission, or accept one writer."},
+                        parallel_blocking)
                 problem = _parallel_source_problem(project) if project else None
                 if problem:
-                    advisories.append({
+                    add({
                         "kind": "parallel_source", "role": "supervisor",
                         "assignment": f"batch {index + 1}", "reason": problem,
                         "resolution": "Commit/clean/reproduce the base or accept "
-                                      "the documented one-writer fallback."})
+                                      "the documented one-writer fallback."},
+                        parallel_blocking)
                 if (len(writers) > 1
                         and len(writers) <= _parallel_permission(state)
                         and not problem and state.get("id")):
@@ -16508,32 +17037,90 @@ def permission_preflight(state, cfg, project, plan=None):
                                  state, ledger_dir, required_count)
                              if ledger_dir and required_count else None)
                     if grant:
-                        missing.append({**grant,
-                                        "assignment": f"batch {index + 1}"})
+                        add({**grant, "assignment": f"batch {index + 1}"},
+                            parallel_blocking)
     result = {"version": 1, "ok": not missing, "missing": missing,
               "advisories": advisories, "checked_at": now(),
-              "checked_by": "supervisor",
-              "scope": ("routes/billing/executables, role and writer skill tools and "
-                        "pinned artifacts, approved check argv policy and check "
-                        "executables, parallel worktree and grant prerequisites")}
+              "checked_by": "supervisor", "scope": "all" if scope_info.get(
+                  "all_roles") else "pending",
+              "pending_scope": scope_info,
+              "scope_description": ("routes/billing/executables, role and writer "
+                                    "skill tools and pinned artifacts, approved "
+                                    "check argv policy and check executables, "
+                                    "parallel worktree and grant prerequisites")}
     state["permission_preflight"] = result
     return result
 
 
 PERMISSION_PROMPT_PATTERNS = (
-    "permission required", "permission denied", "approval required",
+    "permission required", "approval required",
     "authentication required", "login required", "not logged in",
     "credential required", "api key required", "missing api key",
-    "tool permission", "authorization required", "access denied",
+    "authorization required",
 )
+SAFE_PROMPT_TOOLS = frozenset({
+    "bash", "shell", "edit", "write", "read", "glob", "grep", "list",
+    "task", "subagent", "webfetch", "websearch", "question",
+    "external_directory", "apply_patch", "patch",
+})
+PERMISSION_CLASS_REASONS = {
+    "permission": "provider requested permission for a scoped action",
+    "approval": "provider requested interactive approval",
+    "authorization": "provider requested new authorization",
+    "credential": "provider requested credential/authentication",
+}
+
+
+def _safe_prompt_tool(value):
+    text = str(value or "").strip().lower()
+    return text if text in SAFE_PROMPT_TOOLS else None
+
+
+def _prompt_class(kind, part_type):
+    values = (str(kind or "").lower(), str(part_type or "").lower())
+    if any(value in {"credential_required", "authentication_required",
+                     "login_required"} or "credential" in value
+           or "authentication" in value or "login" in value for value in values):
+        return "credential"
+    if any("approval" in value or value == "approval_required" for value in values):
+        return "approval"
+    if any("authorization" in value or value == "authorization_required"
+           for value in values):
+        return "authorization"
+    if any("permission" in value for value in values):
+        return "permission"
+    return None
+
+
+def _prompt_line_looks_like_prompt(line, pattern):
+    low = (line or "").strip().lower()
+    if not low:
+        return False
+    noise = ("test", "assert", "expected", "mock", "fixture", "doc", "readme",
+             "example", "summary", "message", "covered")
+    if any(word in low for word in noise):
+        return False
+    if low.startswith(("error:", "fatal:", "warning:")):
+        return True
+    if low.endswith(("?", ":")):
+        return True
+    if re.search(r"(?:\(|\[)?y/n(?:\)|\])?|yes/no|press enter", low):
+        return True
+    if not low.startswith(pattern):
+        return False
+    remainder = low[len(pattern):]
+    if any(word in remainder for word in
+           ("enter", "login", "log in", "run ", "please", "provide", "continue")):
+        return True
+    return len(low) <= len(pattern) + 12 and not low.endswith(".")
 
 
 def _detect_permission_prompt(raw, route=None):
     """Conservative structured first, documented plaintext only as a fallback.
 
-    A structured record that explicitly names a permission/approval request is
-    authoritative.  Plain-text phrases are only inspected for providers whose
-    CLI is documented to print them; unknown causes remain labeled unknown.
+    Only bounded prompt classes, safe action identifiers and fixed reasons are
+    returned.  Arbitrary structured message/action/reason fields and adjacent
+    plaintext are never copied into authorization state, journal or status.
     """
     provider = (route or {}).get("provider") if isinstance(route, dict) else None
     structured = None
@@ -16549,34 +17136,30 @@ def _detect_permission_prompt(raw, route=None):
         kind = str(record.get("type") or "").lower()
         part = record.get("part") if isinstance(record.get("part"), dict) else {}
         part_type = str(part.get("type") or "").lower()
-        if (kind.startswith("permission") or kind in {
-                "approval_required", "authorization_required",
-                "credential_required"}
-                or part_type in {"permission", "approval", "authorization"}):
-            detail = (record.get("permission") or record.get("action")
-                      or part.get("permission") or part.get("action")
-                      or record.get("message") or "structured permission request")
-            structured = {"action": _safe_progress_text(detail, 160),
-                          "reason": _safe_progress_text(
-                              record.get("reason") or record.get("message")
-                              or "provider requested new authority", 200),
+        prompt_class = _prompt_class(kind, part_type)
+        if prompt_class:
+            tool = _safe_prompt_tool(
+                record.get("permission") or record.get("action")
+                or part.get("permission") or part.get("action"))
+            action = f"{prompt_class} request"
+            if tool:
+                action += f": {tool}"
+            structured = {"action": action,
+                          "reason": PERMISSION_CLASS_REASONS[prompt_class],
                           "source": "structured"}
             break
     if structured:
         return structured
     if provider not in {None, "codex", "claude"}:
         return None
-    lowered = (raw or "").lower()
     for pattern in PERMISSION_PROMPT_PATTERNS:
-        position = lowered.find(pattern)
-        if position < 0:
-            continue
-        snippet = (raw or "")[max(0, position - 80): position + len(pattern) + 120]
-        if "test" in snippet.lower() and "permission" not in snippet.lower():
-            continue
-        return {"action": pattern,
-                "reason": _safe_progress_text(snippet, 220),
-                "source": "documented_plaintext"}
+        for line in (raw or "").splitlines():
+            if pattern in line.lower() and _prompt_line_looks_like_prompt(
+                    line, pattern):
+                return {"action": pattern,
+                        "reason": ("documented noninteractive authorization/"
+                                   f"credential prompt matched: {pattern}"),
+                        "source": "documented_plaintext"}
     return None
 
 
@@ -16587,18 +17170,13 @@ def _unknown_permission_hint(raw):
              "login required", "not logged in", "credential required",
              "api key required", "authorization required")
     for term in terms:
-        position = lowered.rfind(term)
-        if position < 0:
-            continue
-        tail = lowered[position:position + len(term) + 160]
-        line = tail.splitlines()[0] if tail else ""
-        if "test" in line and "permission" not in line:
-            continue
-        return {"action": "unrecognized authority/credential prompt",
-                "reason": _safe_progress_text(
-                    "provider output matches a prompt term but its structured "
-                    "shape is unknown; no authority was granted", 220),
-                "source": "unknown"}
+        for line in lowered.splitlines():
+            if term in line and _prompt_line_looks_like_prompt(line, term):
+                return {"action": "unrecognized authority/credential prompt",
+                        "reason": ("provider output matches a prompt term but its "
+                                   "structured shape is unknown; no authority was "
+                                   "granted"),
+                        "source": "unknown"}
     return None
 
 
@@ -16870,6 +17448,12 @@ def advance(run_dir, state, cfg, deadline=None):
             save(run_dir, state)
         return
     if stage == "implement":
+        lane_problems = _reconcile_parallel_lane_processes(run_dir, state)
+        if lane_problems:
+            pause_with(run_dir, state,
+                       "Parallel writer execution is not proven stopped: "
+                       + json.dumps(lane_problems, ensure_ascii=False), "uncertain")
+            return
         prior_writer = any(job.get("role") == "implementer" for job in state.get("completed_jobs", []) + state.get("failed_jobs", []))
         if (state.get("handoff_authorization") and not prior_writer
                 and not state.get("active_job")
@@ -16904,7 +17488,9 @@ def advance(run_dir, state, cfg, deadline=None):
             state["phase"] = "verify"
             save(run_dir, state)
             return
+        fallback_reason = None
         if batch.get("writers") and resolved_parallel.get("reason"):
+            fallback_reason = resolved_parallel["reason"]
             journal_event(run_dir, state, "parallel_plan_single_fallback",
                           batch_index=state["batch_index"],
                           reason=resolved_parallel["reason"])
@@ -16912,13 +17498,14 @@ def advance(run_dir, state, cfg, deadline=None):
                 "at": now(), "batch_index": state["batch_index"],
                 "reason": resolved_parallel["reason"]})
         requirements = user_requirements(state)
+        correction = state.get("correction", "") or fallback_reason or ""
         context = {
             "project": str(project), "run_id": state["id"], "batch_index": state["batch_index"],
             "approved_plan_version": state["plan_version"], "batch": batch,
             "requirements": requirements,
             "invariants": state["plan"].get("invariants", []), "source": source_snapshot(project),
             "approved_handoff": strip_duplicate_requirements(state.get("approved_handoff"), requirements),
-            "prior_attempt": state.get("implementation"), "correction": state.get("correction", ""),
+            "prior_attempt": state.get("implementation"), "correction": correction,
             "exploration": state.get("exploration"),
             "instruction": (
                 "Implement the batch with meaningful tests, respecting untouched existing changes. "
@@ -17251,8 +17838,7 @@ def advance(run_dir, state, cfg, deadline=None):
         current = source_snapshot(project)
         try:
             validate_acceptance_references(
-                state, project,
-                ([state["verification"]] if single else references),
+                state, project, references,
                 run_dir=run_dir, cfg=cfg,
                 required=[[str(item) for item in check]
                           for check in state["plan"]["batches"][
@@ -18866,7 +19452,9 @@ def create_run(*, project, goal=None, goal_file=None, host=None,
     if max_parallel_writers < 1 or max_parallel_writers > PARALLEL_WRITER_LIMIT:
         raise ValueError(
             f"max_parallel_writers must be between 1 and {PARALLEL_WRITER_LIMIT}")
-    skill_assignments = resolve_skill_assignments(project, cfg, skills)
+    skill_assignments = resolve_skill_assignments(
+        project, cfg, skills, routes=selection["routes"],
+        dialect=selection.get("dialect"))
     trial = validate_planning_trial(cfg, host, ordinary_planning_trial,
                                     declared_risk=planning_trial_risk,
                                     metadata=selection.get("metadata", {}),
@@ -19734,7 +20322,8 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                 "Parallel writer execution is not proven stopped: "
                 + json.dumps(lane_problems, ensure_ascii=False))
         ensure_checkout_lease(state, adopt_legacy=True)
-        preflight = permission_preflight(state, config(), Path(state["project"]))
+        preflight = permission_preflight(state, config(), Path(state["project"]),
+                                        scope="pending")
         if not preflight.get("ok"):
             state["status"] = "blocked"
             state["pause_reason"] = _preflight_block_reason(

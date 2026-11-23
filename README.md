@@ -478,14 +478,18 @@ complete ordered command set, plan/batch/revision and amendment/recovery epochs,
 source and runtime-input identity, environment, toolchain, configuration,
 command policy, containment and per-command log digests still match. The same
 rule is re-applied after the Architect returns and before completion, including
-for a derived reuse record, which must still bind its original records and logs.
-The record bytes that are hashed are the exact bytes parsed. A changed candidate,
-tampered/removed/replaced record or log, environment drift, explicit
-`repeat_checks: true` (honored for single- and multi-batch integration),
-`fresh_verification_required`, or an uncovered final check executes the checks
-again. Worker prose and arbitrary local test claims are never authority. Old
-evidence records stay readable with legacy validation but cannot silently
-certify a new completion.
+for a derived reuse record, which must still bind its original records and logs,
+and for every formal record included in the Architect decision (for example the
+original batch record alongside an explicit-repeat final record). The Reviewer
+packet is refused before assembly if the formal record or any recorded command
+log no longer matches its supervisor digest; a recomputed digest from altered
+bytes cannot replace the recorded authority. The record bytes that are hashed
+are the exact bytes parsed. A changed candidate, tampered/removed/replaced record
+or log, environment drift, explicit `repeat_checks: true` (honored for single-
+and multi-batch integration), `fresh_verification_required`, or an uncovered
+final check executes the checks again. Worker prose and arbitrary local test
+claims are never authority. Old evidence records stay readable with legacy
+validation but cannot silently certify a new completion.
 
 ### Opt-in parallel writers
 
@@ -505,30 +509,43 @@ Parallel writing is a per-run permission, not an implicit model choice:
   guessing.
 - With permission, each writer gets an isolated Git worktree on the same pinned
   clean base, its own persisted execution slot/job artifacts and the existing
-  route grant, quota, cancellation and containment controls. Parent state and
-  `active_job` are not shared between lanes. Lane intent, attempt identity,
-  run/plan/revision/epoch/batch/assignment/base provenance are journaled and
-  saved before the thread can launch; a durable result is only promoted when its
-  provenance and stopped execution still match.
+  route grant, quota, cancellation and containment controls. One transaction
+  source identity (HEAD plus exact tree/index provenance) is admitted once and
+  reused across resume; an operator commit or unexpected index/worktree change
+  preserves every lane and blocks with an explicit reconciliation path instead of
+  starting a lane or applying a patch against a new base. Lane intent, attempt
+  identity, run/plan/revision/epoch/batch/assignment/base provenance are
+  journaled and saved before the thread can launch; a durable result is only
+  promoted when its provenance and stopped execution still match.
+- Authority for every admitted lane is reserved in the run-scoped ledger before
+  any model dispatch. An insufficient grant or a failed reservation produces
+  zero launches and releases reservations whose launch was never attempted.
 - A lane is promoted only for a `complete` report. A valid `blocked` report
   preserves its partial worktree/patch and exact report but never enters the
   verification candidate; a completed sibling is preserved for reuse and is not
   redispatched. A `needs_architect` report goes to strong diagnosis with its
   original question, evidence and unknowns. Resume re-runs only the blocked or
   unfinished lanes, and an explicit one-writer plan stays on the ordinary path.
+  Durable lane execution uncertainty is checked even when the parent label says
+  failed; no cleanup, integration, fallback or replacement launch occurs until
+  the exact old execution is proven stopped.
 - The supervisor inspects actual tracked/untracked/rename/delete/mode and index
   changes, rejects unowned paths or HEAD changes, generates a binary patch per
   lane and proves a dry integration in scratch before touching the canonical
-  checkout. Integration is recorded with the exact all-writer set and expected
-  before/after tree/index identities. A completed apply advances to verification
-  without another writer; an unreadable, foreign or unrecognized intermediate
-  identity blocks before any model dispatch instead of resetting or applying
-  twice. Interruption during startup or collection is reconciled from durable
-  lane records, so a completed sibling is validated rather than relaunched.
-- If one sibling fails after another completes, the completed patch is preserved
-  and integrated; the unfinished lane's worktree stays inspectable and the batch
-  moves to single-writer recovery. Ownership conflicts, unplanned dependencies
-  or integration conflicts preserve every lane and route to strong diagnosis.
+  checkout. A full integration is recorded with the exact approved writer set,
+  transaction intent and expected before/after tree/index identities. A
+  completed full apply advances to verification without another writer; an
+  unreadable, foreign or unrecognized intermediate identity blocks before any
+  model dispatch instead of resetting or applying twice. Interruption during
+  startup or collection is reconciled from durable lane records, so a completed
+  sibling is validated rather than relaunched.
+- If one sibling fails after another completes, the completed patch is applied
+  only as a separately identified sibling-only recovery after the single-writer
+  intent is saved. That partial apply can never authorize verification; a crash
+  before the normal recovery save resumes through single-writer recovery. The
+  unfinished lane's worktree stays inspectable. Ownership conflicts, unplanned
+  dependencies or integration conflicts preserve every lane and route to strong
+  diagnosis.
 - The combined canonical candidate then goes through supervisor checks, one
   fresh independent Reviewer and the strong Architect decision. Timing records
   lane wall/sum, integration and review separately; concurrent durations are
@@ -553,10 +570,12 @@ approval, shell access, routing, billing or scope. Native per-role loading is no
 claimed for the supported adapters; the prompt-injection fallback is recorded in
 state. Required tools are checked against what the exact role can be offered on
 its adapter, not just the supervisor's PATH: a Reviewer/Explorer skill that needs
-shell, edit, network or subagent access fails visibly, while an Implementer skill
-may use it. Missing, changed or over-budget pinned artifacts fail before the
-affected stage; changing the original source after start does not mutate the
-pinned run-local copy. Task keywords never select a skill.
+shell, edit, network or subagent access fails visibly, and an OpenCode Implementer
+skill is bound to that adapter's explicit deny rules (for example subagent or
+network access) rather than the host's broader capability. Missing, changed or
+over-budget pinned artifacts fail before the affected stage; changing the
+original source after start does not mutate the pinned run-local copy. Task
+keywords never select a skill.
 
 ### Authorization preflight and blocked recovery
 
@@ -565,21 +584,27 @@ for the actual route/billing policy (default host subscription and OpenCode Go
 need no new grant; API/OpenCode subscription/free/local do), route and check
 executables under the check environment, role/writer skill tools and pinned
 artifacts, approved check argv policy and parallel worktree/grant prerequisites.
-Plan approval and resume record/continue only when that preflight is clear;
-otherwise they stay blocked with every missing item and action grouped. A
-parallel fan-out reserves enough known route authority before launching any lane,
-so an insufficient grant produces zero launches. `authorize-route` remains the
-human billing grant; `approve-plan`, fallback, destructive changes and deployment
-keep their existing gates.
+Plan approval checks the whole approved run; resume blocks only on pending stage
+requirements, so an exhausted grant for an already-completed paid role is shown
+as deferred instead of stopping unrelated acceptance work. A parallel fan-out
+reserves one run-ledger reservation per admitted lane before any model dispatch;
+an insufficient grant or a failed reservation produces zero launches and
+releases reservations whose launch was never attempted. When a grant is short,
+the surfaced remedy requests one new exact-route grant for the full admitted
+count because admission does not combine multiple grants. `authorize-route`
+remains the human billing grant; `approve-plan`, fallback, destructive changes
+and deployment keep their existing gates.
 
 An unexpected recognized structured permission/approval request, or a documented
 noninteractive credential prompt, is observed while the worker or supervisor
-check is still active and stops it ahead of the normal stage/check deadline. It
-becomes a bounded sanitized durable record with role, assignment, action, reason
-and resume step. Running sibling lanes see the shared pause and are contained
-through the existing guard/interrupt paths before a blocked state is claimed;
-completed edits and verified evidence are preserved. The run reports **blocked**,
-not a retry loop. After the scoped authorization/authentication is corrected,
+check is still active and stops it ahead of the normal stage/check deadline. Only
+bounded prompt classes, safe action identifiers and fixed reasons are persisted;
+arbitrary structured message/action/reason text and adjacent plaintext excerpts
+never reach authorization state, the journal, status or recap. Running sibling
+lanes see the shared pause and are contained through the existing guard/interrupt
+paths before a blocked state is claimed; completed edits and verified evidence
+are preserved. The run reports **blocked**, not a retry loop. After the scoped
+authorization/authentication is corrected,
 `orchestrator_resume` re-runs preflight and continues from the preserved boundary
 without repeating completed work. Unknown causes are labelled unknown; raw
 credential text is not persisted.

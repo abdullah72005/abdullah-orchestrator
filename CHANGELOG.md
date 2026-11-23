@@ -66,6 +66,34 @@ uses [Semantic Versioning](https://semver.org/).
   original records/logs after the Architect returns. The exact hashed bytes are
   parsed, removed/replaced logs are detected, and multi-batch repeat policy is
   honored at integration.
+- Parallel transactions now admit one canonical source identity (HEAD plus exact
+  tree/index provenance) that is reused across resume and checked before every
+  lane launch, promotion and apply. An operator commit or unexpected
+  index/worktree change preserves every lane and blocks for explicit
+  reconciliation; completed lanes are reused after the admitted base is restored.
+- Full integration records are bound to the exact approved writer set and
+  transaction intent. A sibling-only failure apply is recorded as
+  `sibling_recovery` and can never authorize verification; the single-writer
+  fallback intent is saved before the apply so a crash window cannot expose a
+  partial candidate.
+- Lane cleanup, escalation, fallback and retry now inspect durable execution
+  identity for every admitted lane, including lanes labelled failed. Uncertain
+  old execution blocks resume and replacement launch until proven stopped.
+- Permission records now persist only bounded prompt classes, safe action
+  identifiers and fixed reasons; structured private text and adjacent plaintext
+  excerpts never reach state, journal, status or recap. Plaintext detection
+  requires prompt-shaped lines and normal test output is not authority.
+- Reviewer admission validates the formal record and recorded command-log digests
+  before assembling the packet, and post-decision acceptance revalidates every
+  evidence record used by the Architect decision, including a formal record
+  alongside an explicit-repeat final record.
+- Parallel authority is reserved one unit per admitted lane before any model
+  dispatch, with idempotent lane replay and release for launches never attempted.
+  Resume preflight blocks only pending-stage requirements and self-reports the
+  full-grant remedy.
+- Skill required tools are bound to the effective per-role adapter profile,
+  including OpenCode Implementer subagent/network deny rules, and missing pinned
+  artifacts are surfaced before the affected pending dispatch.
 
 ### Changed
 
