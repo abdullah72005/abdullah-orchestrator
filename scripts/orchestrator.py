@@ -10050,9 +10050,12 @@ def _write_no_exec_refusal(state, job, *, reason_code, reasons,
         "job_id": job.get("id"), "kind": job.get("kind"),
         "role": job.get("role"), "route": job.get("route"),
         "route_sha256": route_authorization_sha(job.get("route") or {}),
+        "role_generation": job.get("role_generation"),
         "reservation_id": job.get("grant_reservation_id"),
         "attempt_id": job.get("grant_attempt_id"),
+        "assignment": job.get("assignment"),
         "batch_index": job.get("batch_index"),
+        "parent_run_id": ((state or {}).get("parent_run_id")),
         "reason_code": reason_code, "reasons": list(reasons),
         "expected_binding": job.get("expected_binding"),
         "observed_binding": observed_binding,
@@ -10131,8 +10134,104 @@ def _refuse_dispatch_before_spawn(run_dir, state, jpath, preflight, job, *,
     return cleared
 
 
-def _finish_no_exec_refusal(folder, state):
+def _refusal_coordinate_problem(state, job, record):
+    """Compare a refusal record with the durable dispatch attempt identity."""
+    if record.get("job_id") != job.get("id"):
+        return "the refusal record belongs to another job"
+    if record.get("kind") != job.get("kind"):
+        return "the refusal record belongs to another dispatch kind"
+    if record.get("role") != job.get("role"):
+        return "the refusal record belongs to another role"
+    if record.get("attempt_id") != job.get("grant_attempt_id"):
+        return "the refusal record belongs to another admitted attempt"
+    if record.get("reservation_id") != job.get("grant_reservation_id"):
+        return "the refusal record belongs to another route reservation"
+    if record.get("batch_index") != job.get("batch_index"):
+        return "the refusal record belongs to another batch"
+    if record.get("role_generation") != job.get("role_generation"):
+        return "the refusal record belongs to another role generation"
+    if record.get("expected_binding") != job.get("expected_binding"):
+        return "the refusal record has a different expected binding"
+    if record.get("route_sha256") != route_authorization_sha(
+            job.get("route") or {}):
+        return "the refusal record belongs to another route"
+    if record.get("run_id") not in (None, state.get("id")):
+        return "the refusal record belongs to another run"
+    return None
+
+
+def _refusal_reservation_problem(state, ledger_dir, job, record):
+    """Prove the refusal record names the exact durable ledger reservation."""
+    reservation_id = record.get("reservation_id")
+    if not reservation_id:
+        return None
+    try:
+        ledger = load_grant_ledger(ledger_dir)
+    except RuntimeError as exc:
+        return str(exc)
+    matches = []
+    for grant_id, grant in (ledger.get("grants") or {}).items():
+        if not isinstance(grant, dict):
+            continue
+        for reservation in grant.get("reservations") or []:
+            if (isinstance(reservation, dict)
+                    and reservation.get("id") == reservation_id):
+                matches.append((grant_id, reservation))
+    if len(matches) != 1:
+        return "the exact refused reservation is missing or ambiguous in the ledger"
+    _grant_id, reservation = matches[0]
+    if reservation.get("role") != record.get("role"):
+        return "the refused reservation belongs to another role"
+    if reservation.get("route_sha256") != record.get("route_sha256"):
+        return "the refused reservation belongs to another route"
+    allowed_runs = {item for item in (
+        record.get("run_id"), record.get("parent_run_id"),
+        state.get("id"), state.get("parent_run_id")) if item}
+    if (reservation.get("run_id") is not None
+            and reservation.get("run_id") not in allowed_runs):
+        return "the refused reservation belongs to another run"
+    if (reservation.get("role_generation") is not None
+            and record.get("role_generation") is not None
+            and int(reservation["role_generation"])
+            != int(record["role_generation"])):
+        return "the refused reservation belongs to another role generation"
+    if (job.get("assignment") is not None
+            and reservation.get("lane") not in (None, job.get("assignment"))):
+        return "the refused reservation belongs to another lane"
+    if (record.get("attempt_id") is not None
+            and reservation.get("attempt_id") not in (None,
+                                                       record.get("attempt_id"))):
+        return "the refused reservation belongs to another attempt"
+    if (record.get("batch_index") is not None
+            and reservation.get("batch_index") not in (None,
+                                                       record.get("batch_index"))):
+        return "the refused reservation belongs to another batch"
+    if reservation.get("state") not in {"reserved", "launched", "released"}:
+        return "the refused reservation has an unknown ledger state"
+    return None
+
+
+def _refusal_consent_problem(record):
+    """Validate restored one-shot consent against the refused dispatch role."""
+    for key in ("fallback_authorization", "worker_fallback_authorization"):
+        consent = record.get(key)
+        if consent is None:
+            continue
+        if not isinstance(consent, dict):
+            return "the refusal record carries malformed one-shot consent"
+        if consent.get("role") != record.get("role"):
+            return "the refusal record carries consent for another role"
+        generation = consent.get("role_generation")
+        if (generation is not None and record.get("role_generation") is not None
+                and int(generation) != int(record["role_generation"])):
+            return "the refusal record carries consent for another role generation"
+    return None
+
+
+def _finish_no_exec_refusal(state, state_dir=None, ledger_dir=None):
     """Complete a persisted proven no-child refusal after a restart."""
+    state_dir = Path(state_dir) if state_dir is not None else None
+    ledger_dir = Path(ledger_dir) if ledger_dir is not None else state_dir
     job = state.get("active_job")
     if not isinstance(job, dict):
         return False
@@ -10149,10 +10248,6 @@ def _finish_no_exec_refusal(folder, state):
             or record.get("active_job_created")
             or record.get("model_calls_counted")):
         return False
-    if record.get("job_id") != job.get("id") or record.get("role") != job.get("role"):
-        return False
-    if record.get("run_id") not in (None, state.get("id")):
-        return False
     job_dir = Path(job.get("path") or "")
     if not job_dir or any((job_dir / name).exists() for name in
                           ("execution.json", "completion.json", "report.json",
@@ -10160,15 +10255,25 @@ def _finish_no_exec_refusal(folder, state):
         return False
     if job.get("pid") or job.get("process") or job.get("session_id"):
         return False
+    problem = (_refusal_coordinate_problem(state, job, record)
+               or _refusal_reservation_problem(state, ledger_dir, job, record)
+               or _refusal_consent_problem(record))
+    if problem:
+        state["refusal_coordinate_conflict"] = {
+            "at": now(), "job_id": job.get("id"), "reason": problem,
+            "refusal_path": str(path)}
+        if state_dir is not None:
+            save(state_dir, state)
+        return False
     reservation_id = record.get("reservation_id")
     if reservation_id:
         route = job.get("route") or record.get("route") or {}
         try:
             released = release_route_grant(
-                state, folder, record.get("role"), route,
+                state, ledger_dir, record.get("role"), route,
                 "proven no-child refusal completed after restart",
                 reservation_id=reservation_id, cfg=config(), deadline=None,
-                state_dir=folder, proven_no_exec=True)
+                state_dir=state_dir or ledger_dir, proven_no_exec=True)
         except (GrantLedgerTimeout, RuntimeError, ValueError):
             return False
         if released is None:
@@ -10198,8 +10303,8 @@ def _finish_no_exec_refusal(folder, state):
     state["pause_reason"] = (
         "Dispatch not attempted: " + "; ".join(
             record.get("reasons") or ["proven no-child refusal completed after restart"]))
-    save(folder, state)
-    journal_event(folder, state, "preflight_refusal_completed",
+    save(state_dir or ledger_dir, state)
+    journal_event(state_dir or ledger_dir, state, "preflight_refusal_completed",
                   job_id=job.get("id"), reason_code=record.get("reason_code"),
                   reservation_id=reservation_id)
     return True
@@ -16304,7 +16409,8 @@ def _stopped_attempt_source_binding(state, index, *, current,
 
 
 def _accept_parallel_sibling_recovery(state, index, record, project=None,
-                                      record_path=None, record_sha256=None):
+                                      record_path=None, record_sha256=None,
+                                      integration_proof_sha256=None):
     """Persist the one accepted transition bound to its exact sibling manifest."""
     snapshot = source_snapshot(project) if project is not None else None
     entry = {
@@ -16320,6 +16426,7 @@ def _accept_parallel_sibling_recovery(state, index, record, project=None,
         "record_path": (str(record_path) if record_path is not None else None),
         "record_sha256": (record_sha256 if record_sha256 is not None
                           else _manifest_file_sha(record_path)),
+        "integration_proof_sha256": integration_proof_sha256,
         "mode": "sibling_single_writer",
     }
     state.setdefault("parallel_sibling_single", {})[str(index)] = entry
@@ -16854,6 +16961,13 @@ def _reconcile_parallel_lane_processes(run_dir, state):
                              "reason": f"lane state is unreadable: {exc}"})
             lane["status"] = "uncertain"
             continue
+        if _finish_no_exec_refusal(lane_state, Path(lane_dir), run_dir):
+            # A lane's proven no-child refusal is bookkeeping, not an unknown
+            # child; its exact reservation was refunded and its active job cleared.
+            lane["status"] = "blocked"
+            lane["active_job"] = None
+            lane["no_exec_refusal_completed"] = True
+            continue
         active = lane_state.get("active_job") or {}
         if not isinstance(active, dict) or not active:
             failed = [item for item in lane_state.get("failed_jobs") or []
@@ -17069,6 +17183,181 @@ def _integration_patch_view(patch):
             if key not in {"data", "touched_paths"}}
 
 
+INTEGRATION_PROOF_VERSION = 1
+
+
+def _integration_proof_path(run_dir, batch_index):
+    return _parallel_batch_dir(run_dir, batch_index) / "integration-proof.json"
+
+
+def _integration_proof_payload(state, batch_index, base_head, transaction, mode,
+                               expected, patches, before_sha, after_sha):
+    """The immutable authority written before the first canonical write."""
+    proof_patches = [_integration_patch_view(item) for item in patches]
+    for view, item in zip(proof_patches, patches):
+        view["touched_paths"] = list(item.get("touched_paths") or [])
+    return {
+        "version": INTEGRATION_PROOF_VERSION, "at": now(),
+        "run_id": state.get("id"),
+        "plan_version": state.get("plan_version"),
+        "plan_revision": state.get("plan_revision", 0),
+        "amendment_epoch": state.get("amendment_epoch", 0),
+        "authority_epoch": state.get("authority_epoch", 0),
+        "batch_index": int(batch_index), "base_head": base_head,
+        "base_sha": (transaction or {}).get("base_sha"),
+        "intent": (dict(transaction) if isinstance(transaction, dict) else None),
+        "mode": mode, "expected_writers": sorted(expected),
+        "writers": sorted(item["writer"] for item in patches),
+        "patches": proof_patches,
+        "before_sha": before_sha, "after_sha": after_sha,
+    }
+
+
+def _write_integration_proof(run_dir, state, batch_index, payload):
+    path = _integration_proof_path(run_dir, batch_index)
+    atomic_json(path, payload)
+    digest = _sha256_file(path)
+    journal_event(run_dir, state, "parallel_integration_prepared",
+                  batch_index=int(batch_index), mode=payload.get("mode"),
+                  proof_sha256=digest, before_sha=payload.get("before_sha"),
+                  after_sha=payload.get("after_sha"),
+                  writers=payload.get("writers"),
+                  patches=[{"writer": item.get("writer"),
+                            "sha256": item.get("sha256")}
+                           for item in payload.get("patches") or []])
+    return payload, digest
+
+
+def _load_integration_proof(run_dir, batch_index, expected_sha256=None):
+    path = _integration_proof_path(run_dir, batch_index)
+    if not path.is_file():
+        return None, None, "the prepared integration proof is missing"
+    bound, problem = _read_bound_manifest(path, expected_sha256)
+    if problem:
+        return None, None, problem
+    return bound["record"], bound["sha256"], None
+
+
+def _integration_proof_consistency(proof, *, batch_index, base_head, transaction,
+                                   mode, expected, patches):
+    if not isinstance(proof, dict):
+        return "the prepared integration proof is not an object"
+    if proof.get("version") != INTEGRATION_PROOF_VERSION:
+        return "the prepared integration proof has an unsupported version"
+    if proof.get("batch_index") != int(batch_index):
+        return "the prepared integration proof belongs to another batch"
+    if proof.get("mode") != mode:
+        return "the prepared integration proof belongs to another integration mode"
+    if proof.get("base_head") != base_head:
+        return "the prepared integration proof belongs to another pinned base"
+    intent = proof.get("intent") or {}
+    if isinstance(transaction, dict) and intent:
+        for key in ("run_id", "batch_index", "plan_version", "plan_revision",
+                    "amendment_epoch", "base_head", "base_sha"):
+            if intent.get(key) != transaction.get(key):
+                return (f"the prepared integration proof no longer matches the "
+                        f"admitted transaction ({key})")
+    if sorted(proof.get("expected_writers") or []) != sorted(expected):
+        return "the prepared integration proof covers a different approved writer set"
+    if sorted(proof.get("writers") or []) != sorted(
+            item["writer"] for item in patches):
+        return "the prepared integration proof covers different writer patches"
+    recorded = {item.get("writer"): (item.get("path"), item.get("sha256"))
+                for item in proof.get("patches") or [] if isinstance(item, dict)}
+    current = {item["writer"]: (item.get("path"), item.get("sha256"))
+               for item in patches}
+    if recorded != current:
+        return "the prepared integration proof patch identities changed"
+    if not proof.get("before_sha") or not proof.get("after_sha"):
+        return "the prepared integration proof has no exact before/after identity"
+    if proof["before_sha"] == proof["after_sha"]:
+        return "the prepared integration proof has an unchanged after identity"
+    return None
+
+
+def _proof_matches_record(proof, record):
+    for key in ("before_sha", "after_sha"):
+        if proof.get(key) != record.get(key):
+            return (f"the prepared integration proof {key} differs from the "
+                    "progress record")
+    if sorted(proof.get("writers") or []) != sorted(record.get("writers") or []):
+        return "the prepared integration proof writers differ from the progress record"
+    return None
+
+
+def _load_or_prepare_integration_proof(state, run_dir, project, batch_index,
+                                       base_head, transaction, mode, expected,
+                                       patches, record):
+    """Load the immutable proof, or rebuild it only from provable evidence."""
+    proof_path = _integration_proof_path(run_dir, batch_index)
+    if proof_path.is_file():
+        expected_sha = (record or {}).get("proof_sha256")
+        proof, digest, problem = _load_integration_proof(
+            run_dir, batch_index, expected_sha)
+        if problem:
+            return None, None, problem
+        problem = _integration_proof_consistency(
+            proof, batch_index=batch_index, base_head=base_head,
+            transaction=transaction, mode=mode, expected=expected,
+            patches=patches)
+        if problem:
+            return None, None, problem
+        if record is not None:
+            problem = _proof_matches_record(proof, record)
+            if problem:
+                return None, None, problem
+        return proof, digest, None
+    if record is None:
+        return None, None, None
+    before_sha = record.get("before_sha")
+    after_sha = record.get("after_sha")
+    if not before_sha or not after_sha or before_sha == after_sha:
+        return None, None, (
+            "the prior integration record has no provable before/after identity")
+    scratch_after = _scratch_integration_sha(
+        project, run_dir, batch_index, base_head, patches)
+    if scratch_after != after_sha:
+        return None, None, (
+            "the prior integration record cannot be proved: the admitted patches "
+            "produce a different after identity")
+    payload = _integration_proof_payload(
+        state, batch_index, base_head, transaction, mode, expected, patches,
+        before_sha, after_sha)
+    proof, digest = _write_integration_proof(
+        run_dir, state, batch_index, payload)
+    return proof, digest, None
+
+
+def _sibling_integration_proof(state, run_dir, project, batch_index, record,
+                               resolved, *, require_after_current=True):
+    """Load/rebuild the prepared proof the sibling transition must consume."""
+    if not isinstance(record, dict) or record.get("unreadable"):
+        return None, None, "the recorded sibling integration is unreadable"
+    base_head = record.get("base_head")
+    transaction = (state.get("parallel_writers") or {}).get("transaction")
+    expected = sorted(item["id"] for item in (resolved or {}).get("writers", []))
+    patches, problem = _admit_integration_patches(
+        project, base_head, record.get("patches") or [], resolved)
+    if problem:
+        return None, None, problem
+    proof, digest, problem = _load_or_prepare_integration_proof(
+        state, run_dir, project, batch_index, base_head, transaction,
+        "sibling_recovery", expected, patches, record)
+    if problem:
+        return None, None, problem
+    if proof is None:
+        return None, None, "the prepared sibling integration proof is missing"
+    if proof.get("mode") != "sibling_recovery":
+        return None, None, "the prepared proof is not a sibling-only integration"
+    if require_after_current:
+        current = _checkout_content_sha(project)
+        if current != proof.get("after_sha"):
+            return None, None, (
+                "the canonical checkout does not match the prepared sibling proof "
+                "after identity")
+    return proof, digest, None
+
+
 def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, *,
                         expected_writers=None, mode="full", transaction=None,
                         previous=None, previous_sha256=None,
@@ -17173,85 +17462,15 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
             raise RuntimeError(patch_problem)
     patches = admitted_patches
     writers = sorted(item["writer"] for item in patches)
-    patch_views = [_integration_patch_view(item) for item in patches]
-    manifest = {"version": 1, "batch_index": batch_index, "base_head": base_head,
-                "run_id": state.get("id"),
-                "plan_version": state.get("plan_version"),
-                "plan_revision": state.get("plan_revision", 0),
-                "amendment_epoch": state.get("amendment_epoch", 0),
-                "authority_epoch": state.get("authority_epoch", 0),
-                "mode": mode, "expected_writers": expected,
-                "intent": (dict(transaction) if isinstance(transaction, dict) else None),
-                "writers": writers, "patches": patch_views, "created_at": now()}
     final_phase = "complete" if mode == "full" else "sibling_recovery"
-    current = _checkout_content_sha(project)
-    if isinstance(previous, dict):
-        admitted_before = previous.get("before_sha")
-        admitted_after = previous.get("after_sha")
-        if not admitted_before or not admitted_after:
-            raise RuntimeError(
-                "Recorded parallel integration has no exact before/after identity; "
-                f"inspect the preserved evidence at {record_path}")
-        if admitted_before == admitted_after:
-            raise RuntimeError(
-                "Recorded parallel integration has an impossible unchanged after "
-                f"identity; inspect the preserved evidence at {record_path}")
-        if current not in {admitted_before, admitted_after}:
-            raise RuntimeError(
-                "Parallel integration was interrupted with an unrecognized checkout "
-                "identity; no automatic reset is allowed. Recovery patches and the "
-                f"expected identity are recorded at {record_path}")
-        if current == admitted_after and previous.get("phase") == final_phase:
-            # A record already finalized was proven when it was written; the
-            # admitted identity is still confirmed by the exact current checkout.
-            return previous
-        expected_after = _scratch_integration_sha(
-            project, run_dir, batch_index, base_head, patches)
-        if expected_after != admitted_after:
-            raise RuntimeError(
-                "The admitted integration patches do not produce the recorded after "
-                "identity; the admitted identity is preserved and no canonical "
-                f"apply was attempted. Inspect {record_path}")
-        if expected_after == admitted_before:
-            raise RuntimeError(
-                "The admitted integration patches produce no change from the before "
-                f"identity; no canonical apply was attempted. Inspect {record_path}")
-        if current == admitted_after:
-            # Exact-after: the completed checkout is proven against the admitted
-            # result before finishing attribution. Never reapply or replace it.
-            manifest = previous
-            manifest.update({"patches": patch_views, "writers": writers,
-                             "mode": mode, "expected_writers": expected,
-                             "phase": final_phase,
-                             "applied": sorted(writers), "completed_at": now(),
-                             "paths": sorted({path for patch in patches
-                                              for path in patch["touched_paths"]})})
-            atomic_json(record_path, manifest)
-            return manifest
-        # Exact-before: hold the admitted identity, then recheck it at the
-        # canonical mutation point before applying the same verified bytes.
-        before = _checkout_content_digest(project)
-        if before["head"] != base_head:
-            raise RuntimeError(
-                "Canonical checkout moved since writers started; refusing to integrate")
-        if _checkout_content_sha(project) != admitted_before:
-            raise RuntimeError(
-                "The canonical checkout changed after scratch validation; the exact "
-                f"before boundary is no longer present. Inspect {record_path}")
-        if worktree_states(project):
-            raise RuntimeError(
-                "Canonical checkout became dirty while writers were running; refusing to "
-                "integrate onto unreproducible source")
-        manifest = previous
-        manifest.update({"patches": patch_views, "writers": writers, "mode": mode,
-                         "expected_writers": expected,
-                         "intent": (dict(transaction)
-                                    if isinstance(transaction, dict) else None),
-                         "phase": "prepared", "applied": [],
-                         "prepared_at": now()})
-        atomic_json(record_path, manifest)
-    else:
-        before_sha = current
+    proof, proof_sha256, proof_problem = _load_or_prepare_integration_proof(
+        state, run_dir, project, batch_index, base_head, transaction, mode,
+        expected, patches, previous)
+    if proof_problem:
+        raise RuntimeError(proof_problem)
+    if proof is None:
+        # Fresh integration: establish the immutable authority before the first
+        # canonical write.
         before = _checkout_content_digest(project)
         if before["head"] != base_head:
             raise RuntimeError(
@@ -17260,21 +17479,65 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
             raise RuntimeError(
                 "Canonical checkout became dirty while writers were running; refusing to "
                 "integrate onto unreproducible source")
-        expected_after = _scratch_integration_sha(
+        before_sha = _checkout_content_sha(project)
+        after_sha = _scratch_integration_sha(
             project, run_dir, batch_index, base_head, patches)
-        if expected_after == before_sha:
+        if after_sha == before_sha:
             raise RuntimeError(
                 "The admitted integration patches produce no change from the before "
                 "identity; no canonical apply was attempted")
-        manifest.update({"phase": "prepared", "before_sha": before_sha,
-                         "after_sha": expected_after, "applied": [],
-                         "prepared_at": now()})
+        payload = _integration_proof_payload(
+            state, batch_index, base_head, transaction, mode, expected, patches,
+            before_sha, after_sha)
+        proof, proof_sha256 = _write_integration_proof(
+            run_dir, state, batch_index, payload)
+    before_sha = proof["before_sha"]
+    after_sha = proof["after_sha"]
+    manifest = {
+        "version": 1, "batch_index": batch_index, "base_head": base_head,
+        "run_id": state.get("id"),
+        "plan_version": state.get("plan_version"),
+        "plan_revision": state.get("plan_revision", 0),
+        "amendment_epoch": state.get("amendment_epoch", 0),
+        "authority_epoch": state.get("authority_epoch", 0),
+        "mode": mode, "expected_writers": expected,
+        "intent": (dict(transaction) if isinstance(transaction, dict) else None),
+        "writers": writers, "patches": proof["patches"],
+        "proof_sha256": proof_sha256,
+        "created_at": ((previous or {}).get("created_at") or now())}
+    current = _checkout_content_sha(project)
+    if current == after_sha:
+        # Exact-after: the proof authorizes this exact result. Finish bookkeeping
+        # once and never reapply or replace the admitted identities.
+        manifest.update({"phase": final_phase, "applied": sorted(writers),
+                         "completed_at": now(),
+                         "paths": sorted({path for patch in proof["patches"]
+                                          for path in patch.get("touched_paths", [])})})
         atomic_json(record_path, manifest)
-    # Recheck the exact admitted before boundary immediately before mutation.
-    if _checkout_content_sha(project) != manifest.get("before_sha"):
+        return manifest
+    if current != before_sha:
         raise RuntimeError(
-            "The canonical checkout changed after scratch validation; the exact "
+            "Parallel integration was interrupted with an unrecognized checkout "
+            "identity; no automatic reset is allowed. Recovery patches and the "
+            f"prepared proof are recorded at {record_path}")
+    # Exact-before: continue the approved apply exactly once, after rechecking the
+    # exact before boundary at the canonical mutation point.
+    before = _checkout_content_digest(project)
+    if before["head"] != base_head:
+        raise RuntimeError(
+            "Canonical checkout moved since writers started; refusing to integrate")
+    if _checkout_content_sha(project) != before_sha:
+        raise RuntimeError(
+            "The canonical checkout changed after proof preparation; the exact "
             f"before boundary is no longer present. Inspect {record_path}")
+    if worktree_states(project):
+        raise RuntimeError(
+            "Canonical checkout became dirty while writers were running; refusing to "
+            "integrate onto unreproducible source")
+    manifest.update({"phase": "prepared", "before_sha": before_sha,
+                     "after_sha": after_sha, "applied": [],
+                     "prepared_at": now()})
+    atomic_json(record_path, manifest)
     for patch in patches:
         _apply_writer_patch(project, Path(patch["path"]), index=True,
                             data=patch["data"])
@@ -17282,17 +17545,17 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
         manifest["phase"] = "applying"
         atomic_json(record_path, manifest)
     after = _checkout_content_sha(project)
-    if after != manifest.get("after_sha"):
+    if after != after_sha:
         raise RuntimeError(
-            "Canonical integration does not match the dry-run identity. The index "
-            "and worktree were left intact for inspection; recovery patches and "
-            f"expected identity are recorded at {record_path}")
+            "Canonical integration does not match the prepared proof identity. The "
+            "index and worktree were left intact for inspection; recovery patches "
+            f"and expected identity are recorded at {record_path}")
     manifest.update({"phase": final_phase, "completed_at": now(),
                      "remaining_writers": (sorted(set(expected) - set(writers))
                                            if mode == "full" else []),
                      "paths": sorted({path for lane in lanes.values()
                                       for path in lane.get("changed_paths", [])})
-                     or sorted({path for patch in patches
+                     or sorted({path for patch in proof["patches"]
                                 for path in patch.get("touched_paths", [])})})
     atomic_json(record_path, manifest)
     return manifest
@@ -17949,9 +18212,9 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                 str(batch_index)) or {})
             if isinstance(fallback, dict):
                 reason = fallback.get("reason")
-            if identity == "before" and phase != "complete":
-                # The recorded sibling apply had not started: continue exactly
-                # that apply, still without full-integration authority.
+            if identity == "before" or identity == "after":
+                # Both transitions consume the same prepared proof; exact-after
+                # only finishes bookkeeping, never reapplies.
                 try:
                     integration = _parallel_integrate(
                         run_dir, state, project, batch_index, {},
@@ -17969,15 +18232,6 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                                f"{batch_dir}.", "blocked")
                     return None
                 state["parallel_integration"] = integration
-            else:
-                # The sibling apply finished (or is exactly at its recorded after
-                # identity): only finish bookkeeping, never re-apply.
-                manifest = dict(recovery_record)
-                if phase != "complete":
-                    manifest.update({"phase": "sibling_recovery",
-                                     "completed_at": now()})
-                    atomic_json(integration_path, manifest)
-                state["parallel_integration"] = manifest
             save(run_dir, state)
             reason = reason or (
                 "A saved sibling-only parallel apply exists for this batch; "
@@ -19379,10 +19633,22 @@ def advance(run_dir, state, cfg, deadline=None):
                     "attempt evidence and the sibling manifest are preserved.",
                     "blocked")
                 return
+            proof, proof_sha256, proof_problem = _sibling_integration_proof(
+                state, run_dir, project, batch_index, sibling_record,
+                resolved_parallel, require_after_current=proven is None)
+            if proof_problem:
+                pause_with(
+                    run_dir, state,
+                    "Sibling-only recovery was admitted but its prepared "
+                    "integration proof cannot be validated: " + proof_problem
+                    + ". No writer was launched; every edit, patch, manifest and "
+                    "proof remain preserved for inspection.", "blocked")
+                return
             if accepted is None or not accepted.get("after_snapshot"):
                 accepted = _accept_parallel_sibling_recovery(
                     state, batch_index, sibling_record, project,
-                    record_path=_record_path, record_sha256=sibling_sha256)
+                    record_path=_record_path, record_sha256=sibling_sha256,
+                    integration_proof_sha256=proof_sha256)
                 proven = None
                 save(run_dir, state)
                 journal_event(run_dir, state,
@@ -19390,7 +19656,26 @@ def advance(run_dir, state, cfg, deadline=None):
                               batch_index=batch_index,
                               after_sha=accepted.get("after_sha"),
                               phase=accepted.get("record_phase"),
-                              record_sha256=sibling_sha256)
+                              record_sha256=sibling_sha256,
+                              proof_sha256=proof_sha256)
+            elif accepted.get("integration_proof_sha256") is None:
+                accepted["integration_proof_sha256"] = proof_sha256
+                save(run_dir, state)
+            elif accepted.get("integration_proof_sha256") != proof_sha256:
+                pause_with(
+                    run_dir, state,
+                    "Sibling-only recovery was admitted with a different prepared "
+                    "integration proof than the accepted source. No writer was "
+                    "launched; every edit, proof and manifest remain preserved.",
+                    "blocked")
+                return
+            if accepted.get("after_sha") != proof.get("after_sha"):
+                pause_with(
+                    run_dir, state,
+                    "Sibling-only recovery's accepted after identity does not match "
+                    "its prepared integration proof. No writer was launched; every "
+                    "edit, proof and manifest remain preserved.", "blocked")
+                return
             manifest_problem = _sibling_manifest_binding_problem(
                 accepted, _record_path, record=sibling_record,
                 sha256=sibling_sha256)
@@ -19450,6 +19735,38 @@ def advance(run_dir, state, cfg, deadline=None):
                         + manifest_problem + ". No writer was launched; every "
                         "edit, attempt evidence and the approved sibling "
                         "manifest are preserved.", "blocked")
+                    return
+                proof, proof_sha256, proof_problem = _sibling_integration_proof(
+                    state, run_dir, project, batch_index, sibling_record,
+                    resolved_parallel,
+                    require_after_current=_sibling_single_attempt(
+                        state, accepted, batch_index) is None)
+                if proof_problem:
+                    pause_with(
+                        run_dir, state,
+                        "Sibling-only recovery was admitted but its prepared "
+                        "integration proof cannot be validated: " + proof_problem
+                        + ". No writer was launched; every edit, patch, manifest "
+                        "and proof remain preserved for inspection.", "blocked")
+                    return
+                if accepted.get("integration_proof_sha256") is None:
+                    accepted["integration_proof_sha256"] = proof_sha256
+                    save(run_dir, state)
+                elif accepted.get("integration_proof_sha256") != proof_sha256:
+                    pause_with(
+                        run_dir, state,
+                        "Sibling-only recovery's accepted source is bound to a "
+                        "different prepared integration proof. No writer was "
+                        "launched; every edit, proof and manifest remain "
+                        "preserved.", "blocked")
+                    return
+                if accepted.get("after_sha") != proof.get("after_sha"):
+                    pause_with(
+                        run_dir, state,
+                        "Sibling-only recovery's accepted after identity does not "
+                        "match its prepared integration proof. No writer was "
+                        "launched; every edit, proof and manifest remain "
+                        "preserved.", "blocked")
                     return
                 manifest_binding = _manifest_binding_from_accepted(accepted)
             if _writer_source_boundary(state, batch_index) is not None:
@@ -22329,7 +22646,7 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
         journal_event(folder, state, "fallback_approved", role=role)
         return True
     if action == "resume":
-        _finish_no_exec_refusal(folder, state)
+        _finish_no_exec_refusal(state, folder, folder)
         if state["status"] == "uncertain" or state.get("active_job") or state.get("active_check"):
             raise RuntimeError("Uncertain active dispatch: reconcile exact process/session/checkout first; not safe to retry")
         if state["status"] == "awaiting_plan_approval":
@@ -22389,7 +22706,7 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                           "missing": len(preflight.get("missing") or [])})
         return True
     if action == "reconcile":
-        if _finish_no_exec_refusal(folder, state):
+        if _finish_no_exec_refusal(state, folder, folder):
             return True
         if state["status"] != "uncertain" and not (retry_verification and state["status"] == "running"):
             raise RuntimeError("Run is not in uncertain state")

@@ -2086,8 +2086,100 @@ class IntegrationAdmissionRecoveryTests(BoundaryBase):
             record["base_head"], expected_writers=["a", "b"], mode="full",
             transaction=self.state["parallel_writers"]["transaction"])
 
+    def test_finalized_full_record_with_conflicting_checkout_blocks(self):
+        record, resolved = self.prepared_full()
+        record_path = orc._integration_record_path(self.rundir, 0)
+        original_app = (self.project / "app.py").read_text()
+        # The checkout contains only writer A's patch while the finalized record
+        # claims the combined A+B result.
+        orc._apply_writer_patch(
+            self.project, Path(record["patches"][0]["path"]), index=True)
+        partial_sha = orc._checkout_content_sha(self.project)
+        record.update({"phase": "complete", "applied": ["a", "b"],
+                       "after_sha": partial_sha, "completed_at": orc.now()})
+        orc.atomic_json(record_path, record)
+        self.stage_with_running_state()
+        launches = []
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a writer launched from a conflicting full record")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("proof", self.state["pause_reason"])
+        self.assertFalse((self.project / "b.py").exists())
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "app.py").read_text(), original_app)
+        self.assertEqual(orc.read_json(record_path)["phase"], "complete")
+
+    def test_applying_sibling_record_with_unproved_after_blocks(self):
+        record, resolved = self.prepared_full()
+        record_path = orc._integration_record_path(self.rundir, 0)
+        proof_path = orc._parallel_batch_dir(self.rundir, 0) / "integration-proof.json"
+        if proof_path.exists():
+            proof_path.unlink()
+        orc.git(self.project, ["reset", "--hard", record["base_head"]])
+        orc.git(self.project, ["clean", "-fd"])
+        (self.project / "app.py").write_text("value = 'claimed'\n")
+        claimed = orc._checkout_content_sha(self.project)
+        record.update({"mode": "sibling_recovery", "phase": "applying",
+                       "writers": ["a"], "applied": [],
+                       "patches": [record["patches"][0]],
+                       "after_sha": claimed})
+        orc.atomic_json(record_path, record)
+        self.stage_with_running_state()
+        launches = []
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("sibling recovery continued from an unproved apply")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("cannot be proved", self.state["pause_reason"])
+        self.assertEqual((self.project / "app.py").read_text(),
+                         "value = 'claimed'\n")
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertEqual(orc.read_json(record_path)["phase"], "applying")
+        self.assertNotEqual(self.state["phase"], "verify")
+
+    def test_first_sibling_admission_requires_matching_proof(self):
+        WriterSourceBindingTests.prepare_sibling(self)
+        proof_path = orc._parallel_batch_dir(self.rundir, 0) / "integration-proof.json"
+        orc.atomic_json(proof_path, {"version": 1, "batch_index": 0,
+                                     "mode": "sibling_recovery",
+                                     "before_sha": "1" * 64,
+                                     "after_sha": "0" * 64})
+        launches = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError(
+                "the first sibling writer ignored the prepared proof")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("proof", self.state["pause_reason"])
+        self.assertNotEqual(self.state["phase"], "verify")
+
     def test_patch_replacement_after_admission_applies_the_admitted_bytes(self):
         record, resolved = self.prepared_full()
+        # Force proof reconstruction so a scratch apply observes the replacement.
+        orc._integration_proof_path(self.rundir, 0).unlink()
         original_app = (self.project / "app.py").read_text()
         malicious = self.app_patch(record["base_head"],
                                    self.rundir / "replacement.patch")
@@ -2117,6 +2209,8 @@ class IntegrationAdmissionRecoveryTests(BoundaryBase):
 
     def test_canonical_change_during_scratch_blocks_before_any_apply(self):
         record, resolved = self.prepared_full()
+        # Force proof reconstruction so the canonical edit lands during scratch.
+        orc._integration_proof_path(self.rundir, 0).unlink()
         record_path = orc._integration_record_path(self.rundir, 0)
         self.assertFalse((self.project / "a.py").exists())
         real_apply = orc._apply_writer_patch
@@ -2132,8 +2226,9 @@ class IntegrationAdmissionRecoveryTests(BoundaryBase):
 
         with patch.object(orc, "_apply_writer_patch",
                           side_effect=apply_then_edit):
-            with self.assertRaisesRegex(RuntimeError,
-                                        "changed after scratch validation"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unrecognized checkout identity|changed after proof preparation"):
                 self.integrate_prepared(record, resolved)
         self.assertEqual(mutated, [True])
         self.assertEqual((self.project / "app.py").read_text(), "value = 99\n")
@@ -2489,6 +2584,146 @@ class LaunchBookkeepingBindingTests(BoundaryBase):
         self.assertEqual(ledger["grants"]["bookkeeping-grant"]["reservations"], [],
                          "the subscription fallback consumed a paid slot")
         self.assertEqual(starts, [])
+
+    def test_mismatched_refusal_record_preserves_containment_and_billing(self):
+        self.prepare_paid_sibling()
+        patched, mutated = self.journal_mutation("manifest")
+        real_release = orc.release_route_grant
+        starts = []
+
+        def release_with_loss(*args, **kwargs):
+            if kwargs.get("proven_no_exec"):
+                raise RuntimeError("simulated process loss before refund")
+            return real_release(*args, **kwargs)
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a child started during the failed refusal")
+
+        with patch.object(orc, "journal_event", side_effect=patched), \
+                patch.object(orc, "release_route_grant",
+                             side_effect=release_with_loss), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "Dispatch not attempted"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assertEqual(starts, [])
+        self.state = orc.load(self.state["id"])[1]
+        job = self.state["active_job"]
+        self.assertIsInstance(job, dict)
+        refusal_path = Path(job["path"]) / "no-exec-refusal.json"
+        self.assertTrue(refusal_path.is_file())
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        grant = ledger["grants"]["bookkeeping-grant"]
+        self.assertEqual(orc._grant_usage(grant), 1,
+                         "the unrefunded slot was silently released")
+        record = orc.read_json(refusal_path)
+        record["reservation_id"] = "not-the-exact-slot"
+        orc.atomic_json(refusal_path, record)
+        with self.assertRaisesRegex(RuntimeError, "Uncertain active dispatch"):
+            orc.resume_run(self.state["id"])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertIsInstance(self.state.get("active_job"), dict)
+        self.assertIsInstance(self.state.get("refusal_coordinate_conflict"), dict)
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        grant = ledger["grants"]["bookkeeping-grant"]
+        self.assertEqual(orc._grant_usage(grant), 1,
+                         "a mismatched refusal released billing")
+        self.assertEqual(grant["reservations"][0]["state"], "launched")
+        self.assertEqual(ledger["grants"]["unrelated-grant"]["reservations"], [])
+
+        # Restoring the exact coordinates still completes the refusal once.
+        record["reservation_id"] = job["grant_reservation_id"]
+        orc.atomic_json(refusal_path, record)
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.assert_slot_refunded()
+        self.state = orc.load(self.state["id"])[1]
+        self.assertIsNone(self.state.get("active_job"))
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        self.assertEqual(len(
+            ledger["grants"]["bookkeeping-grant"]["releases"]), 1)
+
+    def test_lane_refusal_disposition_finishes_without_process_uncertainty(self):
+        parent = self.state
+        route = {"provider": "codex", "model": "fixture-primary",
+                 "effort": "low", "billing": "api"}
+        unrelated_route = {"provider": "codex", "model": "fixture-reviewer",
+                           "effort": "low", "billing": "api"}
+        grant = {"id": "lane-grant", "role": "implementer",
+                 "run_id": parent["id"],
+                 "route_sha256": orc.route_authorization_sha(route),
+                 "role_generation": 0, "used": 0, "max_dispatches": 1}
+        unrelated = {"id": "lane-unrelated", "role": "reviewer",
+                     "run_id": parent["id"],
+                     "route_sha256": orc.route_authorization_sha(unrelated_route),
+                     "role_generation": 0, "used": 0, "max_dispatches": 1}
+        parent.update({"batch_index": 0, "model_routes": {"implementer": route},
+                       "route_authorizations": [grant, unrelated]})
+        orc.register_route_grant(self.rundir, grant)
+        orc.register_route_grant(self.rundir, unrelated)
+        orc.save(self.rundir, parent)
+        ids, problem = orc._reserve_parallel_authority(
+            parent, self.rundir, 1, self.cfg, None, 0,
+            targets=[{"writer_id": "a", "attempt_id": "attempt-a"}])
+        self.assertIsNone(problem)
+        reservation_id = ids[0]
+        lane_dir = orc._parallel_batch_dir(self.rundir, 0) / "a"
+        job_dir = lane_dir / "jobs" / "implementer-refused"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        lane_state = copy.deepcopy(parent)
+        lane_state.update({
+            "id": parent["id"] + "--a", "parent_run_id": parent["id"],
+            "status": "running", "active_job": None,
+            "route_authorizations": [copy.deepcopy(grant)]})
+        job = {"id": "refused-lane", "kind": "implementer",
+               "role": "implementer", "status": "dispatched",
+               "path": str(job_dir), "route": route, "role_generation": 0,
+               "assignment": "a", "grant_reservation_id": reservation_id,
+               "grant_attempt_id": "attempt-a", "expected_binding": None,
+               "batch_index": 0}
+        lane_state["active_job"] = job
+        self.assertIsNotNone(orc.mark_route_grant_launched(
+            lane_state, self.rundir, "implementer", route,
+            reservation_id=reservation_id,
+            metadata={"run_id": parent["id"], "batch_index": 0, "lane": "a",
+                      "attempt_id": "attempt-a", "role_generation": 0,
+                      "job_id": "refused-lane"}))
+        refusal = {
+            "version": 1, "at": orc.now(),
+            "run_id": lane_state["id"], "parent_run_id": parent["id"],
+            "job_id": "refused-lane", "kind": "implementer",
+            "role": "implementer", "route": route,
+            "route_sha256": orc.route_authorization_sha(route),
+            "role_generation": 0, "reservation_id": reservation_id,
+            "attempt_id": "attempt-a", "assignment": "a", "batch_index": 0,
+            "reason_code": "dispatch_binding_changed",
+            "reasons": ["Dispatch not attempted: lane binding changed"],
+            "expected_binding": None, "observed_binding": None,
+            "proven_no_exec": True, "active_job_created": False,
+            "model_calls_counted": False,
+            "fallback_authorization": None,
+            "worker_fallback_authorization": None}
+        orc.atomic_json(job_dir / "no-exec-refusal.json", refusal)
+        orc.atomic_json(lane_dir / "state.json", lane_state)
+        parent["parallel_writers"] = {
+            "batch_index": 0, "lanes": {"a": {
+                "status": "running", "lane_dir": str(lane_dir),
+                "batch_index": 0, "assignment": "a"}}}
+        problems = orc._reconcile_parallel_lane_processes(self.rundir, parent)
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            parent["parallel_writers"]["lanes"]["a"]["status"], "blocked")
+        reloaded = orc.read_json(lane_dir / "state.json")
+        self.assertIsNone(reloaded.get("active_job"))
+        self.assertTrue(reloaded["preflight_rejection"]
+                        .get("completed_after_restart"))
+        ledger = orc.load_grant_ledger(self.rundir, run_id=parent["id"])
+        lane_grant = ledger["grants"]["lane-grant"]
+        self.assertEqual(orc._grant_usage(lane_grant), 0)
+        self.assertEqual(lane_grant["reservations"][0]["state"], "released")
+        self.assertTrue(lane_grant["releases"][-1]["proven_no_exec"])
+        self.assertEqual(
+            ledger["grants"]["lane-unrelated"]["reservations"], [])
 
     def test_unchanged_paid_single_writer_still_launches_once(self):
         self.prepare_paid_sibling()
