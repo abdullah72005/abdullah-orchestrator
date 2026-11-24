@@ -16605,6 +16605,41 @@ def _parallel_batch_dir(run_dir, batch_index):
     return Path(run_dir) / PARALLEL_DIR / f"batch-{int(batch_index)}"
 
 
+def _parallel_transaction_slot(transaction):
+    """Stable artifact slot name for one admitted plan transaction.
+
+    Writer IDs are stable and recur across approved plans, so a lane slot must
+    be unique to the exact run/plan/revision/epoch/base that admitted it.  The
+    slot is derived only from the durable transaction binding, which makes it
+    reproducible after a restart without ever reusing an earlier plan's paths.
+    """
+    transaction = transaction or {}
+    identity = {
+        "run_id": transaction.get("run_id"),
+        "plan_version": transaction.get("plan_version"),
+        "plan_revision": transaction.get("plan_revision", 0),
+        "amendment_epoch": transaction.get("amendment_epoch", 0),
+        "base_head": transaction.get("base_head"),
+        "base_sha": transaction.get("base_sha"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    return (f"r{identity['plan_revision']}-e{identity['amendment_epoch']}"
+            f"-{digest}")
+
+
+def _parallel_transaction_lane_dir(run_dir, batch_index, transaction, writer_id):
+    """The durable execution slot for one writer in one plan transaction.
+
+    Slots stay direct children of the batch directory (like the original lane
+    paths) but carry an ``@``-delimited transaction identity.  Writer IDs cannot
+    contain ``@``, so a slot can never be mistaken for another writer's lane.
+    """
+    return (_parallel_batch_dir(run_dir, batch_index)
+            / f"lane@{_parallel_transaction_slot(transaction)}@{writer_id}")
+
+
 def _checkout_content_digest(project):
     """Exact checkout identity: HEAD, bytes, file mode and index state.
 
@@ -17256,19 +17291,35 @@ def _proof_transaction_state(proof, state, batch_index, transaction):
     return "stale" if stale else "bound"
 
 
+class IntegrationArchiveError(RuntimeError):
+    """A superseded proof/record exists but could not be preserved safely."""
+
+
 def _archive_integration_artifact(run_dir, batch_index, path, *, label,
                                   revision=None, epoch=None):
-    """Move one superseded record/proof into batch history without rewriting it."""
+    """Move one superseded record/proof into batch history without rewriting it.
+
+    Returns ``None`` only when there is nothing to preserve.  A path that exists
+    but cannot be read/renamed raises ``IntegrationArchiveError`` so callers can
+    block instead of letting a later write overwrite the only prior copy.
+    """
     path = Path(path)
     if not path.is_file():
         return None
     try:
         data = path.read_bytes()
-    except OSError:
-        return None
+    except OSError as exc:
+        raise IntegrationArchiveError(
+            f"the superseded {label} at {path} cannot be read for preservation: "
+            f"{exc}") from exc
     digest = hashlib.sha256(data).hexdigest()
     history = _parallel_batch_dir(run_dir, batch_index) / "history"
-    history.mkdir(parents=True, exist_ok=True)
+    try:
+        history.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise IntegrationArchiveError(
+            f"the preservation directory {history} cannot be created: {exc}"
+        ) from exc
     revision = "unknown" if revision is None else revision
     epoch = "unknown" if epoch is None else epoch
     destination = history / f"{label}-r{revision}-e{epoch}-{digest[:12]}{path.suffix}"
@@ -17279,15 +17330,23 @@ def _archive_integration_artifact(run_dir, batch_index, path, *, label,
         counter += 1
     try:
         os.replace(path, destination)
-    except OSError:
-        return None
+    except OSError as exc:
+        raise IntegrationArchiveError(
+            f"the superseded {label} at {path} could not be preserved at "
+            f"{destination}: {exc}") from exc
     return destination
 
 
 def _archive_superseded_integration_evidence(run_dir, state, batch_index,
                                              transaction):
-    """Preserve proofs/records from an earlier plan transaction, not current ones."""
+    """Preserve proofs/records from an earlier plan transaction, not current ones.
+
+    Returns ``(archived, failures)``.  Any failure names the artifact that still
+    occupies the live path, so the caller can refuse to launch writers or reuse
+    that path until preservation succeeds.
+    """
     archived = []
+    failures = []
     proof_path = _integration_proof_path(run_dir, batch_index)
     if proof_path.is_file():
         try:
@@ -17298,13 +17357,19 @@ def _archive_superseded_integration_evidence(run_dir, state, batch_index,
             status = _proof_transaction_state(
                 proof, state, batch_index, transaction)
             if status in {"stale", "unbound"}:
-                destination = _archive_integration_artifact(
-                    run_dir, batch_index, proof_path,
-                    label="integration-proof",
-                    revision=proof.get("plan_revision"),
-                    epoch=proof.get("amendment_epoch"))
-                if destination is not None:
-                    archived.append({"kind": "proof", "path": str(destination)})
+                try:
+                    destination = _archive_integration_artifact(
+                        run_dir, batch_index, proof_path,
+                        label="integration-proof",
+                        revision=proof.get("plan_revision"),
+                        epoch=proof.get("amendment_epoch"))
+                except IntegrationArchiveError as exc:
+                    failures.append({"kind": "proof", "path": str(proof_path),
+                                     "reason": str(exc)})
+                else:
+                    if destination is not None:
+                        archived.append({"kind": "proof",
+                                         "path": str(destination)})
     record_path = _integration_record_path(run_dir, batch_index)
     if record_path.is_file():
         try:
@@ -17313,19 +17378,28 @@ def _archive_superseded_integration_evidence(run_dir, state, batch_index,
             record = None
         if isinstance(record, dict) and not _integration_record_current(
                 record, state):
-            destination = _archive_integration_artifact(
-                run_dir, batch_index, record_path,
-                label="integration-record",
-                revision=record.get("plan_revision"),
-                epoch=record.get("amendment_epoch"))
-            if destination is not None:
-                archived.append({"kind": "record", "path": str(destination)})
+            try:
+                destination = _archive_integration_artifact(
+                    run_dir, batch_index, record_path,
+                    label="integration-record",
+                    revision=record.get("plan_revision"),
+                    epoch=record.get("amendment_epoch"))
+            except IntegrationArchiveError as exc:
+                failures.append({"kind": "record", "path": str(record_path),
+                                 "reason": str(exc)})
+            else:
+                if destination is not None:
+                    archived.append({"kind": "record",
+                                     "path": str(destination)})
     if archived:
         journal_event(run_dir, state, "parallel_integration_superseded",
                       batch_index=int(batch_index), archived=archived,
                       plan_revision=state.get("plan_revision", 0),
                       amendment_epoch=state.get("amendment_epoch", 0))
-    return archived
+    if failures:
+        journal_event(run_dir, state, "parallel_integration_archive_blocked",
+                      batch_index=int(batch_index), failures=failures)
+    return archived, failures
 
 
 def _integration_proof_payload(state, batch_index, base_head, transaction, mode,
@@ -17441,11 +17515,16 @@ def _load_or_prepare_integration_proof(state, run_dir, project, batch_index,
                 return None, None, (
                     "the prepared integration proof is not bound to the current "
                     "plan transaction")
-            destination = _archive_integration_artifact(
-                run_dir, batch_index, proof_path,
-                label="integration-proof",
-                revision=proof.get("plan_revision"),
-                epoch=proof.get("amendment_epoch"))
+            try:
+                destination = _archive_integration_artifact(
+                    run_dir, batch_index, proof_path,
+                    label="integration-proof",
+                    revision=proof.get("plan_revision"),
+                    epoch=proof.get("amendment_epoch"))
+            except IntegrationArchiveError as exc:
+                return None, None, (
+                    "the superseded integration proof could not be preserved "
+                    f"before reuse: {exc}. No canonical write was attempted.")
             if destination is not None:
                 journal_event(
                     run_dir, state, "parallel_integration_proof_superseded",
@@ -17528,19 +17607,31 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
             try:
                 previous = read_json(record_path)
             except (OSError, ValueError):
-                _archive_integration_artifact(
-                    run_dir, batch_index, record_path,
-                    label="integration-record", revision="unknown",
-                    epoch="unknown")
+                try:
+                    _archive_integration_artifact(
+                        run_dir, batch_index, record_path,
+                        label="integration-record", revision="unknown",
+                        epoch="unknown")
+                except IntegrationArchiveError as exc:
+                    raise RuntimeError(
+                        "The unreadable integration record could not be "
+                        "preserved before reuse; no canonical write was "
+                        f"attempted: {exc}") from exc
                 previous = None
         if isinstance(previous, dict) and not _integration_record_current(previous, state):
             # A retained record from a superseded plan revision cannot authorize
             # this transaction; move it to accessible history before the new write.
-            _archive_integration_artifact(
-                run_dir, batch_index, record_path,
-                label="integration-record",
-                revision=previous.get("plan_revision"),
-                epoch=previous.get("amendment_epoch"))
+            try:
+                _archive_integration_artifact(
+                    run_dir, batch_index, record_path,
+                    label="integration-record",
+                    revision=previous.get("plan_revision"),
+                    epoch=previous.get("amendment_epoch"))
+            except IntegrationArchiveError as exc:
+                raise RuntimeError(
+                    "The superseded integration record could not be preserved "
+                    "before reuse; no canonical write was attempted: "
+                    f"{exc}") from exc
             previous = None
     elif previous_sha256 is not None and record_path.is_file():
         _bound, problem = _read_bound_manifest(record_path, previous_sha256)
@@ -17851,9 +17942,17 @@ def _validate_lane_outcome(run_dir, state, records, lanes, writer_id, outcome,
         return
     violations = [path for path in changed if not _writer_owns(record, path)]
     attempt = int(lane.get("attempt") or 1)
+    # Patch names are unique per attempt and live inside the transaction-scoped
+    # lane slot, so a recreated worktree can never overwrite a prior attempt's
+    # patch bytes.
+    slot = Path(lane.get("lane_dir") or (Path(batch_dir) / writer_id))
+    patch_path = slot / f"writer-{attempt}.patch"
+    suffix = 1
+    while patch_path.exists() and suffix < 20:
+        patch_path = slot / f"writer-{attempt}-{suffix}.patch"
+        suffix += 1
     try:
-        patch = _writer_patch(Path(lane["worktree"]), base_head,
-                              batch_dir / writer_id / f"writer-{attempt}.patch")
+        patch = _writer_patch(Path(lane["worktree"]), base_head, patch_path)
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         lane.update({"status": "invalid", "error": str(exc),
                      "changed_paths": changed})
@@ -18278,6 +18377,7 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     batch_dir.mkdir(parents=True, exist_ok=True)
     initial_snapshot = source_snapshot(project)
     parallel = state.setdefault("parallel_writers", {})
+    prior_transaction = copy.deepcopy(parallel.get("transaction"))
     if parallel.get("batch_index") != batch_index:
         parallel["lanes"] = {}
     lanes = parallel.setdefault("lanes", {})
@@ -18316,6 +18416,8 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                 "prior_plan_revisions": sorted({
                     lane.get("plan_revision", 0)
                     for lane in stale_lanes.values()}),
+                "writers": sorted(stale_lanes),
+                "prior_transaction": prior_transaction,
                 "lanes": copy.deepcopy(stale_lanes)})
             for writer_id in stale_lanes:
                 lanes.pop(writer_id, None)
@@ -18326,9 +18428,28 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     parallel.update({"batch_index": batch_index, "base_head": base_head,
                      "transaction": transaction,
                      "started_at": parallel.get("started_at") or now()})
+    # Preserve any superseded proof/progress record before this transaction can
+    # reuse those paths or launch a replacement writer.  This runs on resume too:
+    # a retry must still refuse to proceed while preservation is blocked.
+    archived, archive_failures = _archive_superseded_integration_evidence(
+        run_dir, state, batch_index, transaction)
+    if archive_failures:
+        state["parallel_archive_blocked"] = {
+            "at": now(), "batch_index": int(batch_index),
+            "failures": archive_failures,
+            "preserved": archived}
+        pause_with(
+            run_dir, state,
+            "Superseded parallel evidence could not be preserved before this "
+            "transaction reused its paths: "
+            + "; ".join(item.get("reason") or item.get("kind")
+                        for item in archive_failures)
+            + ". No writer was launched, no grant was charged and no patch was "
+            "applied; the original proof/progress bytes remain in place. Restore "
+            "access to the preservation directory and resume.", "blocked")
+        return None
+    state.pop("parallel_archive_blocked", None)
     if created:
-        archived = _archive_superseded_integration_evidence(
-            run_dir, state, batch_index, transaction)
         save(run_dir, state)
         journal_event(run_dir, state, "parallel_transaction_admitted",
                       batch_index=batch_index, base_head=base_head,
@@ -18551,7 +18672,23 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
     prepared = []
     for writer_id in relaunch:
         record = records[writer_id]
-        lane_dir = batch_dir / writer_id
+        existing = lanes.get(writer_id) or {}
+        recorded_dir = existing.get("lane_dir")
+        same_transaction = (
+            existing.get("batch_index") == batch_index
+            and existing.get("plan_version") == state.get("plan_version")
+            and existing.get("plan_revision", 0)
+            == state.get("plan_revision", 0)
+            and existing.get("amendment_epoch", 0)
+            == state.get("amendment_epoch", 0)
+            and existing.get("base_head") == base_head)
+        if recorded_dir and same_transaction:
+            # Resume the exact admitted transaction slot; its artifacts are the
+            # durable evidence this launch continues.
+            lane_dir = Path(recorded_dir)
+        else:
+            lane_dir = _parallel_transaction_lane_dir(
+                run_dir, batch_index, transaction, writer_id)
         lane_dir.mkdir(parents=True, exist_ok=True)
         # Never delete preserved failed output.  Each retry gets a new worktree
         # path while the earlier attempt stays inspectable.
@@ -18676,7 +18813,8 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                 lane["elapsed_seconds"] = round(time.monotonic() - started, 1)
                 if lane.get("status") == "starting":
                     lane["status"] = "running"
-            result_path = batch_dir / writer_id / "lane-result.json"
+            result_path = (Path(lane.get("lane_dir") or (batch_dir / writer_id))
+                           / "lane-result.json")
             if writer_id in announced or not result_path.is_file():
                 continue
             try:
@@ -18711,7 +18849,8 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         lane = lanes.setdefault(writer_id, {})
         outcome = None
         # Read the per-lane result from its own durable execution slot.
-        result_path = batch_dir / writer_id / "lane-result.json"
+        result_path = (Path(lane.get("lane_dir") or (batch_dir / writer_id))
+                       / "lane-result.json")
         if result_path.is_file():
             try:
                 outcome = read_json(result_path)

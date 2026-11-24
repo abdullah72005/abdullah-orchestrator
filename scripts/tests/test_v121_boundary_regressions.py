@@ -43,6 +43,11 @@ def paid_batch():
             "repeat_checks": None}
 
 
+def lane_writer(cwd):
+    """Writer ID from a lane worktree path in either lane-slot layout."""
+    return Path(cwd).parent.name.rsplit("@", 1)[-1]
+
+
 class BoundaryBase(unittest.TestCase):
     setUp = baseline.ControlTests.setUp
     tearDown = baseline.ControlTests.tearDown
@@ -89,7 +94,7 @@ class PaidLaunchBoundaryTests(BoundaryBase):
     def transport(self, spawns):
         def fake_guarded(command, cwd, env, log_stream, launch_file=None,
                          stdin_data=None, error_stream=None, stdin_fifo=None):
-            writer = Path(cwd).parent.name
+            writer = lane_writer(cwd)
             (Path(cwd) / f"{writer}.py").write_text(f"{writer} = 1\n")
             out = command[command.index("--output-last-message") + 1]
             Path(out).write_text(json.dumps(report(f"{writer} finished")))
@@ -736,7 +741,7 @@ class OneShotFallbackBoundaryTests(BoundaryBase):
         def fake_guarded(command, cwd, env, log_stream, launch_file=None,
                          stdin_data=None, error_stream=None, stdin_fifo=None):
             model = command[command.index("--model") + 1]
-            writer = Path(cwd).parent.name
+            writer = lane_writer(cwd)
             (Path(cwd) / f"{writer}.py").write_text(f"{writer} = 1\n")
             out = command[command.index("--output-last-message") + 1]
             Path(out).write_text(json.dumps(report(f"{writer} finished")))
@@ -2411,6 +2416,285 @@ class IntegrationAdmissionRecoveryTests(BoundaryBase):
         self.assertEqual(history[0].read_bytes(), old_proof_bytes)
         self.assertTrue(proof_path.is_file())
         self.assertEqual(orc.read_json(proof_path)["plan_revision"], 2)
+
+    def replan_running(self, writers, *, revision=2, epoch=1):
+        """Approve a replacement plan over the existing durable run state."""
+        plan = copy.deepcopy(self.state["plan"])
+        batch = copy.deepcopy(plan["batches"][0])
+        batch["writers"] = writers
+        plan["batches"][0] = batch
+        self.state.update({
+            "plan": plan, "plan_version": orc.content_hash(plan),
+            "plan_revision": revision, "amendment_epoch": epoch,
+            "status": "running", "phase": "implement",
+            "implementation": None, "parallel_integration": None,
+            "parallel_active": None, "parallel_fallback_batches": {},
+            "correction": ""})
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        return batch
+
+    def test_same_writer_ids_replan_preserves_prior_lane_evidence(self):
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        first = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=first):
+            orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                resolved, None)
+        self.assertEqual(first.count["n"], 2)
+        # Commit the honest revision-1 integration so the replacement plan gets a
+        # genuine clean base; finalization already removed both worktrees.
+        orc.git(self.project, ["add", "-A"])
+        orc.git(self.project, ["commit", "-qm", "revision one"])
+        old_lanes = copy.deepcopy(self.state["parallel_writers"]["lanes"])
+        old_artifacts = {}
+        for writer_id, lane in old_lanes.items():
+            self.assertTrue(lane["worktree_removed"])
+            for name in ("intent.json", "state.json", "lane-result.json"):
+                path = Path(lane["lane_dir"]) / name
+                self.assertTrue(path.is_file(), path)
+                old_artifacts[path] = path.read_bytes()
+            patch_path = Path(lane["patch"]["path"])
+            old_artifacts[patch_path] = patch_path.read_bytes()
+            self.assertEqual(orc._sha256_file(patch_path),
+                             lane["patch"]["sha256"])
+        proof_path = orc._integration_proof_path(self.rundir, 0)
+        record_path = orc._integration_record_path(self.rundir, 0)
+        old_proof_bytes = proof_path.read_bytes()
+        old_record_bytes = record_path.read_bytes()
+        old_patches = {writer_id: lane["patch"]
+                       for writer_id, lane in old_lanes.items()}
+
+        # Approved revision 2 reuses writer IDs A and B with fresh outputs.
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 11\n"}, "b": {"b.py": "b = 22\n"}})
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "call_model", side_effect=second), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.assertEqual(count["n"], 2, "each replacement patch applied exactly once")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "a.py").read_text(), "a = 11\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 22\n")
+
+        # Every earlier intent/state/result/patch byte still resolves in its own
+        # transaction slot; nothing was overwritten by the same writer IDs.
+        for path, data in old_artifacts.items():
+            self.assertTrue(path.is_file(), f"prior artifact disappeared: {path}")
+            self.assertEqual(path.read_bytes(), data,
+                             f"prior artifact was overwritten: {path}")
+        for writer_id, prior_patch in old_patches.items():
+            self.assertEqual(orc._sha256_file(Path(prior_patch["path"])),
+                             prior_patch["sha256"])
+        new_lanes = self.state["parallel_writers"]["lanes"]
+        for writer_id in ("a", "b"):
+            self.assertNotEqual(new_lanes[writer_id]["lane_dir"],
+                                old_lanes[writer_id]["lane_dir"])
+            self.assertNotEqual(new_lanes[writer_id]["patch"]["path"],
+                                old_patches[writer_id]["path"])
+            self.assertNotEqual(new_lanes[writer_id]["patch"]["sha256"],
+                                old_patches[writer_id]["sha256"])
+            self.assertEqual(
+                Path(new_lanes[writer_id]["lane_dir"]).name,
+                "lane@{}@{}".format(
+                    orc._parallel_transaction_slot(
+                        self.state["parallel_writers"]["transaction"]),
+                    writer_id))
+        history = self.state["parallel_writers"]["lane_history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["writers"], ["a", "b"])
+        self.assertEqual(history[0]["prior_transaction"]["plan_revision"], 1)
+        self.assertEqual(history[0]["prior_transaction"]["base_head"],
+                         old_lanes["a"]["base_head"])
+        self.assertEqual({writer_id: lane["lane_dir"]
+                          for writer_id, lane in history[0]["lanes"].items()},
+                         {writer_id: lane["lane_dir"]
+                          for writer_id, lane in old_lanes.items()})
+        batch_dir = orc._parallel_batch_dir(self.rundir, 0)
+        archived_proofs = list((batch_dir / "history").glob(
+            "integration-proof-*"))
+        archived_records = list((batch_dir / "history").glob(
+            "integration-record-*"))
+        self.assertEqual(len(archived_proofs), 1)
+        self.assertEqual(archived_proofs[0].read_bytes(), old_proof_bytes)
+        self.assertEqual(len(archived_records), 1)
+        self.assertEqual(archived_records[0].read_bytes(), old_record_bytes)
+        current = orc.read_json(record_path)
+        self.assertEqual(current["plan_revision"], 2)
+        self.assertEqual(current["after_sha"],
+                         orc._checkout_content_sha(self.project))
+
+    def test_same_writer_ids_after_interrupted_proof_preparation(self):
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        proof_path = orc._integration_proof_path(self.rundir, 0)
+        target = orc._integration_record_path(self.rundir, 0)
+        real_atomic = orc.atomic_json
+        crashed = []
+
+        def crash_prepared(path, value, *args, **kwargs):
+            if (Path(path) == target and value.get("phase") == "prepared"
+                    and not crashed):
+                crashed.append(True)
+                raise RuntimeError("simulated interruption before the record")
+            return real_atomic(path, value, *args, **kwargs)
+
+        first = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=first), \
+                patch.object(orc, "atomic_json", side_effect=crash_prepared):
+            self.assertIsNone(orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                resolved, None))
+        self.assertEqual(crashed, [True])
+        self.assertTrue(proof_path.is_file())
+        self.assertFalse(target.exists())
+        old_proof_bytes = proof_path.read_bytes()
+        old_lanes = copy.deepcopy(self.state["parallel_writers"]["lanes"])
+        old_evidence = {}
+        for writer_id, lane in old_lanes.items():
+            for name in ("intent.json", "state.json", "lane-result.json"):
+                path = Path(lane["lane_dir"]) / name
+                self.assertTrue(path.is_file(), path)
+                old_evidence[path] = path.read_bytes()
+            patch_path = Path(lane["patch"]["path"])
+            old_evidence[patch_path] = patch_path.read_bytes()
+        self.assertEqual(
+            {writer_id: lane["lane_dir"] for writer_id, lane in old_lanes.items()},
+            {writer_id: str(orc._parallel_transaction_lane_dir(
+                self.rundir, 0, self.state["parallel_writers"]["transaction"],
+                writer_id)) for writer_id in old_lanes})
+
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 3\n"}, "b": {"b.py": "b = 4\n"}})
+        with patch.object(orc, "call_model", side_effect=second):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "a.py").read_text(), "a = 3\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 4\n")
+        for path, data in old_evidence.items():
+            self.assertTrue(path.is_file(), f"prior evidence disappeared: {path}")
+            self.assertEqual(path.read_bytes(), data)
+        history = list((orc._parallel_batch_dir(
+            self.rundir, 0) / "history").glob("integration-proof-*"))
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].read_bytes(), old_proof_bytes)
+
+    def test_failed_archive_blocks_replacement_until_evidence_preserved(self):
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        first = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=first):
+            orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                resolved, None)
+        record_path = orc._integration_record_path(self.rundir, 0)
+        proof_path = orc._integration_proof_path(self.rundir, 0)
+        record = orc.read_json(record_path)
+        # Restore the exact admitted base so the replacement starts clean while
+        # the prior proof and progress record remain the only copies on disk.
+        orc.git(self.project, ["reset", "--hard", record["base_head"]])
+        orc.git(self.project, ["clean", "-fd"])
+        old_proof_bytes = proof_path.read_bytes()
+        old_record_bytes = record_path.read_bytes()
+
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        real_replace = os.replace
+        faults = {"proof": True, "record": True}
+
+        def replace_with_fault(source, destination, *args, **kwargs):
+            source_path = Path(source)
+            if faults["proof"] and source_path == proof_path:
+                faults["proof"] = False
+                raise OSError(13, "injected proof rename failure", str(source))
+            if faults["record"] and source_path == record_path:
+                faults["record"] = False
+                raise OSError(13, "injected record rename failure", str(source))
+            return real_replace(source, destination, *args, **kwargs)
+
+        launches = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a replacement writer launched before preservation")
+
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc.os, "replace", side_effect=replace_with_fault), \
+                patch.object(orc, "call_model", side_effect=must_not_run), \
+                apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("preserved", self.state["pause_reason"])
+        self.assertTrue(self.state.get("parallel_archive_blocked"))
+        self.assertEqual(proof_path.read_bytes(), old_proof_bytes,
+                         "the prior proof was overwritten after a failed archive")
+        self.assertEqual(record_path.read_bytes(), old_record_bytes,
+                         "the prior progress record was overwritten")
+        history_dir = orc._parallel_batch_dir(self.rundir, 0) / "history"
+        self.assertEqual(list(history_dir.glob("integration-*")), [],
+                         "a failed archive still moved prior evidence")
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+
+        # Retry with the record archive still failing: the proof may already be
+        # preserved, but the original record must remain intact and nothing runs.
+        faults["record"] = True
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        with patch.object(orc.os, "replace", side_effect=replace_with_fault), \
+                patch.object(orc, "call_model", side_effect=must_not_run), \
+                apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(record_path.read_bytes(), old_record_bytes)
+        history = orc._parallel_batch_dir(self.rundir, 0) / "history"
+        proofs = list(history.glob("integration-proof-*"))
+        self.assertEqual(len(proofs), 1)
+        self.assertEqual(proofs[0].read_bytes(), old_proof_bytes)
+
+        # The fault clears: the approved replacement completes with both new
+        # writers and the original proof/record bytes remain in history.
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 5\n"}, "b": {"b.py": "b = 6\n"}})
+        with patch.object(orc, "call_model", side_effect=second), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.assertEqual(count["n"], 2)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "a.py").read_text(), "a = 5\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 6\n")
+        records = list(history.glob("integration-record-*"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].read_bytes(), old_record_bytes)
+        self.assertEqual(orc.read_json(record_path)["plan_revision"], 2)
 
     def test_same_transaction_proof_mismatch_blocks_without_substitute(self):
         record, resolved = self.prepared_full()
