@@ -17343,7 +17343,10 @@ def _archive_superseded_integration_evidence(run_dir, state, batch_index,
 
     Returns ``(archived, failures)``.  Any failure names the artifact that still
     occupies the live path, so the caller can refuse to launch writers or reuse
-    that path until preservation succeeds.
+    that path until preservation succeeds.  Absent evidence is not a failure;
+    evidence bound to the current transaction is left in place; stale evidence
+    is preserved; anything that cannot be read or safely classified is a
+    failure, because it may be the only copy of prior work.
     """
     archived = []
     failures = []
@@ -17351,46 +17354,87 @@ def _archive_superseded_integration_evidence(run_dir, state, batch_index,
     if proof_path.is_file():
         try:
             proof = read_json(proof_path)
-        except (OSError, ValueError):
-            proof = None
-        if isinstance(proof, dict):
-            status = _proof_transaction_state(
-                proof, state, batch_index, transaction)
-            if status in {"stale", "unbound"}:
-                try:
-                    destination = _archive_integration_artifact(
-                        run_dir, batch_index, proof_path,
-                        label="integration-proof",
-                        revision=proof.get("plan_revision"),
-                        epoch=proof.get("amendment_epoch"))
-                except IntegrationArchiveError as exc:
-                    failures.append({"kind": "proof", "path": str(proof_path),
-                                     "reason": str(exc)})
-                else:
-                    if destination is not None:
-                        archived.append({"kind": "proof",
-                                         "path": str(destination)})
+        except (OSError, ValueError) as exc:
+            failures.append({
+                "kind": "proof", "path": str(proof_path),
+                "state": "unreadable",
+                "reason": ("the prior integration proof is unreadable and cannot "
+                           f"be preserved or classified: {exc}")})
+        else:
+            if not isinstance(proof, dict):
+                failures.append({
+                    "kind": "proof", "path": str(proof_path),
+                    "state": "unclassifiable",
+                    "reason": ("the prior integration proof is not a JSON object, "
+                               "so its transaction binding cannot be classified")})
+            else:
+                status = _proof_transaction_state(
+                    proof, state, batch_index, transaction)
+                if status == "unbound":
+                    failures.append({
+                        "kind": "proof", "path": str(proof_path),
+                        "state": "unclassifiable",
+                        "reason": ("the prior integration proof carries too little "
+                                   "transaction provenance to be safely classified, "
+                                   "preserved or reused")})
+                elif status == "stale":
+                    try:
+                        destination = _archive_integration_artifact(
+                            run_dir, batch_index, proof_path,
+                            label="integration-proof",
+                            revision=proof.get("plan_revision"),
+                            epoch=proof.get("amendment_epoch"))
+                    except IntegrationArchiveError as exc:
+                        failures.append({"kind": "proof",
+                                         "path": str(proof_path),
+                                         "state": "archive_failed",
+                                         "reason": str(exc)})
+                    else:
+                        if destination is not None:
+                            archived.append({"kind": "proof",
+                                             "path": str(destination)})
     record_path = _integration_record_path(run_dir, batch_index)
     if record_path.is_file():
         try:
             record = read_json(record_path)
-        except (OSError, ValueError):
-            record = None
-        if isinstance(record, dict) and not _integration_record_current(
-                record, state):
-            try:
-                destination = _archive_integration_artifact(
-                    run_dir, batch_index, record_path,
-                    label="integration-record",
-                    revision=record.get("plan_revision"),
-                    epoch=record.get("amendment_epoch"))
-            except IntegrationArchiveError as exc:
-                failures.append({"kind": "record", "path": str(record_path),
-                                 "reason": str(exc)})
+        except (OSError, ValueError) as exc:
+            failures.append({
+                "kind": "record", "path": str(record_path),
+                "state": "unreadable",
+                "reason": ("the prior integration progress record is unreadable "
+                           f"and cannot be preserved or classified: {exc}")})
+        else:
+            identity = {}
+            if isinstance(record, dict):
+                identity = {key: record.get(key) for key in
+                            ("run_id", "plan_version", "plan_revision",
+                             "amendment_epoch")
+                            if record.get(key) is not None}
+            if not identity:
+                failures.append({
+                    "kind": "record", "path": str(record_path),
+                    "state": "unclassifiable",
+                    "reason": ("the prior integration progress record carries no "
+                               "transaction identity to be safely classified, "
+                               "preserved or reused")})
+            elif _integration_record_current(record, state):
+                pass
             else:
-                if destination is not None:
-                    archived.append({"kind": "record",
-                                     "path": str(destination)})
+                try:
+                    destination = _archive_integration_artifact(
+                        run_dir, batch_index, record_path,
+                        label="integration-record",
+                        revision=record.get("plan_revision", "unknown"),
+                        epoch=record.get("amendment_epoch", "unknown"))
+                except IntegrationArchiveError as exc:
+                    failures.append({"kind": "record",
+                                     "path": str(record_path),
+                                     "state": "archive_failed",
+                                     "reason": str(exc)})
+                else:
+                    if destination is not None:
+                        archived.append({"kind": "record",
+                                         "path": str(destination)})
     if archived:
         journal_event(run_dir, state, "parallel_integration_superseded",
                       batch_index=int(batch_index), archived=archived,
@@ -18440,13 +18484,13 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
             "preserved": archived}
         pause_with(
             run_dir, state,
-            "Superseded parallel evidence could not be preserved before this "
-            "transaction reused its paths: "
+            "Superseded parallel evidence could not be preserved or safely "
+            "classified before this transaction reused its paths: "
             + "; ".join(item.get("reason") or item.get("kind")
                         for item in archive_failures)
             + ". No writer was launched, no grant was charged and no patch was "
             "applied; the original proof/progress bytes remain in place. Restore "
-            "access to the preservation directory and resume.", "blocked")
+            "access to or repair the preservation paths and resume.", "blocked")
         return None
     state.pop("parallel_archive_blocked", None)
     if created:

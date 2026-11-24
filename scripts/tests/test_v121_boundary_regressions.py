@@ -2696,6 +2696,284 @@ class IntegrationAdmissionRecoveryTests(BoundaryBase):
         self.assertEqual(records[0].read_bytes(), old_record_bytes)
         self.assertEqual(orc.read_json(record_path)["plan_revision"], 2)
 
+    def interrupt_after_prepared_proof(self):
+        """Revision 1 stops between its prepared proof and progress record."""
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        proof_path = orc._integration_proof_path(self.rundir, 0)
+        target = orc._integration_record_path(self.rundir, 0)
+        real_atomic = orc.atomic_json
+        crashed = []
+
+        def crash_prepared(path, value, *args, **kwargs):
+            if (Path(path) == target and value.get("phase") == "prepared"
+                    and not crashed):
+                crashed.append(True)
+                raise RuntimeError("simulated interruption before the record")
+            return real_atomic(path, value, *args, **kwargs)
+
+        first = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=first), \
+                patch.object(orc, "atomic_json", side_effect=crash_prepared):
+            self.assertIsNone(orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                resolved, None))
+        self.assertEqual(crashed, [True])
+        self.assertTrue(proof_path.is_file())
+        self.assertFalse(target.exists())
+        evidence = {}
+        for lane in self.state["parallel_writers"]["lanes"].values():
+            for name in ("intent.json", "state.json", "lane-result.json"):
+                path = Path(lane["lane_dir"]) / name
+                self.assertTrue(path.is_file(), path)
+                evidence[path] = path.read_bytes()
+            patch_path = Path(lane["patch"]["path"])
+            evidence[patch_path] = patch_path.read_bytes()
+        return proof_path, proof_path.read_bytes(), evidence
+
+    def assert_replacement_did_not_start(self, launches, reservations, count):
+        self.assertEqual(launches, [])
+        self.assertEqual(reservations, [],
+                         "a grant reservation was attempted before preservation")
+        self.assertEqual(count["n"], 0, "a canonical patch was applied")
+
+    def test_unreadable_prior_proof_blocks_replacement_before_dispatch(self):
+        proof_path, old_proof_bytes, evidence = self.interrupt_after_prepared_proof()
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        real_read = orc.read_json
+        fault = {"active": True}
+
+        def read_with_fault(path, *args, **kwargs):
+            if fault["active"] and Path(path) == proof_path:
+                raise OSError(5, "injected prior proof read failure", str(path))
+            return real_read(path, *args, **kwargs)
+
+        launches = []
+        reservations = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a replacement writer launched before preservation")
+
+        def must_not_reserve(*args, **kwargs):
+            reservations.append("reserve")
+            raise AssertionError("a grant was reserved before preservation")
+
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "read_json", side_effect=read_with_fault), \
+                patch.object(orc, "call_model", side_effect=must_not_run), \
+                patch.object(orc, "_reserve_parallel_authority",
+                             side_effect=must_not_reserve), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assert_replacement_did_not_start(launches, reservations, count)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertIn("proof", self.state["pause_reason"])
+        blocked = self.state.get("parallel_archive_blocked") or {}
+        failures = blocked.get("failures") or []
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["kind"], "proof")
+        self.assertEqual(failures[0]["state"], "unreadable")
+        self.assertEqual(proof_path.read_bytes(), old_proof_bytes,
+                         "the unreadable prior proof was overwritten")
+        self.assertFalse(orc._integration_record_path(self.rundir, 0).exists())
+        history = orc._parallel_batch_dir(self.rundir, 0) / "history"
+        self.assertEqual(list(history.glob("integration-*")), [])
+        for path, data in evidence.items():
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(path.read_bytes(), data)
+
+        # The read fault clears: the approved replacement proceeds exactly once
+        # and the prior proof is preserved byte-for-byte in history.
+        fault["active"] = False
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 7\n"}, "b": {"b.py": "b = 8\n"}})
+        with patch.object(orc, "call_model", side_effect=second), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.assertEqual(count["n"], 2)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertNotIn("parallel_archive_blocked", self.state)
+        self.assertEqual((self.project / "a.py").read_text(), "a = 7\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 8\n")
+        archived = list(history.glob("integration-proof-*"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_bytes(), old_proof_bytes)
+        self.assertEqual(
+            orc.read_json(orc._integration_record_path(self.rundir, 0))[
+                "plan_revision"], 2)
+
+    def test_unclassifiable_prior_proof_blocks_replacement_before_dispatch(self):
+        proof_path, old_proof_bytes, _evidence = self.interrupt_after_prepared_proof()
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        launches = []
+        reservations = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a replacement writer launched before preservation")
+
+        def must_not_reserve(*args, **kwargs):
+            reservations.append("reserve")
+            raise AssertionError("a grant was reserved before preservation")
+
+        for payload in (b"[]", b'{"version": 1}'):
+            with self.subTest(payload=payload):
+                self.state["status"] = "running"
+                orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+                orc.save(self.rundir, self.state)
+                proof_path.write_bytes(payload)
+                count, apply_patch = (
+                    PostApplyRecoveryTests.count_canonical_applies(self))
+                with patch.object(orc, "call_model", side_effect=must_not_run), \
+                        patch.object(orc, "_reserve_parallel_authority",
+                                     side_effect=must_not_reserve), apply_patch:
+                    orc.advance(self.rundir, self.state, self.cfg)
+                self.assert_replacement_did_not_start(
+                    launches, reservations, count)
+                self.state = orc.load(self.state["id"])[1]
+                self.assertEqual(self.state["status"], "blocked")
+                self.assertEqual(self.state["phase"], "implement")
+                blocked = self.state.get("parallel_archive_blocked") or {}
+                failures = blocked.get("failures") or []
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0]["kind"], "proof")
+                self.assertEqual(failures[0]["state"], "unclassifiable")
+                self.assertIn("classif", failures[0]["reason"])
+                self.assertEqual(proof_path.read_bytes(), payload,
+                                 "the unclassifiable artifact was overwritten")
+
+        # Restoring the readable prior proof lets the approved replacement run
+        # once, preserving the original evidence.
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        proof_path.write_bytes(old_proof_bytes)
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 9\n"}, "b": {"b.py": "b = 10\n"}})
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "call_model", side_effect=second), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.assertEqual(count["n"], 2)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        archived = list((orc._parallel_batch_dir(
+            self.rundir, 0) / "history").glob("integration-proof-*"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_bytes(), old_proof_bytes)
+
+    def test_unreadable_prior_record_blocks_replacement_before_dispatch(self):
+        proof_path, _proof_bytes, _evidence = self.interrupt_after_prepared_proof()
+        proof = orc.read_json(proof_path)
+        record_path = orc._integration_record_path(self.rundir, 0)
+        stale_record = {
+            "version": 1, "batch_index": 0, "phase": "prepared",
+            "run_id": proof.get("run_id"),
+            "plan_version": proof.get("plan_version"),
+            "plan_revision": proof.get("plan_revision", 0),
+            "amendment_epoch": proof.get("amendment_epoch", 0)}
+        stale_bytes = json.dumps(stale_record, indent=2, sort_keys=True).encode()
+        record_path.write_bytes(stale_bytes)
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        real_read = orc.read_json
+        fault = {"active": True}
+
+        def read_with_fault(path, *args, **kwargs):
+            if fault["active"] and Path(path) == record_path:
+                raise OSError(5, "injected prior record read failure", str(path))
+            return real_read(path, *args, **kwargs)
+
+        launches = []
+        reservations = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a replacement writer launched before preservation")
+
+        def must_not_reserve(*args, **kwargs):
+            reservations.append("reserve")
+            raise AssertionError("a grant was reserved before preservation")
+
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "read_json", side_effect=read_with_fault), \
+                patch.object(orc, "call_model", side_effect=must_not_run), \
+                patch.object(orc, "_reserve_parallel_authority",
+                             side_effect=must_not_reserve), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assert_replacement_did_not_start(launches, reservations, count)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        failures = (self.state.get("parallel_archive_blocked") or {}).get(
+            "failures") or []
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["kind"], "record")
+        self.assertEqual(failures[0]["state"], "unreadable")
+        self.assertIn("record", self.state["pause_reason"])
+        self.assertEqual(record_path.read_bytes(), stale_bytes,
+                         "the unreadable prior record was overwritten")
+
+        # Unreadable and unclassifiable artifacts keep blocking; only a readable
+        # stale record is preserved and lets the approved replacement proceed.
+        fault["active"] = False
+        for payload in (b"[]", b"{}"):
+            with self.subTest(payload=payload):
+                record_path.write_bytes(payload)
+                self.state["status"] = "running"
+                orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+                orc.save(self.rundir, self.state)
+                count, apply_patch = (
+                    PostApplyRecoveryTests.count_canonical_applies(self))
+                with patch.object(orc, "call_model", side_effect=must_not_run), \
+                        patch.object(orc, "_reserve_parallel_authority",
+                                     side_effect=must_not_reserve), apply_patch:
+                    orc.advance(self.rundir, self.state, self.cfg)
+                self.assert_replacement_did_not_start(
+                    launches, reservations, count)
+                self.state = orc.load(self.state["id"])[1]
+                self.assertEqual(self.state["status"], "blocked")
+                failures = (self.state.get("parallel_archive_blocked") or {}).get(
+                    "failures") or []
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0]["kind"], "record")
+                self.assertEqual(failures[0]["state"], "unclassifiable")
+                self.assertEqual(record_path.read_bytes(), payload)
+
+        record_path.write_bytes(stale_bytes)
+        self.state["status"] = "running"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 11\n"}, "b": {"b.py": "b = 12\n"}})
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "call_model", side_effect=second), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.assertEqual(count["n"], 2)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        archived = list((orc._parallel_batch_dir(
+            self.rundir, 0) / "history").glob("integration-record-*"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_bytes(), stale_bytes)
+        self.assertEqual(
+            orc.read_json(record_path)["plan_revision"], 2)
+
     def test_same_transaction_proof_mismatch_blocks_without_substitute(self):
         record, resolved = self.prepared_full()
         record_path = orc._integration_record_path(self.rundir, 0)
