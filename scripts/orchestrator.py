@@ -15923,23 +15923,97 @@ def _parallel_transaction_admitted(state, index):
     return False
 
 
+TRANSACTION_TEXT_FIELDS = ("run_id", "plan_version", "base_head", "base_sha")
+TRANSACTION_INT_FIELDS = ("plan_revision", "amendment_epoch", "batch_index")
+TRANSACTION_IDENTITY_FIELDS = ("run_id", "plan_version", "plan_revision",
+                               "amendment_epoch")
+
+
+def _transaction_integer(value):
+    """Strict integer coordinate (int or decimal string) that never raises."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _transaction_coordinate_problem(container, *, prefix=""):
+    """Return an actionable reason when a transaction binding is ill-typed.
+
+    Missing/``None`` coordinates stay allowed so legacy evidence without the
+    additive fields remains readable.  A present coordinate of the wrong type
+    is never treated as absent.
+    """
+    if not isinstance(container, dict):
+        return f"{prefix or 'the transaction binding'} is not a JSON object"
+    for field in TRANSACTION_TEXT_FIELDS:
+        value = container.get(field)
+        if value is not None and not isinstance(value, str):
+            return (f"{prefix}{field} must be a string, found "
+                    f"{type(value).__name__}")
+    for field in TRANSACTION_INT_FIELDS:
+        value = container.get(field)
+        if value is None:
+            continue
+        if _transaction_integer(value) is None:
+            return (f"{prefix}{field} must be an integer, found "
+                    f"{type(value).__name__}")
+    return None
+
+
 def _integration_record_current(record, state):
     """A durable integration record belongs to this run and plan revision."""
     if not isinstance(record, dict):
+        return False
+    if _transaction_coordinate_problem(record):
         return False
     if record.get("run_id") not in (None, (state or {}).get("id")):
         return False
     if record.get("plan_version") not in (None, (state or {}).get("plan_version")):
         return False
+    state_revision = _transaction_integer(
+        (state or {}).get("plan_revision", 0))
+    state_epoch = _transaction_integer(
+        (state or {}).get("amendment_epoch", 0))
+    if state_revision is None:
+        state_revision = 0
+    if state_epoch is None:
+        state_epoch = 0
     if (record.get("plan_revision") is not None
-            and int(record.get("plan_revision")) != int(
-                (state or {}).get("plan_revision", 0))):
+            and _transaction_integer(record.get("plan_revision"))
+            != state_revision):
         return False
     if (record.get("amendment_epoch") is not None
-            and int(record.get("amendment_epoch")) != int(
-                (state or {}).get("amendment_epoch", 0))):
+            and _transaction_integer(record.get("amendment_epoch"))
+            != state_epoch):
         return False
     return True
+
+
+def _integration_record_classification(record, state):
+    """Classify one parsed progress record as current, stale or malformed."""
+    if not isinstance(record, dict):
+        return "malformed", "the integration progress record is not a JSON object"
+    problem = _transaction_coordinate_problem(record)
+    if problem:
+        return "malformed", problem
+    if _integration_record_current(record, state):
+        return "current", None
+    return "stale", None
+
+
+def _record_transaction_identity(record):
+    if not isinstance(record, dict):
+        return {}
+    return {key: record.get(key) for key in TRANSACTION_IDENTITY_FIELDS
+            if record.get(key) is not None}
+
 
 
 def _integration_recovery_record(run_dir, index, state=None):
@@ -15956,8 +16030,15 @@ def _integration_recovery_record(run_dir, index, state=None):
     if problem:
         return path, {"unreadable": problem}, None
     record = bound["record"]
-    if state is not None and not _integration_record_current(record, state):
-        return None, None, None
+    if state is not None:
+        classification, problem = _integration_record_classification(record, state)
+        if classification == "malformed":
+            return path, {"unreadable":
+                          "the durable integration progress record has an invalid "
+                          "transaction coordinate: " + str(problem),
+                          "malformed": problem}, None
+        if classification == "stale":
+            return None, None, None
     return path, record, bound["sha256"]
 
 
@@ -17245,23 +17326,53 @@ def _current_transaction_binding(state, batch_index, transaction):
 
 def _proof_provenance(proof):
     """Present transaction bindings carried by one prepared proof."""
-    present = {key: (proof or {}).get(key) for key in PROOF_TRANSACTION_FIELDS
-               if (proof or {}).get(key) is not None}
-    intent = (proof or {}).get("intent") or {}
-    for key in PROOF_INTENT_FIELDS:
-        if intent.get(key) is not None:
-            present.setdefault("intent_" + key, intent.get(key))
-    if (proof or {}).get("batch_index") is not None:
+    if not isinstance(proof, dict):
+        return {}
+    present = {key: proof.get(key) for key in PROOF_TRANSACTION_FIELDS
+               if proof.get(key) is not None}
+    intent = proof.get("intent")
+    if isinstance(intent, dict):
+        for key in PROOF_INTENT_FIELDS:
+            if intent.get(key) is not None:
+                present.setdefault("intent_" + key, intent.get(key))
+    if proof.get("batch_index") is not None:
         present["batch_index"] = proof.get("batch_index")
     return present
 
 
+def _proof_transaction_problem(proof):
+    """Return why a proof's transaction binding is ill-typed, if it is.
+
+    Missing fields remain allowed for legacy proofs; a present coordinate of
+    the wrong type (including a non-object ``intent``) must never be treated as
+    absent or silently stale.
+    """
+    if not isinstance(proof, dict):
+        return "the integration proof is not a JSON object"
+    intent = proof.get("intent")
+    if intent is not None and not isinstance(intent, dict):
+        return ("intent must be a JSON object, found "
+                f"{type(intent).__name__}")
+    problem = _transaction_coordinate_problem(proof)
+    if problem:
+        return problem
+    if isinstance(intent, dict):
+        problem = _transaction_coordinate_problem(intent, prefix="intent.")
+        if problem:
+            return problem
+    return None
+
+
 def _proof_transaction_state(proof, state, batch_index, transaction):
-    """Classify a proof as bound to, stale for, or unbound from this transaction.
+    """Classify a proof as bound, stale, unbound or malformed for this transaction.
 
     ``stale`` means it belongs to a different admitted plan revision/epoch/base.
     ``unbound`` means it carries too little provenance to be reused safely.
+    ``malformed`` means a present coordinate or nested intent is ill-typed and
+    cannot be safely interpreted at all.
     """
+    if _proof_transaction_problem(proof):
+        return "malformed"
     current = _current_transaction_binding(state, batch_index, transaction)
     provenance = _proof_provenance(proof)
     if not provenance:
@@ -17361,12 +17472,13 @@ def _archive_superseded_integration_evidence(run_dir, state, batch_index,
                 "reason": ("the prior integration proof is unreadable and cannot "
                            f"be preserved or classified: {exc}")})
         else:
-            if not isinstance(proof, dict):
+            malformed = _proof_transaction_problem(proof)
+            if malformed:
                 failures.append({
                     "kind": "proof", "path": str(proof_path),
                     "state": "unclassifiable",
-                    "reason": ("the prior integration proof is not a JSON object, "
-                               "so its transaction binding cannot be classified")})
+                    "reason": ("the prior integration proof cannot be safely "
+                               f"classified: {malformed}")})
             else:
                 status = _proof_transaction_state(
                     proof, state, batch_index, transaction)
@@ -17404,37 +17516,44 @@ def _archive_superseded_integration_evidence(run_dir, state, batch_index,
                 "reason": ("the prior integration progress record is unreadable "
                            f"and cannot be preserved or classified: {exc}")})
         else:
-            identity = {}
-            if isinstance(record, dict):
-                identity = {key: record.get(key) for key in
-                            ("run_id", "plan_version", "plan_revision",
-                             "amendment_epoch")
-                            if record.get(key) is not None}
-            if not identity:
+            if not isinstance(record, dict):
+                failures.append({
+                    "kind": "record", "path": str(record_path),
+                    "state": "unclassifiable",
+                    "reason": ("the prior integration progress record cannot be "
+                               "safely classified: it is not a JSON object")})
+            elif not _record_transaction_identity(record):
                 failures.append({
                     "kind": "record", "path": str(record_path),
                     "state": "unclassifiable",
                     "reason": ("the prior integration progress record carries no "
                                "transaction identity to be safely classified, "
                                "preserved or reused")})
-            elif _integration_record_current(record, state):
-                pass
             else:
-                try:
-                    destination = _archive_integration_artifact(
-                        run_dir, batch_index, record_path,
-                        label="integration-record",
-                        revision=record.get("plan_revision", "unknown"),
-                        epoch=record.get("amendment_epoch", "unknown"))
-                except IntegrationArchiveError as exc:
-                    failures.append({"kind": "record",
-                                     "path": str(record_path),
-                                     "state": "archive_failed",
-                                     "reason": str(exc)})
-                else:
-                    if destination is not None:
-                        archived.append({"kind": "record",
-                                         "path": str(destination)})
+                classification, problem = _integration_record_classification(
+                    record, state)
+                if classification == "malformed":
+                    failures.append({
+                        "kind": "record", "path": str(record_path),
+                        "state": "unclassifiable",
+                        "reason": ("the prior integration progress record cannot "
+                                   f"be safely classified: {problem}")})
+                elif classification == "stale":
+                    try:
+                        destination = _archive_integration_artifact(
+                            run_dir, batch_index, record_path,
+                            label="integration-record",
+                            revision=record.get("plan_revision", "unknown"),
+                            epoch=record.get("amendment_epoch", "unknown"))
+                    except IntegrationArchiveError as exc:
+                        failures.append({"kind": "record",
+                                         "path": str(record_path),
+                                         "state": "archive_failed",
+                                         "reason": str(exc)})
+                    else:
+                        if destination is not None:
+                            archived.append({"kind": "record",
+                                             "path": str(destination)})
     if archived:
         journal_event(run_dir, state, "parallel_integration_superseded",
                       batch_index=int(batch_index), archived=archived,
@@ -17498,9 +17617,14 @@ def _integration_proof_consistency(proof, *, batch_index, base_head, transaction
                                    mode, expected, patches):
     if not isinstance(proof, dict):
         return "the prepared integration proof is not an object"
+    malformed = _proof_transaction_problem(proof)
+    if malformed:
+        return ("the prepared integration proof has an invalid transaction "
+                f"coordinate ({malformed})")
     if proof.get("version") != INTEGRATION_PROOF_VERSION:
         return "the prepared integration proof has an unsupported version"
-    if proof.get("batch_index") != int(batch_index):
+    if (_transaction_integer(proof.get("batch_index"))
+            != _transaction_integer(batch_index)):
         return "the prepared integration proof belongs to another batch"
     if proof.get("mode") != mode:
         return "the prepared integration proof belongs to another integration mode"
@@ -17552,6 +17676,11 @@ def _load_or_prepare_integration_proof(state, run_dir, project, batch_index,
             run_dir, batch_index, expected_sha)
         if problem:
             return None, None, problem
+        malformed = _proof_transaction_problem(proof)
+        if malformed:
+            return None, None, (
+                "the prepared integration proof has an invalid transaction "
+                f"coordinate ({malformed}); no substitute proof was created")
         transaction_state = _proof_transaction_state(
             proof, state, batch_index, transaction)
         if transaction_state in {"stale", "unbound"}:
@@ -18141,13 +18270,16 @@ def _parallel_grant_problem(state, run_dir, count, *, held=0):
 def _parallel_transaction_current(transaction, state, batch_index):
     if not isinstance(transaction, dict):
         return False
+    if _transaction_coordinate_problem(transaction):
+        return False
     return (transaction.get("run_id") in (None, (state or {}).get("id"))
-            and transaction.get("batch_index") == batch_index
+            and _transaction_integer(transaction.get("batch_index"))
+            == _transaction_integer(batch_index)
             and transaction.get("plan_version") in (None, (state or {}).get("plan_version"))
-            and int(transaction.get("plan_revision", 0)) == int(
-                (state or {}).get("plan_revision", 0))
-            and int(transaction.get("amendment_epoch", 0)) == int(
-                (state or {}).get("amendment_epoch", 0)))
+            and _transaction_integer(transaction.get("plan_revision", 0))
+            == _transaction_integer((state or {}).get("plan_revision", 0))
+            and _transaction_integer(transaction.get("amendment_epoch", 0))
+            == _transaction_integer((state or {}).get("amendment_epoch", 0)))
 
 
 def _parallel_transaction(state, project, batch_index, base_snapshot):
@@ -18304,6 +18436,14 @@ def _parallel_record_scope_problem(record, transaction, resolved):
     """Validate a durable manifest against the approved set and transaction."""
     if not isinstance(record, dict):
         return "the durable parallel integration record is not an object"
+    malformed = _transaction_coordinate_problem(record)
+    if malformed:
+        return ("the durable parallel integration record has an invalid "
+                f"transaction coordinate: {malformed}")
+    intent = record.get("intent")
+    if intent is not None and not isinstance(intent, dict):
+        return ("the durable parallel integration record has a non-object "
+                "intent")
     approved = sorted(item["id"] for item in (resolved or {}).get("writers", []))
     expected = _record_expected_writers(record)
     if expected and approved and expected != approved:

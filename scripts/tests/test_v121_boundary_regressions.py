@@ -2974,6 +2974,142 @@ class IntegrationAdmissionRecoveryTests(BoundaryBase):
         self.assertEqual(
             orc.read_json(record_path)["plan_revision"], 2)
 
+    def stage_blocked_by_malformed_evidence(self, *, field, kind):
+        """Run the public stage boundary and assert one durable blocked result."""
+        launches = []
+        reservations = []
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a writer launched before malformed evidence was reported")
+
+        def must_not_reserve(*args, **kwargs):
+            reservations.append("reserve")
+            raise AssertionError("a grant was reserved over malformed evidence")
+
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "call_model", side_effect=must_not_run), \
+                patch.object(orc, "_reserve_parallel_authority",
+                             side_effect=must_not_reserve), apply_patch:
+            payload = orc.stage_run(self.state["id"], expected_phase="implement")
+        self.assert_replacement_did_not_start(launches, reservations, count)
+        self.assertIsNotNone(payload, "the stage boundary returned no payload")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["outcome"], "blocked")
+        self.assertEqual(payload["next_action"], "orchestrator_resume")
+        self.assertIn(field, payload["pause_reason"])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["phase"], "implement")
+        failures = (self.state.get("parallel_archive_blocked") or {}).get(
+            "failures") or []
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["kind"], kind)
+        self.assertEqual(failures[0]["state"], "unclassifiable")
+        self.assertIn(field, failures[0]["reason"])
+        return payload
+
+    def test_malformed_proof_intent_blocks_at_stage_run(self):
+        proof_path, old_proof_bytes, evidence = self.interrupt_after_prepared_proof()
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        proof = orc.read_json(proof_path)
+        proof["intent"] = "unexpected-intent"
+        tampered = json.dumps(proof, indent=2, sort_keys=True).encode()
+        proof_path.write_bytes(tampered)
+        self.stage_blocked_by_malformed_evidence(field="intent", kind="proof")
+        self.assertEqual(proof_path.read_bytes(), tampered,
+                         "the malformed proof was overwritten")
+        for path, data in evidence.items():
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(path.read_bytes(), data)
+
+        # Restoring the valid prior proof lets the approved replacement resume
+        # once and preserves the historical evidence.
+        proof_path.write_bytes(old_proof_bytes)
+        orc.resume_run(self.state["id"])
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 13\n"}, "b": {"b.py": "b = 14\n"}})
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "call_model", side_effect=second), apply_patch:
+            payload = orc.stage_run(self.state["id"])
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.assertEqual(count["n"], 2)
+        self.assertEqual(payload["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        archived = list((orc._parallel_batch_dir(
+            self.rundir, 0) / "history").glob("integration-proof-*"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_bytes(), old_proof_bytes)
+
+    def test_malformed_record_coordinates_block_at_stage_run(self):
+        proof_path, _proof_bytes, _evidence = self.interrupt_after_prepared_proof()
+        proof = orc.read_json(proof_path)
+        record_path = orc._integration_record_path(self.rundir, 0)
+        base_record = {
+            "version": 1, "batch_index": 0, "phase": "prepared",
+            "run_id": proof.get("run_id"),
+            "plan_version": proof.get("plan_version"),
+            "plan_revision": proof.get("plan_revision", 0),
+            "amendment_epoch": proof.get("amendment_epoch", 0)}
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        for field in ("plan_revision", "amendment_epoch"):
+            with self.subTest(field=field):
+                self.state["status"] = "running"
+                orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+                orc.save(self.rundir, self.state)
+                malformed = dict(base_record)
+                malformed[field] = {"not": field}
+                tampered = json.dumps(malformed, indent=2, sort_keys=True).encode()
+                record_path.write_bytes(tampered)
+                self.stage_blocked_by_malformed_evidence(field=field,
+                                                        kind="record")
+                self.assertEqual(record_path.read_bytes(), tampered,
+                                 "the malformed record was overwritten")
+
+        # A valid stale record again permits the approved replacement to finish.
+        stale = dict(base_record)
+        stale["plan_revision"] = proof.get("plan_revision", 0)
+        stale_bytes = json.dumps(stale, indent=2, sort_keys=True).encode()
+        record_path.write_bytes(stale_bytes)
+        orc.resume_run(self.state["id"])
+        second = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 15\n"}, "b": {"b.py": "b = 16\n"}})
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "call_model", side_effect=second), apply_patch:
+            payload = orc.stage_run(self.state["id"])
+        self.assertEqual(sorted(second.starts), ["a", "b"])
+        self.assertEqual(second.count["n"], 2)
+        self.assertEqual(count["n"], 2)
+        self.assertEqual(payload["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        archived = list((orc._parallel_batch_dir(
+            self.rundir, 0) / "history").glob("integration-record-*"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_bytes(), stale_bytes)
+        self.assertEqual(orc.read_json(record_path)["plan_revision"], 2)
+
+    def test_malformed_proof_coordinate_blocks_at_stage_run(self):
+        proof_path, _old_proof_bytes, _evidence = self.interrupt_after_prepared_proof()
+        self.replan_running([pw.writer("a", path="a.py"),
+                             pw.writer("b", path="b.py")])
+        proof = orc.read_json(proof_path)
+        proof["plan_revision"] = {"not": "a revision"}
+        tampered = json.dumps(proof, indent=2, sort_keys=True).encode()
+        proof_path.write_bytes(tampered)
+        self.stage_blocked_by_malformed_evidence(field="plan_revision",
+                                                kind="proof")
+        self.assertEqual(proof_path.read_bytes(), tampered)
+        history = orc._parallel_batch_dir(self.rundir, 0) / "history"
+        self.assertEqual(list(history.glob("integration-proof-*")), [],
+                         "a malformed proof was archived as if merely stale")
+
     def test_same_transaction_proof_mismatch_blocks_without_substitute(self):
         record, resolved = self.prepared_full()
         record_path = orc._integration_record_path(self.rundir, 0)
