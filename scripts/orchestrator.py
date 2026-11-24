@@ -10623,14 +10623,20 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
         raise RuntimeError(
             "Dispatch not attempted: " + binding_problem
             + f" (diagnostic: {rejection_path})")
+    spent_fallback = None
+    spent_worker_fallback = None
     if ((fallback and fallback.get("role") == role
          and authorization_state.get("fallback_authorization"))
             or fallback_selected):
         # The exact selected route passed preflight, identity recheck and the
         # transport gate. Only now is one-shot consent actually spent.
         if fallback and fallback.get("role") == role:
+            spent_fallback = copy.deepcopy(
+                authorization_state.get("fallback_authorization"))
             authorization_state["fallback_authorization"] = None
         if fallback_selected:
+            spent_worker_fallback = copy.deepcopy(
+                authorization_state.get("worker_fallback_authorization"))
             authorization_state["worker_fallback_authorization"] = None
         save(grant_state_dir, authorization_state)
     stdin_data = prompt if output_format in {"codex", "claude"} else None
@@ -10672,6 +10678,55 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     if state is not None:
         state["active_job"] = job
         save(run_dir, state)
+    # The binding is rechecked after the durable launch intent and active-job
+    # persistence too: a change during that bookkeeping must never reach a
+    # child. No child exists, so this reuses the positively-proven no-exec
+    # ledger accounting for only the exact held/marked slot and restores any
+    # one-shot consent that was spent above.
+    binding_problem, binding_observed = _dispatch_binding_problem(
+        expected_binding, project)
+    if binding_problem:
+        if reservation is not None:
+            try:
+                release_route_grant(
+                    authorization_state, authoritative_dir, role, route,
+                    "dispatch binding changed during launch bookkeeping",
+                    reservation_id=ledger_reservation_id, cfg=cfg,
+                    deadline=deadline, state_dir=grant_state_dir,
+                    proven_no_exec=True)
+            except GrantLedgerTimeout:
+                pass
+        if spent_fallback is not None:
+            authorization_state["fallback_authorization"] = spent_fallback
+        if spent_worker_fallback is not None:
+            authorization_state["worker_fallback_authorization"] = (
+                spent_worker_fallback)
+        if spent_fallback is not None or spent_worker_fallback is not None:
+            save(grant_state_dir, authorization_state)
+        rejection_path = jpath / "preflight-rejected.json"
+        rejection = {**preflight, "kind": kind, "job_id": job_id, "role": role,
+                     "decision": "candidate_changed",
+                     "reason_code": "dispatch_binding_changed",
+                     "reasons": ["Dispatch not attempted: " + binding_problem],
+                     "expected_binding": expected_binding,
+                     "observed_binding": binding_observed,
+                     "active_job_created": False,
+                     "model_calls_counted": False}
+        atomic_json(rejection_path, rejection)
+        if state is not None:
+            state["preflight_rejection"] = {
+                **rejection, "path": str(rejection_path)}
+            state["active_job"] = None
+            pause_with(run_dir, state,
+                       "Dispatch not attempted: " + binding_problem, "blocked")
+            journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
+                          role=role, kind=kind,
+                          reason_code="dispatch_binding_changed",
+                          reasons=[binding_problem],
+                          path=str(rejection_path))
+        raise RuntimeError(
+            "Dispatch not attempted: " + binding_problem
+            + f" (diagnostic: {rejection_path})")
     started = time.monotonic()
     out_file = jpath / "events.log"
     proc = None
@@ -15617,19 +15672,22 @@ def _integration_record_current(record, state):
 
 
 def _integration_recovery_record(run_dir, index, state=None):
-    """Read the durable integration record; distinguish absent/unreadable."""
+    """Read, hash and parse the durable integration record exactly once.
+
+    The returned digest is the admission evidence for every later scope check
+    and dispatch binding: a replacement manifest read afterwards can only
+    confirm that digest, never establish replacement authority.
+    """
     path = _integration_record_path(run_dir, index)
     if not path.is_file():
-        return None, None
-    try:
-        record = read_json(path)
-    except (OSError, ValueError) as exc:
-        return path, {"unreadable": str(exc)}
-    if not isinstance(record, dict):
-        return path, {"unreadable": "not a JSON object"}
+        return None, None, None
+    bound, problem = _read_bound_manifest(path, None)
+    if problem:
+        return path, {"unreadable": problem}, None
+    record = bound["record"]
     if state is not None and not _integration_record_current(record, state):
-        return None, None
-    return path, record
+        return None, None, None
+    return path, record, bound["sha256"]
 
 
 def _parallel_sibling_acceptance(state, index):
@@ -15750,8 +15808,13 @@ def _read_bound_manifest(path, expected_sha256):
     return {"record": record, "sha256": actual, "bytes": len(data)}, None
 
 
-def _sibling_manifest_binding_problem(accepted, record_path):
-    """Reject an accepted sibling source that no longer matches its manifest."""
+def _sibling_manifest_binding_problem(accepted, record_path, record=None,
+                                      sha256=None):
+    """Reject an accepted sibling source that no longer matches its manifest.
+
+    When the caller already holds the one admitted read (``record``/``sha256``)
+    this confirms those exact bytes instead of reading the path again.
+    """
     if not isinstance(accepted, dict):
         return "the accepted sibling source binding is missing"
     recorded_path = accepted.get("record_path")
@@ -15767,11 +15830,18 @@ def _sibling_manifest_binding_problem(accepted, record_path):
             same_path = False
         if not same_path:
             return "the accepted sibling manifest belongs to another path"
-    bound, problem = _read_bound_manifest(
-        record_path, accepted.get("record_sha256"))
-    if problem:
-        return problem
-    record = bound["record"]
+    if record is None:
+        bound, problem = _read_bound_manifest(
+            record_path, accepted.get("record_sha256"))
+        if problem:
+            return problem
+        record = bound["record"]
+        sha256 = bound["sha256"]
+    elif (accepted.get("record_sha256") is not None
+          and sha256 != accepted.get("record_sha256")):
+        return "the accepted sibling manifest changed after acceptance"
+    if not isinstance(record, dict):
+        return "the accepted sibling manifest is not a JSON object"
     if accepted.get("after_sha") != record.get("after_sha"):
         return "the accepted sibling after identity no longer matches its manifest"
     if (accepted.get("record_phase") is not None
@@ -16068,7 +16138,7 @@ def _stopped_attempt_source_binding(state, index, *, current,
 
 
 def _accept_parallel_sibling_recovery(state, index, record, project=None,
-                                      record_path=None):
+                                      record_path=None, record_sha256=None):
     """Persist the one accepted transition bound to its exact sibling manifest."""
     snapshot = source_snapshot(project) if project is not None else None
     entry = {
@@ -16082,7 +16152,8 @@ def _accept_parallel_sibling_recovery(state, index, record, project=None,
         "after_source": _source_identity_view(snapshot),
         "record_phase": (record or {}).get("phase"),
         "record_path": (str(record_path) if record_path is not None else None),
-        "record_sha256": _manifest_file_sha(record_path),
+        "record_sha256": (record_sha256 if record_sha256 is not None
+                          else _manifest_file_sha(record_path)),
         "mode": "sibling_single_writer",
     }
     state.setdefault("parallel_sibling_single", {})[str(index)] = entry
@@ -16107,9 +16178,10 @@ def _parallel_decision(state, project, records, index, run_dir=None):
                      else (run_path(state["id"]) if (state or {}).get("id") else None))
     except (ValueError, TypeError):
         directory = None
-    record_path, record = (None, None)
+    record_path, record, record_sha256 = (None, None, None)
     if directory is not None:
-        record_path, record = _integration_recovery_record(directory, index, state)
+        record_path, record, record_sha256 = _integration_recovery_record(
+            directory, index, state)
     if record_path is not None:
         if isinstance(record, dict) and not record.get("unreadable"):
             phase = record.get("phase")
@@ -16170,7 +16242,8 @@ def _parallel_decision(state, project, records, index, run_dir=None):
                         "preserved canonical changes and lane artifacts"),
                     "recovery": {"source": "integration_record",
                                  "path": str(record_path), "phase": phase,
-                                 "mode": mode, "validated": True}})
+                                 "mode": mode, "validated": True,
+                                 "record_sha256": record_sha256}})
                 return decision
         # A durable integration attempt for this exact batch is always resolved
         # through the parallel recovery path, even if the canonical checkout is
@@ -17289,6 +17362,52 @@ def _parallel_record_scope_problem(record, transaction, resolved):
             if intent.get(key) != transaction.get(key):
                 return (f"the recorded integration intent no longer matches the "
                         f"admitted transaction ({key})")
+    mode = record.get("mode", "full")
+    phase = record.get("phase")
+    if mode not in {"full", "sibling_recovery"}:
+        return f"the recorded integration mode {mode!r} is not recognized"
+    if mode == "sibling_recovery" or str(phase).startswith("sibling"):
+        if mode != "sibling_recovery":
+            return "the recorded sibling phase has a different integration mode"
+        if phase not in {"prepared", "applying", "sibling_recovery",
+                         "complete"}:
+            return ("the recorded sibling integration has an unrecognized "
+                    f"phase {phase!r}")
+        patches = [item for item in record.get("patches") or []
+                   if isinstance(item, dict)]
+        if not patches:
+            return "the recorded sibling integration has no patch scope"
+        patch_writers = sorted(item.get("writer") for item in patches
+                               if item.get("writer"))
+        if len(patch_writers) != len(patches):
+            return "the recorded sibling integration has an unassigned patch"
+        if recorded_writers and patch_writers != recorded_writers:
+            return ("the recorded sibling patches do not match its recorded "
+                    "writer set")
+        approved_by_id = {item["id"]: item
+                          for item in (resolved or {}).get("writers", [])}
+        for patch in patches:
+            writer = patch.get("writer")
+            owned = approved_by_id.get(writer)
+            if owned is None:
+                return ("the recorded sibling patch belongs to an unapproved "
+                        f"writer {writer!r}")
+            paths = [item for item in patch.get("paths") or []
+                     if isinstance(item, str)]
+            for relative in paths:
+                if not _writer_owns(owned, relative):
+                    return (f"the recorded sibling patch for {writer} touches "
+                            f"unowned path {relative}")
+            patch_path = patch.get("path")
+            patch_sha = patch.get("sha256")
+            if not patch_path or not patch_sha:
+                return "the recorded sibling patch identity is incomplete"
+            try:
+                actual = _sha256_file(Path(patch_path))
+            except OSError as exc:
+                return "the recorded sibling patch is unreadable: " + str(exc)
+            if actual != patch_sha:
+                return "the recorded sibling patch bytes changed"
     return None
 
 
@@ -17352,8 +17471,8 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         journal_event(run_dir, state, "parallel_transaction_admitted",
                       batch_index=batch_index, base_head=base_head,
                       base_sha=transaction["base_sha"])
-    integration_path, recovery_record = _integration_recovery_record(
-        run_dir, batch_index, state)
+    integration_path, recovery_record, _recovery_sha256 = (
+        _integration_recovery_record(run_dir, batch_index, state))
     # Prove every recorded lane execution stopped before deciding recovery or
     # dispatching anything, including a checkout that already matches the after
     # identity.
@@ -18799,21 +18918,55 @@ def advance(run_dir, state, cfg, deadline=None):
             accepted = _parallel_sibling_acceptance(state, batch_index)
             proven = (_sibling_single_attempt(state, accepted, batch_index)
                       if accepted is not None else None)
-            _record_path, sibling_record = _integration_recovery_record(
-                run_dir, batch_index, state)
+            _record_path, sibling_record, sibling_sha256 = (
+                _integration_recovery_record(run_dir, batch_index, state))
+            admitted_sha256 = recovery.get("record_sha256")
+            if (_record_path is None or not isinstance(sibling_record, dict)
+                    or sibling_record.get("unreadable")):
+                pause_with(
+                    run_dir, state,
+                    "Sibling-only recovery was admitted but its exact completed "
+                    "manifest is no longer readable. No writer was launched; "
+                    "every edit and the preserved attempt evidence remain.",
+                    "blocked")
+                return
+            if (admitted_sha256 is not None
+                    and sibling_sha256 != admitted_sha256):
+                pause_with(
+                    run_dir, state,
+                    "Sibling-only recovery was admitted but its completed "
+                    "manifest changed after scope validation. No writer was "
+                    "launched; every edit and the replacement manifest are "
+                    "preserved for inspection.", "blocked")
+                return
+            scope_problem = _parallel_record_scope_problem(
+                sibling_record,
+                ((state.get("parallel_writers") or {}).get("transaction")),
+                resolved_parallel)
+            if scope_problem:
+                pause_with(
+                    run_dir, state,
+                    "Sibling-only recovery was admitted but its exact completed "
+                    "manifest no longer has the validated scope: "
+                    + scope_problem + ". No writer was launched; every edit, "
+                    "attempt evidence and the sibling manifest are preserved.",
+                    "blocked")
+                return
             if accepted is None or not accepted.get("after_snapshot"):
                 accepted = _accept_parallel_sibling_recovery(
-                    state, batch_index, sibling_record or {}, project,
-                    record_path=_record_path)
+                    state, batch_index, sibling_record, project,
+                    record_path=_record_path, record_sha256=sibling_sha256)
                 proven = None
                 save(run_dir, state)
                 journal_event(run_dir, state,
                               "parallel_sibling_recovery_accepted",
                               batch_index=batch_index,
                               after_sha=accepted.get("after_sha"),
-                              phase=accepted.get("record_phase"))
+                              phase=accepted.get("record_phase"),
+                              record_sha256=sibling_sha256)
             manifest_problem = _sibling_manifest_binding_problem(
-                accepted, _record_path)
+                accepted, _record_path, record=sibling_record,
+                sha256=sibling_sha256)
             if manifest_problem:
                 pause_with(
                     run_dir, state,
@@ -18857,10 +19010,11 @@ def advance(run_dir, state, cfg, deadline=None):
             manifest_binding = None
             accepted = _parallel_sibling_acceptance(state, batch_index)
             if accepted is not None:
-                record_path, _sibling_record = _integration_recovery_record(
-                    run_dir, batch_index, state)
+                record_path, sibling_record, sibling_sha256 = (
+                    _integration_recovery_record(run_dir, batch_index, state))
                 manifest_problem = _sibling_manifest_binding_problem(
-                    accepted, record_path)
+                    accepted, record_path, record=sibling_record,
+                    sha256=sibling_sha256)
                 if manifest_problem:
                     pause_with(
                         run_dir, state,
