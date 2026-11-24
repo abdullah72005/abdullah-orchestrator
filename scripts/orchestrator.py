@@ -10029,6 +10029,182 @@ def _record_prelaunch_refusal(run_dir, state, jpath, preflight, job_id, kind,
     return rejection_path
 
 
+NO_EXEC_REFUSAL_VERSION = 1
+
+
+def _no_exec_refusal_path(job):
+    path = (job or {}).get("path")
+    return (Path(path) / "no-exec-refusal.json") if path else None
+
+
+def _write_no_exec_refusal(state, job, *, reason_code, reasons,
+                           observed_binding=None, fallback=None,
+                           worker_fallback=None):
+    """Persist the exact proven no-child disposition before accounting writes."""
+    path = _no_exec_refusal_path(job)
+    if path is None:
+        return None
+    record = {
+        "version": NO_EXEC_REFUSAL_VERSION, "at": now(),
+        "run_id": ((state or {}).get("id")),
+        "job_id": job.get("id"), "kind": job.get("kind"),
+        "role": job.get("role"), "route": job.get("route"),
+        "route_sha256": route_authorization_sha(job.get("route") or {}),
+        "reservation_id": job.get("grant_reservation_id"),
+        "attempt_id": job.get("grant_attempt_id"),
+        "batch_index": job.get("batch_index"),
+        "reason_code": reason_code, "reasons": list(reasons),
+        "expected_binding": job.get("expected_binding"),
+        "observed_binding": observed_binding,
+        "proven_no_exec": True, "active_job_created": False,
+        "model_calls_counted": False,
+        "fallback_authorization": fallback,
+        "worker_fallback_authorization": worker_fallback,
+    }
+    atomic_json(path, record)
+    job["no_exec_refusal"] = {"path": str(path), "reason_code": reason_code}
+    return record
+
+
+def _refuse_dispatch_before_spawn(run_dir, state, jpath, preflight, job, *,
+                                  authorization_state, authoritative_dir, route,
+                                  grant_state_dir, cfg, deadline,
+                                  reason_code, reasons, observed_binding=None,
+                                  decision="candidate_changed",
+                                  spent_fallback=None,
+                                  spent_worker_fallback=None):
+    """Finish a proven no-child refusal with idempotent durable bookkeeping."""
+    role = job.get("role")
+    kind = job.get("kind")
+    job_id = job.get("id")
+    reservation_id = job.get("grant_reservation_id")
+    record_path = _write_no_exec_refusal(
+        state, job, reason_code=reason_code, reasons=reasons,
+        observed_binding=observed_binding, fallback=spent_fallback,
+        worker_fallback=spent_worker_fallback)
+    cleared = True
+    if reservation_id:
+        try:
+            released = release_route_grant(
+                authorization_state, authoritative_dir, role, route,
+                "proven no-child refusal before spawn",
+                reservation_id=reservation_id, cfg=cfg, deadline=deadline,
+                state_dir=grant_state_dir, proven_no_exec=True)
+        except (GrantLedgerTimeout, RuntimeError, ValueError):
+            released = None
+        if released is None:
+            cleared = False
+    if cleared:
+        if spent_fallback is not None:
+            authorization_state["fallback_authorization"] = spent_fallback
+        if spent_worker_fallback is not None:
+            authorization_state["worker_fallback_authorization"] = (
+                spent_worker_fallback)
+        if spent_fallback is not None or spent_worker_fallback is not None:
+            save(grant_state_dir, authorization_state)
+    rejection_path = Path(jpath) / "preflight-rejected.json"
+    rejection = {**(preflight or {}), "kind": kind, "job_id": job_id,
+                 "role": role, "decision": decision,
+                 "reason_code": reason_code, "reasons": list(reasons),
+                 "expected_binding": job.get("expected_binding"),
+                 "observed_binding": observed_binding,
+                 "active_job_created": False, "model_calls_counted": False,
+                 "proven_no_exec": True,
+                 "no_exec_refusal": str(record_path) if record_path else None}
+    atomic_json(rejection_path, rejection)
+    if state is not None:
+        state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
+        if cleared:
+            state["active_job"] = None
+            pause_with(run_dir, state,
+                       "Dispatch not attempted: " + "; ".join(reasons), "blocked")
+        else:
+            state["status"] = "blocked"
+            state["pause_reason"] = (
+                "Dispatch not attempted but the proven no-child slot accounting "
+                "is still pending: " + "; ".join(reasons))
+            save(run_dir, state)
+        journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
+                      role=role, kind=kind, reason_code=reason_code,
+                      reasons=list(reasons), path=str(rejection_path),
+                      proven_no_exec=True)
+    return cleared
+
+
+def _finish_no_exec_refusal(folder, state):
+    """Complete a persisted proven no-child refusal after a restart."""
+    job = state.get("active_job")
+    if not isinstance(job, dict):
+        return False
+    path = _no_exec_refusal_path(job)
+    if path is None or not path.is_file():
+        return False
+    try:
+        record = read_json(path)
+    except (OSError, ValueError):
+        return False
+    if (not isinstance(record, dict)
+            or record.get("version") != NO_EXEC_REFUSAL_VERSION
+            or not record.get("proven_no_exec")
+            or record.get("active_job_created")
+            or record.get("model_calls_counted")):
+        return False
+    if record.get("job_id") != job.get("id") or record.get("role") != job.get("role"):
+        return False
+    if record.get("run_id") not in (None, state.get("id")):
+        return False
+    job_dir = Path(job.get("path") or "")
+    if not job_dir or any((job_dir / name).exists() for name in
+                          ("execution.json", "completion.json", "report.json",
+                           "launch.json")):
+        return False
+    if job.get("pid") or job.get("process") or job.get("session_id"):
+        return False
+    reservation_id = record.get("reservation_id")
+    if reservation_id:
+        route = job.get("route") or record.get("route") or {}
+        try:
+            released = release_route_grant(
+                state, folder, record.get("role"), route,
+                "proven no-child refusal completed after restart",
+                reservation_id=reservation_id, cfg=config(), deadline=None,
+                state_dir=folder, proven_no_exec=True)
+        except (GrantLedgerTimeout, RuntimeError, ValueError):
+            return False
+        if released is None:
+            return False
+    if (record.get("fallback_authorization") is not None
+            and not state.get("fallback_authorization")):
+        state["fallback_authorization"] = record["fallback_authorization"]
+    if (record.get("worker_fallback_authorization") is not None
+            and not state.get("worker_fallback_authorization")):
+        state["worker_fallback_authorization"] = (
+            record["worker_fallback_authorization"])
+    rejection_path = job_dir / "preflight-rejected.json"
+    rejection = {
+        "kind": job.get("kind"), "job_id": job.get("id"),
+        "role": job.get("role"), "decision": "candidate_changed",
+        "reason_code": record.get("reason_code"),
+        "reasons": list(record.get("reasons") or []),
+        "expected_binding": record.get("expected_binding"),
+        "observed_binding": record.get("observed_binding"),
+        "active_job_created": False, "model_calls_counted": False,
+        "proven_no_exec": True, "completed_after_restart": True,
+        "at": now()}
+    atomic_json(rejection_path, rejection)
+    state["preflight_rejection"] = {**rejection, "path": str(rejection_path)}
+    state["active_job"] = None
+    state["status"] = "blocked"
+    state["pause_reason"] = (
+        "Dispatch not attempted: " + "; ".join(
+            record.get("reasons") or ["proven no-child refusal completed after restart"]))
+    save(folder, state)
+    journal_event(folder, state, "preflight_refusal_completed",
+                  job_id=job.get("id"), reason_code=record.get("reason_code"),
+                  reservation_id=reservation_id)
+    return True
+
+
 def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, archive=None,
                deadline=None, decision_binding=None, route=None, grant_state=None,
                grant_dir=None, expected_source=None, dispatch_evidence=None,
@@ -10647,6 +10823,12 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
            "amendment_epoch": (state.get("amendment_epoch", 0) if state is not None else 0),
            "authority_epoch": (state.get("authority_epoch", 0) if state is not None else 0),
            "assignment": assignment,
+           "grant_reservation_id": (ledger_reservation_id
+                                    if reservation is not None else None),
+           "grant_attempt_id": grant_attempt_id,
+           "expected_binding": expected_binding,
+           "batch_index": (state.get("batch_index")
+                           if isinstance(state, dict) else None),
            "launch_file": str(jpath / "launch.json"),
            "dispatch_evidence": dispatch_evidence,
            "review_packet_binding": review_packet,
@@ -10678,55 +10860,8 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     if state is not None:
         state["active_job"] = job
         save(run_dir, state)
-    # The binding is rechecked after the durable launch intent and active-job
-    # persistence too: a change during that bookkeeping must never reach a
-    # child. No child exists, so this reuses the positively-proven no-exec
-    # ledger accounting for only the exact held/marked slot and restores any
-    # one-shot consent that was spent above.
-    binding_problem, binding_observed = _dispatch_binding_problem(
-        expected_binding, project)
-    if binding_problem:
-        if reservation is not None:
-            try:
-                release_route_grant(
-                    authorization_state, authoritative_dir, role, route,
-                    "dispatch binding changed during launch bookkeeping",
-                    reservation_id=ledger_reservation_id, cfg=cfg,
-                    deadline=deadline, state_dir=grant_state_dir,
-                    proven_no_exec=True)
-            except GrantLedgerTimeout:
-                pass
-        if spent_fallback is not None:
-            authorization_state["fallback_authorization"] = spent_fallback
-        if spent_worker_fallback is not None:
-            authorization_state["worker_fallback_authorization"] = (
-                spent_worker_fallback)
-        if spent_fallback is not None or spent_worker_fallback is not None:
-            save(grant_state_dir, authorization_state)
-        rejection_path = jpath / "preflight-rejected.json"
-        rejection = {**preflight, "kind": kind, "job_id": job_id, "role": role,
-                     "decision": "candidate_changed",
-                     "reason_code": "dispatch_binding_changed",
-                     "reasons": ["Dispatch not attempted: " + binding_problem],
-                     "expected_binding": expected_binding,
-                     "observed_binding": binding_observed,
-                     "active_job_created": False,
-                     "model_calls_counted": False}
-        atomic_json(rejection_path, rejection)
-        if state is not None:
-            state["preflight_rejection"] = {
-                **rejection, "path": str(rejection_path)}
-            state["active_job"] = None
-            pause_with(run_dir, state,
-                       "Dispatch not attempted: " + binding_problem, "blocked")
-            journal_event(run_dir, state, "preflight_rejected", job_id=job_id,
-                          role=role, kind=kind,
-                          reason_code="dispatch_binding_changed",
-                          reasons=[binding_problem],
-                          path=str(rejection_path))
-        raise RuntimeError(
-            "Dispatch not attempted: " + binding_problem
-            + f" (diagnostic: {rejection_path})")
+    # Complete every fallible local preparation (including the log stream) before
+    # the final binding check, then refuse immediately before guarded spawn.
     started = time.monotonic()
     out_file = jpath / "events.log"
     proc = None
@@ -10736,7 +10871,38 @@ def call_model(run_dir, state, cfg, role, kind, prompt, project, host=None, arch
     handled_failure = False
     live_permission = None
     try:
-        with out_file.open("w", encoding="utf-8") as log:
+        log = out_file.open("w", encoding="utf-8")
+    except OSError as exc:
+        reasons = ["the event log stream could not be opened: " + str(exc)]
+        _refuse_dispatch_before_spawn(
+            run_dir, state, jpath, preflight, job,
+            authorization_state=authorization_state,
+            authoritative_dir=authoritative_dir, route=route,
+            grant_state_dir=grant_state_dir, cfg=cfg, deadline=deadline,
+            reason_code="preflight_local_failure", reasons=reasons,
+            decision="preflight_rejected", spent_fallback=spent_fallback,
+            spent_worker_fallback=spent_worker_fallback)
+        raise RuntimeError(
+            "Dispatch not attempted: " + reasons[0]
+            + f" (diagnostic: {jpath / 'preflight-rejected.json'})")
+    binding_problem, binding_observed = _dispatch_binding_problem(
+        expected_binding, project)
+    if binding_problem:
+        log.close()
+        reasons = ["Dispatch not attempted: " + binding_problem]
+        _refuse_dispatch_before_spawn(
+            run_dir, state, jpath, preflight, job,
+            authorization_state=authorization_state,
+            authoritative_dir=authoritative_dir, route=route,
+            grant_state_dir=grant_state_dir, cfg=cfg, deadline=deadline,
+            reason_code="dispatch_binding_changed", reasons=reasons,
+            observed_binding=binding_observed, spent_fallback=spent_fallback,
+            spent_worker_fallback=spent_worker_fallback)
+        raise RuntimeError(
+            "Dispatch not attempted: " + binding_problem
+            + f" (diagnostic: {jpath / 'preflight-rejected.json'})")
+    try:
+        with log:
             spawn_attempted = True
             proc, lease_fd = _spawn_guarded(cmd, project, env, log,
                                             launch_file=launch_file,
@@ -16462,14 +16628,137 @@ def _writer_patch(lane_project, base_head, destination):
             "bytes": len(data)}
 
 
-def _apply_writer_patch(worktree, patch_path, *, check_only=False, index=False):
+def _apply_writer_patch(worktree, patch_path, *, check_only=False, index=False,
+                        data=None):
     arguments = ["apply", "--binary", "--whitespace=nowarn"]
     if check_only:
         arguments.append("--check")
     if index:
         arguments.append("--index")
-    arguments.append(str(patch_path))
-    git(worktree, arguments)
+    if data is None:
+        arguments.append(str(patch_path))
+        git(worktree, arguments)
+        return
+    arguments.append("-")
+    subprocess.run(["git", "-C", str(worktree), *arguments], input=data,
+                   capture_output=True, check=True, timeout=30)
+
+
+def _name_status_paths(raw):
+    """Parse ``git diff-index --name-status -z`` output, including renames."""
+    items = raw.split(b"\0")
+    paths = set()
+    index = 0
+    while index < len(items):
+        status = items[index]
+        index += 1
+        if not status:
+            continue
+        code = os.fsdecode(status)
+        if code[:1] in {"R", "C"}:
+            if index + 1 >= len(items):
+                raise RuntimeError("Malformed Git name-status output")
+            paths.add(os.fsdecode(items[index]))
+            paths.add(os.fsdecode(items[index + 1]))
+            index += 2
+            continue
+        if index >= len(items):
+            raise RuntimeError("Malformed Git name-status output")
+        paths.add(os.fsdecode(items[index]))
+        index += 1
+    return paths
+
+
+def _patch_touched_paths(project, patch_data, base_head):
+    """Paths touched by the exact patch bytes, derived by Git without applying.
+
+    A temporary index is populated from ``base_head`` and the patch is applied
+    only there, so mode changes, additions, deletions, renames and C-quoted
+    paths are all attributed by Git itself.
+    """
+    project = Path(project)
+    handle, index_path = tempfile.mkstemp(prefix="orchestrator-patch-index-")
+    os.close(handle)
+    try:
+        os.unlink(index_path)
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = index_path
+
+        def run(arguments, input_data=None):
+            return subprocess.run(
+                ["git", "-C", str(project), *arguments], input=input_data,
+                capture_output=True, check=True, timeout=30, env=env)
+
+        run(["read-tree", base_head])
+        run(["apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
+            input_data=patch_data)
+        raw = run(["diff-index", "--cached", "--name-status", "-z", "-M",
+                   base_head]).stdout
+    finally:
+        try:
+            os.unlink(index_path)
+        except OSError:
+            pass
+    return _name_status_paths(raw)
+
+
+def _admit_integration_patches(project, base_head, patches, resolved):
+    """Read each exact patch once and validate its actual Git-derived scope."""
+    if not isinstance(patches, list) or not patches:
+        return None, "the recorded integration has no writer patch scope"
+    approved_by_id = {item["id"]: item
+                      for item in (resolved or {}).get("writers", [])}
+    verified = []
+    seen_paths = {}
+    for item in patches:
+        if not isinstance(item, dict):
+            return None, "the recorded integration has a malformed patch"
+        writer = item.get("writer")
+        owned = approved_by_id.get(writer)
+        if owned is None:
+            return None, (f"the integration patch belongs to an unapproved "
+                          f"writer {writer!r}")
+        patch_path = item.get("path")
+        patch_sha = item.get("sha256")
+        if not patch_path or not patch_sha:
+            return None, f"the integration patch for {writer} has no exact identity"
+        try:
+            data = Path(patch_path).read_bytes()
+        except OSError as exc:
+            return None, f"the integration patch for {writer} is unreadable: {exc}"
+        if hashlib.sha256(data).hexdigest() != patch_sha:
+            return None, f"the integration patch for {writer} changed after admission"
+        try:
+            touched = sorted(_patch_touched_paths(project, data, base_head))
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            return None, (f"the integration patch for {writer} cannot be "
+                          f"attributed: {exc}")
+        if not touched:
+            return None, f"the integration patch for {writer} changes no path"
+        declared = [item for item in item.get("paths") or []
+                    if isinstance(item, str)]
+        outside_recorded = sorted(set(touched) - set(declared)) if declared else []
+        if outside_recorded:
+            return None, (f"the integration patch for {writer} touches paths "
+                          "outside its recorded scope: "
+                          + ", ".join(outside_recorded))
+        for relative in touched:
+            if not _writer_owns(owned, relative):
+                return None, (f"the integration patch for {writer} touches "
+                              f"unowned path {relative}")
+            other = sorted(
+                writer_id for writer_id, record in approved_by_id.items()
+                if writer_id != writer and _writer_owns(record, relative))
+            if other:
+                return None, (f"the integration patch for {writer} touches "
+                              f"path {relative} owned by {', '.join(other)}")
+            if relative in seen_paths:
+                return None, (f"the integration patches for "
+                              f"{seen_paths[relative]} and {writer} both touch "
+                              f"{relative}")
+            seen_paths[relative] = writer
+        verified.append({**item, "data": data, "touched_paths": touched})
+    return verified, None
 
 
 def _integration_record_path(run_dir, batch_index):
@@ -16754,20 +17043,65 @@ def _parallel_progress(state, lanes, started_at):
     return parallel
 
 
+def _scratch_integration_sha(project, run_dir, batch_index, base_head, patches):
+    """Apply the exact admitted patch bytes in scratch and return its identity."""
+    scratch = _parallel_batch_dir(run_dir, batch_index) / "dry-integration"
+    _git_worktree_remove(project, scratch)
+    create_writer_worktree(project, scratch, base_head)
+    try:
+        for patch in patches:
+            if "data" not in patch:
+                raise RuntimeError("An integration patch has no verified bytes")
+            path = patch.get("path")
+            _apply_writer_patch(scratch, path, check_only=True,
+                                data=patch["data"])
+            # Apply to both index and worktree so the dry-run identity covers the
+            # exact tree/index state the canonical integration will produce.
+            _apply_writer_patch(scratch, path, index=True, data=patch["data"])
+        return _checkout_content_sha(scratch)
+    finally:
+        _git_worktree_remove(project, scratch)
+
+
+def _integration_patch_view(patch):
+    """The JSON-safe identity of one verified integration patch."""
+    return {key: value for key, value in patch.items()
+            if key not in {"data", "touched_paths"}}
+
+
 def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, *,
-                        expected_writers=None, mode="full", transaction=None):
-    """Dry-run every patch in scratch, then apply the exact combined result."""
+                        expected_writers=None, mode="full", transaction=None,
+                        previous=None, previous_sha256=None,
+                        admitted_patches=None, resolved=None):
+    """Dry-run the exact admitted patch bytes, then apply those same bytes once."""
     record_path = _integration_record_path(run_dir, batch_index)
-    previous = None
-    if record_path.is_file():
-        try:
-            previous = read_json(record_path)
-        except (OSError, ValueError):
+    if previous is None:
+        # Fresh integration reads the record once; recovery callers pass their
+        # already-admitted object and digest so no second read can gain authority.
+        if record_path.is_file():
+            try:
+                previous = read_json(record_path)
+            except (OSError, ValueError):
+                previous = None
+        if isinstance(previous, dict) and not _integration_record_current(previous, state):
+            # A retained record from a superseded plan revision cannot authorize
+            # this transaction; preserve it on disk until the next write replaces it.
             previous = None
-    if isinstance(previous, dict) and not _integration_record_current(previous, state):
-        # A retained record from a superseded plan revision cannot authorize
-        # this transaction; preserve it on disk until the next write replaces it.
-        previous = None
+    elif previous_sha256 is not None and record_path.is_file():
+        _bound, problem = _read_bound_manifest(record_path, previous_sha256)
+        if problem:
+            raise RuntimeError(
+                "The admitted integration record changed after classification: "
+                + problem)
+    if resolved is None:
+        batches = (state.get("plan") or {}).get("batches") or []
+        raw_writers = (batches[batch_index].get("writers")
+                       if batch_index < len(batches) else None)
+        try:
+            resolved = {"writers": _writer_assignment_records(raw_writers)}
+        except ValueError as exc:
+            raise RuntimeError(
+                "The approved writer ownership is unavailable: " + str(exc))
     patches = [{"writer": writer_id, **(lane.get("patch") or {}),
                 "paths": list(lane.get("changed_paths") or [])}
                for writer_id, lane in sorted(lanes.items())
@@ -16832,6 +17166,14 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
             raise RuntimeError(
                 "Recorded parallel integration patches no longer match the durable "
                 "lane artifacts; a changed patch cannot authorize integration")
+    if admitted_patches is None:
+        admitted_patches, patch_problem = _admit_integration_patches(
+            project, base_head, patches, resolved)
+        if patch_problem:
+            raise RuntimeError(patch_problem)
+    patches = admitted_patches
+    writers = sorted(item["writer"] for item in patches)
+    patch_views = [_integration_patch_view(item) for item in patches]
     manifest = {"version": 1, "batch_index": batch_index, "base_head": base_head,
                 "run_id": state.get("id"),
                 "plan_version": state.get("plan_version"),
@@ -16840,80 +17182,118 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
                 "authority_epoch": state.get("authority_epoch", 0),
                 "mode": mode, "expected_writers": expected,
                 "intent": (dict(transaction) if isinstance(transaction, dict) else None),
-                "writers": writers, "patches": patches, "created_at": now()}
-    if isinstance(previous, dict) and previous.get("phase") == "complete" \
-            and previous.get("mode", "full") == "full":
-        current = _checkout_content_sha(project)
-        if current == previous.get("after_sha"):
-            return previous
-        raise RuntimeError(
-            "Recorded parallel integration is complete but the canonical checkout "
-            "no longer matches its expected identity. Inspect the preserved patches "
-            f"at {_parallel_batch_dir(run_dir, batch_index)} before any retry.")
-    if isinstance(previous, dict) and previous.get("before_sha") and previous.get(
-            "after_sha"):
-        current = _checkout_content_sha(project)
-        if current == previous["after_sha"]:
-            previous.update({"phase": "complete", "completed_at": now()})
-            atomic_json(record_path, previous)
-            return previous
-        if current != previous["before_sha"]:
+                "writers": writers, "patches": patch_views, "created_at": now()}
+    final_phase = "complete" if mode == "full" else "sibling_recovery"
+    current = _checkout_content_sha(project)
+    if isinstance(previous, dict):
+        admitted_before = previous.get("before_sha")
+        admitted_after = previous.get("after_sha")
+        if not admitted_before or not admitted_after:
+            raise RuntimeError(
+                "Recorded parallel integration has no exact before/after identity; "
+                f"inspect the preserved evidence at {record_path}")
+        if admitted_before == admitted_after:
+            raise RuntimeError(
+                "Recorded parallel integration has an impossible unchanged after "
+                f"identity; inspect the preserved evidence at {record_path}")
+        if current not in {admitted_before, admitted_after}:
             raise RuntimeError(
                 "Parallel integration was interrupted with an unrecognized checkout "
                 "identity; no automatic reset is allowed. Recovery patches and the "
                 f"expected identity are recorded at {record_path}")
+        if current == admitted_after and previous.get("phase") == final_phase:
+            # A record already finalized was proven when it was written; the
+            # admitted identity is still confirmed by the exact current checkout.
+            return previous
+        expected_after = _scratch_integration_sha(
+            project, run_dir, batch_index, base_head, patches)
+        if expected_after != admitted_after:
+            raise RuntimeError(
+                "The admitted integration patches do not produce the recorded after "
+                "identity; the admitted identity is preserved and no canonical "
+                f"apply was attempted. Inspect {record_path}")
+        if expected_after == admitted_before:
+            raise RuntimeError(
+                "The admitted integration patches produce no change from the before "
+                f"identity; no canonical apply was attempted. Inspect {record_path}")
+        if current == admitted_after:
+            # Exact-after: the completed checkout is proven against the admitted
+            # result before finishing attribution. Never reapply or replace it.
+            manifest = previous
+            manifest.update({"patches": patch_views, "writers": writers,
+                             "mode": mode, "expected_writers": expected,
+                             "phase": final_phase,
+                             "applied": sorted(writers), "completed_at": now(),
+                             "paths": sorted({path for patch in patches
+                                              for path in patch["touched_paths"]})})
+            atomic_json(record_path, manifest)
+            return manifest
+        # Exact-before: hold the admitted identity, then recheck it at the
+        # canonical mutation point before applying the same verified bytes.
+        before = _checkout_content_digest(project)
+        if before["head"] != base_head:
+            raise RuntimeError(
+                "Canonical checkout moved since writers started; refusing to integrate")
+        if _checkout_content_sha(project) != admitted_before:
+            raise RuntimeError(
+                "The canonical checkout changed after scratch validation; the exact "
+                f"before boundary is no longer present. Inspect {record_path}")
+        if worktree_states(project):
+            raise RuntimeError(
+                "Canonical checkout became dirty while writers were running; refusing to "
+                "integrate onto unreproducible source")
         manifest = previous
-        manifest.update({"writers": writers, "patches": patches, "mode": mode,
+        manifest.update({"patches": patch_views, "writers": writers, "mode": mode,
                          "expected_writers": expected,
                          "intent": (dict(transaction)
-                                    if isinstance(transaction, dict) else None)})
-    before = _checkout_content_digest(project)
-    if before["head"] != base_head:
+                                    if isinstance(transaction, dict) else None),
+                         "phase": "prepared", "applied": [],
+                         "prepared_at": now()})
+        atomic_json(record_path, manifest)
+    else:
+        before_sha = current
+        before = _checkout_content_digest(project)
+        if before["head"] != base_head:
+            raise RuntimeError(
+                "Canonical checkout moved since writers started; refusing to integrate")
+        if worktree_states(project):
+            raise RuntimeError(
+                "Canonical checkout became dirty while writers were running; refusing to "
+                "integrate onto unreproducible source")
+        expected_after = _scratch_integration_sha(
+            project, run_dir, batch_index, base_head, patches)
+        if expected_after == before_sha:
+            raise RuntimeError(
+                "The admitted integration patches produce no change from the before "
+                "identity; no canonical apply was attempted")
+        manifest.update({"phase": "prepared", "before_sha": before_sha,
+                         "after_sha": expected_after, "applied": [],
+                         "prepared_at": now()})
+        atomic_json(record_path, manifest)
+    # Recheck the exact admitted before boundary immediately before mutation.
+    if _checkout_content_sha(project) != manifest.get("before_sha"):
         raise RuntimeError(
-            "Canonical checkout moved since writers started; refusing to integrate")
-    if worktree_states(project):
-        raise RuntimeError(
-            "Canonical checkout became dirty while writers were running; refusing to "
-            "integrate onto unreproducible source")
-    scratch = _parallel_batch_dir(run_dir, batch_index) / "dry-integration"
-    _git_worktree_remove(project, scratch)
-    create_writer_worktree(project, scratch, base_head)
-    try:
-        for patch in patches:
-            path = Path(patch.get("path", ""))
-            if not path.is_file() or _sha256_file(path) != patch.get("sha256"):
-                raise RuntimeError(
-                    f"Writer patch is missing or changed: {path}")
-            _apply_writer_patch(scratch, path, check_only=True)
-            # Apply to both index and worktree so the dry-run identity covers the
-            # exact tree/index state the canonical integration will produce.
-            _apply_writer_patch(scratch, path, index=True)
-        expected_after = _checkout_content_sha(scratch)
-    finally:
-        _git_worktree_remove(project, scratch)
-    manifest.update({"phase": "prepared", "before_sha": _checkout_content_sha(project),
-                     "after_sha": expected_after, "applied": [],
-                     "prepared_at": now()})
-    atomic_json(record_path, manifest)
+            "The canonical checkout changed after scratch validation; the exact "
+            f"before boundary is no longer present. Inspect {record_path}")
     for patch in patches:
-        _apply_writer_patch(project, Path(patch["path"]), index=True)
+        _apply_writer_patch(project, Path(patch["path"]), index=True,
+                            data=patch["data"])
         manifest.setdefault("applied", []).append(patch["writer"])
         manifest["phase"] = "applying"
         atomic_json(record_path, manifest)
     after = _checkout_content_sha(project)
-    if after != expected_after:
+    if after != manifest.get("after_sha"):
         raise RuntimeError(
             "Canonical integration does not match the dry-run identity. The index "
             "and worktree were left intact for inspection; recovery patches and "
             f"expected identity are recorded at {record_path}")
-    phase = "complete" if mode == "full" else "sibling_recovery"
-    manifest.update({"phase": phase, "completed_at": now(),
+    manifest.update({"phase": final_phase, "completed_at": now(),
                      "remaining_writers": (sorted(set(expected) - set(writers))
                                            if mode == "full" else []),
                      "paths": sorted({path for lane in lanes.values()
                                       for path in lane.get("changed_paths", [])})
                      or sorted({path for patch in patches
-                                for path in patch.get("paths", [])})})
+                                for path in patch.get("touched_paths", [])})})
     atomic_json(record_path, manifest)
     return manifest
 
@@ -17366,48 +17746,63 @@ def _parallel_record_scope_problem(record, transaction, resolved):
     phase = record.get("phase")
     if mode not in {"full", "sibling_recovery"}:
         return f"the recorded integration mode {mode!r} is not recognized"
-    if mode == "sibling_recovery" or str(phase).startswith("sibling"):
-        if mode != "sibling_recovery":
-            return "the recorded sibling phase has a different integration mode"
-        if phase not in {"prepared", "applying", "sibling_recovery",
-                         "complete"}:
+    allowed_phases = {"prepared", "applying", "complete"}
+    if mode == "sibling_recovery":
+        allowed_phases.add("sibling_recovery")
+    if phase not in allowed_phases:
+        return (f"the recorded integration has an unrecognized phase {phase!r} "
+                f"for mode {mode!r}")
+    patches = [item for item in record.get("patches") or []
+               if isinstance(item, dict)]
+    if len(patches) != len(record.get("patches") or []):
+        return "the recorded integration has a malformed patch"
+    if not patches:
+        return "the recorded integration has no writer patch scope"
+    patch_writers = sorted(item.get("writer") for item in patches
+                           if item.get("writer"))
+    if len(patch_writers) != len(patches):
+        return "the recorded integration has an unassigned patch"
+    if mode == "full":
+        if approved and patch_writers != approved:
+            return ("the recorded full integration patches cover writers "
+                    + ", ".join(patch_writers) + " but the approved assignment is "
+                    + ", ".join(approved))
+    else:
+        if str(phase).startswith("sibling") and phase not in {
+                "prepared", "applying", "sibling_recovery", "complete"}:
             return ("the recorded sibling integration has an unrecognized "
                     f"phase {phase!r}")
-        patches = [item for item in record.get("patches") or []
-                   if isinstance(item, dict)]
-        if not patches:
-            return "the recorded sibling integration has no patch scope"
-        patch_writers = sorted(item.get("writer") for item in patches
-                               if item.get("writer"))
-        if len(patch_writers) != len(patches):
-            return "the recorded sibling integration has an unassigned patch"
         if recorded_writers and patch_writers != recorded_writers:
             return ("the recorded sibling patches do not match its recorded "
                     "writer set")
-        approved_by_id = {item["id"]: item
-                          for item in (resolved or {}).get("writers", [])}
-        for patch in patches:
-            writer = patch.get("writer")
-            owned = approved_by_id.get(writer)
-            if owned is None:
-                return ("the recorded sibling patch belongs to an unapproved "
-                        f"writer {writer!r}")
-            paths = [item for item in patch.get("paths") or []
-                     if isinstance(item, str)]
-            for relative in paths:
-                if not _writer_owns(owned, relative):
-                    return (f"the recorded sibling patch for {writer} touches "
-                            f"unowned path {relative}")
-            patch_path = patch.get("path")
-            patch_sha = patch.get("sha256")
-            if not patch_path or not patch_sha:
-                return "the recorded sibling patch identity is incomplete"
-            try:
-                actual = _sha256_file(Path(patch_path))
-            except OSError as exc:
-                return "the recorded sibling patch is unreadable: " + str(exc)
-            if actual != patch_sha:
-                return "the recorded sibling patch bytes changed"
+        outside_patches = [item for item in patch_writers if item not in approved]
+        if outside_patches:
+            return ("the recorded sibling patches include writers outside the "
+                    "approved assignment: " + ", ".join(outside_patches))
+    approved_by_id = {item["id"]: item
+                      for item in (resolved or {}).get("writers", [])}
+    for patch in patches:
+        writer = patch.get("writer")
+        owned = approved_by_id.get(writer)
+        if owned is None:
+            return ("the recorded integration patch belongs to an unapproved "
+                    f"writer {writer!r}")
+        paths = [item for item in patch.get("paths") or []
+                 if isinstance(item, str)]
+        for relative in paths:
+            if not _writer_owns(owned, relative):
+                return (f"the recorded patch for {writer} touches unowned "
+                        f"path {relative}")
+            other = sorted(
+                writer_id for writer_id, record in approved_by_id.items()
+                if writer_id != writer and _writer_owns(record, relative))
+            if other:
+                return (f"the recorded patch for {writer} touches path {relative} "
+                        f"owned by {', '.join(other)}")
+        patch_path = patch.get("path")
+        patch_sha = patch.get("sha256")
+        if not patch_path or not patch_sha:
+            return "the recorded integration patch identity is incomplete"
     return None
 
 
@@ -17504,6 +17899,32 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                        "patch was applied; the preserved evidence is unchanged.",
                        "blocked")
             return None
+        if not recovery_record.get("before_sha") or not recovery_record.get(
+                "after_sha"):
+            pause_with(run_dir, state,
+                       "The recorded parallel integration has no exact before/after "
+                       "identity; no writer was launched and no patch was applied. "
+                       "Inspect the preserved record and patches before any retry.",
+                       "blocked")
+            return None
+        if phase in {"prepared", "applying"} and (
+                recovery_record["before_sha"] == recovery_record["after_sha"]):
+            pause_with(run_dir, state,
+                       "The recorded prepared parallel integration identifies the "
+                       "unchanged before checkout as its after identity; no writer "
+                       "was launched and no patch was applied. Inspect the preserved "
+                       "record and patches before any retry.", "blocked")
+            return None
+        admitted_patches, patch_problem = _admit_integration_patches(
+            project, recovery_record.get("base_head") or base_head,
+            recovery_record.get("patches") or [], resolved)
+        if patch_problem:
+            pause_with(run_dir, state,
+                       "The recorded parallel integration patches cannot be "
+                       "admitted safely: " + patch_problem + ". No writer was "
+                       "launched and no patch was applied; the preserved patch "
+                       "artifacts are unchanged.", "blocked")
+            return None
         identity, _current = _parallel_canonical_identity(project, recovery_record)
         if mode == "sibling_recovery" or str(phase).startswith("sibling"):
             if phase in {"sibling_recovery", "complete"} and identity != "after":
@@ -17536,7 +17957,10 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                         run_dir, state, project, batch_index, {},
                         recovery_record.get("base_head") or base_head,
                         expected_writers=approved_writers,
-                        mode="sibling_recovery", transaction=transaction)
+                        mode="sibling_recovery", transaction=transaction,
+                        previous=recovery_record,
+                        previous_sha256=_recovery_sha256,
+                        admitted_patches=admitted_patches, resolved=resolved)
                 except RuntimeError as exc:
                     pause_with(run_dir, state,
                                "Sibling-only parallel recovery could not complete: "
@@ -17601,7 +18025,9 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                 run_dir, state, project, batch_index, {},
                 recovery_record.get("base_head") or base_head,
                 expected_writers=approved_writers, mode="full",
-                transaction=transaction)
+                transaction=transaction, previous=recovery_record,
+                previous_sha256=_recovery_sha256,
+                admitted_patches=admitted_patches, resolved=resolved)
         except RuntimeError as exc:
             state["parallel_integration"] = {
                 "version": 1, "batch_index": batch_index,
@@ -17976,7 +18402,8 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
                     _parallel_integrate(
                         run_dir, state, project, batch_index, completed, base_head,
                         expected_writers=[record["id"] for record in records.values()],
-                        mode="sibling_recovery", transaction=transaction)
+                        mode="sibling_recovery", transaction=transaction,
+                        resolved=resolved)
                 state["parallel_integration"] = read_json(integration_path)
             except RuntimeError as exc:
                 if _checkout_content_sha(project) != pre_integration_sha:
@@ -18022,7 +18449,7 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         integration = _parallel_integrate(
             run_dir, state, project, batch_index, lanes, base_head,
             expected_writers=[record["id"] for record in records.values()],
-            mode="full", transaction=transaction)
+            mode="full", transaction=transaction, resolved=resolved)
     except RuntimeError as exc:
         if _checkout_content_sha(project) != pre_integration_sha:
             state["parallel_integration"] = {
@@ -21902,6 +22329,7 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
         journal_event(folder, state, "fallback_approved", role=role)
         return True
     if action == "resume":
+        _finish_no_exec_refusal(folder, state)
         if state["status"] == "uncertain" or state.get("active_job") or state.get("active_check"):
             raise RuntimeError("Uncertain active dispatch: reconcile exact process/session/checkout first; not safe to retry")
         if state["status"] == "awaiting_plan_approval":
@@ -21961,6 +22389,8 @@ def modify_locked(folder, state, run_id, action, role=None, retry_verification=F
                           "missing": len(preflight.get("missing") or [])})
         return True
     if action == "reconcile":
+        if _finish_no_exec_refusal(folder, state):
+            return True
         if state["status"] != "uncertain" and not (retry_verification and state["status"] == "running"):
             raise RuntimeError("Run is not in uncertain state")
         lane_targets = _uncertain_parallel_lane_ids(state)

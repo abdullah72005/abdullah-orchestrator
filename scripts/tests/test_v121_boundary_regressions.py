@@ -1974,6 +1974,175 @@ class ManifestAdmissionBindingTests(BoundaryBase):
         self.assertNotIn("parallel_sibling_single", self.state)
 
 
+class IntegrationAdmissionRecoveryTests(BoundaryBase):
+    """Recovery applies only the admitted patch scope and exact identities."""
+
+    def prepared_full(self):
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        fake = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+
+        def crash_after_first(value):
+            return (value.get("phase") == "applying"
+                    and list(value.get("applied") or []) == ["a"])
+
+        with patch.object(orc, "call_model", side_effect=fake):
+            with PostApplyRecoveryTests.crash_on_manifest(
+                    self, crash_after_first):
+                orc.run_parallel_batch(
+                    self.rundir, self.state, self.cfg, self.project, batch,
+                    resolved, None)
+        record_path = orc._integration_record_path(self.rundir, 0)
+        record = orc.read_json(record_path)
+        self.assertEqual(record["phase"], "prepared")
+        self.assertEqual(record["applied"], [])
+        orc.git(self.project, ["reset", "--hard", record["base_head"]])
+        orc.git(self.project, ["clean", "-fd"])
+        self.state = orc.load(self.state["id"])[1]
+        self.state.update({"status": "running", "phase": "implement",
+                           "implementation": None,
+                           "parallel_integration": None})
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        return record, resolved
+
+    def stage_with_running_state(self):
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "running"
+        self.state["phase"] = "implement"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+
+    def app_patch(self, base_head, destination):
+        scratch = self.rundir / "unowned-scratch"
+        orc.create_writer_worktree(self.project, scratch, base_head)
+        try:
+            (scratch / "app.py").write_text("value = 'unowned'\n")
+            return orc._writer_patch(scratch, base_head, destination)
+        finally:
+            orc._git_worktree_remove(self.project, scratch)
+
+    def test_prepared_sibling_patch_bytes_outside_ownership_block(self):
+        record, resolved = self.prepared_full()
+        record_path = orc._integration_record_path(self.rundir, 0)
+        original_app = (self.project / "app.py").read_text()
+        malicious = self.app_patch(record["base_head"],
+                                   self.rundir / "unowned.patch")
+        record.update({
+            "mode": "sibling_recovery", "phase": "prepared",
+            "writers": ["a"], "applied": [],
+            "patches": [{"writer": "a", **malicious, "paths": ["a.py"]}]})
+        orc.atomic_json(record_path, record)
+        self.stage_with_running_state()
+        launches = []
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a writer launched over an unowned patch")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0, "the unowned patch was applied")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("outside its recorded scope", self.state["pause_reason"])
+        self.assertEqual((self.project / "app.py").read_text(), original_app)
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertEqual(orc.read_json(record_path)["phase"], "prepared")
+        self.assertEqual(orc.read_json(record_path)["applied"], [])
+        self.assertNotEqual(self.state["phase"], "verify")
+
+    def test_prepared_full_record_with_unchanged_after_identity_blocks(self):
+        record, resolved = self.prepared_full()
+        record_path = orc._integration_record_path(self.rundir, 0)
+        record["after_sha"] = record["before_sha"]
+        orc.atomic_json(record_path, record)
+        self.stage_with_running_state()
+        launches = []
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a writer launched over a false full integration")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertIn("after identity", self.state["pause_reason"])
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+        self.assertEqual(orc.read_json(record_path)["phase"], "prepared")
+        self.assertNotEqual(self.state["phase"], "verify")
+
+    def integrate_prepared(self, record, resolved):
+        return orc._parallel_integrate(
+            self.rundir, self.state, self.project, 0, {},
+            record["base_head"], expected_writers=["a", "b"], mode="full",
+            transaction=self.state["parallel_writers"]["transaction"])
+
+    def test_patch_replacement_after_admission_applies_the_admitted_bytes(self):
+        record, resolved = self.prepared_full()
+        original_app = (self.project / "app.py").read_text()
+        malicious = self.app_patch(record["base_head"],
+                                   self.rundir / "replacement.patch")
+        malicious_data = Path(malicious["path"]).read_bytes()
+        target = Path(record["patches"][0]["path"])
+        real_apply = orc._apply_writer_patch
+        replaced = []
+
+        def apply_then_replace(worktree, patch_path, **kwargs):
+            result = real_apply(worktree, patch_path, **kwargs)
+            if (Path(worktree).resolve() != self.project.resolve()
+                    and not replaced):
+                target.write_bytes(malicious_data)
+                replaced.append(True)
+            return result
+
+        with patch.object(orc, "_apply_writer_patch",
+                          side_effect=apply_then_replace):
+            integration = self.integrate_prepared(record, resolved)
+        self.assertEqual(replaced, [True])
+        self.assertEqual(integration["phase"], "complete")
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+        self.assertEqual((self.project / "app.py").read_text(), original_app)
+        self.assertEqual(target.read_bytes(), malicious_data,
+                         "the replacement patch file was silently rewritten")
+
+    def test_canonical_change_during_scratch_blocks_before_any_apply(self):
+        record, resolved = self.prepared_full()
+        record_path = orc._integration_record_path(self.rundir, 0)
+        self.assertFalse((self.project / "a.py").exists())
+        real_apply = orc._apply_writer_patch
+        mutated = []
+
+        def apply_then_edit(worktree, patch_path, **kwargs):
+            result = real_apply(worktree, patch_path, **kwargs)
+            if (Path(worktree).resolve() != self.project.resolve()
+                    and not mutated):
+                (self.project / "app.py").write_text("value = 99\n")
+                mutated.append(True)
+            return result
+
+        with patch.object(orc, "_apply_writer_patch",
+                          side_effect=apply_then_edit):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "changed after scratch validation"):
+                self.integrate_prepared(record, resolved)
+        self.assertEqual(mutated, [True])
+        self.assertEqual((self.project / "app.py").read_text(), "value = 99\n")
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+        self.assertEqual(orc.read_json(record_path)["phase"], "prepared")
+        self.assertTrue(Path(record["patches"][0]["path"]).is_file())
+
+
 class LaunchBookkeepingBindingTests(BoundaryBase):
     """A binding change during spawn bookkeeping is a proven no-child refusal."""
 
@@ -2162,6 +2331,164 @@ class LaunchBookkeepingBindingTests(BoundaryBase):
         self.assertEqual(grant["reservations"], [],
                          "a subscription fallback consumed the paid slot")
         self.assertNotEqual(self.state["phase"], "verify")
+
+    def test_mode_change_during_log_open_blocks_without_charge(self):
+        self.prepare_paid_sibling()
+        mode_before = (self.project / "a.py").stat().st_mode & 0o777
+        original_app = (self.project / "app.py").read_text()
+        testcase = self
+        real_open = Path.open
+        mutated = []
+
+        def open_with_drift(path_obj, *args, **kwargs):
+            handle = real_open(path_obj, *args, **kwargs)
+            if path_obj.name == "events.log" and not mutated:
+                mutated.append(True)
+                testcase.flip_mode()
+            return handle
+
+        starts = []
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a child started after log-open drift")
+
+        with patch.object(Path, "open", new=open_with_drift), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "Dispatch not attempted"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assert_no_child_refusal(mutated, starts)
+        self.assert_slot_refunded()
+        self.assertEqual((self.project / "app.py").read_text(), original_app)
+        self.assertNotEqual(
+            (self.project / "a.py").stat().st_mode & 0o777, mode_before)
+        self.assertNotEqual(self.state["phase"], "verify")
+
+    def test_interrupted_refusal_finishes_on_resume_without_double_accounting(self):
+        self.prepare_paid_sibling()
+        patched, mutated = self.journal_mutation("manifest")
+        real_atomic = orc.atomic_json
+        interrupted = []
+
+        def atomic_with_loss(path, value, *args, **kwargs):
+            if Path(path).name == "preflight-rejected.json":
+                interrupted.append(True)
+                raise RuntimeError(
+                    "simulated process loss before rejection write")
+            return real_atomic(path, value, *args, **kwargs)
+
+        starts = []
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a child started during the interrupted refusal")
+
+        with patch.object(orc, "journal_event", side_effect=patched), \
+                patch.object(orc, "atomic_json", side_effect=atomic_with_loss), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "simulated process loss"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assertEqual(interrupted, [True])
+        self.assertEqual(starts, [])
+        self.state = orc.load(self.state["id"])[1]
+        job = self.state["active_job"]
+        self.assertIsInstance(job, dict)
+        job_dir = Path(job["path"])
+        self.assertTrue((job_dir / "no-exec-refusal.json").is_file(),
+                        "the no-child disposition was not durable")
+        self.assertFalse((job_dir / "preflight-rejected.json").exists())
+        self.assert_slot_refunded()
+
+        reconciled = orc.reconcile_run(self.state["id"])
+        self.assertEqual(reconciled["status"], "blocked")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertIsNone(self.state.get("active_job"))
+        self.assertTrue(self.state["preflight_rejection"]
+                        .get("completed_after_restart"))
+        self.assert_slot_refunded()
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertIsNone(self.state.get("active_job"))
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        grant = ledger["grants"]["bookkeeping-grant"]
+        self.assertEqual(len(grant["releases"]), 1,
+                         "the same refusal was refunded twice")
+        unrelated = ledger["grants"]["unrelated-grant"]
+        self.assertEqual(unrelated["reservations"], [])
+
+        # A second public resume is idempotent.
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.assert_slot_refunded()
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        self.assertEqual(len(ledger["grants"]["bookkeeping-grant"]["releases"]), 1)
+
+        # The drifted manifest still blocks any replacement dispatch.
+        starts = []
+
+        def must_not_spawn_again(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a child started after the completed refusal")
+
+        self.state = orc.load(self.state["id"])[1]
+        with patch.object(orc, "_spawn_guarded",
+                          side_effect=must_not_spawn_again):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(starts, [])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertNotEqual(self.state["phase"], "verify")
+        self.assert_slot_refunded()
+
+    def test_interrupted_fallback_refusal_preserves_consent_on_resume(self):
+        _route, _grant = self.prepare_paid_sibling()
+        self.state = orc.load(self.state["id"])[1]
+        self.state["route_authorizations"] = []
+        self.state["status"] = "blocked"
+        orc.save(self.rundir, self.state)
+        self.assertTrue(orc.modify_locked(
+            self.rundir, self.state, self.state["id"], "approve-fallback",
+            role="implementer"))
+        self.state = orc.load(self.state["id"])[1]
+        fallback_before = copy.deepcopy(self.state["fallback_authorization"])
+        self.state["status"] = "paused"
+        orc.atomic_json(self.rundir / "control.json", {"action": "pause"})
+        orc.save(self.rundir, self.state)
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running",
+                         self.state.get("pause_reason"))
+        self.state = orc.load(self.state["id"])[1]
+        patched, mutated = self.active_job_mutation("manifest")
+        real_atomic = orc.atomic_json
+        interrupted = []
+
+        def atomic_with_loss(path, value, *args, **kwargs):
+            if Path(path).name == "preflight-rejected.json":
+                interrupted.append(True)
+                raise RuntimeError(
+                    "simulated process loss before rejection write")
+            return real_atomic(path, value, *args, **kwargs)
+
+        starts = []
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a fallback child started during the refusal")
+
+        with patch.object(orc, "save", side_effect=patched), \
+                patch.object(orc, "atomic_json", side_effect=atomic_with_loss), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "simulated process loss"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assertIsInstance(self.state.get("active_job"), dict)
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertIsNone(self.state.get("active_job"))
+        self.assertEqual(self.state.get("fallback_authorization"),
+                         fallback_before)
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        self.assertEqual(ledger["grants"]["bookkeeping-grant"]["reservations"], [],
+                         "the subscription fallback consumed a paid slot")
+        self.assertEqual(starts, [])
 
     def test_unchanged_paid_single_writer_still_launches_once(self):
         self.prepare_paid_sibling()
