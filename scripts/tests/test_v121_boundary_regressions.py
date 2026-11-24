@@ -2176,6 +2176,270 @@ class IntegrationAdmissionRecoveryTests(BoundaryBase):
         self.assertIn("proof", self.state["pause_reason"])
         self.assertNotEqual(self.state["phase"], "verify")
 
+    def test_exact_after_full_reload_retains_identities_and_does_not_reapply(self):
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        fake = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+        with patch.object(orc, "call_model", side_effect=fake):
+            result = orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                resolved, None)
+        self.assertIsNotNone(result)
+        record_path = orc._integration_record_path(self.rundir, 0)
+        complete = orc.read_json(record_path)
+        self.assertEqual(complete["phase"], "complete")
+        self.assertTrue(complete.get("before_sha"))
+        self.assertTrue(complete.get("after_sha"))
+        self.assertEqual(complete["after_sha"],
+                         orc._checkout_content_sha(self.project))
+        self.assertTrue(complete.get("proof_sha256"))
+        # Simulate a crash after the canonical apply but before the final record
+        # write: the canonical checkout is exactly at after, the progress record
+        # still says applying.
+        applying = dict(complete)
+        applying.update({"phase": "applying", "applied": ["a", "b"],
+                         "completed_at": None})
+        orc.atomic_json(record_path, applying)
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "running"
+        self.state["phase"] = "implement"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        launches = []
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a completed integration was replayed")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            finalized = orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                resolved, None)
+        self.assertIsNotNone(finalized)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        for _ in range(2):
+            self.state = orc.load(self.state["id"])[1]
+            self.state["status"] = "running"
+            self.state["phase"] = "implement"
+            orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+            orc.save(self.rundir, self.state)
+            self.assertEqual(
+                orc.read_json(record_path)["before_sha"], complete["before_sha"])
+            self.assertEqual(
+                orc.read_json(record_path)["after_sha"], complete["after_sha"])
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+        self.assertEqual(orc.read_json(record_path)["after_sha"],
+                         complete["after_sha"])
+
+    def test_exact_after_sibling_reload_retains_identities_and_continues_once(self):
+        _batch, record = SiblingSingleRecoveryTests.sibling_run(self)
+        record_path = orc._integration_record_path(self.rundir, 0)
+        self.assertEqual(record["phase"], "sibling_recovery")
+        self.assertTrue(record.get("before_sha"))
+        self.assertEqual(record["after_sha"],
+                         orc._checkout_content_sha(self.project))
+        applying = dict(record)
+        applying.update({"phase": "applying", "applied": [],
+                         "completed_at": None})
+        orc.atomic_json(record_path, applying)
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "running"
+        self.state["phase"] = "implement"
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        launches = []
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a sibling integration was replayed")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            resolved = orc.resolve_parallel_batch(
+                self.state, self.project, _batch, run_dir=self.rundir)
+            orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, _batch,
+                resolved, None)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        for _ in range(2):
+            self.state = orc.load(self.state["id"])[1]
+            self.state["status"] = "running"
+            self.state["phase"] = "implement"
+            orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+            orc.save(self.rundir, self.state)
+            self.assertEqual(
+                orc.read_json(record_path)["after_sha"], record["after_sha"])
+        starts = []
+
+        def finish(run_dir, state, cfg, role, kind, prompt, project, **kwargs):
+            starts.append(kwargs.get("assignment"))
+            (Path(project) / "b.py").write_text("b = 2\n")
+            return report("b finished"), pw.writer_job(run_dir, "single")
+
+        with patch.object(orc, "call_model", side_effect=finish), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(starts, [None])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 2\n")
+        self.assertEqual(orc.read_json(record_path)["after_sha"],
+                         record["after_sha"])
+
+    def test_tracked_edit_during_prepared_record_write_blocks_before_apply(self):
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        fake = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+        target = orc._integration_record_path(self.rundir, 0)
+        real_atomic = orc.atomic_json
+        mutated = []
+
+        def atomic_with_edit(path, value, *args, **kwargs):
+            if (Path(path) == target and value.get("phase") == "prepared"
+                    and not mutated):
+                mutated.append(True)
+                (self.project / "app.py").write_text("value = 'during-write'\n")
+                orc.git(self.project, ["add", "app.py"])
+            return real_atomic(path, value, *args, **kwargs)
+
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+        with patch.object(orc, "call_model", side_effect=fake), \
+                patch.object(orc, "atomic_json", side_effect=atomic_with_edit), \
+                apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assertEqual(count["n"], 0, "patches were applied after write drift")
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertEqual((self.project / "app.py").read_text(),
+                         "value = 'during-write'\n")
+        staged = orc.git(self.project,
+                         ["diff", "--cached", "--name-only"]).decode().split()
+        self.assertIn("app.py", staged)
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+        record = orc.read_json(target)
+        self.assertEqual(record["phase"], "prepared")
+        self.assertTrue(record.get("before_sha"))
+        self.assertTrue(record.get("after_sha"))
+        self.assertTrue(orc._integration_proof_path(self.rundir, 0).is_file())
+        self.assertNotEqual(self.state["phase"], "verify")
+
+    def test_replan_archives_old_proof_and_recovers_new_transaction(self):
+        batch, resolved = PostApplyRecoveryTests.prepare_writers(
+            self, [pw.writer("a", path="a.py"), pw.writer("b", path="b.py")])
+        fake_ab = pw.ParallelWriterTests.fake_model(
+            self, {"a": {"a.py": "a = 1\n"}, "b": {"b.py": "b = 2\n"}})
+        target = orc._integration_record_path(self.rundir, 0)
+        proof_path = orc._integration_proof_path(self.rundir, 0)
+        real_atomic = orc.atomic_json
+        crashed = []
+
+        def atomic_with_loss(path, value, *args, **kwargs):
+            if (Path(path) == target and value.get("phase") == "prepared"
+                    and not crashed):
+                crashed.append(True)
+                raise RuntimeError("simulated proof-preparation loss")
+            return real_atomic(path, value, *args, **kwargs)
+
+        with patch.object(orc, "call_model", side_effect=fake_ab), \
+                patch.object(orc, "atomic_json", side_effect=atomic_with_loss):
+            self.assertIsNone(orc.run_parallel_batch(
+                self.rundir, self.state, self.cfg, self.project, batch,
+                resolved, None))
+        self.assertEqual(crashed, [True])
+        self.assertTrue(proof_path.is_file())
+        self.assertFalse(target.exists())
+        old_proof_bytes = proof_path.read_bytes()
+        old_proof = orc.read_json(proof_path)
+        self.assertEqual(old_proof["plan_revision"], 1)
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+
+        self.state = orc.load(self.state["id"])[1]
+        plan = copy.deepcopy(self.state["plan"])
+        replacement = copy.deepcopy(plan["batches"][0])
+        replacement["writers"] = [pw.writer("c", path="c.py"),
+                                  pw.writer("d", path="d.py")]
+        plan["batches"][0] = replacement
+        self.state.update({
+            "plan": plan, "plan_version": orc.content_hash(plan),
+            "plan_revision": 2, "amendment_epoch": 1,
+            "status": "running", "phase": "implement",
+            "implementation": None, "parallel_integration": None,
+            "parallel_fallback_batches": {}, "correction": ""})
+        orc.atomic_json(self.rundir / "control.json", {"action": "run"})
+        orc.save(self.rundir, self.state)
+        fake_cd = pw.ParallelWriterTests.fake_model(
+            self, {"c": {"c.py": "c = 3\n"}, "d": {"d.py": "d = 4\n"}})
+        with patch.object(orc, "call_model", side_effect=fake_cd):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(sorted(fake_cd.starts), ["c", "d"])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        self.assertEqual((self.project / "c.py").read_text(), "c = 3\n")
+        self.assertEqual((self.project / "d.py").read_text(), "d = 4\n")
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+        current = orc.read_json(target)
+        self.assertEqual(current["plan_revision"], 2)
+        self.assertTrue(current.get("before_sha"))
+        self.assertTrue(current.get("after_sha"))
+        self.assertEqual(current["after_sha"],
+                         orc._checkout_content_sha(self.project))
+        history = list(
+            (orc._parallel_batch_dir(self.rundir, 0) / "history").glob(
+                "integration-proof-*"))
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].read_bytes(), old_proof_bytes)
+        self.assertTrue(proof_path.is_file())
+        self.assertEqual(orc.read_json(proof_path)["plan_revision"], 2)
+
+    def test_same_transaction_proof_mismatch_blocks_without_substitute(self):
+        record, resolved = self.prepared_full()
+        record_path = orc._integration_record_path(self.rundir, 0)
+        proof_path = orc._integration_proof_path(self.rundir, 0)
+        proof = orc.read_json(proof_path)
+        proof["after_sha"] = "f" * 64
+        orc.atomic_json(proof_path, proof)
+        tampered = proof_path.read_bytes()
+        self.stage_with_running_state()
+        launches = []
+        count, apply_patch = PostApplyRecoveryTests.count_canonical_applies(self)
+
+        def must_not_run(*args, **kwargs):
+            launches.append("model")
+            raise AssertionError("a substitute proof authorized integration")
+
+        with patch.object(orc, "call_model", side_effect=must_not_run), apply_patch:
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(launches, [])
+        self.assertEqual(count["n"], 0)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertEqual(proof_path.read_bytes(), tampered)
+        self.assertEqual(orc.read_json(record_path)["phase"], "prepared")
+        self.assertFalse((self.project / "a.py").exists())
+        self.assertFalse((self.project / "b.py").exists())
+
     def test_patch_replacement_after_admission_applies_the_admitted_bytes(self):
         record, resolved = self.prepared_full()
         # Force proof reconstruction so a scratch apply observes the replacement.

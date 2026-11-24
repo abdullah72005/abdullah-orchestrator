@@ -17190,6 +17190,144 @@ def _integration_proof_path(run_dir, batch_index):
     return _parallel_batch_dir(run_dir, batch_index) / "integration-proof.json"
 
 
+PROOF_TRANSACTION_FIELDS = ("run_id", "plan_version", "plan_revision",
+                            "amendment_epoch", "base_head", "base_sha")
+PROOF_INTENT_FIELDS = ("run_id", "batch_index", "plan_version", "plan_revision",
+                       "amendment_epoch", "base_head", "base_sha")
+
+
+def _current_transaction_binding(state, batch_index, transaction):
+    return {
+        "run_id": (state or {}).get("id"),
+        "plan_version": (state or {}).get("plan_version"),
+        "plan_revision": (state or {}).get("plan_revision", 0),
+        "amendment_epoch": (state or {}).get("amendment_epoch", 0),
+        "base_head": (transaction or {}).get("base_head"),
+        "base_sha": (transaction or {}).get("base_sha"),
+        "batch_index": int(batch_index),
+    }
+
+
+def _proof_provenance(proof):
+    """Present transaction bindings carried by one prepared proof."""
+    present = {key: (proof or {}).get(key) for key in PROOF_TRANSACTION_FIELDS
+               if (proof or {}).get(key) is not None}
+    intent = (proof or {}).get("intent") or {}
+    for key in PROOF_INTENT_FIELDS:
+        if intent.get(key) is not None:
+            present.setdefault("intent_" + key, intent.get(key))
+    if (proof or {}).get("batch_index") is not None:
+        present["batch_index"] = proof.get("batch_index")
+    return present
+
+
+def _proof_transaction_state(proof, state, batch_index, transaction):
+    """Classify a proof as bound to, stale for, or unbound from this transaction.
+
+    ``stale`` means it belongs to a different admitted plan revision/epoch/base.
+    ``unbound`` means it carries too little provenance to be reused safely.
+    """
+    current = _current_transaction_binding(state, batch_index, transaction)
+    provenance = _proof_provenance(proof)
+    if not provenance:
+        return "unbound"
+    strong = {"plan_revision", "amendment_epoch", "base_head", "base_sha",
+              "intent_plan_revision", "intent_amendment_epoch",
+              "intent_base_head", "intent_base_sha"}
+    if not any(key in provenance for key in strong):
+        return "unbound"
+    stale = False
+    for key, value in provenance.items():
+        if key.startswith("intent_"):
+            current_value = current.get(key[len("intent_"):])
+        else:
+            current_value = current.get(key)
+        if current_value is None:
+            continue
+        if key in {"plan_revision", "amendment_epoch", "batch_index"}:
+            try:
+                same = int(value) == int(current_value)
+            except (TypeError, ValueError):
+                same = False
+        else:
+            same = value == current_value
+        if not same:
+            stale = True
+    return "stale" if stale else "bound"
+
+
+def _archive_integration_artifact(run_dir, batch_index, path, *, label,
+                                  revision=None, epoch=None):
+    """Move one superseded record/proof into batch history without rewriting it."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    history = _parallel_batch_dir(run_dir, batch_index) / "history"
+    history.mkdir(parents=True, exist_ok=True)
+    revision = "unknown" if revision is None else revision
+    epoch = "unknown" if epoch is None else epoch
+    destination = history / f"{label}-r{revision}-e{epoch}-{digest[:12]}{path.suffix}"
+    counter = 1
+    while destination.exists():
+        destination = history / (
+            f"{label}-r{revision}-e{epoch}-{digest[:12]}-{counter}{path.suffix}")
+        counter += 1
+    try:
+        os.replace(path, destination)
+    except OSError:
+        return None
+    return destination
+
+
+def _archive_superseded_integration_evidence(run_dir, state, batch_index,
+                                             transaction):
+    """Preserve proofs/records from an earlier plan transaction, not current ones."""
+    archived = []
+    proof_path = _integration_proof_path(run_dir, batch_index)
+    if proof_path.is_file():
+        try:
+            proof = read_json(proof_path)
+        except (OSError, ValueError):
+            proof = None
+        if isinstance(proof, dict):
+            status = _proof_transaction_state(
+                proof, state, batch_index, transaction)
+            if status in {"stale", "unbound"}:
+                destination = _archive_integration_artifact(
+                    run_dir, batch_index, proof_path,
+                    label="integration-proof",
+                    revision=proof.get("plan_revision"),
+                    epoch=proof.get("amendment_epoch"))
+                if destination is not None:
+                    archived.append({"kind": "proof", "path": str(destination)})
+    record_path = _integration_record_path(run_dir, batch_index)
+    if record_path.is_file():
+        try:
+            record = read_json(record_path)
+        except (OSError, ValueError):
+            record = None
+        if isinstance(record, dict) and not _integration_record_current(
+                record, state):
+            destination = _archive_integration_artifact(
+                run_dir, batch_index, record_path,
+                label="integration-record",
+                revision=record.get("plan_revision"),
+                epoch=record.get("amendment_epoch"))
+            if destination is not None:
+                archived.append({"kind": "record", "path": str(destination)})
+    if archived:
+        journal_event(run_dir, state, "parallel_integration_superseded",
+                      batch_index=int(batch_index), archived=archived,
+                      plan_revision=state.get("plan_revision", 0),
+                      amendment_epoch=state.get("amendment_epoch", 0))
+    return archived
+
+
 def _integration_proof_payload(state, batch_index, base_head, transaction, mode,
                                expected, patches, before_sha, after_sha):
     """The immutable authority written before the first canonical write."""
@@ -17296,6 +17434,25 @@ def _load_or_prepare_integration_proof(state, run_dir, project, batch_index,
             run_dir, batch_index, expected_sha)
         if problem:
             return None, None, problem
+        transaction_state = _proof_transaction_state(
+            proof, state, batch_index, transaction)
+        if transaction_state in {"stale", "unbound"}:
+            if record is not None and _integration_record_current(record, state):
+                return None, None, (
+                    "the prepared integration proof is not bound to the current "
+                    "plan transaction")
+            destination = _archive_integration_artifact(
+                run_dir, batch_index, proof_path,
+                label="integration-proof",
+                revision=proof.get("plan_revision"),
+                epoch=proof.get("amendment_epoch"))
+            if destination is not None:
+                journal_event(
+                    run_dir, state, "parallel_integration_proof_superseded",
+                    batch_index=int(batch_index), proof_path=str(destination),
+                    prior_plan_revision=proof.get("plan_revision"),
+                    prior_amendment_epoch=proof.get("amendment_epoch"))
+            return None, None, None
         problem = _integration_proof_consistency(
             proof, batch_index=batch_index, base_head=base_head,
             transaction=transaction, mode=mode, expected=expected,
@@ -17371,10 +17528,19 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
             try:
                 previous = read_json(record_path)
             except (OSError, ValueError):
+                _archive_integration_artifact(
+                    run_dir, batch_index, record_path,
+                    label="integration-record", revision="unknown",
+                    epoch="unknown")
                 previous = None
         if isinstance(previous, dict) and not _integration_record_current(previous, state):
             # A retained record from a superseded plan revision cannot authorize
-            # this transaction; preserve it on disk until the next write replaces it.
+            # this transaction; move it to accessible history before the new write.
+            _archive_integration_artifact(
+                run_dir, batch_index, record_path,
+                label="integration-record",
+                revision=previous.get("plan_revision"),
+                epoch=previous.get("amendment_epoch"))
             previous = None
     elif previous_sha256 is not None and record_path.is_file():
         _bound, problem = _read_bound_manifest(record_path, previous_sha256)
@@ -17504,6 +17670,7 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
         "intent": (dict(transaction) if isinstance(transaction, dict) else None),
         "writers": writers, "patches": proof["patches"],
         "proof_sha256": proof_sha256,
+        "before_sha": before_sha, "after_sha": after_sha,
         "created_at": ((previous or {}).get("created_at") or now())}
     current = _checkout_content_sha(project)
     if current == after_sha:
@@ -17538,6 +17705,13 @@ def _parallel_integrate(run_dir, state, project, batch_index, lanes, base_head, 
                      "after_sha": after_sha, "applied": [],
                      "prepared_at": now()})
     atomic_json(record_path, manifest)
+    # Persisting preparation is itself fallible local work. Recheck the exact
+    # before boundary after that write and immediately before the first apply.
+    if _checkout_content_sha(project) != before_sha:
+        raise RuntimeError(
+            "The canonical checkout changed while the prepared integration record "
+            "was being persisted; no canonical apply was attempted. Inspect "
+            f"{record_path}")
     for patch in patches:
         _apply_writer_patch(project, Path(patch["path"]), index=True,
                             data=patch["data"])
@@ -18121,14 +18295,44 @@ def run_parallel_batch(run_dir, state, cfg, project, batch, resolved, deadline):
         state, project, batch_index, initial_snapshot)
     base_head = transaction["base_head"]
     base_snapshot = initial_snapshot
+    if created and lanes:
+        stale_lanes = {
+            writer_id: lane for writer_id, lane in lanes.items()
+            if (lane.get("plan_version") != state.get("plan_version")
+                or lane.get("plan_revision", 0)
+                != state.get("plan_revision", 0)
+                or lane.get("amendment_epoch", 0)
+                != state.get("amendment_epoch", 0)
+                or lane.get("base_head") != base_head)}
+        if stale_lanes:
+            # Prior-revision lane evidence stays inspectable on disk and in
+            # lane_history, but it cannot participate in this transaction.
+            parallel.setdefault("lane_history", []).append({
+                "at": now(), "batch_index": batch_index,
+                "base_head": base_head,
+                "prior_plan_versions": sorted({
+                    str(lane.get("plan_version"))
+                    for lane in stale_lanes.values()}),
+                "prior_plan_revisions": sorted({
+                    lane.get("plan_revision", 0)
+                    for lane in stale_lanes.values()}),
+                "lanes": copy.deepcopy(stale_lanes)})
+            for writer_id in stale_lanes:
+                lanes.pop(writer_id, None)
+            parallel["lanes"] = lanes
+            journal_event(run_dir, state, "parallel_lanes_superseded",
+                          batch_index=batch_index, base_head=base_head,
+                          writers=sorted(stale_lanes))
     parallel.update({"batch_index": batch_index, "base_head": base_head,
                      "transaction": transaction,
                      "started_at": parallel.get("started_at") or now()})
     if created:
+        archived = _archive_superseded_integration_evidence(
+            run_dir, state, batch_index, transaction)
         save(run_dir, state)
         journal_event(run_dir, state, "parallel_transaction_admitted",
                       batch_index=batch_index, base_head=base_head,
-                      base_sha=transaction["base_sha"])
+                      base_sha=transaction["base_sha"], archived=archived)
     integration_path, recovery_record, _recovery_sha256 = (
         _integration_recovery_record(run_dir, batch_index, state))
     # Prove every recorded lane execution stopped before deciding recovery or
