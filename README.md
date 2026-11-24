@@ -581,15 +581,20 @@ Parallel writing is a per-run permission, not an implicit model choice:
   prompt and expected dispatch source are frozen from that same validated sibling
   snapshot and bound to the manifest digest, so an edit during context
   construction, preflight or launch admission blocks before any child starts
-  while preserving the worktree and manifest. A preflight refusal or missing
+  while preserving the worktree and manifest. The final no-child gate rechecks the
+  frozen source signature together with the exact checkout tree/index/file-mode
+  digest and re-hashes and parses the same manifest bytes it validated, for the
+  first and every subsequent correction attempt. A preflight refusal or missing
   launch is not a proven attempt; external divergence stays blocked. Once an
   attempt has a durable source-bound job/launch, its continuation remains tied to
   the approved batch, revision, epoch and sibling manifest. The next writer starts
-  from the last exact source boundary recorded by that attempt's failure,
-  completion or operator reconciliation evidence; an edit after that boundary
-  requires explicit reconciliation, while unchanged partial worker output
-  resumes through the ordinary source-bound gate. The unfinished lane's worktree
-  stays inspectable. Ownership
+  from the last exact source boundary (source plus tree/index/mode) recorded by
+  that attempt's failure, completion or operator reconciliation evidence.
+  Reconciliation preserves an already-attested boundary and surfaces any later
+  edit as a visible source conflict through reconcile, resume and dispatch; an
+  edit after that boundary requires explicit amendment/replan, while unchanged
+  partial worker output resumes through the ordinary source-bound gate. The
+  unfinished lane's worktree stays inspectable. Ownership
   conflicts, unplanned dependencies or integration conflicts preserve every lane
   and route to strong diagnosis.
 - The combined canonical candidate then goes through supervisor checks, one
@@ -633,9 +638,11 @@ artifacts, approved check argv policy and parallel worktree/grant prerequisites.
 Plan approval checks the whole approved run; resume blocks only on pending stage
 requirements, so an exhausted grant for an already-completed paid role is shown
 as deferred instead of stopping unrelated acceptance work. The effective route is
-resolved before capabilities are checked: an approved one-shot fallback owns the
-blocking executable, grant and skill-tool checks for the pending stage, while an
-unused primary's missing CLI or exhausted grant is advisory. A parallel fan-out
+resolved before capabilities are checked for every fallback-capable pending role
+(Architect, Explorer, Implementer and Reviewer): an approved one-shot fallback
+owns the blocking executable, grant and skill-tool checks for the pending stage,
+while an unused primary's missing CLI or exhausted grant is advisory. An admitted
+parallel Implementer remains pinned to its primary. A parallel fan-out
 reserves one run-ledger reservation per admitted lane before any model dispatch;
 an insufficient grant or a failed reservation produces zero launches and
 releases reservations whose launch was never attempted, while a held slot whose

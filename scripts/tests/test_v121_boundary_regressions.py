@@ -1080,6 +1080,40 @@ class NoExecReleaseTests(BoundaryBase):
         self.assertEqual(
             ledger["grants"]["reviewer-grant"]["reservations"], [])
 
+    def test_final_binding_refusal_releases_only_the_held_slot(self):
+        route, ids = self.paid_grant()
+        lane_state = copy.deepcopy(self.state)
+        observed = orc._source_observation(self.project)
+        binding = {"version": 1, "source": observed["source"],
+                   "signature": observed["signature"],
+                   "checkout_sha256": "0" * 64,
+                   "manifest": None, "origin": "test"}
+
+        def must_not_spawn(*args, **kwargs):
+            raise AssertionError("a child started after a binding refusal")
+
+        with patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "Dispatch not attempted"):
+                orc.call_model(
+                    self.rundir, lane_state, self.cfg, "implementer",
+                    "implementer", "do work", self.project, route=route,
+                    assignment="a", grant_reservation_id=ids[0],
+                    grant_attempt_id="attempt-a", expected_binding=binding)
+        rejection = lane_state["preflight_rejection"]
+        self.assertEqual(rejection["reason_code"], "dispatch_binding_changed")
+        self.assertFalse(rejection["active_job_created"])
+        self.assertEqual(rejection["expected_binding"]["checkout_sha256"],
+                         "0" * 64)
+        self.assertIsNotNone(rejection["observed_binding"]["checkout_sha256"])
+        ledger = orc.load_grant_ledger(self.rundir, run_id=self.state["id"])
+        grant = ledger["grants"]["exec-grant"]
+        by_id = {item["id"]: item for item in grant["reservations"]}
+        self.assertEqual(by_id[ids[0]]["state"], "released")
+        self.assertEqual(by_id[ids[0]]["release_reason"],
+                         "dispatch binding changed before launch")
+        self.assertEqual(by_id[ids[1]]["state"], "reserved")
+        self.assertEqual(orc._grant_usage(grant), 1)
+
     def test_confirmed_process_failure_retains_the_slot(self):
         route, ids = self.paid_grant()
 
@@ -1620,7 +1654,7 @@ class StoppedWriterSourceTests(BoundaryBase):
         self.assertEqual(reconciled["status"], "paused")
         self.state = orc.load(self.state["id"])[1]
         boundary = self.state["writer_source_boundaries"]["0"]
-        self.assertEqual(boundary["phase"], "reconciliation")
+        self.assertEqual(boundary["phase"], "failure")
         self.assertEqual(orc.signature(boundary["source"]),
                          orc.signature(orc.source_snapshot(self.project)))
 
@@ -1736,6 +1770,299 @@ class EffectiveRouteExecutableTests(BoundaryBase):
                             for item in missing), missing)
         self.assertIn("route_executable", self.state["pause_reason"])
         self.assertIsInstance(self.state.get("fallback_authorization"), dict)
+
+
+class LateDispatchBindingTests(BoundaryBase):
+    """Every bound input is rechecked at the final no-child dispatch gate."""
+
+    def prepare_sibling(self):
+        WriterSourceBindingTests.prepare_sibling(self)
+
+    def mutate_at_prompt(self, kind, mutated):
+        real_prompt = orc.prompt_request
+
+        def prompt_with_mutation(prompt_kind, context):
+            if prompt_kind == "implementer" and not mutated:
+                mutated.append(True)
+                if kind == "manifest":
+                    path = orc._integration_record_path(self.rundir, 0)
+                    path.write_bytes(path.read_bytes() + b"\n")
+                else:
+                    (self.project / "a.py").chmod(0o600)
+            return real_prompt(prompt_kind, context)
+        return prompt_with_mutation
+
+    def blocked_first_dispatch(self, kind):
+        self.prepare_sibling()
+        mutated = []
+        starts = []
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a child started after a late binding change")
+
+        with patch.object(orc, "prompt_request",
+                          side_effect=self.mutate_at_prompt(kind, mutated)), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "Dispatch not attempted"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assertEqual(starts, [])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["preflight_rejection"]["reason_code"],
+                         "dispatch_binding_changed")
+        self.assertFalse(self.state["preflight_rejection"]["active_job_created"])
+        self.assertEqual((self.project / "a.py").read_text(), "a = 1\n")
+        return self.state["preflight_rejection"]
+
+    def test_manifest_change_after_prompt_construction_blocks(self):
+        rejection = self.blocked_first_dispatch("manifest")
+        self.assertIn("manifest changed", rejection["reasons"][0])
+        self.assertTrue(orc._integration_record_path(
+            self.rundir, 0).read_bytes().endswith(b"\n"))
+        self.assertEqual(rejection["expected_binding"]["checkout_sha256"],
+                         rejection["observed_binding"]["checkout_sha256"])
+
+    def test_mode_change_after_prompt_construction_blocks(self):
+        rejection = self.blocked_first_dispatch("mode")
+        self.assertIn("tree/index/mode", rejection["reasons"][0])
+        self.assertEqual((self.project / "a.py").stat().st_mode & 0o777, 0o600)
+        self.assertNotEqual(rejection["expected_binding"]["checkout_sha256"],
+                            rejection["observed_binding"]["checkout_sha256"])
+
+    def blocked_retry(self, kind):
+        self.prepare_sibling()
+        attempts = []
+        with patch.object(
+                orc, "_spawn_guarded",
+                side_effect=StoppedWriterSourceTests.failing_transport(
+                    self, attempts)):
+            with self.assertRaisesRegex(RuntimeError, "exited 1"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(attempts, ["fixture-primary"])
+        boundary = self.state["writer_source_boundaries"]["0"]
+        self.state["status"] = "uncertain"
+        orc.save(self.rundir, self.state)
+        self.assertEqual(orc.reconcile_run(self.state["id"])["status"], "paused")
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        mutated = []
+        starts = []
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a retry started after a late binding change")
+
+        with patch.object(orc, "prompt_request",
+                          side_effect=self.mutate_at_prompt(kind, mutated)), \
+                patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            with self.assertRaisesRegex(RuntimeError, "Dispatch not attempted"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(mutated, [True])
+        self.assertEqual(starts, [])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual(self.state["preflight_rejection"]["reason_code"],
+                         "dispatch_binding_changed")
+        self.assertEqual(self.state["writer_source_boundaries"]["0"]["signature"],
+                         boundary["signature"])
+        self.assertEqual(self.state["writer_source_boundaries"]["0"]["checkout_sha256"],
+                         boundary["checkout_sha256"])
+        self.assertEqual((self.project / "b.py").read_text(), "b = 'partial'\n")
+        return boundary
+
+    def test_manifest_change_before_correction_retry_blocks(self):
+        self.blocked_retry("manifest")
+        self.assertTrue(orc._integration_record_path(
+            self.rundir, 0).read_bytes().endswith(b"\n"))
+
+    def test_mode_change_before_correction_retry_blocks(self):
+        self.blocked_retry("mode")
+        self.assertEqual((self.project / "a.py").stat().st_mode & 0o777, 0o600)
+
+
+class ReconcileSourceAuthorityTests(BoundaryBase):
+    """Reconciliation contains the process without rewriting source authority."""
+
+    def failed_attempt(self):
+        WriterSourceBindingTests.prepare_sibling(self)
+        attempts = []
+        with patch.object(
+                orc, "_spawn_guarded",
+                side_effect=StoppedWriterSourceTests.failing_transport(
+                    self, attempts)):
+            with self.assertRaisesRegex(RuntimeError, "exited 1"):
+                orc.advance(self.rundir, self.state, self.cfg)
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(attempts, ["fixture-primary"])
+        return self.state["writer_source_boundaries"]["0"]
+
+    def test_edit_before_reconcile_preserves_boundary_and_blocks_resume(self):
+        boundary = self.failed_attempt()
+        original_app = (self.project / "app.py").read_text()
+        (self.project / "app.py").write_text("value = 99\n")
+        self.state["status"] = "uncertain"
+        orc.save(self.rundir, self.state)
+
+        reconciled = orc.reconcile_run(self.state["id"])
+        self.assertEqual(reconciled["status"], "paused")
+        self.state = orc.load(self.state["id"])[1]
+        preserved = self.state["writer_source_boundaries"]["0"]
+        self.assertEqual(preserved["phase"], "failure")
+        self.assertEqual(preserved["signature"], boundary["signature"])
+        self.assertEqual(preserved["checkout_sha256"],
+                         boundary["checkout_sha256"])
+        conflict = self.state["source_boundary_conflict"]
+        self.assertEqual(conflict["expected"]["signature"], boundary["signature"])
+        self.assertNotEqual(conflict["observed"]["signature"],
+                            boundary["signature"])
+        self.assertEqual(conflict["expected"]["checkout_sha256"],
+                         boundary["checkout_sha256"])
+        self.assertIn("source blocker", self.state["pause_reason"])
+
+        starts = []
+
+        def must_not_spawn(*args, **kwargs):
+            starts.append("child")
+            raise AssertionError("a replacement started over an attributed edit")
+
+        with patch.object(orc, "_spawn_guarded", side_effect=must_not_spawn):
+            resumed = orc.resume_run(self.state["id"])
+            self.assertEqual(resumed["status"], "blocked")
+            self.state = orc.load(self.state["id"])[1]
+            self.assertIn("still differs", self.state["pause_reason"])
+            payload = orc.stage_run(self.state["id"])
+            self.assertFalse(payload["ok"])
+        self.assertEqual(starts, [])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "implement")
+        self.assertEqual(self.state["status"], "blocked")
+        self.assertEqual((self.project / "app.py").read_text(), "value = 99\n")
+        self.assertEqual((self.project / "b.py").read_text(), "b = 'partial'\n")
+
+        (self.project / "app.py").write_text(original_app)
+        self.assertEqual(orc.resume_run(self.state["id"])["status"], "running")
+        self.state = orc.load(self.state["id"])[1]
+        resumed_starts = []
+        with patch.object(
+                orc, "_spawn_guarded",
+                side_effect=StoppedWriterSourceTests.finishing_transport(
+                    self, resumed_starts)):
+            orc.advance(self.rundir, self.state, self.cfg)
+        self.assertEqual(resumed_starts, ["fixture-primary"])
+        self.state = orc.load(self.state["id"])[1]
+        self.assertEqual(self.state["phase"], "verify",
+                         self.state.get("pause_reason"))
+        job = [item for item in self.state["completed_jobs"]
+               if item.get("role") == "implementer"][-1]
+        dispatch = orc.read_json(Path(job["path"]) / "dispatch.json")
+        self.assertEqual(orc.signature(dispatch["source"]),
+                         boundary["signature"])
+
+
+class ReviewerFallbackPreflightTests(BoundaryBase):
+    """Every fallback-capable pending role resolves its effective route first."""
+
+    def reviewer_state(self):
+        primary = {"provider": "opencode",
+                   "model": "opencode-go/reviewer-fixture",
+                   "effort": "low", "billing": "api",
+                   "fallback_route": {"provider": "codex",
+                                      "model": "fixture-review-fallback",
+                                      "effort": "low",
+                                      "billing": "subscription"}}
+        self.state.update({"phase": "review", "status": "blocked",
+                           "model_routes": {"reviewer": primary},
+                           "active_job": None, "active_check": None})
+        orc.save(self.rundir, self.state)
+        with patch.object(orc, "require_human_operator",
+                          return_value={"actor": "test", "method": "test"}):
+            approved = orc.approve_worker_fallback_run("test-run00", "reviewer")
+        self.assertTrue(approved["ok"])
+        self.state = orc.load(self.state["id"])[1]
+        self.state["status"] = "paused"
+        orc.atomic_json(self.rundir / "control.json", {"action": "pause"})
+        orc.save(self.rundir, self.state)
+
+    def which_without(self, missing):
+        real = shutil.which
+
+        def fake(command, path=None):
+            if command in missing:
+                return None
+            return real(command, path=path)
+        return fake
+
+    def test_reviewer_resume_uses_the_selected_fallback(self):
+        self.reviewer_state()
+        with patch.object(orc.shutil, "which",
+                          side_effect=self.which_without({"opencode"})):
+            resumed = orc.resume_run(self.state["id"])
+        self.assertEqual(resumed["status"], "running",
+                         self.state.get("pause_reason"))
+        self.state = orc.load(self.state["id"])[1]
+        preflight = self.state["permission_preflight"]
+        self.assertTrue(any(item.get("kind") == "route_executable"
+                            and item.get("role") == "reviewer"
+                            and item.get("primary_deferred")
+                            for item in preflight["advisories"]), preflight)
+        self.assertTrue(any(item.get("kind") == "route_grant"
+                            and item.get("role") == "reviewer"
+                            and item.get("primary_deferred")
+                            for item in preflight["advisories"]), preflight)
+        self.assertFalse(any(item.get("kind") in {"route_executable",
+                                                  "route_grant"}
+                             and item.get("role") == "reviewer"
+                             for item in preflight["missing"]), preflight)
+        seen = []
+
+        def transport(command, cwd, env, log_stream, launch_file=None,
+                      stdin_data=None, error_stream=None, stdin_fifo=None):
+            seen.append((command[command.index("--model") + 1],
+                         "read-only" in command))
+            out = command[command.index("--output-last-message") + 1]
+            Path(out).write_text(json.dumps({
+                "contract_version": 2, "status": "complete",
+                "summary": "reviewed on the fallback", "files": [],
+                "tests": [], "evidence": ["app.py"], "unknowns": [],
+                "blocker": "", "findings": []}))
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(0.3)"],
+                start_new_session=True)
+            if launch_file:
+                orc.atomic_json(Path(launch_file),
+                                {"guard": orc.process_identity(proc.pid)})
+            return proc, None
+
+        self.state["status"] = "running"
+        orc.save(self.rundir, self.state)
+        with patch.object(orc.shutil, "which",
+                          side_effect=self.which_without({"opencode"})), \
+                patch.object(orc, "_spawn_guarded", side_effect=transport):
+            report, _job = orc.call_model(
+                self.rundir, self.state, self.cfg, "reviewer", "reviewer",
+                "review", self.project)
+        self.assertEqual(seen, [("fixture-review-fallback", True)])
+        self.assertEqual(report["status"], "complete")
+        self.assertIsNone(self.state.get("worker_fallback_authorization"))
+
+    def test_missing_selected_reviewer_fallback_blocks_resume(self):
+        self.reviewer_state()
+        with patch.object(orc.shutil, "which",
+                          side_effect=self.which_without({"opencode", "codex"})):
+            resumed = orc.resume_run(self.state["id"])
+        self.assertEqual(resumed["status"], "blocked")
+        self.state = orc.load(self.state["id"])[1]
+        missing = self.state["permission_preflight"]["missing"]
+        self.assertTrue(any(item.get("kind") == "route_executable"
+                            and item.get("role") == "reviewer"
+                            and item.get("selected_route") == "fallback"
+                            for item in missing), missing)
+        self.assertIsInstance(self.state.get("worker_fallback_authorization"),
+                              dict)
 
 
 if __name__ == "__main__":
