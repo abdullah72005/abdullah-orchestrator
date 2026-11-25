@@ -1,8 +1,9 @@
 # Installation
 
 This guide installs the published `v1.0.0` release, or the locally verified
-v1.2.0 candidate at the revision recorded in
-[release evidence](release-evidence/v1.2.0/README.md), from a fresh clone. It
+v1.2.1 candidate at the revision recorded in
+[release evidence](release-evidence/verified-parallel-orchestration/README.md),
+from a fresh clone. It
 verifies the installation without spending a model call, and shows how to
 upgrade, roll back and uninstall.
 
@@ -63,12 +64,12 @@ git checkout v1.0.0          # pin the latest published release tag
 python3 scripts/install_wsl.py --register-codex
 ```
 
-> **v1.2.0 is a locally verified release candidate, not a published tag.**
-> `git checkout v1.2.0` fails until that release is published. To run the
-> candidate, check out the candidate revision recorded in
-> [release evidence](release-evidence/v1.2.0/README.md) (branch
-> `feat/orchestrator-v1-2` in the maintainer checkout), then run the same
-> installer. Install the published `v1.0.0` tag for a tagged release.
+> **v1.2.1 is a locally verified release candidate, not a published tag.**
+> `git checkout v1.2.1` fails until that release is published. To run the
+> candidate, check out the accepted revision recorded in
+> [release evidence](release-evidence/verified-parallel-orchestration/README.md),
+> then run the same installer. Install the published `v1.0.0` tag for a tagged
+> release.
 
 What the installer does, and does not do:
 
@@ -315,14 +316,15 @@ followed by a preflight. Your config and run state are separate and untouched.
 cd /path/to/abdullah-orchestrator
 git fetch --tags
 git status --short                 # stop if you have local changes you care about
-git checkout v1.0.0                # a published tag; use the candidate revision for 1.2.0
+git checkout v1.0.0                # a published tag; use the candidate revision for 1.2.1
 python3 -m unittest discover -s scripts/tests
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
 ```
 
-The published tags stop at `v1.0.0`. The v1.2.0 candidate is identified by the
-revision in [release evidence](release-evidence/v1.2.0/README.md); check that
-revision out directly (or the candidate branch) until a `v1.2.0` tag exists.
+The published tags stop at `v1.0.0`. The v1.2.1 candidate is identified by the
+revision in
+[release evidence](release-evidence/verified-parallel-orchestration/README.md);
+check that revision out directly until a `v1.2.1` tag exists.
 
 Finish or migrate active runs before changing versions. `python3
 scripts/orchestrator.py compatibility <RUN>` reports `current`, `legacy`,

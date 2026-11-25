@@ -319,6 +319,37 @@ unverified: Claude desktop in-chat progress and its observer, Codex desktop
 tool-card progress and in-app Stop, fresh-thread recovery in the desktop UI,
 and authenticated long Claude stages.
 
+### v1.2.1 verified parallel orchestration (2026-11-25)
+
+Batch 01 was accepted as a local candidate at
+`bfa77f2407900e0155aceaa66b3d1398e63bdbc6` (`bfa77f2`) on
+`feat/verified-parallel-orchestration`, based on GitHub main
+`70d7c3773e883e97a45e29c665adafccc218ff1e`. It adds supervisor-bound reuse of
+the formal verification for final acceptance, bounded stage progress with
+replay, opt-in parallel writers with isolated worktrees and exact integration,
+explicit role/writer skill routing, and grouped permission preflight with
+durable blocked recovery. Internal identifiers are unchanged: supervisor
+`3.1.0`, state/config schema `3`, worker report contract `2`.
+
+| Check | Result |
+|---|---|
+| Full deterministic suite at `bfa77f2` | exit 0 — **1,342 tests, 1,332 passed, 0 failed or errored, 10 skipped**, 2,338.90 s on Python 3.10.12 |
+| Compile at `bfa77f2` | exit 0 |
+| `git diff --check 70d7c37..bfa77f2` | exit 0 |
+| `git diff --exit-code bfa77f2 -- scripts` | exit 0 at acceptance (documentation-only evidence) |
+| `orchestrator.py version` at publication | product `1.2.1`; supervisor `3.1.0`; state schema `3`; config schema `3`; report contract `2` |
+
+The 1,342-test gate belongs to the accepted code/test revision `bfa77f2` and
+completed once on the final source. The publication integration bumps only the
+public product constant, its version assertions and documentation; the accepted
+gate is not presented as a rerun of those version edits. The 10 skips are the
+opt-in `test_opencode_v2_integration` module, which requires
+`ABDULLAH_OPENCODE_V2_BIN`. Evidence, measurements and limits are recorded in
+[release-evidence/verified-parallel-orchestration](release-evidence/verified-parallel-orchestration/README.md).
+The Architect verdict was **CONDITIONAL PASS**: authenticated candidate host
+validation remains open. Fixture results and local supervisor checks are not
+authenticated host or provider-settlement evidence.
+
 ### Real end-to-end milestone (2026-11-16 → 2026-11-18)
 
 Run `20261116T124500-973e8c02`, on a dedicated isolated Codex profile, config,

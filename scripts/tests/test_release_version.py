@@ -21,7 +21,7 @@ class ReleaseIdentityTests(unittest.TestCase):
     def test_public_version_is_separate_from_internal_identifiers(self):
         info = orc.version_info()
         self.assertEqual(info["product"], "abdullah-orchestrator")
-        self.assertEqual(info["product_version"], "1.2.0")
+        self.assertEqual(info["product_version"], "1.2.1")
         # A public tag must not renumber the supervisor protocol or schemas.
         self.assertEqual(info["supervisor_version"], "3.1.0")
         self.assertEqual(info["state_schema_version"], 3)

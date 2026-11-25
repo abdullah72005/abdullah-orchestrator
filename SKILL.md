@@ -7,7 +7,7 @@ description: Run or resume Abdullah's durable, quota-aware software engineering 
 
 One interactive conversation is the coordinator. The visible model (Luna Medium in Codex) talks to the user and invokes a bundled Python MCP supervisor. The supervisor owns execution state, process lifecycle, checkpoints, verification and recovery; a separate strong Architect (Sol High in Codex) makes consequential decisions. The **original** `abdullah-architect` and `abdullah-implementer` remain untouched.
 
-Public product version **1.2.0**. The internal supervisor protocol remains
+Public product version **1.2.1**. The internal supervisor protocol remains
 `3.1.0`, state/config schema `3`, and report contract `2`; a public tag never
 renumbers them. `python3 scripts/orchestrator.py version` prints all identifiers.
 See `docs/versioning.md` for upgrade and compatibility policy.

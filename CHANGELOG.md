@@ -4,9 +4,15 @@ All notable changes to Abdullah Orchestrator are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — 2026-11-23
+## [1.2.1] — 2026-11-25
 
-### v1.2.1 phase: verified reuse, parallel writers, skills and preflight
+**Local release candidate.** Batch 01 of the v1.2.1 phase adds supervisor-bound
+verification reuse, bounded stage progress, opt-in parallel writers, explicit
+skill routing and grouped permission preflight. Internal identifiers are
+unchanged: supervisor protocol `3.1.0`, state/config schema `3`, worker report
+contract `2`, verification evidence `2`. The accepted candidate gate and its
+limits are recorded in
+[docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md).
 
 ### Added
 
@@ -686,7 +692,8 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.0.0...main
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.2.1...main
+[1.2.1]: docs/release-evidence/verified-parallel-orchestration/README.md
 [1.2.0]: docs/release-evidence/v1.2.0/README.md
 [1.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0
 [3.1.0]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v3.0.0...main

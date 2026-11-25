@@ -7,7 +7,7 @@
 <p align="center"><strong>Strong-model decisions. Cost-conscious execution. Independent verification. One controlling conversation.</strong></p>
 
 <p align="center">
-  <a href="docs/release-evidence/v1.2.0/README.md"><img alt="Release v1.2.0 candidate" src="https://img.shields.io/badge/release-v1.2.0%20candidate-2f6f4e"></a>
+  <a href="docs/release-evidence/verified-parallel-orchestration/README.md"><img alt="Release v1.2.1 candidate" src="https://img.shields.io/badge/release-v1.2.1%20candidate-2f6f4e"></a>
   <a href="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab"></a>
   <a href="#requirements"><img alt="Runtime: standard library only" src="https://img.shields.io/badge/runtime-stdlib%20only-4b5563"></a>
@@ -27,7 +27,7 @@ provider, model, reasoning variant and billing classification per role. The
 default worker route is OpenCode Go.
 
 > [!IMPORTANT]
-> **Project status — v1.2.0 release candidate.** Codex + OpenCode V2 is
+> **Project status — v1.2.1 release candidate.** Codex + OpenCode V2 is
 > the primary route; Codex + OpenCode Go end-to-end execution and
 > interrupted-run recovery are demonstrated. OpenCode V1 remains experimental.
 > Claude Code has passed installed-CLI registration and a headless
@@ -35,11 +35,12 @@ default worker route is OpenCode Go.
 > completed planning and implementation through the disposable supervisor.
 > Authenticated long Claude stages, desktop Stop controls and same-session
 > Reviewer shell/edit capability remain unverified.
-> A **post-v1.2.0 follow-up** adds live stage progress and richer single-chat
-> reporting. It is not a new release and does not recertify v1.2.0. Native
-> in-chat progress was observed only on Claude Code CLI; Codex CLI and Claude
-> desktop lack a verified in-chat live view, and Codex desktop tool-card progress
-> remains unverified.
+> **v1.2.1** adds supervisor-bound verification reuse, bounded stage progress,
+> opt-in parallel writers, explicit skill routing and grouped permission
+> preflight. It includes the post-v1.2.0 live-progress and single-chat reporting
+> follow-up. Native in-chat progress was observed only on Claude Code CLI; Codex
+> CLI and Claude desktop lack a verified in-chat live view, and Codex desktop
+> tool-card progress remains unverified.
 > Broader live compatibility and long-duration endurance testing remain ongoing.
 > See [Tested behavior](#tested-behavior) and
 > [Security and limitations](#security-and-limitations).
@@ -162,7 +163,7 @@ cd abdullah-orchestrator
 python3 scripts/install_wsl.py --register-codex
 ```
 
-The v1.2.0 candidate is available on `main` without a v1.2.0 release tag.
+The v1.2.1 candidate is available on `main` without a v1.2.1 release tag.
 To install a specific candidate, check out its recorded commit and run the
 installer:
 
@@ -175,8 +176,8 @@ python3 scripts/install_wsl.py --register-codex
 The last published release instructions remain
 [the existing `v1.0.0` tag](https://github.com/abdullah72005/abdullah-orchestrator/tree/v1.0.0).
 The candidate's deterministic evidence is in
-[docs/release-evidence/v1.2.0/](docs/release-evidence/v1.2.0/README.md).
-Do not assume a public `v1.2.0` tag or release exists.
+[docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md).
+Do not assume a public `v1.2.1` tag or release exists.
 
 The installer is idempotent and refuses to overwrite unrelated skills or
 servers. It:
@@ -463,11 +464,13 @@ Remaining unverified client behavior:
 - Authenticated long Claude stages and native Claude desktop stop/reconnect
   behavior remain unverified.
 
-## Verified verification reuse, parallel writers, skills and preflight
+## Verified verification reuse, parallel writers, skills and preflight (v1.2.1)
 
-This v1.2.1-phase work is additive: existing state/protocol versions, manual
-plan approval, model pins, billing controls and the independent Reviewer are
-unchanged. Defaults keep one writer and no explicitly selected skill.
+v1.2.1 is additive: existing state/protocol versions, manual plan approval,
+model pins, billing controls and the independent Reviewer are unchanged.
+Defaults keep one writer and no explicitly selected skill. The candidate
+evidence is in
+[docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md).
 
 ### Reuse the one formal verification
 
@@ -697,6 +700,17 @@ part of this v1.2.0 list.
 
 ## Tested behavior
 
+**v1.2.1 candidate suite (offline, no model calls):** the accepted Batch 01
+candidate `bfa77f2407900e0155aceaa66b3d1398e63bdbc6` (`bfa77f2`) ran **1,342
+tests, with 1,332 passing and 10 skipped** in 2,338.90 s on Python 3.10.12.
+Compileall and both Git checks passed; the complete gate ran once on the final
+source. The 10 skips are the opt-in OpenCode V2 introspection module. This is
+the Batch 01 acceptance result recorded in
+[docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md);
+authenticated candidate host validation remains open. The version-only
+publication commit changes no `scripts/` behavior beyond the public version
+constant and its assertions.
+
 **Post-v1.2.0 follow-up suite (offline, no model calls):** the accepted feature
 revision `720dd7c2e4c0b404cccc430e14f40c1f1385dd04` (`720dd7c`) ran **1,183
 tests, OK, 10 skipped** in 1,715.570 s on Python 3.10.12. The 10 skips are the
@@ -806,6 +820,7 @@ Reporting: [SECURITY.md](SECURITY.md).
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → exact recovery command |
 | [docs/versioning.md](docs/versioning.md) | Public release vs supervisor, schema and contract versions |
 | [docs/validation.md](docs/validation.md) | Test evidence, E2E milestone, explicit non-claims |
+| [docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md) | v1.2.1 Batch 01 acceptance evidence and measurements |
 | [docs/release-evidence/live-progress/](docs/release-evidence/live-progress/README.md) | Follow-up live-progress evidence, desktop fixture and operator steps |
 | [docs/security-model.md](docs/security-model.md) | Trust boundaries, permissions, limitations |
 | [docs/maintenance.md](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 handoff |
@@ -814,17 +829,21 @@ Reporting: [SECURITY.md](SECURITY.md).
 
 ## Project status
 
-**v1.2.0 release candidate.** Adds immediate escalation, versioned
-requirement replans, verbatim user requirements for workers, independent review
-evidence with batch-delta attribution, stdin prompt transport for Codex/Claude,
-byte-aware OpenCode exec checks, foreground stage announcements, the ordinary
-Medium planning trial, the `gpt-6.2-sol` Codex Architect default, and scoped
-Superpowers instructions for active runs. The candidate suite result is recorded
-in [docs/release-evidence/v1.2.0/](docs/release-evidence/v1.2.0/README.md).
-A post-v1.2.0 follow-up adds live stage progress, the read-only `status --follow`
-observer and richer single-chat reporting. Its 1,183-test evidence belongs to
-revision `720dd7c`, is kept separate from the v1.2.0 result, and is not a new
-release or tag.
+**v1.2.1 release candidate.** Adds supervisor-bound reuse of the formal
+verification for final acceptance, bounded stage progress with replay, opt-in
+parallel writers with isolated worktrees and exact integration, explicit
+role/writer skill routing, and grouped permission preflight with durable blocked
+recovery. It keeps the v1.2.0 escalation, versioned replans, verbatim user
+requirements, independent review evidence, stdin prompt transport, byte-aware
+OpenCode exec checks, foreground stage announcements, the ordinary Medium
+planning trial, the `gpt-6.2-sol` Codex Architect default, and scoped Superpowers
+instructions for active runs. The Batch 01 candidate suite result is recorded in
+[docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md);
+the historical v1.2.0 result remains in
+[docs/release-evidence/v1.2.0/](docs/release-evidence/v1.2.0/README.md).
+The post-v1.2.0 live-progress and single-chat reporting follow-up is included in
+v1.2.1; its 1,183-test evidence belongs to revision `720dd7c` and is preserved
+as that follow-up's result.
 Codex + OpenCode Go E2E and interrupted-run recovery demonstrated at v1.0.0.
 Broader live compatibility and endurance testing remain ongoing. Earlier
 internal tags (`v3.0.0`, `v3.1.0-audit-candidate.1`) are historical engineering

@@ -1,7 +1,7 @@
 # Architecture
 
 This document describes the implementation that ships in `scripts/orchestrator.py`
-(public product version **1.2.0**; internal supervisor version **3.1.0**;
+(public product version **1.2.1**; internal supervisor version **3.1.0**;
 state/config schema 3; worker report contract 2). It is written for someone who
 needs to modify, audit, or debug the workflow — not as marketing material.
 
@@ -296,7 +296,7 @@ entitlement or execution.
 
 | Identifier | Value | Meaning |
 |---|---|---|
-| `PRODUCT_VERSION` | `1.2.0` | Public product release, independent of everything below |
+| `PRODUCT_VERSION` | `1.2.1` | Public product release, independent of everything below |
 | `SUPERVISOR_VERSION` | `3.1.0` | Internal supervisor/protocol version, pinned in config |
 | `STATE_SCHEMA_VERSION` | `3` | On-disk run state shape |
 | `CONFIG_SCHEMA_VERSION` | `3` | Configuration shape |
