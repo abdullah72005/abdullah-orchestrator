@@ -23567,7 +23567,7 @@ def _viewer_lines(state, snapshot):
             lines.append("waiting for the next stage · model has not launched")
         lines.extend(_viewer_next_lines(nxt))
         return lines[:11]
-    if launch.get("state") in {"running", "launching", "verification"}:
+    if launch.get("state") in {"running", "launching", "verification", "blocked"}:
         lines.append("actor: %s · model: %s" % (
             actor or "unknown",
             _safe_progress_text(launch.get("statement"), 120)
@@ -25406,7 +25406,9 @@ def launch_view(state, *, started=None, ended=None):
                      "actor_label": _LAUNCH_ACTOR_LABELS["operator"],
                      "worker_started": worker_started,
                      "blocked_by": {"code": status, "reason": reason},
-                     "statement": (started_label + " · blocked by " + status
+                     "statement": (started_label + " · "
+                                   + ("stage blocked" if status == "blocked"
+                                      else "blocked by " + str(status))
                                    + (" · " + reason if reason else ""))})
         return view
     view.update({"state": "not_launched", "actor": "coordinator",

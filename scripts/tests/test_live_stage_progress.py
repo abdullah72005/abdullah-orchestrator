@@ -1279,6 +1279,28 @@ class LaunchEvidenceTests(ProgressFixture):
         self.assertEqual(launch["actor"], "worker")
         self.assertEqual(launch["statement"], "worker active")
 
+    def test_postlaunch_block_distinguishes_a_launched_worker(self):
+        self.synthetic_start()
+        jobdir = self.folder / "jobs" / "impl-y"
+        jobdir.mkdir(parents=True)
+        orc.atomic_json(jobdir / "execution.json", {"status": "running"})
+        state = self._rewrite(
+            status="blocked", pause_reason="the worker failed",
+            active_job={"id": "impl-y", "kind": "implementer",
+                        "status": "failed", "path": str(jobdir)})
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "blocked")
+        self.assertTrue(launch["worker_started"])
+        self.assertIn("worker launched", launch["statement"])
+        self.assertIn("the worker failed", launch["statement"])
+        self.assertEqual(launch["actor"], "operator")
+        self.assertEqual(launch["next_action"], "orchestrator_resume")
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("worker launched", text)
+        self.assertIn("the worker failed", text)
+        self.assertIn("actor: operator", text)
+
 
 if __name__ == "__main__":
     unittest.main()
