@@ -16833,7 +16833,12 @@ def _attempt_batch_index(state, job):
 
 
 def _attempt_was_launched(job):
-    """Distinguish an admitted-but-unlaunched job from a real child attempt."""
+    """Distinguish an admitted-but-unlaunched job from a real child attempt.
+
+    A bare ``failure.json`` is written when the spawn itself fails, so it is not
+    launch evidence.  Only a guard launch identity or a completed execution
+    record proves that a child actually existed.
+    """
     if not isinstance(job, dict) or not job.get("id"):
         return False
     launch_file = _job_launch_file(job)
@@ -16842,8 +16847,8 @@ def _attempt_was_launched(job):
     if not job.get("path"):
         return False
     path = Path(job["path"])
-    return any((path / name).exists()
-               for name in ("execution.json", "completion.json", "failure.json"))
+    return any((path / name).is_file()
+               for name in ("execution.json", "completion.json"))
 
 
 def _writer_source_boundary(state, index):
@@ -23572,6 +23577,10 @@ def _viewer_lines(state, snapshot):
             actor or "unknown",
             _safe_progress_text(launch.get("statement"), 120)
             or "launch state unknown"))
+        next_action = _safe_progress_text(
+            snapshot.get("next_action") or launch.get("next_action"), 80)
+        if next_action:
+            lines.append("next: " + next_action)
     lines.append("%s · %s · %s" % (
         _safe_progress_text(snapshot.get("agent_label"), 60) or "worker",
         _safe_progress_text(snapshot.get("stage"), 40) or "stage",
@@ -23647,9 +23656,16 @@ def status_follow(run_id, out=None, *, interval=0.75, inplace=None,
                     rendered = None
                     printed = 0
                     signature = None
+            check = snapshot.get("check") or {}
             current = (snapshot.get("attempt_id"), snapshot.get("activity"),
                        snapshot.get("outcome"), state.get("status"),
-                       snapshot.get("available"), snapshot.get("ownership"))
+                       snapshot.get("available"), snapshot.get("ownership"),
+                       snapshot.get("milestone"), snapshot.get("next_action"),
+                       (snapshot.get("launch") or {}).get("state"),
+                       (snapshot.get("launch") or {}).get("worker_started"),
+                       (snapshot.get("launch") or {}).get("model_active"),
+                       check.get("ordinal"), check.get("total"),
+                       check.get("completed"))
             due = current != signature or time.monotonic() - last_print >= heartbeat
             if inplace:
                 if lines != rendered:
@@ -24855,9 +24871,17 @@ def _verification_commands(state):
 
 
 def next_action_for(state):
+    check = state.get("active_check")
     job = state.get("active_job") or {}
-    if state.get("active_check") or (job and job.get("status") in {"running", "dispatched", "uncertain"}):
-        if job.get("status") == "running" and not state.get("active_check"):
+    if check:
+        # A live, owned check is progress to observe.  Only unresolved
+        # ownership needs operator reconciliation.
+        if (check.get("status") == "uncertain"
+                or state.get("status") == "uncertain"):
+            return "orchestrator_reconcile"
+        return "orchestrator_status"
+    if job and job.get("status") in {"running", "dispatched", "uncertain"}:
+        if job.get("status") == "running":
             # A stage may be live in another tool call; do not launch a duplicate.
             return "orchestrator_status"
         return "orchestrator_reconcile"
@@ -25324,22 +25348,71 @@ def _verification_check_ordinal(state):
             "total": (total or None), "completed": done}
 
 
-def launch_view(state, *, started=None, ended=None):
+def _job_for_attempt(state, records, attempt):
+    """Return the exact job admitted for one attempt, including after cleanup.
+
+    The durable attempt-to-job link is the attempt-scoped ``stage_activity``
+    event written at the launch boundary.  A cleared ``active_job`` no longer
+    erases whether that attempt actually started; a bare job directory without
+    such evidence is never guessed into this attempt.
+    """
+    state = state or {}
+    job_ids = []
+    if attempt:
+        for event in records or []:
+            if event.get("event") != "stage_activity":
+                continue
+            if event.get("activity") not in {"worker_launched",
+                                             "worker_report_received"}:
+                continue
+            if event.get("attempt") != attempt:
+                continue
+            job_id = event.get("job_id")
+            if job_id and job_id not in job_ids:
+                job_ids.append(job_id)
+    candidates = []
+    active = state.get("active_job")
+    if isinstance(active, dict) and active:
+        candidates.append(active)
+    for key in ("completed_jobs", "failed_jobs"):
+        candidates.extend(item for item in state.get(key) or []
+                          if isinstance(item, dict))
+    lane_jobs = []
+    lanes = ((state.get("parallel_writers") or {}).get("lanes") or {})
+    for lane in lanes.values():
+        job = lane.get("active_job") if isinstance(lane, dict) else None
+        if isinstance(job, dict) and job:
+            lane_jobs.append(job)
+    candidates.extend(lane_jobs)
+    for candidate in candidates:
+        if candidate.get("id") in job_ids:
+            return candidate
+    if isinstance(active, dict) and active:
+        return active
+    if lane_jobs:
+        return lane_jobs[0]
+    return None
+
+
+def launch_view(state, *, started=None, ended=None, job=None, records=None):
     """Durable statement of whether this attempt's model actually launched.
 
     A status word never proves a launch: only the guard launch record or a
-    job's execution/completion/failure artifact does. The view is bounded and
-    terminal-safe and is shared by status, MCP progress and the viewer, so a
-    prelaunch refusal cannot read like a running or merely waiting stage.
+    job's real execution/completion artifact does.  The view is bound to the
+    admitted attempt so a stale rejection cannot mask a newer worker and a
+    cleared ``active_job`` cannot erase a persisted launched failure.
     """
     state = state or {}
-    job = state.get("active_job") if isinstance(state.get("active_job"), dict) else {}
+    if not isinstance(job, dict):
+        job = _job_for_attempt(state, records, (started or {}).get("attempt"))
+    job = job if isinstance(job, dict) else {}
     check = state.get("active_check") if isinstance(state.get("active_check"), dict) else {}
     rejection = (state.get("preflight_rejection")
                  if isinstance(state.get("preflight_rejection"), dict) else {})
     status = state.get("status")
     job_status = job.get("status")
     launched = bool(job) and _attempt_was_launched(job)
+    job_reason = _safe_progress_text(job.get("error"), 240)
     next_action = next_action_for(state)
     view = {"worker_started": launched, "model_active": False,
             "model_calls": None, "actor": "unknown",
@@ -25348,14 +25421,61 @@ def launch_view(state, *, started=None, ended=None):
             "statement": "ownership unknown", "state": "unknown"}
     if check:
         progress = _verification_check_ordinal(state)
+        if check.get("status") == "uncertain" or status == "uncertain":
+            reason = _safe_progress_text(
+                check.get("error") or state.get("pause_reason")
+                or "; ".join(str(item) for item in check.get("interrupt_gate") or []),
+                240)
+            view.update({"state": "blocked", "actor": "operator",
+                         "actor_label": _LAUNCH_ACTOR_LABELS["operator"],
+                         "next_action": "orchestrator_reconcile",
+                         "blocked_by": {"code": "verification_uncertain",
+                                        "reason": reason},
+                         "statement": ("supervisor check ownership is unresolved · "
+                                       "no model is active"
+                                       + (" · " + reason if reason else ""))})
+            return view
         statement = "supervisor check running · no model is active"
         if progress["ordinal"]:
             statement += f" · check {progress['ordinal']}/{progress['total']}"
+            if progress["ordinal"] < progress["total"]:
+                statement += (f" · next check {progress['ordinal'] + 1}/"
+                              f"{progress['total']}")
+            else:
+                statement += " · next: verification result"
         view.update({"state": "verification", "actor": "supervisor",
                      "actor_label": _LAUNCH_ACTOR_LABELS["supervisor"],
+                     "next_action": "orchestrator_status",
                      "statement": statement, "check": progress})
         return view
-    if rejection:
+    if job and ended is None and job_status in {
+            "running", "dispatched", "queued", "failed", "blocked", "uncertain"}:
+        if job_status == "running" and launched:
+            view.update({"state": "running", "actor": "worker",
+                         "actor_label": _LAUNCH_ACTOR_LABELS["worker"],
+                         "worker_started": True, "model_active": True,
+                         "statement": "worker active"})
+            return view
+        if job_status in {"dispatched", "queued"} or job_status == "running":
+            view.update({"state": "launching", "actor": "supervisor",
+                         "actor_label": _LAUNCH_ACTOR_LABELS["supervisor"],
+                         "worker_started": launched,
+                         "statement": ("launching the worker · model not active yet"
+                                       if job_status == "dispatched" else
+                                       "worker launch is not proven · model not active")})
+            return view
+        reason = job_reason or _safe_progress_text(state.get("pause_reason"), 240)
+        view.update({"state": "blocked", "actor": "operator",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["operator"],
+                     "worker_started": launched, "model_active": False,
+                     "blocked_by": {"code": job_status or status, "reason": reason},
+                     "next_action": ("orchestrator_reconcile"
+                                     if job_status == "uncertain" else "orchestrator_resume"),
+                     "statement": (("worker launched · stage blocked"
+                                    if launched else "worker not launched · stage blocked")
+                                   + (" · " + reason if reason else ""))})
+        return view
+    if not job and rejection:
         code = _safe_progress_text(rejection.get("reason_code"), 80) or "preflight_rejected"
         reasons = rejection.get("reasons") or []
         detail = _safe_progress_text(
@@ -25388,14 +25508,32 @@ def launch_view(state, *, started=None, ended=None):
                      "statement": "no model is active · awaiting fallback authorization"})
         return view
     if ended is not None:
-        paused = status in PAUSED_STATES
+        outcome = _safe_progress_text(ended.get("outcome"), 40) or "complete"
+        reason = _safe_progress_text(ended.get("error"), 200)
+        paused = status in PAUSED_STATES or outcome not in {"complete", "cancelled"}
+        if launched:
+            statement = "no model is active · stage finished · worker launched"
+        elif job:
+            statement = "no model is active · stage finished · worker not launched"
+        else:
+            statement = "no model is active · stage finished · worker launch unknown"
+        if outcome not in {"complete", "cancelled"}:
+            statement += " · outcome " + outcome
+        if reason:
+            statement += " · " + reason
+        if paused and status:
+            statement += " · run is " + str(status)
         view.update({"state": "blocked" if paused else "finished",
                      "actor": "operator" if paused else "nobody",
                      "actor_label": (_LAUNCH_ACTOR_LABELS["operator"] if paused
                                      else _LAUNCH_ACTOR_LABELS["nobody"]),
-                     "worker_started": launched,
-                     "statement": ("no model is active · stage finished"
-                                   + (" · run is " + str(status) if paused else ""))})
+                     "worker_started": launched if job else None,
+                     "next_action": _safe_progress_text(
+                         ended.get("next_action"), 80) or next_action,
+                     "blocked_by": ({"code": outcome, "reason": reason or
+                                     _safe_progress_text(state.get("pause_reason"), 200)}
+                                    if paused else None),
+                     "statement": statement})
         return view
     if job_status == "running" and launched:
         view.update({"state": "running", "actor": "worker",
@@ -25473,6 +25611,7 @@ def stage_snapshot(folder, state):
     recent_milestones = recent_milestones[-6:]
     if quiet is None and started:
         quiet = _event_age_seconds(started.get("at"))
+    attempt_job = _job_for_attempt(state, records, attempt)
     worker = state.get("active_job") or {}
     if milestone is None and worker.get("status") == "running":
         stream_milestone = _structured_worker_milestone(folder, worker)
@@ -25562,7 +25701,8 @@ def stage_snapshot(folder, state):
                  "expected": _safe_progress_text(next_preview.get("expected"), 200),
                  "model": _safe_progress_text(next_preview.get("model"), 60),
                  "effort": _safe_progress_text(next_preview.get("effort"), 24)},
-        "launch": launch_view(state, started=started, ended=ended),
+        "launch": launch_view(state, started=started, ended=ended,
+                              job=attempt_job, records=records),
         "status": state.get("status"),
     }
 
@@ -25573,49 +25713,73 @@ def stage_progress(run_id):
 
 
 def stage_progress_message(snapshot):
-    """One bounded human-readable line for MCP progress notifications."""
-    parts = []
+    """One bounded human-readable line for MCP progress notifications.
+
+    Actor, next action and elapsed time are protected fields: a long blocked
+    handoff statement may be shortened, but it cannot push the decisive next
+    step or timing out of the existing 240-character bound.
+    """
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    launch = snapshot.get("launch") or {}
+    launch_state = launch.get("state")
+    details = []
     label = snapshot.get("agent_label") or snapshot.get("role") or snapshot.get("stage")
     stage = snapshot.get("stage")
     if label and stage:
-        parts.append(_safe_progress_text(f"{label} · {stage}", 80))
+        details.append(_safe_progress_text(f"{label} · {stage}", 80))
     elif label:
-        parts.append(_safe_progress_text(label, 80))
+        details.append(_safe_progress_text(label, 80))
     batch = snapshot.get("batch") or {}
     if batch.get("label"):
-        parts.append(_safe_progress_text(batch["label"], 40))
+        details.append(_safe_progress_text(batch["label"], 40))
     if snapshot.get("model"):
         route = _safe_progress_text(snapshot["model"], 60)
         if snapshot.get("effort"):
             route += f" ({_safe_progress_text(snapshot['effort'], 24)})"
-        parts.append(route)
+        details.append(route)
     if snapshot.get("activity"):
-        parts.append(_safe_progress_text(snapshot["activity"], 80))
-    launch = snapshot.get("launch") or {}
-    launch_state = launch.get("state")
+        details.append(_safe_progress_text(snapshot["activity"], 80))
     if launch_state in {"blocked", "verification", "finished", "not_launched",
-                        "launching"} and launch.get("statement"):
-        parts.append(_safe_progress_text(launch["statement"], 140))
+                        "launching", "running"} and launch.get("statement"):
+        details.append(_safe_progress_text(launch["statement"], 120))
     if snapshot.get("milestone"):
-        parts.append(_safe_progress_text(snapshot["milestone"], 120))
+        details.append(_safe_progress_text(snapshot["milestone"], 100))
     assignments = snapshot.get("assignments") or []
     if assignments:
-        parts.append("writers: " + ", ".join(
+        details.append("writers: " + ", ".join(
             "%s=%s" % (item.get("assignment") or "writer",
                        item.get("status") or "unknown")
             for item in assignments[:3]))
     if snapshot.get("heartbeat"):
-        parts.append(_safe_progress_text(snapshot["heartbeat"], 60))
+        details.append(_safe_progress_text(snapshot["heartbeat"], 60))
     if snapshot.get("long_running"):
-        parts.append("45m marker")
-    if snapshot.get("elapsed_seconds") is not None:
-        parts.append(f"{snapshot['elapsed_seconds']:.0f}s")
-    elif snapshot.get("elapsed_source") == "unknown":
-        parts.append("elapsed unavailable")
+        details.append("45m marker")
     if snapshot.get("outcome"):
-        parts.append(_safe_progress_text(snapshot["outcome"], 32))
-    return _safe_progress_text(" · ".join(part for part in parts if part), 240) \
-        or "stage running"
+        details.append(_safe_progress_text(snapshot["outcome"], 32))
+    core = []
+    actor = _safe_progress_text(launch.get("actor_label"), 40)
+    if actor and launch_state not in {None, "unknown"}:
+        core.append("actor: " + actor)
+    next_action = _safe_progress_text(
+        snapshot.get("next_action") or launch.get("next_action"), 60)
+    if next_action:
+        core.append("next: " + next_action)
+    if snapshot.get("elapsed_seconds") is not None:
+        core.append(f"{snapshot['elapsed_seconds']:.0f}s")
+    elif snapshot.get("elapsed_source") == "unknown":
+        core.append("elapsed unavailable")
+    protected = " · ".join(part for part in core if part)
+    budget = 240 - (len(protected) + 3 if protected else 0)
+    selected = []
+    for part in details:
+        if not part:
+            continue
+        candidate = " · ".join(selected + [part])
+        if len(candidate) > budget:
+            continue
+        selected.append(part)
+    message = " · ".join(selected + ([protected] if protected else []))
+    return _safe_progress_text(message, 240) or "stage running"
 
 
 

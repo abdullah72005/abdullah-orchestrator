@@ -396,6 +396,26 @@ class ProgressMessageTests(unittest.TestCase):
         self.assertLessEqual(len(message), 240)
         self.assertIn("3s", message)
 
+    def test_blocked_reviewer_keeps_actor_next_action_and_elapsed(self):
+        snapshot = {
+            "agent_label": "Reviewer", "stage": "review", "model": "deepseek",
+            "effort": "high", "activity": "reviewing the candidate",
+            "elapsed_seconds": 42.0, "elapsed_source": "live",
+            "next_action": "orchestrator_resume",
+            "launch": {"state": "blocked", "actor_label": "operator",
+                       "statement": ("zero launches · worker not started · blocked by "
+                                     "transport_too_large · "
+                                     + "mandatory handoff context is very large " * 8)},
+            "milestone": "review packet prepared " * 10,
+            "heartbeat": "no new progress for 90s",
+        }
+        message = orc.stage_progress_message(snapshot)
+        self.assertLessEqual(len(message), 240)
+        self.assertIn("42s", message)
+        self.assertIn("actor: operator", message)
+        self.assertIn("next: orchestrator_resume", message)
+        self.assertIn("blocked", message)
+
     def test_token_validation_rejects_booleans_and_objects(self):
         self.assertTrue(orc._valid_progress_token(1))
         self.assertTrue(orc._valid_progress_token("abc"))
@@ -1124,6 +1144,45 @@ class TerminalViewerTests(ProgressFixture):
         self.assertIn("measured 3.4s", text)
         self.assertIn("stage finished (complete)", text)
 
+    def test_plain_refresh_prints_check_and_launch_changes(self):
+        self.stage()
+        base = {
+            "available": True, "run_id": self.run_id,
+            "batch": {"label": "Batch 1/1"}, "agent_label": "Supervisor",
+            "stage": "verify", "attempt_id": "attempt-1", "model": None,
+            "effort": None, "elapsed_seconds": 5.0, "elapsed_source": "live",
+            "activity": "supervisor check running",
+            "next_action": "orchestrator_status", "outcome": None,
+            "ownership": "active", "milestone": None,
+            "launch": {"state": "verification", "actor_label": "supervisor",
+                       "statement": "supervisor check running · check 1/2",
+                       "next_action": "orchestrator_status"},
+            "check": {"ordinal": 1, "total": 2, "completed": 0},
+            "next": {"phase": "review", "agent_label": "Reviewer",
+                     "task": "review", "expected": "verdict"},
+        }
+        second = json.loads(json.dumps(base))
+        second["check"] = {"ordinal": 2, "total": 2, "completed": 1}
+        second["launch"]["statement"] = ("supervisor check running · check 2/2 · "
+                                         "next: verification result")
+        calls = {"count": 0}
+
+        def snapshot(_folder, _state):
+            calls["count"] += 1
+            return base if calls["count"] == 1 else second
+
+        out = io.StringIO()
+        with patch.object(orc, "DEFAULT_STATE", self.runs), \
+                patch.dict(os.environ, self.env), \
+                patch.object(orc, "stage_snapshot", side_effect=snapshot):
+            orc.status_follow(self.run_id, out, inplace=False, interval=0.05,
+                              heartbeat=999, max_seconds=0.5)
+        text = out.getvalue()
+        self.assertGreaterEqual(text.count("run "), 2, text)
+        self.assertIn("check 1/2", text)
+        self.assertIn("check 2/2", text)
+        self.assertIn("next: orchestrator_status", text)
+
     def test_final_state_without_end_exits_after_the_grace_bound(self):
         self.synthetic_start(monotonic_started=round(time.monotonic() - 3, 3))
         state = json.loads((self.folder / "state.json").read_text())
@@ -1318,6 +1377,116 @@ class LaunchEvidenceTests(ProgressFixture):
         self.assertIn("worker launched", text)
         self.assertIn("the worker failed", text)
         self.assertIn("actor: operator", text)
+
+    def test_stale_transport_rejection_does_not_mask_a_new_running_job(self):
+        self.synthetic_start()
+        jobdir = self.folder / "jobs" / "impl-new"
+        jobdir.mkdir(parents=True)
+        orc.atomic_json(jobdir / "execution.json", {"status": "running"})
+        state = self._rewrite(
+            status="running",
+            preflight_rejection={
+                "reason_code": "transport_too_large",
+                "reasons": ["prior attempt was too large"],
+                "active_job_created": False, "model_calls_counted": False},
+            active_job={"id": "impl-new", "kind": "implementer",
+                        "status": "running", "path": str(jobdir)})
+        launch = self.snapshot()["launch"]
+        self.assertEqual(launch["state"], "running", launch)
+        self.assertTrue(launch["worker_started"])
+        self.assertTrue(launch["model_active"])
+        self.assertNotIn("zero launches", launch["statement"])
+        text = "\n".join(orc._viewer_lines(state, self.snapshot()))
+        self.assertIn("worker active", text)
+        self.assertNotIn("transport_too_large", text)
+
+    def test_persisted_launched_failure_survives_cleared_active_job(self):
+        self.synthetic_start()
+        jobdir = self.folder / "jobs" / "impl-failed"
+        jobdir.mkdir(parents=True)
+        orc.atomic_json(jobdir / "execution.json", {"returncode": 1})
+        job = {"id": "impl-failed", "kind": "implementer", "status": "failed",
+               "path": str(jobdir), "error": "failed: implementer exited 1"}
+        _append(self.folder, {"event": "stage_activity",
+                              "activity": "worker_launched",
+                              "attempt": "synthetic0001", "job_id": "impl-failed"})
+        _append(self.folder, {"event": "stage_end", "stage": "implement",
+                              "attempt": "synthetic0001", "elapsed_seconds": 4.2,
+                              "outcome": "paused",
+                              "error": job["error"],
+                              "next_action": "orchestrator_resume"})
+        state = self._rewrite(status="blocked", pause_reason=job["error"],
+                              active_job=None, failed_jobs=[job])
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "blocked")
+        self.assertTrue(launch["worker_started"])
+        self.assertIn("worker launched", launch["statement"])
+        self.assertIn("implementer exited 1", launch["statement"])
+        self.assertEqual(launch["next_action"], "orchestrator_resume")
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("worker launched", text)
+        self.assertIn("implementer exited 1", text)
+        self.assertIn("next: orchestrator_resume", text)
+
+    def test_bare_failure_json_is_not_launch_evidence(self):
+        jobdir = self.folder / "jobs" / "impl-spawn-failed"
+        jobdir.mkdir(parents=True)
+        orc.atomic_json(jobdir / "failure.json", {"error": "spawn failed"})
+        job = {"id": "impl-spawn-failed", "status": "failed",
+               "path": str(jobdir), "error": "spawn failed"}
+        self.assertFalse(orc._attempt_was_launched(job))
+        self.synthetic_start()
+        state = self._rewrite(status="blocked", pause_reason="spawn failed",
+                              active_job=job)
+        launch = self.snapshot()["launch"]
+        self.assertEqual(launch["state"], "blocked")
+        self.assertFalse(launch["worker_started"])
+        self.assertIn("worker not launched", launch["statement"])
+        orc.atomic_json(jobdir / "execution.json", {"returncode": 1})
+        self.assertTrue(orc._attempt_was_launched(job))
+
+    def test_uncertain_check_is_blocked_not_reported_running(self):
+        commands = [["python3", "-m", "unittest"]]
+        state = self._rewrite(
+            status="uncertain", phase="verify", active_job=None,
+            pause_reason="check containment is unproven",
+            active_check={"id": "check-1", "argv": commands[0],
+                          "status": "uncertain",
+                          "interrupt_gate": ["escaped process remains"]},
+            check_progress={"identity": {"argv": commands},
+                            "evidence": {"commands": []}})
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "blocked", launch)
+        self.assertEqual(launch["actor"], "operator")
+        self.assertEqual(launch["next_action"], "orchestrator_reconcile")
+        self.assertIn("ownership is unresolved", launch["statement"])
+        self.assertNotIn("check running", launch["statement"])
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("no model is active", text)
+        self.assertIn("next: orchestrator_reconcile", text)
+
+    def test_live_check_next_action_is_observation_not_reconcile(self):
+        commands = [["python3", "-m", "unittest"], ["git", "diff", "--check"]]
+        state = self._rewrite(
+            status="running", phase="verify", active_job=None,
+            active_check={"id": "check-1", "argv": commands[0]},
+            check_progress={"identity": {"argv": commands},
+                            "evidence": {"commands": [{"argv": commands[0]}]}})
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["next_action"], "orchestrator_status")
+        self.assertEqual(orc.next_action_for(state), "orchestrator_status")
+        self.assertEqual(launch["check"],
+                         {"ordinal": 2, "total": 2, "completed": 1})
+        self.assertIn("check 2/2", launch["statement"])
+        self.assertIn("next: verification result", launch["statement"])
+        message = orc.stage_progress_message(snapshot)
+        self.assertIn("check 2/2", message)
+        self.assertIn("actor: supervisor", message)
+        self.assertIn("next: orchestrator_status", message)
+        self.assertLessEqual(len(message), 240)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,19 @@ do not treat CI as a replacement for that local gate. A documentation-only
 follow-up needs documentation/version checks plus proof that the tested
 code/test tree is byte-identical.
 
+**Reviewer packet proof (v1.2.2 repair).** `test_v122_reviewer_packet_proof.py`
+builds a disposable linked worktree, records a real writer delta, runs a
+representative three-check verification record, and exercises the effective
+Reviewer path: every projected manifest file, delta index, referenced hunk,
+raw verification record and complete log is read through
+`read_review_projection` and re-hashed. The real Reviewer prompt is rendered
+with the combined incident shape and the real OpenCode argv/transport
+preparation is checked with spawn intercepted. A corrupted index, hunk, record
+or log is refused at the dispatch boundary before any spawn. The packet is
+explicitly a **representative** record, not an authority-bound saved-run
+verification. Implementer-owned full-discovery evidence is reported separately
+and does not become supervisor verification authority.
+
 Coverage areas:
 | Area | Representative tests |
 |---|---|
@@ -55,6 +68,7 @@ Coverage areas:
 | OpenCode dialects | V1/V2 profile generation, effective-permission validation, glob-overlap rejection; version-aware source discovery and authoritative V2 normalization |
 | Usage accounting | nested OpenCode usage, derived/partial totals, bounded 429 detection |
 | MCP surface | nine tools, no approval/grant tools, cancellation, recovery guidance |
+| Foreground progress | `test_live_stage_progress.py`: attempt-bound launch evidence after `active_job` cleanup, stale rejection isolation, bare spawn-failure refusal, live versus uncertain check ownership, protected actor/next/elapsed rendering, and plain-mode refresh on check or launch changes |
 | Release identity | `test_release_version.py`: public version separated from supervisor/schema/contract identifiers, version command, pinned example config |
 | Security regressions | credential env scrubbing, API-billing fail-closed, sensitive CLI gating |
 

@@ -51,6 +51,21 @@ shell, so both mandatory live surfaces remain open blockers.
 
 ### Changed
 
+- Foreground progress is bound to the admitted attempt and its real launch
+  evidence rather than a run-wide rejection or a cleared `active_job`. A stale
+  preflight rejection cannot mask a newer running worker, a persisted launched
+  failure keeps its reason after cleanup, and a bare spawn `failure.json` is not
+  launch proof. Uncertain check ownership is blocked for reconciliation while a
+  live check is observation; MCP progress protects actor, next action and
+  elapsed time within its existing 240-character bound, and the plain viewer
+  refreshes on check or launch changes.
+- The Reviewer packet proof now runs through the real renderer and OpenCode
+  argv/transport preparation with spawn intercepted in a linked worktree. It
+  re-reads every manifest file, delta/index, referenced hunk, raw verification
+  record and complete log through the effective confined Reviewer path, and
+  refuses a corrupted index, hunk, record or log at the dispatch boundary. The
+  representative three-check packet is explicitly not authority-bound
+  saved-run verification.
 - The Reviewer handoff no longer inlines bulk delta-index file/hunk entries,
   which could exceed OpenCode's argv UTF-8 byte budget. It now carries a
   validated digest-bound reference (readable index path, projection/root and
