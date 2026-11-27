@@ -136,8 +136,10 @@ class StageDeadlineTests(unittest.TestCase):
         # turn this into the pre-spawn branch.  The long check's marker plus
         # its 30s sleep proves it was running when the clipped deadline ended
         # it.  The first-check window is only a startup floor; the long check
-        # still receives the genuine remaining stage budget.
-        self.configure_stage(3.0)
+        # still receives the genuine remaining stage budget.  The stage budget
+        # is intentionally generous relative to the 0.2s first check so only
+        # the 30s sleep can exhaust it, even on a heavily loaded suite host.
+        self.configure_stage(15.0)
         first_marker = self.root / "first-check-started"
         long_marker = self.root / "long-check-started"
         first_check = (

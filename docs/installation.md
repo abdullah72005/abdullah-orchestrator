@@ -20,6 +20,8 @@ exact recovery commands.
 | Native Windows Codex desktop + WSL2 supervisor | GUI smoke pending | The native Codex backend discovered the skill and connected to WSL MCP. Desktop stage controls still require live validation. |
 | Linux (x86_64) + Codex CLI | Supported | Same code paths; specific distributions are not individually certified. |
 | Linux/WSL + Claude Code CLI | **Experimental** | Installed CLI registration and a headless stage passed with local fixtures. Authenticated interactive stages, Esc/cancel and reconnect remain unverified. |
+| Linux/WSL + Antigravity CLI (`agy`) | **Not live-certified** | Opt-in guarded dispatch, capability-gated argv, stdin UTF-8 transport, terminal-report validation and conflict-safe registration are fixture-tested. `agy` was absent from the validation shell; no authenticated stage has run. |
+| Windows Antigravity desktop + WSL2 supervisor | **Not live-certified** | Setup emits the verified distro/Python/checkout/state paths and a `wsl.exe` bridge; desktop registration, >180 s stage, rendering, interruption, reconnect and resume remain unverified. |
 | OpenCode V1 (`>=1.18 <2.0`) | **Experimental** | Source-backed and fixture-tested; no live V1 binary was available for this release. |
 | Alternative OpenCode providers (non-Go) | **Experimental** | Policy, grants and fail-closed routing are tested with fake CLIs; live provider settlement is not. |
 | Supervisor running directly on Windows | Unsupported | Run the supervisor in WSL2. |
@@ -48,6 +50,11 @@ Authentication is yours to arrange before preflight:
   `OPENAI_API_KEY` out of the environment for the orchestrator session if you
   intend to use subscription billing — `doctor` reports this as a billing risk.
 - **Claude host:** sign in with the Claude CLI.
+- **Antigravity host (opt-in, not live-certified):** install and authenticate the
+  Antigravity CLI. Verify `agy --version` and `agy --help`, the model catalogue,
+  supported effort levels and billing classification yourself; the supervisor
+  refuses dispatch unless the installed help advertises the required headless
+  tokens. `agy` was not available in this candidate's validation shell.
 - **Workers:** an OpenCode Go subscription (default), or an alternative provider
   you explicitly authorize per run.
 
@@ -215,6 +222,68 @@ The installer deliberately never rewrites host settings. Verify with
 `claude mcp get abdullah-orchestrator` and `/mcp` inside Claude Code.
 [Claude Code CLI validation evidence](release-evidence/v1.2.0/README.md#claude-code-cli-compatibility)
 
+### Antigravity CLI in WSL2 (opt-in)
+
+Antigravity is a third controlling host, but it is **not live-certified** in this
+candidate. The supervisor keeps a separate adapter: `agy` is checked against its
+installed `--help` for `--print`, `--model` and `--output-format` (and
+`--effort`/`--session` when used), prompts travel on stdin, and acceptance
+requires a structured terminal report with a matching session, not just exit 0.
+
+1. Confirm the installed CLI: `agy --version`, `agy --help`, a real model id,
+   supported effort, authentication and billing. Keep the output for the run
+   record. If `agy` is missing, Antigravity dispatch remains blocked.
+2. Add an opt-in `architect.antigravity` entry yourself (the shipped example
+   omits it so existing configs stay valid):
+
+   ```json
+   "antigravity": {"model": "<verified-id>", "effort": "high", "auth": "subscription"}
+   ```
+
+   Final acceptance requires `high`. Do not guess a model id or a billing class.
+3. Register the stdio server in the CLI's settings file, or merge it with an
+   explicit path:
+
+   ```bash
+   python3 scripts/install_wsl.py --register-antigravity \
+     --antigravity-settings ~/.gemini/settings.json
+   ```
+
+   The writer only edits an existing parseable `mcpServers` object, preserves
+   unrelated servers, backs up first, is idempotent and refuses conflicts. It
+   does not create a guessed location or schema.
+4. Keep a server-scoped timeout above `max_stage_seconds` + margin (shipped
+   18,000,000 ms vs 17,000 s). `install_wsl.py` rejects an insufficient or
+   non-finite bound. Do not apply it globally. The installed `agy` version's
+   per-tool foreground setting could not be verified here; until it is, a
+   foreground stage depends on the server bound and a real desktop stage above
+   180 s remains undemonstrated.
+5. Run `doctor --host antigravity` and confirm `cli_compatible.antigravity`,
+   `billing_preflight` and the resolved routes before any paid dispatch.
+
+### Antigravity Windows desktop connected to WSL2
+
+The desktop application's own conversation must reach the supervisor inside the
+Ubuntu distro. Running `agy` in the integrated terminal is **not** GUI
+integration.
+
+```bash
+python3 scripts/install_wsl.py --setup-desktop
+```
+
+The output records the actual `WSL_DISTRO_NAME`, absolute WSL Python, checkout,
+`~/.config` and run-state paths, and the `opencode`/`agy` executables. Register
+the printed `wsl.exe -d <distro> --exec /usr/bin/env PATH=... ABDULLAH_CONFIG=...
+ABDULLAH_STATE_DIR=... <python> <supervisor> mcp` entry in the desktop
+application's **own MCP settings**, so a non-login shell still uses the same
+isolated configuration, state and worker executables. Missing distro or CLIs are
+listed as blockers; never relabel a WSL supervisor as native Windows.
+
+Keep the desktop chat in the same conversation and let the coordinator follow
+`next_action` automatically. Long-stage, progress-rendering, interruption,
+reconnect and resume behavior for the desktop host are unverified until an
+authenticated run passes; keep the run state for that validation.
+
 ## 4. Configure
 
 The installer already copied `scripts/config.example.json` to
@@ -257,6 +326,19 @@ Expected `doctor` fields on a ready host: `"ready": true`, `"api_billing_risk":
 []`, `"route_authorization_required": []`, `"opencode_dialect": "v2"` and one
 resolved route per role. Full reference: [configuration.md](configuration.md).
 
+Inspect every role in one place without changing anything:
+
+```bash
+python3 scripts/orchestrator.py models            # defaults and architect hosts
+python3 scripts/orchestrator.py models <RUN_ID>   # effective pins for one run
+```
+
+The same view is the MCP `orchestrator_models` tool. It separates the
+host-managed conversation model from the dispatched Architect. Change defaults
+only for future runs, pass per-run `routes` for one new run, or use the existing
+`switch-role` preview/apply at a safe boundary; none of these silently reroutes
+an existing pinned run.
+
 ## 5. First run
 
 Open one Codex chat (the verified configuration uses Luna Medium as the visible
@@ -268,7 +350,11 @@ $abdullah-orchestrator
 
 Provide an absolute project path and a precise goal. The skill will call
 `orchestrator_start` once, then exactly one stage per foreground call. You do not
-need to paste supervisor commands yourself.
+need to paste supervisor commands yourself. A valid plan progresses
+automatically; the coordinator does not ask you to approve it unless you
+explicitly requested design consultation. Startup and `status` show one real
+execution-environment line such as
+`Running in Ubuntu (WSL2) · Project: /home/abdullah/my-project`.
 
 > [!WARNING]
 > Do not use `orchestrator.py start` from a shell for this step. Unlike the MCP

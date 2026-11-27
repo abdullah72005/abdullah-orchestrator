@@ -350,6 +350,54 @@ The Architect verdict was **CONDITIONAL PASS**: authenticated candidate host
 validation remains open. Fixture results and local supervisor checks are not
 authenticated host or provider-settlement evidence.
 
+### Antigravity and autonomous progression candidate (fixture-tested)
+
+The three-host candidate adds deterministic coverage for: Codex/Claude/Antigravity
+routing with explicit host validation; guarded `agy` capability checks; large
+Arabic UTF-8 prompts on stdin only; terminal-report/session/conflict validation;
+configure-models projection; automatic high-risk multi-writer progression;
+conversation consultation replies with stale-response rejection; run-scoped
+routine-check exceptions (including cross-run, wrong-checkout and revised-plan
+rejection); bounded recovery classification; environment display; conflict-safe
+Antigravity settings merging; and insufficient-timeout/unknown-distro setup
+refusal. Operator-only boundaries are asserted for each agent marker
+independently and for a missing TTY, so a suite launched by a supervisor cannot
+inherit its own identity into a "human" path.
+
+The reviewer handoff regressions render through the actual OpenCode UTF-8 route
+preparation. A large delta index compacts to a resolvable digest-bound
+reference, and a passed verification record with twenty bulky check logs
+(unique markers inside each supervisor tail) stays below the
+129,501-byte argv limit. Each command keeps its argv, exit code, `log_path`,
+`log_sha256` and `log_bytes`; the omitted log text is read back from the
+manifest-bound projection, whose byte-identical log copies re-hash to the
+recorded digests and which also carries the complete verification record.
+
+These are **fixture results**. No real `agy` process was launched, and no
+authenticated Antigravity CLI or Windows desktop stage has passed. `agy` was
+absent from the validation shell. Therefore:
+
+- Antigravity CLI/desktop planning-to-acceptance is **not** certified;
+- a real desktop stage exceeding 180 s is **not** demonstrated;
+- desktop progress rendering, interruption, reconnect and resume are **not**
+  observed;
+- fixture success is never reported as live host support.
+
+The candidate's validation shell was checked directly: `command -v agy` and
+`command -v antigravity` returned nothing; the only matching local file,
+`/usr/lib/python3.10/antigravity.py`, is Python's standard-library simulation
+module, not the Antigravity CLI. On the Windows side, no Antigravity application
+was found under `C:\Program Files`, `C:\Program Files (x86)`,
+`%LOCALAPPDATA%\Programs` or `%APPDATA%`. The exact prerequisite is therefore an
+installed and authenticated Antigravity CLI (`agy --version`, `agy --help`) in
+the selected Ubuntu distro, plus the Windows Antigravity desktop application
+connected through `wsl.exe` to that distro. Nothing was substituted for either
+surface.
+
+The required live acceptance remains an explicit blocker for the affected
+surfaces, while Codex/Claude regressions continue to run against the same
+candidate.
+
 ### Real end-to-end milestone (2026-11-16 → 2026-11-18)
 
 Run `20261116T124500-973e8c02`, on a dedicated isolated Codex profile, config,
@@ -521,6 +569,12 @@ Be explicit with reviewers and users:
 - **Linux-only managed configuration.** Managed OpenCode/Claude files are
   covered on Linux; macOS and Windows managed delivery is not certified.
 - **`doctor`** does not authenticate, prove entitlement, or run a model.
+- **Antigravity is not live-certified.** No authenticated `agy` CLI or Windows
+  desktop stage has run; `agy` was absent from the validation shell. Guarded
+  argv, stdin UTF-8 transport, report validation, setup merging and routing are
+  fixture-tested only. The mandatory real CLI and desktop acceptance, a >180 s
+  desktop stage, desktop rendering and desktop interrupt/reconnect remain open
+  blockers and are not claimed as support.
 
 ## 7. Reproducing the checks
 

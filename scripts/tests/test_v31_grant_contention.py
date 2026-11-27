@@ -404,23 +404,59 @@ class CallModelGrantWaitTests(unittest.TestCase):
         self.assertEqual(orc._grant_usage(ledger["grants"]["grant-wait"]), 0)
 
     def test_stage_deadline_while_waiting_is_not_authorization_exhaustion(self):
+        # This asserts the reservation/classification branch, which is the same
+        # for every route.  It is pinned to a strong usage-billed route so the
+        # OpenCode version/config discovery (whole-stage work of its own) can
+        # never consume the budget before the wait on a loaded suite host; that
+        # used to fail as "deadline expired during routing inspection" instead
+        # of the durable grant classification asserted below.  Contention and
+        # discovery on a worker route stay covered by the tests above.
+        strong_route = {"provider": "codex", "model": "codex/gpt-5",
+                        "effort": "high", "billing": "api"}
+        self.state["model_routes"] = {"explorer": strong_route}
+        self.state["route_authorizations"] = [{
+            "id": "grant-deadline-wait", "role": "explorer",
+            "route_sha256": orc.route_authorization_sha(strong_route),
+            "max_dispatches": 1, "used": 0,
+            "attestation": "reviewed api endpoint"}]
+        orc.register_route_grant(self.rundir,
+                                 self.state["route_authorizations"][0],
+                                 cfg=self.cfg)
+        orc.save(self.rundir, self.state)
         holder = self.start_holder()
-        # Owned version/config inspection is whole-stage work too; leave it
-        # enough budget to complete and let the deadline expire in the wait.
-        self.cfg["limits"]["max_grant_lock_wait_seconds"] = 5.0
         try:
+            self.cfg["limits"]["max_grant_lock_wait_seconds"] = 5.0
             with self.assertRaisesRegex(RuntimeError, "deadline|ledger"):
                 orc.call_model(self.rundir, self.state, self.cfg, "explorer",
                                "explorer", "prompt", self.project,
                                deadline=time.monotonic() + 2.0)
+            state = orc.read_json(self.rundir / "state.json")
+            rejection = state["preflight_rejection"]
+            self.assertEqual(rejection["reason_code"], "grant_deadline_expired")
+            self.assertNotIn("exhausted", " ".join(rejection["reasons"]))
+            self.assertFalse(self.history.exists())
+            self.assertEqual(
+                orc._grant_usage(
+                    orc.load_grant_ledger(self.rundir)["grants"]["grant-deadline-wait"]),
+                0)
+            # Negative control on the same held ledger: without an expired
+            # stage deadline the identical fixture must classify as contention
+            # and still consume nothing.  The deadline, not host load or lock
+            # state, decides the durable reason code.
+            self.cfg["limits"]["max_grant_lock_wait_seconds"] = 0.25
+            with self.assertRaisesRegex(RuntimeError, "contention"):
+                orc.call_model(self.rundir, self.state, self.cfg, "explorer",
+                               "explorer", "prompt", self.project)
+            contended = orc.read_json(
+                self.rundir / "state.json")["preflight_rejection"]
+            self.assertEqual(contended["reason_code"], "grant_ledger_timeout")
+            self.assertEqual(
+                orc._grant_usage(
+                    orc.load_grant_ledger(self.rundir)["grants"]["grant-deadline-wait"]),
+                0)
         finally:
             holder.kill()
             holder.communicate(timeout=5)
-        state = orc.read_json(self.rundir / "state.json")
-        rejection = state["preflight_rejection"]
-        self.assertEqual(rejection["reason_code"], "grant_deadline_expired")
-        self.assertNotIn("exhausted", " ".join(rejection["reasons"]))
-        self.assertFalse(self.history.exists())
 
 
 if __name__ == "__main__":

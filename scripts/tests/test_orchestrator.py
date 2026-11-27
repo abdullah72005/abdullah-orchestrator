@@ -71,10 +71,19 @@ class ControlTests(unittest.TestCase):
         # Every test is isolated from the live orchestrator state and its
         # checkout registry.  Ambient ABDULLAH_* overrides are replaced as
         # well: leases_root() reads them dynamically, so exporting them for a
-        # real run must not leak into the suite.
+        # real run must not leak into the suite.  The agent-marker set is
+        # cleared too: a supervisor-managed check exports its own job/run/check
+        # identity, and an operator-only path (migrate/restore/retire/...) would
+        # otherwise refuse for a reason the test never asked about.  Tests that
+        # assert either side of that boundary patch the markers explicitly.
         env_patch = patch.dict(os.environ, {
             "ABDULLAH_STATE_DIR": str(self.root / "runs"),
             "ABDULLAH_CONFIG": str(self.root / "config.json"),
+            "ABDULLAH_JOB_ID": "",
+            "ABDULLAH_RUN_ID": "",
+            "ABDULLAH_CHECK_TOKEN": "",
+            "ABDULLAH_PARENT_JOB": "",
+            "ABDULLAH_AGENT_CONTEXT": "",
             # Tests must never read a live user's OpenCode config/account/plugin
             # boundary (or any other HOME-derived state).
             "HOME": str(self.root / "home"),
@@ -95,7 +104,7 @@ class ControlTests(unittest.TestCase):
             raise AssertionError("Test state root escaped the temporary directory")
         real_popen = subprocess.Popen
         def guarded_popen(args, *pos, **kwargs):
-            if isinstance(args, (list, tuple)) and Path(args[0]).name in {'codex', 'claude', 'opencode'}:
+            if isinstance(args, (list, tuple)) and Path(args[0]).name in {'codex', 'claude', 'opencode', 'agy'}:
                 path = orc.shutil.which(args[0], path=(kwargs.get('env') or os.environ).get('PATH'))
                 if not path or not Path(path).resolve().is_relative_to(self.root):
                     raise AssertionError('Tests must never launch a real model CLI')
@@ -104,17 +113,19 @@ class ControlTests(unittest.TestCase):
         guard.start()
         self.addCleanup(guard.stop)
         self.project = setup_repo(self.root)
-        # Dialect selection may introspect the installed CLI.  Provide a
-        # deterministic test-owned binary so the Popen tripwire never has to
-        # allow a real model runtime and tests remain hermetic.
+        # Dialect selection may introspect the installed CLI.  Provide
+        # deterministic test-owned binaries for every supported host so tests
+        # never depend on which model CLIs the developer machine happens to
+        # have, and the Popen tripwire never has to allow a real model runtime.
         fixture_bin = self.root / "fixture-bin"
         fixture_bin.mkdir()
-        fixture_cli = fixture_bin / "opencode"
-        fixture_cli.write_text(
-            "#!/usr/bin/env python3\n"
-            "import sys\n"
-            "print('1.18.35' if '--version' in sys.argv else '--help')\n")
-        fixture_cli.chmod(0o755)
+        for name in ("opencode", "codex", "claude"):
+            fixture_cli = fixture_bin / name
+            fixture_cli.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "print('1.18.35' if '--version' in sys.argv else '--help')\n")
+            fixture_cli.chmod(0o755)
         path_patch = patch.dict(os.environ, {
             "PATH": str(fixture_bin) + ":" + os.environ.get("PATH", "")})
         path_patch.start()

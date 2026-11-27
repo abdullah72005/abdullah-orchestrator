@@ -2,7 +2,8 @@ interface:
   display_name: Abdullah Orchestrator
   short_description: Coordinate coding agents with durable recovery
   default_prompt: Use $abdullah-orchestrator to plan and run this engineering goal
-    with cheap OpenCode workers, verified evidence, and recoverable execution.
+    from Codex, Claude Code or Antigravity with cheap OpenCode workers, automatic
+    plan progression, verified evidence, and recoverable execution.
   icon_small: assets/icon.svg
   icon_large: assets/icon.svg
 policy:

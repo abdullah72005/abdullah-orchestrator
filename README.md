@@ -33,6 +33,10 @@ default worker route is OpenCode Go.
 > Claude Code has passed installed-CLI registration and a headless
 > fixture-backed planning stage, and the Windows Codex desktop with a WSL agent
 > completed planning and implementation through the disposable supervisor.
+> Antigravity is **opt-in and not live-certified**: guarded `agy` routing, stdin
+> transport, terminal report validation and CLI/desktop setup are fixture-tested,
+> but no authenticated Antigravity CLI or desktop run has passed, and `agy` was
+> absent from the validation shell.
 > Authenticated long Claude stages, desktop Stop controls and same-session
 > Reviewer shell/edit capability remain unverified.
 > **v1.2.1** adds supervisor-bound verification reuse, bounded stage progress,
@@ -134,7 +138,7 @@ safe to leave running for hours.
 | **Explicit billing authorization** | Non-Go routes require a human `authorize-route` grant bound to role, run and exact route material; unknown routes refuse rather than silently bill an API. |
 | **Fallback safety** | Fallback is never automatic and never inherited from another route. |
 | **Checkout ownership** | One lease per canonical Git checkout; conflicts return resolution commands instead of retrying. |
-| **Codex and Claude host integration** | stdio MCP server plus installer registration for both hosts; Claude has installed-CLI registration and a headless fixture-backed stage, but authenticated long stages are not yet certified. |
+| **Codex, Claude and Antigravity host integration** | stdio MCP server plus installer registration for Codex and Claude; Claude has installed-CLI registration and a headless fixture-backed stage. Antigravity is opt-in: guarded `agy` stdin dispatch, capability-gated arguments, structured terminal-report validation and conflict-safe CLI/desktop setup exist, but no authenticated CLI or desktop live run has passed yet. |
 
 Implemented behavior and *live-validated* behavior are deliberately separated.
 See [Tested behavior](#tested-behavior) and [docs/validation.md](docs/validation.md).
@@ -146,7 +150,7 @@ See [Tested behavior](#tested-behavior) and [docs/validation.md](docs/validation
 | OS | **Linux or WSL2 (Ubuntu)** — the verified platform. Native macOS/Windows and managed configuration delivery are not certified. |
 | Python | **3.10+**, standard library only (no `pip install`, no virtualenv required). CI runs 3.10, 3.12 and 3.13. |
 | Git | Any reasonably current `git`; verification uses real checkouts and worktrees. |
-| Host CLI | Codex CLI **or** Claude Code CLI, both authenticated for your own account. |
+| Host CLI | Codex CLI, Claude Code CLI, or the opt-in Antigravity `agy` CLI, authenticated for your own account. Antigravity is not live-certified in this candidate. |
 | Worker CLI | OpenCode on a tested line: `>=1.18 <2.0` or `>=2.2 <3.0`. Other versions are refused instead of guessed. |
 | Worker account | **OpenCode Go** subscription by default, or another OpenCode provider with an explicit, human-authorized billing route. |
 | Docker | Only for projects whose verification needs containers. |
@@ -216,6 +220,92 @@ verified installation walkthrough — including a clean-environment test, Claude
 Code setup, upgrades, rollback and uninstall — is in
 **[docs/installation.md](docs/installation.md)**.
 
+## Automatic progression and Antigravity
+
+**Automatic progression is the default** on Codex, Claude Code and Antigravity, in
+CLI and desktop. Once a valid Architect plan completes, the supervisor admits it
+and the coordinator keeps calling `orchestrator_stage` without asking the user to
+continue. Risk, complexity and writer count never create an approval gate.
+Corrections, verification, replanning and supported recoverable failures continue
+automatically; only explicit pause/cancel, an unresolved sensitive
+authorization, credentials/external access or an irreducible technical blocker
+stops the run. `status`, `stage` and `resume` expose the same recorded next
+action and a bounded recovery classification.
+
+Design consultation remains opt-in (`plan_approval: true`). The user answers in
+the controlling conversation and the coordinator records that exact reply with
+`orchestrator_consult`; a material reply becomes a versioned amendment, and
+accepting the unchanged plan needs no terminal command. Paid-route,
+destructive-operation, deployment, credential and external-access authorization
+stay separate human-only actions.
+
+**Configure models** in one place: MCP `orchestrator_models` or
+`orchestrator.py models [RUN]`. It shows Architect (per host), Explorer,
+Implementer and Reviewer provider, model, supported effort/variant, billing,
+metadata availability and effective pins, and explicitly separates the
+host-managed conversation model from the dispatched Architect. Defaults,
+one-run overrides and existing-run `switch-role` changes reuse the existing
+validated mechanisms; default edits use the validated, atomic, backup-first
+`orchestrator.py set-default` preview/apply and never rewrite an existing run's
+pins or invalidate otherwise valid evidence.
+
+At startup, in `status`, and in the read-only `status --follow` viewer, one line
+reports the real execution environment, for example
+`Running in Ubuntu (WSL2) · Project: /home/abdullah/my-project`. It is derived
+inside the supervisor process, so a Windows desktop coordinator cannot make a
+WSL supervisor claim native Windows.
+
+### Antigravity CLI in WSL2 (opt-in; live certification pending)
+
+Antigravity uses a separately guarded headless `agy` Architect dispatch while
+OpenCode keeps the Explorer, Implementer and Reviewer roles. The adapter:
+
+- checks the installed `agy --help` for `--print`, `--model` and
+  `--output-format` (and `--effort`/`--session` when used) and refuses to launch
+  with guessed arguments;
+- sends the whole prompt, including large Arabic UTF-8 text, on stdin and never
+  in argv;
+- requires a terminal structured report with matching session identity, and
+  rejects an incomplete stream, conflicting results, a wrong session, a missing
+  report or permission-denied work independently of the process exit code;
+- keeps Linux process groups, inherited descriptors, file locks and `/proc`
+  recovery, and contains descendants.
+
+```bash
+# after verifying `agy --version` / `agy --help` yourself
+python3 scripts/install_wsl.py --register-antigravity \
+  --antigravity-settings ~/.gemini/settings.json   # or the installed CLI's real path
+```
+
+The writer only merges into an existing settings file, refuses conflicts,
+preserves unrelated servers and backs up before rewriting. It never guesses a
+missing schema. `agy` is absent from the candidate's validation shell, so
+Antigravity dispatch and live validation remain actionable blockers until the
+installed CLI is verified with a real model catalogue, effort support,
+authentication and billing classification.
+
+### Antigravity Windows desktop → WSL2 supervisor
+
+The desktop application's own conversation must launch the supervisor inside the
+verified Ubuntu distro. Running `agy` in the desktop's integrated terminal does
+not satisfy desktop integration.
+
+```bash
+python3 scripts/install_wsl.py --setup-desktop
+```
+
+The output records the actual `WSL_DISTRO_NAME`, absolute WSL Python, checkout,
+config and run-state paths, and the `opencode`/`agy` executables, then prints the
+Windows `wsl.exe -d <distro> --exec /usr/bin/env PATH=... ABDULLAH_CONFIG=...
+ABDULLAH_STATE_DIR=... <python> <supervisor> mcp` bridge to register in the
+**desktop app's own MCP settings**, so a non-login shell still reaches the same
+isolated configuration, run state and worker executables. Missing distro/CLIs are
+reported as blockers. Keep the server-scoped timeout above `whole-stage + margin` (shipped:
+18,000,000 ms against 17,000 s); the installer rejects an insufficient or
+non-finite bound. No authenticated desktop run has passed yet, so native
+progress rendering, a real >180 s desktop stage, interruption, reconnection and
+resume remain unverified for this host.
+
 ## Configuration
 
 One file: `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`), or
@@ -247,6 +337,7 @@ shipped validator:
 |---|---|---|
 | Architect (Codex) | `architect.codex.model` / `.effort` | Passed through; confirm it exists in your Codex catalog. |
 | Architect (Claude) | `architect.claude.model` / `.effort` | Same, for the Claude host. |
+| Architect (Antigravity) | `architect.antigravity.model` / `.effort` / `.auth` | Opt-in; must stay at `high` for final acceptance. Confirm the model id against the installed `agy` catalogue before use. |
 | Explorer | `workers.explorer` | Optional read-only investigation. |
 | Implementer | `workers.implementer` | The only writer. |
 | Reviewer | `workers.reviewer` | Fresh independent context. |
@@ -287,24 +378,31 @@ Rules the supervisor enforces:
   permissions, verification, unknown keys) still mark the run `config_changed`
   and block stages until resolved. See
   [docs/configuration.md](docs/configuration.md#changing-configuration-during-a-run).
-- New runs must state their host (`codex` or `claude`); there is no implicit
-  default.
+- New runs must state their host (`codex`, `claude` or opt-in `antigravity`);
+  there is no implicit default. Existing Codex/Claude configurations stay valid
+  without an `architect.antigravity` entry.
 
 ## Usage
 
-Inside the Codex/Claude chat, the skill drives nine MCP tools:
+Inside the Codex, Claude Code or Antigravity chat, the skill drives twelve MCP tools:
 
 | Tool | Purpose |
 |---|---|
 | `orchestrator_start` | Create durable run state (does not dispatch a worker). |
 | `orchestrator_stage` | Run exactly one stage in the foreground. |
-| `orchestrator_status` | Deterministic compact status, bounded plan view and canonical verdict; no model call. |
+| `orchestrator_status` | Deterministic compact status, bounded plan view, execution environment and canonical verdict; no model call. |
 | `orchestrator_recap` | Quick or developer recap from recorded evidence. |
 | `orchestrator_interrupt` | Persist, terminate and verify an interruption. |
 | `orchestrator_amend` | Record a requirement/correction amendment and pause safely. |
 | `orchestrator_resume` | Mark a paused run runnable (does not execute a stage). |
 | `orchestrator_reconcile` | Clear a parent job/check or lane-only attempt only after containment proves it stopped. |
 | `orchestrator_runs` | List recent runs for recovery from a new chat. |
+| `orchestrator_consult` | Record the user's exact answer to an explicit plan consultation. |
+| `orchestrator_models` | Configure-models view for every role, host and pin; no change is applied implicitly. |
+| `orchestrator_check_exceptions` | Read this run's scoped routine-check authorizations. |
+
+`approve-plan`, `approve-fallback`, `authorize-route` and `authorize-check`
+remain human-only CLI actions and are deliberately not MCP tools.
 
 The stage loop is:
 
@@ -342,22 +440,27 @@ an explicit request such as “Ask me about architecture and design choices befo
 you finalize the plan.” The Architect then puts concise rationale in the plan
 summary, flags consequential forks with trade-offs and its recommendation, and
 uses the blocker for a question that must be answered before a valid plan is
-possible. The coordinator presents that actual proposal or question. If the
-reply answers a blocking question or materially changes the design or
-requirements, it records the exact reply with `orchestrator_amend` and obtains a
-versioned revised plan; if the user accepts the unchanged plan, it shows the
-existing human approval action without a needless replan. Chat discussion never
-grants execution authority, and approval of an earlier plan cannot authorize its
+possible. The coordinator presents that actual proposal or question. The user's
+reply is handled in the controlling conversation and recorded with
+`orchestrator_consult`: a material answer becomes a versioned amended plan, while
+accepting the unchanged plan needs no terminal command. A stale reply from an
+older plan revision is rejected. Chat discussion never grants paid-route or
+destructive authorization, and approval of an earlier plan cannot authorize its
 revision. Once an amendment supersedes a blocked question, status reports
 replanning pending rather than the answered question.
 
-Human-only actions are **not** MCP tools and run in your own terminal:
+Protected human-only actions are **not** MCP tools and run in your own terminal
+when needed:
 
 ```bash
-python3 scripts/orchestrator.py approve-plan <RUN> --confirm approve-plan:<RUN>
 python3 scripts/orchestrator.py authorize-route <RUN> --role implementer ...
 python3 scripts/orchestrator.py approve-fallback <RUN> --role implementer --confirm approve-fallback:<RUN>
+python3 scripts/orchestrator.py authorize-check <RUN> --argv '["python3","-m","unittest"]' \
+  --reason "planned check" --authorized-by "operator" --confirm check-exception:<RUN>:<SHA12>
 ```
+
+`approve-plan` remains available for a legacy/manual gate but is no longer the
+normal consultation path.
 
 > [!WARNING]
 > The CLI `start` command is **not** the state-only `orchestrator_start` tool.
@@ -686,8 +789,15 @@ part of this v1.2.0 list.
   invalidated while artifacts and audit history remain readable.
 - Implementer and Reviewer receive the user's verbatim goal and amendments once,
   separate from the Architect's interpretation. The fresh Reviewer also receives
-  acceptance criteria, an observed batch-delta index and supervisor-generated
-  check results through a digest-bound read-only projection inside the checkout.
+  acceptance criteria, supervisor-generated check results and a validated
+  digest-bound reference to the observed batch-delta index through a
+  digest-bound read-only projection inside the checkout. The complete index,
+  hunks and byte-identical check logs stay in that projection; the prompt keeps
+  only the readable index path, root/projection and
+  run/batch/plan/candidate/verification bindings, file count and canonical
+  content digest, plus each command's argv, exit code and log digest with a
+  concise 300-character log excerpt, so a large review still fits the route's
+  UTF-8 byte budget.
 - Codex and Claude receive the full request on stdin (no positional prompt);
   OpenCode keeps its supported positional transport behind byte-aware exec
   checks. Stable policy is delivered once per effective route.
@@ -717,6 +827,15 @@ tests, OK, 10 skipped** in 1,715.570 s on Python 3.10.12. The 10 skips are the
 same opt-in OpenCode introspection module. The documentation-only commit after it
 does not change `scripts/`. Earlier follow-up gates also passed; the 1,183 result
 is the final one. This is follow-up evidence, not a new v1.2.0 suite result.
+
+**Antigravity/autonomous-progression candidate (offline):** routing,
+capability gating, stdin UTF-8 transport, terminal report validation, model
+configuration, consultation replies, automatic progression, scoped check
+exceptions, bounded recovery, environment display and setup/conflict handling
+have deterministic fixture coverage. This is fixture-tested behavior only: no
+real `agy` process, authenticated Antigravity CLI/desktop stage or desktop
+progress rendering is attested. `agy` was absent from the validation shell, so
+those remain explicit blockers rather than claims.
 
 **Deterministic suite (offline, no model calls):** the final v1.2.0
 candidate ran **1,069 tests, with 1,059 passing and 10 skipped** on Python

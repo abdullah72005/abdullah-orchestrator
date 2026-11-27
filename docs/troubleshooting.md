@@ -63,6 +63,34 @@ Set `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` in the user settings used by the
 interactive host, and add the per-server `"timeout"` to the user MCP store, not
 `settings.json`. See [Installation](installation.md#claude-code-host).
 
+### Antigravity: `agy` missing, unsupported help or wrong schema
+
+`doctor --host antigravity` refusing to dispatch is expected when `agy` is not on
+PATH, `agy --help` does not advertise `--print`/`--model`/`--output-format`
+(plus `--effort`/`--session` when used), or the configured model/effort is
+unsupported. Do not edit the adapter to guess flags. Install the CLI, verify the
+installed version/docs/catalogue, then retry. `--register-antigravity` only
+merges into an explicit existing settings file; a missing file, invalid JSON or
+conflicting `abdullah-orchestrator` entry is refused without writing.
+
+```bash
+agy --version && agy --help
+python3 scripts/orchestrator.py doctor --project /abs/repo --host antigravity
+python3 scripts/install_wsl.py --setup-desktop   # distro/Python/paths/blockers
+```
+
+A desktop coordinator whose stage times out at a fixed ceiling has a server
+timeout below the stage budget; keep the server-scoped bound above
+`max_stage_seconds` + margin. The installer rejects an insufficient bound.
+
+### Plan did not pause for approval
+
+That is expected: automatic progression is the default. A gate exists only when
+the user explicitly requested design consultation (`plan_approval: true`).
+Answer in the controlling conversation; the coordinator records it with
+`orchestrator_consult`. Do not run `approve-plan` for an ordinary run, and do not
+treat consultation as paid-route or destructive-action authorization.
+
 ## Run lifecycle
 
 ### CLI `start` dispatched models immediately

@@ -16,8 +16,12 @@ codex mcp add abdullah-orchestrator -- python3 /abs/path/to/abdullah-orchestrato
 
 `install_wsl.py --register-codex` can perform that registration. New runs must
 name their controlling host explicitly (`orchestrator_start` requires `host:
-codex|claude`; the CLI requires `start --host`). There is no silent Codex
-default, and resume refuses a host that contradicts the persisted run.
+codex|claude|antigravity`; the CLI requires `start --host`). There is no silent
+Codex default, and resume refuses a host that contradicts the persisted run.
+Antigravity is opt-in: it needs `architect.antigravity` and a verified `agy`
+whose `--help` advertises the headless tokens; missing capabilities block
+dispatch instead of falling through to Claude. See the installation guide for
+the CLI/desktop setup and the validated timeout bound.
 
 For Claude Code, register the same stdio server as a user-scoped server only
 when explicitly requested:
@@ -78,7 +82,7 @@ The MCP server exposes small foreground tools:
 | `orchestrator_reconcile` | Clear a proven-stopped uncertain attempt; fails closed |
 | `orchestrator_runs` | List recent runs for new-chat recovery |
 
-Plan approval, fallback authorization, route grants and worker-fallback consent are deliberately **not** MCP tools. A model cannot approve its own plan, authorize its own fallback, or grant its own billed route. The user runs `orchestrator.py approve-plan`, `approve-fallback`, `authorize-route`, or `approve-worker-fallback` in an interactive terminal, with the exact typed confirmation. The MCP server rejects those names.
+Plan approval, fallback authorization, route grants and worker-fallback consent are deliberately **not** MCP tools. A model cannot approve its own plan, authorize its own fallback, or grant its own billed route. Automatic progression is the default: a valid plan proceeds without approval, and risk/complexity/writer count never create a gate. Only an explicit design-consultation request (`plan_approval: true`) pauses; the user answers in the controlling conversation and the coordinator records that exact reply with `orchestrator_consult` (a material reply versions the plan, acceptance needs no terminal command). Legacy/manual `orchestrator.py approve-plan`, `approve-fallback`, `authorize-route` and `approve-worker-fallback` remain human-only CLI actions with exact typed confirmation, and the MCP server rejects those names.
 
 Each `orchestrator_stage` call runs one stage in the foreground. Send one short
 line in the current chat with the worker, model and effort, task and expected
@@ -122,14 +126,24 @@ you finalize the plan” should start the run with `plan_approval: true`. That
 Architect puts the rationale in `summary`, flags consequential forks with
 trade-offs and a recommendation, and uses `blocker` for a question that must be
 answered before a valid plan exists. Present the proposal and actual questions
-in chat. If the reply answers a blocking question or materially changes the
-design or requirements, record the user's exact reply with `orchestrator_amend`,
-resume, and obtain a versioned revised plan. If the user accepts the unchanged
-plan, do not amend or replan; show the exact human approval action. Discussion
-cannot grant execution authority, and approval of an earlier plan never
-authorizes its revision. Once an amendment supersedes a blocked question,
-status shows replanning pending. The executing plan still requires the human-only
-`approve-plan` command.
+in chat. Handle the reply in the controlling conversation: a material answer or
+requirement change is recorded with `orchestrator_consult` (`response`,
+`decision: "amend"`), which creates a versioned amended plan; acceptance of the
+unchanged proposal is recorded with `decision: "accept"` and needs no terminal
+command. A reply bound to a superseded plan revision or amendment epoch is
+rejected. Discussion cannot grant paid-route or destructive authorization, and
+approval of an earlier plan never authorizes its revision. Legacy/manual
+`approve-plan` stays available to a human but is not part of this flow.
+
+Compliance is supervisor-enforced, not just prompt text: `progression` in
+status/stage/resume reports `automatic`, any consultation requirement and a
+bounded recovery class. Routine corrections, verification and supported
+recoverable failures continue without asking the user; explicit pause/cancel,
+sensitive authorization, credentials/external access and irreducible blockers
+stop the run. Run-scoped routine-check exceptions may admit an exact
+non-destructive plan argv (never a shell wrapper or paid/destructive action) and
+are visible with `check-exceptions`; they never alter shared config or another
+saved run.
 
 ```bash
 python3 scripts/orchestrator.py status --run <RUN_ID> --follow

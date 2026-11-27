@@ -251,12 +251,21 @@ class PlanQuality(unittest.TestCase):
 
 
 class HumanAuthorization(unittest.TestCase):
+    # Ambient agent markers make an operator-only action refuse before the TTY
+    # check.  These tests assert one dimension at a time, so clear the other.
+    _MARKERS = ("ABDULLAH_JOB_ID", "ABDULLAH_RUN_ID", "ABDULLAH_CHECK_TOKEN",
+                "ABDULLAH_PARENT_JOB", "ABDULLAH_AGENT_CONTEXT")
+
+    def _human_env(self):
+        return patch.dict(os.environ, {key: "" for key in self._MARKERS})
+
     def test_mcp_does_not_expose_human_only_approvals(self):
         self.assertNotIn("orchestrator_approve_plan", orc.MCP_TOOL_NAMES)
         self.assertNotIn("orchestrator_approve_fallback", orc.MCP_TOOL_NAMES)
 
     def test_non_interactive_operator_action_is_refused(self):
-        with patch.object(orc.sys.stdin, "isatty", return_value=False):
+        with self._human_env(), \
+                patch.object(orc.sys.stdin, "isatty", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "interactive operator terminal"):
                 orc.require_human_operator("approve-plan", "run-1", "approve-plan:run-1")
 
@@ -267,7 +276,8 @@ class HumanAuthorization(unittest.TestCase):
                                            "approve-fallback:run-1")
 
     def test_confirmation_token_is_exact(self):
-        with patch.object(orc.sys.stdin, "isatty", return_value=True):
+        with self._human_env(), \
+                patch.object(orc.sys.stdin, "isatty", return_value=True):
             with self.assertRaisesRegex(RuntimeError, "Confirmation mismatch"):
                 orc.require_human_operator("approve-plan", "run-1", "approve-plan:run-2")
             result = orc.require_human_operator("approve-plan", "run-1", "approve-plan:run-1")

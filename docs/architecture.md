@@ -24,11 +24,11 @@ needs to modify, audit, or debug the workflow — not as marketing material.
 
 | Component | Implementation | Responsibility |
 |---|---|---|
-| Visible coordinator | Codex Luna Medium / Claude chat | Talk to the user; call MCP tools; summarize results |
+| Visible coordinator | Codex Luna Medium / Claude chat / Antigravity chat | Talk to the user; call MCP tools; summarize results |
 | Supervisor | `scripts/orchestrator.py` | State machine, guards, verification, evidence, recovery |
-| MCP server | `orchestrator.py mcp` | Nine foreground tools over stdio JSON-RPC |
+| MCP server | `orchestrator.py mcp` | Twelve foreground tools over stdio JSON-RPC |
 | Guard | `orchestrator.py _guard` | Session/process-group leader; kills the tree if the lease closes |
-| Architect | Codex `gpt-6.2-sol` or Claude Opus, high effort | Plan, diagnose, integrate, accept |
+| Architect | Codex `gpt-6.2-sol`, Claude Opus, or opt-in Antigravity `agy`, high effort | Plan, diagnose, integrate, accept |
 | Explorer | OpenCode Go, low variant | Read-only investigation |
 | Implementer | OpenCode Go, high variant | One bounded writer per batch |
 | Reviewer | OpenCode Go, high variant, fresh context | Independent findings |
@@ -36,6 +36,18 @@ needs to modify, audit, or debug the workflow — not as marketing material.
 The Architect and workers are external CLIs. The supervisor never imports them;
 it builds argv, launches them under a guard, parses structured output, and
 records provenance.
+
+### Controlling hosts
+
+Three host names are accepted: `codex`, `claude` and `antigravity`. Host-specific
+behavior varies only where it genuinely must (validation, doctor probes, prompt
+transport, report extraction, billing preflight, MCP registration and progress
+rendering). Antigravity is **opt-in**: a configuration without an
+`architect.antigravity` entry keeps Codex and Claude working, and an Antigravity
+run fails with an actionable error naming that key instead of falling through to
+Claude behavior. Antigravity Architect dispatch is separately guarded, uses the
+installed `agy` CLI's own stdin transport and refuses any argument the installed
+help does not advertise.
 
 ## Repository and runtime layout
 
@@ -108,6 +120,19 @@ call are clipped to the remaining budget. An expired budget blocks at the
 current phase with no acceptance, no completed job, and no later Reviewer or
 worker start. Deadline regressions assert that safety behavior rather than the
 exact timeout wording.
+
+The Reviewer handoff uses a manifest-bound read-only projection inside the
+checkout for requirements, acceptance criteria, verification records, complete
+check logs, the complete batch-delta index and its hunks. The projection copies
+each check log byte-for-byte, so its digest is the recorded `log_sha256`. The
+prompt inlines only a digest-bound delta reference (readable index path,
+projection root/manifest and run/batch/plan/candidate/verification bindings,
+file count and canonical content digest) and a concise 300-character excerpt per
+check log beside its argv, exit code, `log_path`, `log_sha256` and `log_bytes`.
+This keeps large reviews inside the OpenCode argv UTF-8 byte budget without
+dropping user requirements, source identity, verification verdicts or
+command/log digests. Missing, unreadable, altered, symlinked, escaping or
+mismatched index references block before a Reviewer launch.
 
 ## Dispatch and report pipeline
 

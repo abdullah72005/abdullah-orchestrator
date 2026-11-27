@@ -10,7 +10,7 @@ described as a limitation.
 | Boundary | Controlled by | Strength |
 |---|---|---|
 | User ↔ coordinator | Chat | User intent; coordinator cannot approve its own plan or fallback |
-| Coordinator ↔ supervisor | stdio MCP | Small typed surface; nine tools |
+| Coordinator ↔ supervisor | stdio MCP | Small typed surface; twelve tools |
 | Supervisor ↔ workers | Guarded process session + environment markers | Strong for same-user process trees; not an OS sandbox |
 | Workers ↔ project files | Generated OpenCode/Claude permissions | Application-level allow/deny; CLI-enforced |
 | Worker ↔ credentials | Scrubbed environment + `.env` denies | Defense in depth; not complete isolation |
@@ -28,6 +28,11 @@ described as a limitation.
 - **One writer per checkout.** A lease registry names one owning run per
   canonical checkout. Conflicting stages return the owner and resolution
   commands rather than racing.
+- **No recursive supervisor dispatch.** Every dispatched worker is marked with
+  `ABDULLAH_AGENT_CONTEXT` (and the Architect also with
+  `ABDULLAH_PARENT_JOB`); `create_run` refuses a new run from such a context
+  before reading config or writing state. Only the controlling host
+  conversation creates runs.
 - **No unguarded execution.** Model calls and verification run under a guard
   that is a session/process-group leader. If the lease pipe closes, the guard
   kills the tree.
@@ -50,7 +55,9 @@ described as a limitation.
   is boundary observation, not OS write prevention: a same-user write restored
   to identical bytes before observation is not detected.
 - **Explicit host and shared billing preflight.** New runs require an explicit
-  `codex` or `claude` host; resume refuses a contradictory host. One
+  `codex`, `claude` or opt-in `antigravity` host; resume refuses a contradictory
+  host. Antigravity is capability-gated against installed `agy --help`, never
+  falls through to Claude, and a missing CLI/model/effort is a blocker. One
   deterministic preflight is shared by dispatch and `doctor`. It resolves the
   effective Claude config directory/settings sources and rejects observable
   subscription overrides (API keys, tokens, endpoints, model/fallback routing,

@@ -1176,12 +1176,12 @@ class CorrectionCycleF120Tests(ReleaseFixture):
         self.assertTrue(Path(evidence["manifest"]).is_file())
         self.assertTrue(evidence["files_truncated"])
         delta = parsed["delta_index"]
-        self.assertTrue(delta["files_truncated"])
+        self.assertNotIn("files", delta)
+        self.assertEqual(delta["file_count"], 60)
+        self.assertTrue(delta["files_sha256"])
         self.assertTrue(delta["index_paths"])
         self.assertTrue(Path(delta["index_paths"][0]).is_file())
-        hunk_path = Path(delta["files"][0]["hunks"][0]["path"])
-        self.assertTrue(hunk_path.is_file())
-        self.assertIn("+value = 42", hunk_path.read_text())
+        self.assertIn("+value = 42", real_hunk.read_text())
         # The pointer is readable through the Reviewer's real read policy.
         relative = Path(projection["root"]).name + "/" + \
             next(name for name in projection["files"] if name.endswith(".patch"))
@@ -1614,6 +1614,74 @@ class ProjectionIntegrityF120Tests(ReleaseFixture):
         self.assertEqual(rejection.code, "review_projection_unavailable")
 
 
+    def test_delta_reference_rejects_altered_missing_and_symlinked_index(self):
+        state = self._review_state()
+        projection, rejection = self._projection(state)
+        self.assertIsNone(rejection)
+        index_path = Path(projection["root"]) / "delta" / "index.json"
+        self.assertTrue(index_path.is_file())
+        reference = orc.review_delta_index_reference(state, projection)
+        self.assertEqual(reference["index_paths"], [str(index_path)])
+        self.assertEqual(
+            reference["index_content_hash"],
+            orc.content_hash(json.loads(index_path.read_text(encoding="utf-8"))))
+        original = index_path.read_bytes()
+        index_path.write_bytes(original + b"\n")
+        with self.assertRaises(orc.VerificationEvidenceRejected) as caught:
+            orc.review_delta_index_reference(state, projection)
+        self.assertEqual(caught.exception.code,
+                         "review_delta_reference_invalid")
+        self.assertEqual(caught.exception.details["reason"], "index_altered")
+        index_path.write_bytes(original)
+        self.assertEqual(
+            orc.review_delta_index_reference(state, projection)["index_sha256"],
+            reference["index_sha256"])
+        moved = index_path.with_name("index.moved.json")
+        index_path.rename(moved)
+        index_path.symlink_to(moved)
+        try:
+            with self.assertRaises(orc.VerificationEvidenceRejected) as caught:
+                orc.review_delta_index_reference(state, projection)
+            self.assertEqual(caught.exception.details["reason"],
+                             "index_path_escapes_projection")
+        finally:
+            index_path.unlink()
+            moved.rename(index_path)
+        index_path.unlink()
+        with self.assertRaises(orc.VerificationEvidenceRejected) as caught:
+            orc.review_delta_index_reference(state, projection)
+        self.assertEqual(caught.exception.details["reason"], "index_missing")
+
+    def test_altered_delta_index_blocks_review_before_dispatch(self):
+        state = self._review_state()
+        package = self._package()
+        projection, rejection = self._projection(state, package)
+        self.assertIsNone(rejection)
+        index_path = Path(projection["root"]) / "delta" / "index.json"
+        real_prepare = orc.prepare_review_projection
+
+        def tampered_prepare(*args, **kwargs):
+            value, problem = real_prepare(*args, **kwargs)
+            if value is not None:
+                index_path.write_bytes(index_path.read_bytes() + b" ")
+            return value, problem
+
+        with patch.object(orc, "review_verification_admission",
+                          return_value=(state["plan"]["batches"][0],
+                                        package)), \
+                patch.object(orc, "prepare_review_projection",
+                             side_effect=tampered_prepare), \
+                patch.object(orc, "call_model") as call_model:
+            orc.advance(self.rundir, state, self.cfg)
+        call_model.assert_not_called()
+        self.assertEqual(state["status"], "blocked")
+        self.assertIn(state["verification_rejection"]["code"],
+                      {"review_packet_invalid",
+                       "review_delta_reference_invalid"})
+        self.assertEqual(state["usage"]["strong_calls"], 0)
+        self.assertEqual(state["usage"]["cheap_calls"], 0)
+
+
 class BatchCorrectionsR02Tests(ReleaseFixture):
     def _commit(self, message="fixture"):
         subprocess.run(["git", "add", "-A"], cwd=self.project, check=True,
@@ -1843,7 +1911,291 @@ class BatchCorrectionsR02Tests(ReleaseFixture):
         self.assertTrue(evidence["files_truncated"])
         delta = parsed["delta_index"]
         self.assertTrue(delta["index_paths"])
-        self.assertTrue(delta["files"][0]["hunks"][0]["path"].endswith("0001.patch"))
+        self.assertNotIn("files", delta)
+        self.assertEqual(delta["file_count"], 1000)
+        self.assertTrue(delta["files_sha256"])
+
+    def _bulky_delta_projection(self):
+        """Real manifest-bound projection whose persisted index is genuinely large."""
+        plan = self.plan()
+        state = self.state(phase="review", plan=plan,
+                           plan_version=orc.content_hash(plan))
+        hunks_dir = self.root / "bulky-delta" / "hunks"
+        hunks_dir.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for number in range(60):
+            hunk = hunks_dir / f"{number:04d}.patch"
+            hunk.write_text(
+                f"--- a/mod{number:03d}.py\n"
+                f"+++ b/mod{number:03d}.py\n"
+                f"@@ -1 +1 @@\n-value = {number}\n+value = {number + 1}\n",
+                encoding="utf-8")
+            paths.append({
+                "path": f"mod{number:03d}.py",
+                "attributable": "observed",
+                "note": "observed window change " + ("ب" * 500),
+                "hunks": [{
+                    "path": str(hunk), "scope": "worktree",
+                    "bytes": hunk.stat().st_size,
+                    "sha256": orc._sha256_file(hunk),
+                    "note": "hunk metadata " + ("ح" * 700)}]})
+        state["batch_deltas"] = [{
+            "attempt": 1, "job_id": "impl-bulky", "batch_index": 0,
+            "plan_version": state["plan_version"],
+            "hunks_dir": str(hunks_dir), "paths": paths,
+            "limitations": [], "complete": True,
+            "index_path": str(hunks_dir.parent / "index.json")}]
+        self.saved(state)
+        package = {"commands": [{
+            "argv": ["python3", "-m", "unittest"], "returncode": 0,
+            "log": str(self.root / "bulky.log"), "log_sha256": "b" * 64,
+            "log_bytes": 12, "output_tail": "OK"}],
+            "passed": True, "source_unchanged": True,
+            "candidate_hash": orc.signature(orc.source_snapshot(self.project)),
+            "verification_path": str(self.root / "bulky-verification.json"),
+            "verification_sha256": "bulky-verify", "evidence_version": 2}
+        projection, rejection = orc.prepare_review_projection(
+            self.rundir, state, self.cfg, self.project,
+            plan["batches"][0], package)
+        self.assertIsNone(rejection)
+        return state, plan, package, projection
+
+    def test_large_delta_index_compacts_to_digest_bound_reference(self):
+        state, plan, package, projection = self._bulky_delta_projection()
+        index_path = Path(projection["root"]) / "delta" / "index.json"
+        self.assertTrue(index_path.is_file())
+        # The persisted index really is large enough to break an argv prompt.
+        inline_index = orc.batch_delta_index(state)
+        self.assertGreater(index_path.stat().st_size, 100_000)
+        self.assertGreater(
+            len(json.dumps(inline_index, ensure_ascii=False).encode("utf-8")),
+            orc._arg_string_limit())
+        reference = orc.review_delta_index_reference(state, projection)
+        persisted = json.loads(index_path.read_text(encoding="utf-8"))
+        self.assertNotIn("files", reference)
+        self.assertEqual(reference["file_count"], 60)
+        self.assertEqual(reference["index_paths"], [str(index_path)])
+        self.assertEqual(reference["index_sha256"],
+                         orc._sha256_file(index_path))
+        self.assertEqual(reference["index_content_hash"],
+                         orc.content_hash(persisted))
+        self.assertEqual(reference["candidate_hash"],
+                         projection["candidate_hash"])
+        self.assertEqual(reference["verification_sha256"], "bulky-verify")
+        self.assertEqual(reference["plan_version"], state["plan_version"])
+        context = {
+            "project": str(self.project), "batch": plan["batches"][0],
+            "plan_version": state["plan_version"],
+            "source": orc.source_snapshot(self.project),
+            "verification": package,
+            "requirements": orc.user_requirements(state),
+            "review_evidence": {
+                "root": projection["root"], "manifest": projection["manifest"],
+                "manifest_sha256": projection["manifest_sha256"],
+                "projection_sha256": projection["projection_sha256"],
+                "files": projection["files"],
+                "limitations": projection["limitations"],
+                "untrusted_files": ["verification.json"]},
+            "delta_index": reference,
+            "invariants": plan["invariants"],
+            "approved_handoff": {
+                "goal": plan["batches"][0]["goal"],
+                "acceptance": plan["batches"][0]["acceptance"],
+                "risk": plan["batches"][0]["risk"]},
+            "instruction": "Review the candidate independently.",
+        }
+        captured = {}
+        with patch.object(orc, "config", return_value=self.cfg), \
+                self.assertRaisesRegex(RuntimeError, "stop-after-gates"):
+            self._dispatch(state, orc.prompt_request("reviewer", context),
+                           captured)
+        prompt = captured["prompt"]
+        budget = max(4096, orc._arg_string_limit() - 1024)
+        self.assertLessEqual(len(prompt.encode("utf-8")), budget)
+        self.assertIsNone(orc.transport_space_error(
+            ["/bin/true", prompt], {}, prompt=prompt))
+        body = prompt.split("Task and evidence:\n", 1)[1]
+        body = body.rsplit("\n\nReply with ONE valid JSON object", 1)[0]
+        rendered = json.loads(body)
+        delta = rendered["delta_index"]
+        self.assertNotIn("files", delta)
+        self.assertEqual(delta["file_count"], 60)
+        self.assertEqual(delta["index_paths"], reference["index_paths"])
+        self.assertEqual(delta["index_content_hash"],
+                         reference["index_content_hash"])
+        # Mandatory decision context and integrity bindings survive intact.
+        self.assertEqual(rendered["requirements"], orc.user_requirements(state))
+        self.assertEqual(rendered["source"]["git_head"],
+                         context["source"]["git_head"])
+        self.assertEqual(rendered["verification"]["passed"], True)
+        self.assertEqual(
+            rendered["verification"]["commands"][0]["log_sha256"],
+            "b" * 64)
+        self.assertEqual(rendered["approved_handoff"]["risk"], "ordinary")
+        # The reference resolves through the Reviewer's real read policy.
+        relative = Path(projection["root"]).name + "/delta/index.json"
+        resolved = json.loads(orc.read_review_projection(self.project, relative))
+        self.assertEqual(len(resolved["files"]), 60)
+        self.assertEqual(orc.content_hash(resolved), delta["index_content_hash"])
+        self.assertTrue(resolved["files"][0]["hunks"])
+
+    def _many_log_verification_record(self, count=20):
+        """A realistic passed record whose reconstructible tails are large.
+
+        Every log carries a unique marker inside the supervisor's bounded
+        3,000-character tail but outside the concise prompt excerpt, so the
+        regression can prove the omitted detail is still readable in the
+        manifest-bound review projection.
+        """
+        snapshot = orc.source_snapshot(self.project)
+        fingerprint = orc.signature(snapshot)
+        commands = []
+        for index in range(count):
+            log = self.root / f"full-check-{index:02d}.log"
+            body = "test_ok: representative supervisor verification output\n" * 120
+            log.write_text(
+                body
+                + f"OMITTED-FULL-LOG-MARKER-{index:02d}\n"
+                + ("阿拉伯 " * 260)
+                + f"\nRESULT-{index:02d}: OK\n",
+                encoding="utf-8")
+            argv = ["python3", "-m", "unittest", "discover", "-s",
+                    "scripts/tests", "-k", f"scope_{index:02d}.", "-v"]
+            commands.append({
+                "argv": argv, "returncode": 0,
+                "log": str(log),
+                "log_sha256": orc._sha256_file(log),
+                "log_bytes": log.stat().st_size,
+                "source_proof": {"kind": "non-compose", "attested": False,
+                                 "source": str(self.project), "argv": argv},
+                "command_policy": {"allowed": True, "argv": argv,
+                                   "policy": "direct", "shell_wrapper": False,
+                                   "env_wrapper": False, "malformed": False},
+            })
+        record = {
+            "run_id": "test-v12000", "batch": "batch 0", "final": False,
+            "candidate": snapshot, "after": snapshot,
+            "candidate_hash": fingerprint, "after_hash": fingerprint,
+            "passed": True, "source_unchanged": True,
+            "started_at": "start", "finished_at": "end",
+            "commands": commands,
+        }
+        path = self.root / "full-verification.json"
+        orc.atomic_json(path, record)
+        return path, snapshot, fingerprint
+
+    def test_many_check_logs_compact_to_digest_bound_excerpts_in_budget(self):
+        state = self._review_state()
+        record_path, snapshot, fingerprint = self._many_log_verification_record()
+        package = orc.verification_evidence_package(
+            {"path": str(record_path), "passed": True,
+             "candidate_hash": fingerprint},
+            snapshot, run_id=state["id"],
+            plan_version=state.get("plan_version"),
+            plan_revision=state.get("plan_revision", 0),
+            amendment_epoch=state.get("amendment_epoch", 0),
+            run_state=state)
+        self.assertEqual(len(package["commands"]), 20)
+        # The reconstructible inline tails alone exceed the old per-log budget.
+        self.assertGreater(
+            sum(len(item["output_tail"]) for item in package["commands"]),
+            40_000)
+        projection, rejection = self._review_projection(state, package)
+        self.assertIsNone(rejection)
+        reference = orc.review_delta_index_reference(state, projection)
+        context = {
+            "project": str(self.project), "batch": state["plan"]["batches"][0],
+            "plan_version": state["plan_version"],
+            "source": snapshot, "verification": package,
+            "requirements": orc.user_requirements(state),
+            "review_evidence": {
+                "root": projection["root"], "manifest": projection["manifest"],
+                "manifest_sha256": projection["manifest_sha256"],
+                "projection_sha256": projection["projection_sha256"],
+                "files": projection["files"],
+                "limitations": projection["limitations"],
+                "untrusted_files": ["verification.json"]},
+            "delta_index": reference,
+            "invariants": state["plan"]["invariants"],
+            "instruction": "Review the candidate independently.",
+        }
+        captured = {}
+        with patch.object(orc, "config", return_value=self.cfg), \
+                self.assertRaisesRegex(RuntimeError, "stop-after-gates"):
+            self._dispatch(state, orc.prompt_request("reviewer", context),
+                           captured)
+        prompt = captured["prompt"]
+        self.assertLess(len(prompt.encode("utf-8")), 129_501)
+        self.assertIsNone(orc.transport_space_error(
+            ["/bin/true", prompt], {}, prompt=prompt))
+        body = prompt.split("Task and evidence:\n", 1)[1]
+        body = body.rsplit("\n\nReply with ONE valid JSON object", 1)[0]
+        rendered = json.loads(body)
+        commands = rendered["verification"]["commands"]
+        # Without the concise-excerpt step the same reconstructible tails would
+        # push this exact handoff back over the pinned argv byte limit.
+        legacy = orc._context_evidence_summary(package, excerpt_limit=4000)
+        legacy_bytes = len(json.dumps(legacy, ensure_ascii=False).encode())
+        concise_bytes = len(json.dumps(rendered["verification"],
+                                       ensure_ascii=False).encode())
+        self.assertGreater(legacy_bytes, concise_bytes)
+        self.assertGreater(len(prompt.encode("utf-8"))
+                           + (legacy_bytes - concise_bytes), 129_501)
+        self.assertEqual(len(commands), 20)
+        self.assertEqual(rendered["verification"]["passed"], True)
+        self.assertEqual(rendered["requirements"], orc.user_requirements(state))
+        self.assertEqual(rendered["source"]["git_head"], snapshot["git_head"])
+        for index, (command, source) in enumerate(zip(commands, package["commands"])):
+            self.assertEqual(command["argv"], source["argv"])
+            self.assertEqual(command["returncode"], source["returncode"])
+            self.assertEqual(command["log_sha256"], source["log_sha256"])
+            self.assertEqual(command["log_bytes"], source["log_bytes"])
+            self.assertLessEqual(len(command["output_tail"]), 300)
+            self.assertTrue(command["output_tail_truncated"])
+            self.assertEqual(command["output_tail_original_chars"],
+                             len(source["output_tail"]))
+            self.assertNotIn(f"OMITTED-FULL-LOG-MARKER-{index:02d}",
+                             command["output_tail"])
+        # Omitted detail stays readable and digest-bound in the real projection.
+        root = Path(projection["root"])
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        projected = json.loads(
+            (root / "verification.json").read_text(encoding="utf-8"))
+        self.assertTrue(projected["untrusted"])
+        record_entry = projected["projection_record"]
+        self.assertTrue(record_entry)
+        record_raw = (root / record_entry).read_bytes()
+        self.assertEqual(hashlib.sha256(record_raw).hexdigest(),
+                         manifest["files"][record_entry]["sha256"])
+        self.assertEqual(record_raw, record_path.read_bytes())
+        for index, (command, source) in enumerate(zip(projected["commands"],
+                                                      package["commands"])):
+            relative = command["projection_log"]
+            self.assertTrue(relative)
+            path = root / relative
+            raw = path.read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                             manifest["files"][relative]["sha256"])
+            self.assertEqual(len(raw), manifest["files"][relative]["bytes"])
+            # The projection copy is the complete log, digest-bound to the
+            # supervisor record rather than a lossy re-rendering.
+            self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                             source["log_sha256"])
+            self.assertEqual(command["source_log_sha256"], source["log_sha256"])
+            self.assertEqual(command["source_log_bytes"], source["log_bytes"])
+            self.assertEqual(orc._sha256_file(Path(command["source_log_path"])),
+                             command["source_log_sha256"])
+            text = raw.decode("utf-8")
+            self.assertIn(f"OMITTED-FULL-LOG-MARKER-{index:02d}", text)
+            self.assertTrue(text.endswith(commands[index]["output_tail"]))
+        # The delta reference remains resolvable alongside the concise logs.
+        delta = rendered["delta_index"]
+        self.assertNotIn("files", delta)
+        self.assertEqual(delta["index_sha256"], reference["index_sha256"])
+        resolved = json.loads(orc.read_review_projection(
+            self.project, Path(projection["root"]).name + "/delta/index.json"))
+        self.assertEqual(orc.content_hash(resolved),
+                         delta["index_content_hash"])
 
     def test_true_oversized_mandatory_review_is_refused_uncounted(self):
         state = self.saved(self.state(

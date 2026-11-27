@@ -30,6 +30,8 @@ chmod 600 ~/.config/abdullah-orchestrator/config.json
 |---|---|---|
 | Codex Architect model and effort | Yes | Passed through unchanged; confirm it exists in the installed catalog |
 | Claude Architect model and effort | Yes | Passed through unchanged; confirm it exists in the installed catalog |
+| Antigravity Architect model/effort/billing | Yes (opt-in) | `architect.antigravity` is absent by default; effort must stay `high`; a missing `agy`/unsupported value blocks dispatch |
+| Configure Models view / future-run defaults | Yes | `orchestrator_models`/`models` is read-only; `set-default` previews then applies atomically with a backup and typed confirmation |
 | Explorer / Implementer / Reviewer model | Yes | Fully qualified `provider/model-id`; prefix and declared provider must match |
 | Explorer / Implementer / Reviewer provider | Yes | Any OpenCode provider; recorded as `worker_provider` |
 | Explorer / Implementer / Reviewer variant | Yes | Set per role; `doctor` verifies it on V1 where the catalog exposes variants |
@@ -89,7 +91,8 @@ edit only the values you need.
 ## Architect models
 
 `architect.codex` is used when a run's host is `codex`; `architect.claude` when
-the host is `claude`. The route is:
+the host is `claude`; `architect.antigravity` when the host is `antigravity`. The
+route is:
 
 ```text
 provider = host
@@ -97,6 +100,12 @@ model    = architect.<host>.model
 effort   = architect.<host>.effort
 billing  = architect.<host>.auth
 ```
+
+Antigravity is opt-in and **not live-certified**: the shipped example omits
+`architect.antigravity`, existing Codex/Claude configs remain valid, and a run
+that names `antigravity` without the entry is refused with an actionable error.
+The installed `agy` version must advertise the adapter's required headless
+tokens; a missing CLI or unsupported model/effort is a blocker, not a fallback.
 
 - `auth` should stay `subscription` for the supported workflow. The supervisor
   fails closed if `OPENAI_API_KEY` (Codex host) or `ANTHROPIC_API_KEY` (Claude
@@ -363,6 +372,36 @@ Metadata boundaries:
 
 ### Per-run routes and role switches
 
+Inspect every role and effective pin without changing anything:
+
+```bash
+python3 scripts/orchestrator.py models            # defaults + architect hosts
+python3 scripts/orchestrator.py models <RUN_ID>   # this run's effective pins
+```
+
+The same data is the MCP `orchestrator_models` tool. It distinguishes the
+host-managed conversation model from the dispatched Architect and reports
+provider, model, effort/variant, billing and metadata availability. Three
+operations stay separate: change shared defaults with the validated
+`set-default` preview/apply below (future runs only; existing pins and valid
+evidence are untouched), pass per-run `routes` for one new run, or use
+the preview/apply switch below at an existing safe boundary. A stale preview, an
+active-stage switch, an unsupported selection or an unauthorized provider/billing
+change is rejected.
+
+```bash
+# Future-run default: read-only preview first, then apply atomically with a backup.
+python3 scripts/orchestrator.py set-default --role implementer \
+  --route '{"model":"opencode-go/glm-5.3","variant":"high","billing":"go"}'
+python3 scripts/orchestrator.py set-default --role implementer \
+  --route '{"model":"opencode-go/glm-5.3","variant":"high","billing":"go"}' \
+  --apply --confirm 'set-default:implementer:<PROPOSAL_SHA12>'
+```
+
+A billing-route change additionally requires `--accept-billing-change`. The
+Architect default must stay High, and `set-default` refuses a model-owned worker
+context; a configuration edited after the preview makes the confirmation stale.
+
 Configuration holds defaults. A run pins its resolved routes at creation;
 changing the config later does not rewrite them. To select different routes for
 one run, pass the same role-keyed object at creation:
@@ -498,6 +537,54 @@ Explicit `migrate-run` initializes current routing pins and records their source
 for old schema-2 routes whose fingerprint was null.
 Arbitrary plugins/gateways that cannot be inspected remain an explicit
 limitation, not a universal proof.
+
+## Automatic progression and consultation
+
+Automatic progression is supervisor policy for ordinary runs and does not depend
+on risk, complexity or writer count. A valid plan is admitted and the coordinator
+continues through `next_action` without a user approval step. Corrections,
+verification, replanning and supported recoverable failures do not ask the user
+to continue. Explicit pause/cancel, unresolved sensitive authorization,
+credentials/external access and irreducible technical blockers remain stopping
+conditions.
+
+`plan_approval: true` at start (or an explicit later request) is the only
+consultation gate. The user's exact reply is recorded in the controlling
+conversation:
+
+```bash
+python3 scripts/orchestrator.py consult <RUN_ID> --response "Use SQLite." --decision amend
+python3 scripts/orchestrator.py consult <RUN_ID> --response "Looks good."       # classified
+```
+
+MCP equivalent: `orchestrator_consult`. A material reply creates a versioned
+amended plan; accepting the unchanged proposal needs no `approve-plan` command.
+A reply bound to a superseded plan revision or amendment epoch is rejected.
+Consultation never grants paid-route, destructive, deployment, credential or
+external-access authority.
+
+`status`, `stage` and `resume` expose the same bounded `progression` view:
+`automatic`, `consultation_required`, recovery classification and the recorded
+next action.
+
+### Run-scoped routine-check exceptions
+
+The supervisor may admit an ordinary non-destructive plan check (for example
+`python3 -m unittest ...`) through a run-scoped exception bound to the run,
+checkout, plan revision and exact argv, with recorded provenance. It revalidates
+relevant executable/runtime identities before use, and it never edits shared
+configuration or another saved run. It cannot authorize paid routes, destructive
+actions, deployment, credentials or external access; shell wrappers are never
+auto-excepted. A manual exception is a human-only action: `authorize-check`
+requires an interactive operator terminal, refuses a model-owned worker context,
+and accepts only the exact typed confirmation shown below.
+
+```bash
+python3 scripts/orchestrator.py check-exceptions <RUN_ID>
+python3 scripts/orchestrator.py authorize-check <RUN_ID> --argv '["python3","-m","unittest"]' \
+  --reason "planned deterministic check" --authorized-by "operator" \
+  --confirm check-exception:<RUN_ID>:<SHA12>
+```
 
 ## Fallback models
 

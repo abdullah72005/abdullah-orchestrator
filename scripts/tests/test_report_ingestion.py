@@ -66,6 +66,15 @@ class Harness(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # Operator-only recovery paths refuse when any agent marker is inherited.
+        # A supervisor-managed check exports its own identity, so clear the
+        # marker set here instead of depending on how the suite was launched.
+        markers = patch.dict(os.environ, {
+            key: "" for key in ("ABDULLAH_JOB_ID", "ABDULLAH_RUN_ID",
+                                "ABDULLAH_CHECK_TOKEN", "ABDULLAH_PARENT_JOB",
+                                "ABDULLAH_AGENT_CONTEXT")})
+        markers.start()
+        self.addCleanup(markers.stop)
         state_patch = patch.object(orc, "DEFAULT_STATE", self.root / "runs")
         state_patch.start()
         self.addCleanup(state_patch.stop)

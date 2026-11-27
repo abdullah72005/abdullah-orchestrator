@@ -281,7 +281,12 @@ class ChatReportingTests(ControlTests):
         self.assertFalse(view["approval"]["approved"])
         self.assertEqual(view["summary"], "Proposed direction summary")
         self.assertEqual(view["invariants"], ["Preserve the public API"])
-        self.assertTrue(status["next_action"].startswith("operator: approve-plan"))
+        # Amendment 76f94d6c: the user answers this consultation in the
+        # controlling conversation; a terminal approve-plan is no longer the
+        # required path. The plan still is not approved without that answer.
+        self.assertEqual(status["next_action"], "orchestrator_consult")
+        self.assertEqual(status["consultation"]["status"], "awaiting_user")
+        self.assertEqual(status["progression"]["consultation_required"], True)
 
     def test_user_reply_is_carried_into_the_revised_plan(self):
         self.state.update({
@@ -351,7 +356,7 @@ class ChatReportingTests(ControlTests):
         status = orc.status_run("test-run00")
         self.assertEqual(status["plan_view"]["approval"]["status"], "awaiting_user")
         self.assertFalse(status["plan_view"]["approval"]["approved"])
-        self.assertTrue(status["next_action"].startswith("operator: approve-plan"))
+        self.assertEqual(status["next_action"], "orchestrator_consult")
         refused = orc.stage_run("test-run00")
         self.assertFalse(refused["ok"])
 

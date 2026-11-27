@@ -4,6 +4,85 @@ All notable changes to Abdullah Orchestrator are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**Antigravity integration and autonomous progression candidate.** No public
+version, push or release is implied. Antigravity CLI and Windows desktop support
+is **fixture-tested, not live-certified**: `agy` was absent from the validation
+shell, so both mandatory live surfaces remain open blockers.
+
+### Added
+
+- Opt-in third controlling host `antigravity` through configuration, CLI/MCP
+  schemas, doctor, route resolution, billing preflight, skill discovery,
+  progress, cancellation and recovery. Existing Codex/Claude configs stay valid
+  without an `architect.antigravity` entry; doctor/adapters never fall through to
+  Claude behavior.
+- Separately guarded `agy` Architect dispatch: installed-help capability gate,
+  stdin-only UTF-8 transport for large Arabic prompts, terminal structured report
+  with session identity, and rejection of incomplete streams, conflicting
+  results, wrong sessions, permission-denied work and unsupported model/effort.
+- Conflict-safe Antigravity setup: explicit-path settings merge that preserves
+  unrelated servers, backs up first, is idempotent, and rejects missing, invalid
+  or conflicting files. A validated finite server-timeout bound above the
+  whole-stage budget (insufficient/non-finite bounds refused) and a
+  `--setup-desktop` WSL identity/launch report with explicit blockers.
+- Configure-models entry point (`orchestrator_models` / `orchestrator.py models`)
+  for every role and host, separating the host-managed conversation model from
+  the dispatched Architect. Validated future-run default changes use the
+  human-only, atomic, backup-first `set-default` preview/apply with typed
+  confirmation, High Architect enforcement and explicit billing acknowledgment;
+  existing run pins and evidence are untouched.
+- Automatic plan admission/progression supervisor policy across hosts. Explicit
+  consultation answers are recorded from the controlling conversation via
+  `orchestrator_consult`; material replies create versioned amendments, stale
+  replies are rejected, and no terminal approval command is needed for an
+  unchanged proposal.
+- Run-scoped routine-check exceptions bound to run, checkout, plan revision and
+  exact argv, with recorded provenance and executable revalidation. Shared config
+  and other saved runs are unaffected; paid/destructive/credential/external
+  actions are never authorized. A manual `authorize-check` is human-only and
+  refuses a model-owned worker context.
+- Dispatched workers carry `ABDULLAH_AGENT_CONTEXT` (Architect also
+  `ABDULLAH_PARENT_JOB`); `create_run` refuses recursive supervisor dispatch
+  before reading config or writing state.
+- One startup/status/follow-viewer execution-environment line derived from the
+  supervisor process (Ubuntu/WSL2 only when detected; real project path).
+
+### Changed
+
+- The Reviewer handoff no longer inlines bulk delta-index file/hunk entries,
+  which could exceed OpenCode's argv UTF-8 byte budget. It now carries a
+  validated digest-bound reference (readable index path, projection/root and
+  run/batch/plan/candidate/verification bindings, file count, canonical content
+  hash) while the complete index and hunks stay in the read-only projection.
+  Missing, altered, symlinked, escaping or mismatched references block before
+  Reviewer launch; a large-index regression renders through the real OpenCode
+  route.
+- Reviewer check-log handoff is now a concise 300-character excerpt beside the
+  recorded argv, exit code, `log_path`, `log_sha256` and `log_bytes`. Complete
+  check logs are copied byte-for-byte into the manifest-bound read-only review
+  projection, so the projection copy re-hashes to the recorded digest. A
+  many-log regression renders through the real OpenCode UTF-8 route preparation
+  and proves the prompt stays below the 129,501-byte argv limit while omitted
+  log text remains readable and digest-bound.
+- Plan approval is no longer required for risk, complexity or writer count;
+  design consultation is opt-in only.
+- `status`, `stage` and `resume` expose a bounded progression/recovery view and
+  the same recorded next action.
+- The free-route guard is owned by route policy: an authorized free route now
+  clears any inherited `OPENCODE_DISABLE_FREE_MODELS` instead of depending on
+  the caller's environment. Deterministic tests clear inherited agent markers so
+  operator-only boundaries and free-route behavior are asserted against policy,
+  not the shell that launched the suite.
+
+### Limitations
+
+- No authenticated Antigravity CLI or desktop acceptance; desktop >180 s stage,
+  rendering, interruption, reconnect and resume are unverified.
+- Deterministic three-host, transport, setup, consultation, authorization,
+  progression, recovery and environment tests are fixture-based.
+
 ## [1.2.1] — 2026-11-25
 
 **Local release candidate.** Batch 01 of the v1.2.1 phase adds supervisor-bound

@@ -1,6 +1,6 @@
 ---
 name: abdullah-orchestrator
-description: Run or resume Abdullah's durable, quota-aware software engineering workflow from one interactive Codex or Claude conversation. Dispatches a strong Architect plus OpenCode Go Explorer, Implementer and independent Reviewer as visible foreground MCP calls, with safe interruption, evidence-backed recaps, deterministic recovery and recoverable checkpoints.
+description: Run or resume Abdullah's durable, quota-aware software engineering workflow from one interactive Codex, Claude Code or Antigravity conversation (CLI or Windows desktop). Dispatches a strong Architect plus OpenCode Go Explorer, Implementer and independent Reviewer as visible foreground MCP calls, with automatic plan progression, safe interruption, evidence-backed recaps, deterministic recovery and recoverable checkpoints.
 ---
 
 # Abdullah Orchestrator
@@ -14,22 +14,31 @@ See `docs/versioning.md` for upgrade and compatibility policy.
 
 ## Default mode: one interactive foreground conversation
 
-Interactive foreground mode keeps the user in one Codex or Claude Code chat.
-For Codex, Luna Medium is the usual coordinator. Invoke
-`$abdullah-orchestrator` and stay in the same conversation.
+Interactive foreground mode keeps the user in one Codex, Claude Code or
+Antigravity chat, in the CLI or the Windows desktop app. For Codex, Luna Medium
+is the usual coordinator. Invoke `$abdullah-orchestrator` and stay in the same
+conversation.
 
-- The strong Architect remains a separate Sol High worker; the Python supervisor remains deterministic.
+- The strong Architect remains a separate worker; the Python supervisor remains deterministic.
 - Every engineering stage is one visible foreground MCP invocation.
 - Before dispatch, the coordinator sends one short chat line with the worker, model and effort, task and expected output.
 - During the call, native progress appears on clients that render the supervisor's updates. This varies by client and version.
 - When the call returns, the coordinator sends one short chat line with the outcome, measured stage time from `elapsed_seconds`, and next action.
-- The coordinator proceeds to the next stage within the same conversation.
+- The coordinator proceeds to the next stage within the same conversation without asking the user to continue. Valid plans progress automatically unless the user explicitly requested a consultation.
 
-The stage announcement and result belong in the current chat on Codex and
-Claude Code, in CLI and desktop. The stage result supplies measured duration
-even on clients without live rendering. Claude Code CLI `2.1.247` showed native
-updates during testing. Codex CLI `0.169.1` showed tool start and completion in
-the tested `exec` session. The read-only terminal observer is optional.
+The stage announcement and result belong in the current chat on Codex, Claude
+Code and Antigravity, in CLI and desktop. The stage result supplies measured
+duration even on clients without live rendering. Claude Code CLI `2.1.247`
+showed native updates during testing. Codex CLI `0.169.1` showed tool start and
+completion in the tested `exec` session. Antigravity progress rendering is
+client-dependent; a bounded `progress.replay` is always returned for replay, and
+it never costs an inference call. The read-only terminal observer is optional
+and is not desktop GUI integration.
+
+Startup, `status` and the read-only `status --follow` viewer include one
+execution-environment line derived from the supervisor process itself, for
+example `Running in Ubuntu (WSL2) · Project: /home/abdullah/my-project`. A
+Windows desktop chat never makes a WSL supervisor report native Windows.
 
 Legacy detached `start --background` mode is optional, is **not** the default, and must not be selected without the user's explicit authorization. It survives closing a chat only while WSL stays awake; a sleeping host cannot execute jobs.
 
@@ -68,13 +77,58 @@ Legacy detached `start --background` mode is optional, is **not** the default, a
    communication bound; it does not apply a timeout by itself.
 5. Restart Codex, open **one** chat with Luna Medium, and invoke `$abdullah-orchestrator`.
 
+### Antigravity CLI in WSL2
+
+The Antigravity CLI host is opt-in and **not yet live-certified**. The supervisor
+refuses dispatch unless the installed `agy --help` advertises the exact headless
+tokens its adapter requires (`--print`, `--model`, `--output-format`, plus
+`--effort`/`--session` when those features are used). `agy` is not on PATH in the
+candidate's validation shell, so treat a missing CLI as an actionable blocker,
+not as success.
+
+1. Verify the installed CLI yourself: `agy --version` and `agy --help`; keep the
+   output for the run record.
+2. Add `architect.antigravity` to your own config with a verified model id and
+   `effort: "high"`, plus `auth` (`subscription`, `api`, `go`, `free` or
+   `local`). Final acceptance still requires High; the shipped example
+   deliberately has no Antigravity entry so existing Codex/Claude configs keep
+   working.
+3. Register the stdio MCP server in the installed CLI's settings, or merge it
+   safely with an explicit path:
+   `python3 scripts/install_wsl.py --register-antigravity --antigravity-settings <PATH>`.
+   The writer refuses a missing/invalid/conflicting file, preserves unrelated
+   servers, backs up before rewriting and never invents a schema.
+4. Keep a **server-scoped** communication timeout above `max_stage_seconds`
+   with margin. The shipped bound is 18,000,000 ms (5 h) against a 17,000 s
+   budget; `install_wsl.py` rejects an insufficient bound. Do not apply it
+   globally. Per-tool foreground configuration on the installed `agy` is
+   unverified in this environment.
+5. Prompts, including large Arabic UTF-8 text, travel on **stdin**, never as
+   argv. A structured terminal report is required; a clean process exit alone is
+   not acceptance.
+
+### Antigravity Windows desktop connected to WSL2
+
+Run everything on the Linux side. The desktop conversation is only the
+coordinator; running `agy` in its integrated terminal is not GUI integration.
+
+```bash
+python3 scripts/install_wsl.py --setup-desktop
+```
+
+The output records the actual `WSL_DISTRO_NAME`, absolute Python, checkout,
+config, run-state, `opencode` and `agy` paths plus the Windows `wsl.exe` launch
+bridge. Register that entry in the **desktop application's own MCP settings**,
+not only in a terminal. If `agy`/`opencode` or the distro is unknown, the output
+lists blockers; do not relabel a WSL supervisor as native Windows.
+
 The runtime selects OpenCode V1 or V2 configuration based on the installed CLI version, supports the tested ranges `>=1.18 <2.0` and `>=2.2 <3.0`, and rejects untested versions. It never silently switches from paid Go to free models or from subscription auth to billed API credentials.
 
 ## Operations
 
 Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrator_runs` takes `run_id`. Do not invent tool names or bypass these operations with ad-hoc supervisor commands.
 
-1. **Start a run** — `orchestrator_start` with the absolute `project`, a precise `goal`, and the required controlling `host` (`codex` or `claude`). Other optional arguments: `plan_approval`, `require_explorer`, `allow_explorer`, `explorer_policy` (`none`|`on_demand`|`required`), `approved_handoff` plus `authorize_handoff`, `skip_doctor`, and `ordinary_planning_trial` (with `planning_trial_risk: "ordinary"`). New and legacy runs default to `explorer_policy=none` unless permission is explicit. It creates durable state and does **not** dispatch a worker.
+1. **Start a run** — `orchestrator_start` with the absolute `project`, a precise `goal`, and the required controlling `host` (`codex`, `claude` or `antigravity`). Other optional arguments: `plan_approval`, `require_explorer`, `allow_explorer`, `explorer_policy` (`none`|`on_demand`|`required`), `approved_handoff` plus `authorize_handoff`, `skip_doctor`, and `ordinary_planning_trial` (with `planning_trial_risk: "ordinary"`). New and legacy runs default to `explorer_policy=none` unless permission is explicit. It creates durable state and does **not** dispatch a worker.
 
    `orchestrator_start` also accepts `max_parallel_writers: 1..3` (default 1)
    and an explicit `skills` object keyed by role and stable writer ID. Pass
@@ -103,9 +157,11 @@ Use the MCP tools below. Every tool except `orchestrator_start` and `orchestrato
 8. **Resume the same conversation** — `orchestrator_resume` with `run_id`, then continue with `orchestrator_stage`. Resume only marks the paused run runnable; it does not execute a stage. Pending-stage preflight can still block resume and lists the exact actions; a completed paid role's exhausted grant is shown as deferred rather than blocking unrelated work. Finished lanes whose durable results await collection and exact integration checkpoints need no new grant; a pending approved fallback is preflighted against the route it will actually use, so an unused primary does not block it. Do not bypass the gate or start a parallel lane before its authority reservation succeeds.
 9. **Attach from a new conversation** — `orchestrator_runs` to list recent runs, then `orchestrator_status` for the chosen `run_id`, then `orchestrator_resume` when the state is safe.
 10. **Reconcile an uncertain run** — `orchestrator_reconcile` with `run_id`. It succeeds only when the unified containment gate proves the recorded session, launch record, job/run markers, check token, descendants and escaped processes are all stopped. It also discovers parallel lanes whose execution is uncertain even when the parent has no `active_job`/`active_check`; completed siblings and any pending scoped authorization are preserved. It clears the stale active job/check and disarms unrelated retry sessions; it fails closed when any marked survivor remains. Never retry before reconciliation. If no launch identity was ever persisted, the **user** must inspect the exact situation and run the CLI `reconcile RUN_ID --launch-missing --evidence '<inspection>'`; this writes an audited resolution and does not execute a model.
-11. **Plan approval or authorized fallback** — these are human-only actions and are **not** MCP tools. Ask the user to run `orchestrator.py approve-plan <ID> --confirm approve-plan:<ID>` or `approve-fallback <ID> --role <role> --confirm approve-fallback:<ID>` in their own interactive terminal. A model cannot approve its own plan or authorize its own fallback.
-12. **Resolve checkout ownership** — a `checkout_conflict` result or `orchestrator_status` conflict is not retried. Inspect `orchestrator_runs` and the CLI `checkout-status --project PATH`. An inactive conflicting run may be retired with `retire RUN_ID --reason ... --acknowledge ...`; an orphaned registry record may be cleared with `checkout-recover --project PATH --owner RUN_ID --reason ... --acknowledge ...`; a legacy run may be adopted with `adopt RUN_ID`. These are **user-executed CLI actions**, not MCP tools and not routine stage calls. The coordinator must show the exact command and wait; it must not claim to have performed a protected action. Sensitive CLI actions are disabled by default (`authorization.sensitive_cli_enabled: false`); the user must enable them in the local config. An initializing owner only gets retry/status guidance, never retirement or adoption advice.
-13. **Cancel a run** — the MCP server exposes no cancel tool. Interrupt first with `orchestrator_interrupt` (or the host's Esc cancel) and verify `stopped: true`. Then, only with explicit user authorization and after enabling `authorization.sensitive_cli_enabled`, run `python3 <SKILL_DIR>/scripts/orchestrator.py cancel <ID>` in the native shell; it writes a cancellation control request that a running supervisor consumes. A paused run is preserved for audit, not deleted.
+11. **Plan approval / consultation** — automatic progression is the default: a valid plan goes to implementation without an approval gate regardless of risk, complexity or writer count. Only an explicit user request for design consultation (`plan_approval: true` at start, or an explicit ask later) creates a gate; the user answers **in the controlling conversation**, and the coordinator records that exact reply with `orchestrator_consult` (`run_id`, `response`, optional `decision: "accept" | "amend"`). A material reply creates a versioned amended plan; accepting the unchanged proposal needs no separate terminal command. `approve-plan` remains a human-only CLI action for legacy/manual use and is never an MCP tool; `approve-fallback` and `authorize-route` are likewise human-only. A model cannot approve its own plan or authorize its own paid route.
+12. **Configure models** — `orchestrator_models` (optional `run_id`) is the discoverable configure-models entry point; CLI: `orchestrator.py models [ID]`. It shows provider, model, effort/variant, billing, metadata availability and effective pins for Architect, Explorer, Implementer and Reviewer, distinguishes the host-managed conversation model from the dispatched Architect, and lists which architect hosts are configured. Changes reuse config validation, the run `routes` override, `switch-role` preview/apply and `authorize-route`; unsupported or paid routes are refused before dispatch.
+13. **Inspect run-scoped check exceptions** — `orchestrator_check_exceptions` with `run_id` lists automatic/scoped exceptions bound to this run, checkout, plan revision and exact argv. They never change shared configuration or another saved run, and never authorize paid routes, destructive actions, credentials or external access.
+14. **Resolve checkout ownership** — a `checkout_conflict` result or `orchestrator_status` conflict is not retried. Inspect `orchestrator_runs` and the CLI `checkout-status --project PATH`. An inactive conflicting run may be retired with `retire RUN_ID --reason ... --acknowledge ...`; an orphaned registry record may be cleared with `checkout-recover --project PATH --owner RUN_ID --reason ... --acknowledge ...`; a legacy run may be adopted with `adopt RUN_ID`. These are **user-executed CLI actions**, not MCP tools and not routine stage calls. The coordinator must show the exact command and wait; it must not claim to have performed a protected action. Sensitive CLI actions are disabled by default (`authorization.sensitive_cli_enabled: false`); the user must enable them in the local config. An initializing owner only gets retry/status guidance, never retirement or adoption advice.
+15. **Cancel a run** — the MCP server exposes no cancel tool. Interrupt first with `orchestrator_interrupt` (or the host's Esc cancel) and verify `stopped: true`. Then, only with explicit user authorization and after enabling `authorization.sensitive_cli_enabled`, run `python3 <SKILL_DIR>/scripts/orchestrator.py cancel <ID>` in the native shell; it writes a cancellation control request that a running supervisor consumes. A paused run is preserved for audit, not deleted.
 
 ## The workflow
 
@@ -148,7 +204,30 @@ For every engineering task use this loop:
    what changed, how it works, one or two key paths or symbols, the Implementer's
    observed test notes attributed to the worker, and whether supervisor
    verification is still pending. Keep it concise; expand only on request.
-4. Repeat `orchestrator_stage` until the run is complete, paused, blocked or uncertain.
+4. Repeat `orchestrator_stage` while the recorded next action is runnable, without
+   asking the user to continue. Handle normal corrections, replanning,
+   verification and supported recoverable failures yourself; do not replay
+   completed work. Keep a safely observable running stage monitored rather than
+   ending the turn. Stop only for explicit pause/cancel, unresolved sensitive
+   authorization, credentials/external access or an irreducible technical
+   blocker, and report the exact recorded next action.
+
+The status/recap payload includes a bounded `progression` view with
+`automatic`, `consultation_required` and a recovery classification plus the
+recorded next action. Follow it consistently from `stage`, `status` and `resume`
+instead of reconstructing policy in chat.
+
+Run-scoped routine-check exceptions are created by the supervisor for ordinary
+non-destructive checks in the approved plan (for example
+`python3 -m unittest ...`). They are bound to this run, checkout, plan revision
+and exact argv, revalidate executable identities before use, and are visible via
+`orchestrator_check_exceptions`. They never edit shared configuration, affect
+another saved run, or authorize paid routes, destructive actions, deployment,
+credentials or external access. Shell wrappers and arbitrary downloads are
+never auto-excepted; use the human-only `authorize-check` in your own
+interactive terminal when a narrow check genuinely needs it. The supervisor
+refuses it from a model-owned worker context or without the exact typed
+confirmation.
 
 On completion, give the short final handback: delivered behavior, verification
 evidence, Architect verdict, material limitations and the final run state.
@@ -161,46 +240,42 @@ not part of the chat view.
 
 Do not poll with a model; status and recap are deterministic. Do not select the legacy background mode in an interactive chat.
 
-## Plan approval and design consultation (opt-in)
+## Automatic progression and design consultation (opt-in)
 
-The default is automated execution. An ordinary request to see the plan,
-rationale or progress does not pause for approval. Use `plan_approval: true`
-only when the user explicitly asks for design consultation before the plan is
-finalized, for example: “Ask me about architecture and design choices before
-you finalize the plan.”
+Automatic progression is supervisor policy, not coordinator self-approval. A
+valid plan proceeds to exploration/implementation without asking the user, and
+risk, complexity and writer count never create an approval requirement. Do not
+manufacture a consultation pause for an ordinary request to see the plan,
+rationale or progress.
+
+Use `plan_approval: true` only when the user explicitly asks for design
+consultation before the plan is finalized, for example: “Ask me about
+architecture and design choices before you finalize the plan.” The Architect may
+then ask only about genuinely consequential ambiguity, and must not seek routine
+confirmation.
 
 With that opt-in, the strong Architect puts the proposed direction and concise
-rationale in the plan `summary`. It flags each consequential fork with the
-practical trade-off and its recommendation, and uses `blocker` for a question
-that must be answered before a valid plan can exist. Present the proposed plan
-and the actual questions in chat. Then distinguish the reply:
+rationale in the plan `summary`, flags each consequential fork with its
+trade-off and recommendation, and uses `blocker` only for a question that must
+be answered before a valid plan can exist. Present the proposed plan and the
+actual questions in chat. Then handle the user's reply **in the controlling
+conversation**:
 
-- If the reply answers a blocking question, or materially changes the design or
-  requirements, record the exact reply with `orchestrator_amend` and
-  `architect_review: true`, then `orchestrator_resume` and `orchestrator_stage`
-  to obtain a versioned revised plan. Present the revision and its rationale.
-- If the user says the unchanged plan looks good or otherwise accepts it without
-  changes, do not amend or replan. Show the existing exact human approval action
-  from `next_action`:
+- A material answer or requirement change: record the exact reply with
+  `orchestrator_consult` (`response`, `decision: "amend"`), which creates a
+  versioned amended plan; then `orchestrator_resume` and `orchestrator_stage` to
+  obtain it. The amendment carries the user's verbatim text.
+- Acceptance of the unchanged proposal: record it with `orchestrator_consult`
+  (`decision: "accept"`, or the default classification when it is unambiguous).
+  No separate terminal command is required and the run becomes runnable.
+- A stale reply (older plan revision or amendment epoch) is rejected; answer
+  the current revision.
 
-  ```bash
-  orchestrator.py approve-plan <ID> --confirm approve-plan:<ID>
-  ```
-
-Routine runs stay automated. Do not manufacture a consultation pause for an
-ordinary request to see the plan. Genuine blockers still surface as blocked
-planning questions with their rationale.
-
-Chat discussion and answers can inform the plan but cannot grant execution
-authority. Approval of an earlier plan never authorizes a revision. A blocked
-planning attempt exposes its decision question and rationale through
-`plan_view` and its attested report reference; it never shows an older proposal
-as the current plan. The reference must match this loaded run, plan revision,
-amendment epoch, current job and digest; otherwise only the saved bounded
-question and rationale are shown. Once an amendment supersedes that question,
-status shows replanning pending rather than the answered question. An unapproved
-plan cannot start a writer through `orchestrator_stage` or
-`orchestrator_resume`.
+Consultation is separate from sensitive authorization. Chat discussion and
+answers inform the plan but cannot grant paid-route, destructive-operation,
+deployment, credential or external-access authority. Approval of an earlier plan
+never authorizes a revision. An unapproved consultation-gated plan cannot start
+a writer through `orchestrator_stage` or `orchestrator_resume`.
 
 ## Interruption, questions and amendment
 
@@ -250,6 +325,7 @@ Recovery from a new chat: `orchestrator_runs` → `orchestrator_status` → `orc
 - An explicit Implementer `needs_architect` goes straight to strong diagnosis with its question and evidence. A routine, attributable check failure gets at most one cheap retry before diagnosis. A clear new user requirement triggers a versioned strong replan and leaves nothing stale authorized.
 - **Superpowers scoping:** inside an active orchestrator stage, do not use the `writing-plans`, `executing-plans` or `subagent-driven-development` skills: the supervisor already owns plans, sequencing and dispatch. Keep `systematic-debugging` for real failures and focused test-driven development for the behavior being changed. Brainstorming may precede an unsettled run. The standalone manual `abdullah-architect` and `abdullah-implementer` skills are unaffected and remain separate tools.
 - Architect can synchronously dispatch and consume cheap Explorer findings during planning or diagnosis through `orchestrator.py explore`, only when the run's explicit `explorer_policy` permits it. Missing/legacy policy means no nested dispatch.
+- No recursive supervisor dispatch: every dispatched worker is marked (`ABDULLAH_AGENT_CONTEXT`, and the Architect also `ABDULLAH_PARENT_JOB`), and `create_run` refuses to start another run from that context before reading config or writing state. Only the controlling host conversation creates runs; a worker that needs more work returns its report instead.
 - Risk-based QA: one fresh Reviewer for ordinary behavior, targeted finding verification when useful, no fixed jury, no endless debate.
 - Supervisor runs the approved checks and records the actual worktree fingerprint and Docker source identity. Never accept a green run against a stale or unrelated checkout.
 - Size handoffs comfortably for worker contexts. New workers for batches and substantial corrections; coherent briefs, bounded retries, no context-rot loops.
@@ -267,6 +343,10 @@ The MCP tools are the primary interface. The same durable operations remain avai
 python3 <SKILL_DIR>/scripts/orchestrator.py stage <ID>
 python3 <SKILL_DIR>/scripts/orchestrator.py status <ID>
 python3 <SKILL_DIR>/scripts/orchestrator.py status --run <ID> --follow   # read-only live observer
+python3 <SKILL_DIR>/scripts/orchestrator.py models [ID]                  # configure-models view
+python3 <SKILL_DIR>/scripts/orchestrator.py consult <ID> --response "..." [--decision amend|accept]
+python3 <SKILL_DIR>/scripts/orchestrator.py check-exceptions <ID>
+python3 <SKILL_DIR>/scripts/orchestrator.py authorize-check <ID> --argv '["python3","-m","unittest"]' --reason "..." --authorized-by "operator" --confirm check-exception:<ID>:<sha12>
 python3 <SKILL_DIR>/scripts/orchestrator.py recap <ID> --detail developer
 python3 <SKILL_DIR>/scripts/orchestrator.py interrupt <ID> --reason "user stop"
 python3 <SKILL_DIR>/scripts/orchestrator.py amend <ID> --text "requirement change" --architect-review
@@ -302,10 +382,29 @@ All run commands accept either a positional `<ID>` or `--run <ID>`, never both. 
 
 ## Model configuration
 
+One discoverable entry point shows every role: MCP `orchestrator_models`
+(optional `run_id`) or CLI `python3 <SKILL_DIR>/scripts/orchestrator.py models
+[ID]`. It distinguishes the **host-managed conversation model** from the
+**dispatched Architect**, and reports provider, model, supported effort/variant,
+billing route, metadata availability and effective pins for Architect, Explorer,
+Implementer and Reviewer. `architect_hosts` shows which of `codex`, `claude` and
+`antigravity` are configured; an unconfigured Antigravity entry is a normal
+state for existing installations.
+
 All model routes are read from `~/.config/abdullah-orchestrator/config.json` (or `ABDULLAH_CONFIG`) on every operation:
 
-- **Architect** — `architect.codex` and `architect.claude` select the model and effort for each host. The shipped default is `gpt-6.2-sol` at `high` for Codex and `claude-opus-5-5` at `high` for Claude. The value is passed through unchanged, so confirm it against the installed Codex/Claude catalog; keep `auth: "subscription"`. Final Architect acceptance always uses this High route, including after an ordinary Medium planning trial.
+- **Architect** — `architect.codex`, `architect.claude` and (opt-in) `architect.antigravity` select the model and effort for each host. The shipped default is `gpt-6.2-sol` at `high` for Codex and `claude-opus-5-5` at `high` for Claude. The value is passed through unchanged, so confirm it against the installed host catalogue; keep `auth: "subscription"` unless the user authorized another explicit billing route. Final Architect acceptance always uses the High route, including after an ordinary Medium planning trial; an Antigravity default below High is refused.
 - **Workers** — `workers.explorer`, `workers.implementer` and `workers.reviewer` select a fully qualified `provider/model` ID, an optional `provider` (must match the prefix), `variant`, and `billing`. The default remains `opencode-go/...` with `billing: "go"`. Non-Go routes (`subscription`, `api`, `free`, `local`) require an explicit human `authorize-route` grant bound to the role, run and exact route; a route-scoped fallback needs separate one-dispatch consent.
 - **Discovery** — `opencode models --verbose` (V1, includes variants) or `opencode models` (V2, IDs only), then `python3 scripts/orchestrator.py doctor --project <abs>` to confirm `route_models_listed`, `variant_verified`, `billing_preflight`, `provider_availability` and resolved routes.
+
+Three safe operations: change **defaults** for future runs with the validated,
+backup-first CLI `set-default --role ROLE --route JSON` (preview; add `--apply`
+and its `--confirm`, plus `--accept-billing-change` for a billing change) —
+existing run pins are untouched and existing evidence stays valid; override
+routes for **one new run** via `orchestrator_start` `routes` or `start
+--routes`; change a role at an **existing safe boundary** with the existing
+`switch-role` preview/apply plus `--confirm`. A stale preview, an active-stage
+switch, an unsupported selection or an unauthorized provider/billing change is
+rejected. `set-default` is human-only and refuses a model-owned worker context.
 
 Worker routes are pinned at creation with a redacted provider/config fingerprint. The supervisor never silently switches provider, model, variant or billing, and never claims a dollar cap. Do not edit the config on the user's behalf or bypass validation. Configuration is user-owned: show exact values and ask before changing it. Set routes before `orchestrator_start`; editing the config mid-run marks the run `config_changed` and blocks further stages. A new run requires an explicit `host: "codex"` or `"claude"`. Full reference: `docs/configuration.md`.
