@@ -24,6 +24,7 @@ conversation.
 - Before dispatch, the coordinator sends one short chat line with the worker, model and effort, task and expected output.
 - During the call, native progress appears on clients that render the supervisor's updates. This varies by client and version.
 - When the call returns, the coordinator sends one short chat line with the outcome, measured stage time from `elapsed_seconds`, and next action.
+- Every transition names the acting worker or says nobody is active, the current task or outcome, measured elapsed time and the concrete next step. A pending or preflight state says the model has not launched. Verification says no model is active and gives the current safe check ordinal, never check argv. A blocked result states whether the worker launched, the durable reason code, and who acts next; a prelaunch refusal reads as zero launches with an actionable next step.
 - The coordinator proceeds to the next stage within the same conversation without asking the user to continue. Valid plans progress automatically unless the user explicitly requested a consultation.
 
 The stage announcement and result belong in the current chat on Codex, Claude

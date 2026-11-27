@@ -23539,10 +23539,39 @@ def _viewer_lines(state, snapshot):
     if environment.get("label"):
         lines.append(environment["label"])
     nxt = snapshot.get("next") or {}
+    launch = snapshot.get("launch") or {}
+    actor = _safe_progress_text(launch.get("actor_label"), 60)
     if not snapshot.get("available"):
-        lines.append("waiting for the next stage")
+        launch_state = launch.get("state")
+        if launch_state == "blocked":
+            blocked = launch.get("blocked_by") or {}
+            lines.append("blocked: " + (
+                _safe_progress_text(blocked.get("reason"), 160)
+                or _safe_progress_text(blocked.get("code"), 80)
+                or "reason unavailable"))
+            lines.append("model: " + (
+                _safe_progress_text(launch.get("statement"), 160)
+                or "zero launches"))
+            lines.append("actor: %s · next: %s" % (
+                actor or "unknown",
+                _safe_progress_text(snapshot.get("next_action"), 80) or "unknown"))
+        elif launch_state == "finished":
+            lines.append("run finished · no model is active")
+        elif launch_state == "verification":
+            lines.append(_safe_progress_text(launch.get("statement"), 160)
+                         or "supervisor check running · no model is active")
+        elif actor:
+            lines.append("waiting for the next stage · model has not launched · actor: "
+                         + actor)
+        else:
+            lines.append("waiting for the next stage · model has not launched")
         lines.extend(_viewer_next_lines(nxt))
         return lines[:11]
+    if launch.get("state") in {"running", "launching", "verification"}:
+        lines.append("actor: %s · model: %s" % (
+            actor or "unknown",
+            _safe_progress_text(launch.get("statement"), 120)
+            or "launch state unknown"))
     lines.append("%s · %s · %s" % (
         _safe_progress_text(snapshot.get("agent_label"), 60) or "worker",
         _safe_progress_text(snapshot.get("stage"), 40) or "stage",
@@ -23580,9 +23609,10 @@ def _viewer_lines(state, snapshot):
     if snapshot.get("outcome") or snapshot.get("ownership") in {"complete", "stale"}:
         outcome = snapshot.get("outcome") or snapshot.get("ownership")
         next_action = snapshot.get("next_action") or nxt.get("agent_label")
-        lines.append("outcome: %s · elapsed %s · next: %s" % (
+        lines.append("outcome: %s · elapsed %s · actor: %s · next: %s" % (
             _safe_progress_text(outcome, 40),
             ("%.1fs" % elapsed) if elapsed is not None else "unavailable",
+            actor or "unknown",
             _safe_progress_text(next_action, 80) or "unknown"))
         if state.get("status") not in FINAL_STATES and nxt.get("phase"):
             lines.extend(_viewer_next_lines(nxt))
@@ -25270,6 +25300,121 @@ def _progress_assignments(state, limit=3):
     return view
 
 
+_LAUNCH_ACTOR_LABELS = {
+    "worker": "worker",
+    "supervisor": "supervisor",
+    "operator": "operator",
+    "coordinator": "coordinator",
+    "nobody": "nobody is active",
+    "unknown": "ownership unknown",
+}
+
+
+def _verification_check_ordinal(state):
+    """Safe check ordinal/total for a running supervisor check; never argv."""
+    progress = state.get("check_progress") or {}
+    identity = progress.get("identity") or {}
+    commands = identity.get("argv") if isinstance(identity, dict) else None
+    completed = ((progress.get("evidence") or {}).get("commands")
+                 if isinstance(progress, dict) else None)
+    total = len(commands) if isinstance(commands, list) else 0
+    done = len(completed) if isinstance(completed, list) else 0
+    return {"ordinal": (min(total, done + 1) if total else None),
+            "total": (total or None), "completed": done}
+
+
+def launch_view(state, *, started=None, ended=None):
+    """Durable statement of whether this attempt's model actually launched.
+
+    A status word never proves a launch: only the guard launch record or a
+    job's execution/completion/failure artifact does. The view is bounded and
+    terminal-safe and is shared by status, MCP progress and the viewer, so a
+    prelaunch refusal cannot read like a running or merely waiting stage.
+    """
+    state = state or {}
+    job = state.get("active_job") if isinstance(state.get("active_job"), dict) else {}
+    check = state.get("active_check") if isinstance(state.get("active_check"), dict) else {}
+    rejection = (state.get("preflight_rejection")
+                 if isinstance(state.get("preflight_rejection"), dict) else {})
+    status = state.get("status")
+    job_status = job.get("status")
+    launched = bool(job) and _attempt_was_launched(job)
+    next_action = next_action_for(state)
+    view = {"worker_started": launched, "model_active": False,
+            "model_calls": None, "actor": "unknown",
+            "actor_label": _LAUNCH_ACTOR_LABELS["unknown"],
+            "blocked_by": None, "next_action": next_action,
+            "statement": "ownership unknown", "state": "unknown"}
+    if check:
+        progress = _verification_check_ordinal(state)
+        statement = "supervisor check running · no model is active"
+        if progress["ordinal"]:
+            statement += f" · check {progress['ordinal']}/{progress['total']}"
+        view.update({"state": "verification", "actor": "supervisor",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["supervisor"],
+                     "statement": statement, "check": progress})
+        return view
+    if rejection:
+        code = _safe_progress_text(rejection.get("reason_code"), 80) or "preflight_rejected"
+        reasons = rejection.get("reasons") or []
+        detail = _safe_progress_text(
+            reasons[0] if reasons else state.get("pause_reason"), 240)
+        view.update({"state": "blocked", "actor": "operator",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["operator"],
+                     "worker_started": False, "model_active": False,
+                     "model_calls": (0 if rejection.get("model_calls_counted") is False
+                                     else None),
+                     "blocked_by": {"code": code, "reason": detail},
+                     "statement": ("zero launches · worker not started · blocked by "
+                                   + code + (" · " + detail if detail else ""))})
+        return view
+    if ended is not None:
+        view.update({"state": "finished", "actor": "nobody",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["nobody"],
+                     "worker_started": launched,
+                     "statement": "no model is active · stage finished"})
+        return view
+    if job_status == "running" and launched:
+        view.update({"state": "running", "actor": "worker",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["worker"],
+                     "worker_started": True, "model_active": True,
+                     "statement": "worker active"})
+        return view
+    if job_status in {"dispatched", "running"}:
+        view.update({"state": "launching", "actor": "supervisor",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["supervisor"],
+                     "worker_started": launched,
+                     "statement": ("launching the worker · model not active yet"
+                                   if job_status == "dispatched" else
+                                   "worker launch is not proven · model not active")})
+        return view
+    if status in FINAL_STATES:
+        view.update({"state": "finished", "actor": "nobody",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["nobody"],
+                     "worker_started": launched,
+                     "statement": "no model is active · run finished"})
+        return view
+    if status in PAUSED_STATES:
+        reason = _safe_progress_text(state.get("pause_reason"), 240)
+        if started and not job:
+            started_label = "worker launch state unknown"
+            worker_started = None
+        else:
+            started_label = "worker launched" if launched else "worker not launched"
+            worker_started = launched
+        view.update({"state": "blocked", "actor": "operator",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["operator"],
+                     "worker_started": worker_started,
+                     "blocked_by": {"code": status, "reason": reason},
+                     "statement": (started_label + " · blocked by " + status
+                                   + (" · " + reason if reason else ""))})
+        return view
+    view.update({"state": "not_launched", "actor": "coordinator",
+                 "actor_label": _LAUNCH_ACTOR_LABELS["coordinator"],
+                 "statement": "model has not launched"})
+    return view
+
+
 def stage_snapshot(folder, state):
     """Read-only progress for the most recent stage attempt in a run."""
     records = journal_tail_bounded(folder, 200)
@@ -25392,6 +25537,7 @@ def stage_snapshot(folder, state):
                  "expected": _safe_progress_text(next_preview.get("expected"), 200),
                  "model": _safe_progress_text(next_preview.get("model"), 60),
                  "effort": _safe_progress_text(next_preview.get("effort"), 24)},
+        "launch": launch_view(state, started=started, ended=ended),
         "status": state.get("status"),
     }
 
@@ -25420,6 +25566,11 @@ def stage_progress_message(snapshot):
         parts.append(route)
     if snapshot.get("activity"):
         parts.append(_safe_progress_text(snapshot["activity"], 80))
+    launch = snapshot.get("launch") or {}
+    launch_state = launch.get("state")
+    if launch_state in {"blocked", "verification", "finished", "not_launched",
+                        "launching"} and launch.get("statement"):
+        parts.append(_safe_progress_text(launch["statement"], 140))
     if snapshot.get("milestone"):
         parts.append(_safe_progress_text(snapshot["milestone"], 120))
     assignments = snapshot.get("assignments") or []
@@ -25477,6 +25628,7 @@ def stage_payload(folder, state, stage, role, task, expected, elapsed, error=Non
             "plan_view": plan_view(state, folder) if stage == "plan" else None,
             "error": error, "pause_reason": state.get("pause_reason"),
             "progress_line": progress, "next_action": next_action_for(state),
+            "launch": live_progress.get("launch"),
             "progress": {
                 "milestone": live_progress.get("milestone"),
                 "milestone_source": live_progress.get("milestone_source"),
@@ -25851,6 +26003,7 @@ def status_run(run_id):
     job = state.get("active_job") or {}
     conflict = checkout_conflict(state) if state.get("status") not in FINAL_STATES else None
     started_event, ended_event = _last_stage_markers(folder)
+    progress = stage_snapshot(folder, state)
     return {
         "ok": True, "run_id": run_id,
         "status": "checkout_conflict" if conflict else state.get("status"),
@@ -25858,7 +26011,8 @@ def status_run(run_id):
         "batch": (current_batch(state) or {}).get("title"),
         "batch_identity": batch_identifier(state),
         "host": state.get("host"), "route": route_report(state),
-        "stage_progress": stage_snapshot(folder, state),
+        "stage_progress": progress,
+        "launch": progress.get("launch"),
         "last_stage": ({"stage": started_event.get("stage"),
                         "agent_label": started_event.get("agent_label"),
                         "started_at": started_event.get("started_at"),

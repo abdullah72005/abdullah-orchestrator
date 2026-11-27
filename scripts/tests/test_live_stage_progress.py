@@ -1190,5 +1190,95 @@ class TerminalViewerTests(ProgressFixture):
                     and "# implemented" in (self.project / "app.py").read_text())
 
 
+class LaunchEvidenceTests(ProgressFixture):
+    """Every transition states whether a model launched, who acts and why."""
+
+    def _rewrite(self, **updates):
+        path = self.folder / "state.json"
+        state = json.loads(path.read_text())
+        state.update(updates)
+        path.write_text(json.dumps(state))
+        return state
+
+    def test_pending_stage_says_model_has_not_launched(self):
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "not_launched")
+        self.assertFalse(launch["worker_started"])
+        self.assertFalse(launch["model_active"])
+        self.assertEqual(launch["statement"], "model has not launched")
+        state = json.loads((self.folder / "state.json").read_text())
+        lines = orc._viewer_lines(state, snapshot)
+        self.assertTrue(any("has not launched" in line for line in lines), lines)
+
+    def test_prelaunch_refusal_reports_zero_launches_reason_and_actor(self):
+        state = self._rewrite(
+            status="blocked",
+            pause_reason="Dispatch not attempted (transport): too large",
+            preflight_rejection={
+                "reason_code": "transport_too_large",
+                "reasons": ["Essential handoff context exceeds the configured budget"],
+                "active_job_created": False, "model_calls_counted": False,
+                "kind": "reviewer", "role": "reviewer"},
+            active_job=None, active_check=None)
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "blocked")
+        self.assertFalse(launch["worker_started"])
+        self.assertEqual(launch["model_calls"], 0)
+        self.assertEqual(launch["blocked_by"]["code"], "transport_too_large")
+        self.assertEqual(launch["actor"], "operator")
+        self.assertEqual(launch["next_action"], "orchestrator_resume")
+        self.assertIn("zero launches", launch["statement"])
+        status = orc.status_run(self.run_id)
+        self.assertEqual(status["launch"], launch)
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("blocked:", text)
+        self.assertIn("transport_too_large", text)
+        self.assertIn("zero launches", text)
+        self.assertIn("actor: operator", text)
+        self.assertIn("next: orchestrator_resume", text)
+        self.assertNotIn("waiting for the next stage", text)
+
+    def test_verification_says_no_model_and_check_ordinal(self):
+        commands = [["python3", "-m", "unittest"], ["git", "diff", "--check"]]
+        state = self._rewrite(
+            status="running", phase="verify", active_job=None,
+            active_check={"id": "check-1", "argv": commands[0]},
+            check_progress={"identity": {"argv": commands},
+                            "evidence": {"commands": [{"argv": commands[0]}]}})
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "verification")
+        self.assertFalse(launch["model_active"])
+        self.assertEqual(launch["check"],
+                         {"ordinal": 2, "total": 2, "completed": 1})
+        self.assertIn("no model is active", launch["statement"])
+        self.assertIn("check 2/2", launch["statement"])
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("supervisor", text)
+        self.assertIn("check 2/2", text)
+        self.assertIn("check 2/2", orc.stage_progress_message(snapshot))
+
+    def test_running_is_claimed_only_with_launch_evidence(self):
+        self.synthetic_start()
+        jobdir = self.folder / "jobs" / "impl-x"
+        self._rewrite(
+            status="running", phase="implement",
+            active_job={"id": "impl-x", "kind": "implementer",
+                        "status": "running", "path": str(jobdir)})
+        unproven = self.snapshot()["launch"]
+        self.assertEqual(unproven["state"], "launching")
+        self.assertFalse(unproven["model_active"])
+        self.assertIn("not proven", unproven["statement"])
+        jobdir.mkdir(parents=True)
+        orc.atomic_json(jobdir / "execution.json", {"status": "running"})
+        launch = self.snapshot()["launch"]
+        self.assertEqual(launch["state"], "running")
+        self.assertTrue(launch["model_active"])
+        self.assertEqual(launch["actor"], "worker")
+        self.assertEqual(launch["statement"], "worker active")
+
+
 if __name__ == "__main__":
     unittest.main()
