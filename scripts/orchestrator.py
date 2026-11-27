@@ -25304,6 +25304,7 @@ _LAUNCH_ACTOR_LABELS = {
     "worker": "worker",
     "supervisor": "supervisor",
     "operator": "operator",
+    "user": "user",
     "coordinator": "coordinator",
     "nobody": "nobody is active",
     "unknown": "ownership unknown",
@@ -25368,11 +25369,33 @@ def launch_view(state, *, started=None, ended=None):
                      "statement": ("zero launches · worker not started · blocked by "
                                    + code + (" · " + detail if detail else ""))})
         return view
+    if status == "awaiting_plan_approval":
+        view.update({"state": "blocked", "actor": "user",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["user"],
+                     "worker_started": launched, "model_active": False,
+                     "blocked_by": {"code": status,
+                                    "reason": _safe_progress_text(
+                                        state.get("pause_reason"), 240)},
+                     "statement": "no model is active · awaiting your plan consultation answer"})
+        return view
+    if status == "needs_fallback_approval":
+        view.update({"state": "blocked", "actor": "operator",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["operator"],
+                     "worker_started": launched, "model_active": False,
+                     "blocked_by": {"code": status,
+                                    "reason": _safe_progress_text(
+                                        state.get("pause_reason"), 240)},
+                     "statement": "no model is active · awaiting fallback authorization"})
+        return view
     if ended is not None:
-        view.update({"state": "finished", "actor": "nobody",
-                     "actor_label": _LAUNCH_ACTOR_LABELS["nobody"],
+        paused = status in PAUSED_STATES
+        view.update({"state": "blocked" if paused else "finished",
+                     "actor": "operator" if paused else "nobody",
+                     "actor_label": (_LAUNCH_ACTOR_LABELS["operator"] if paused
+                                     else _LAUNCH_ACTOR_LABELS["nobody"]),
                      "worker_started": launched,
-                     "statement": "no model is active · stage finished"})
+                     "statement": ("no model is active · stage finished"
+                                   + (" · run is " + str(status) if paused else ""))})
         return view
     if job_status == "running" and launched:
         view.update({"state": "running", "actor": "worker",

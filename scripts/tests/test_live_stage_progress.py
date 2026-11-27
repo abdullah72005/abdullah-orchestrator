@@ -1279,6 +1279,24 @@ class LaunchEvidenceTests(ProgressFixture):
         self.assertEqual(launch["actor"], "worker")
         self.assertEqual(launch["statement"], "worker active")
 
+    def test_consultation_block_names_the_user_as_next_actor(self):
+        self.synthetic_start()
+        _append(self.folder, {"event": "stage_end", "stage": "implement",
+                              "attempt": "synthetic0001", "elapsed_seconds": 2.0,
+                              "outcome": "complete",
+                              "next_action": "orchestrator_consult"})
+        state = self._rewrite(status="awaiting_plan_approval",
+                              pause_reason="Review the proposed plan")
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "blocked")
+        self.assertEqual(launch["actor"], "user")
+        self.assertIn("awaiting your plan consultation", launch["statement"])
+        self.assertEqual(launch["next_action"], "orchestrator_consult")
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("actor: user", text)
+        self.assertIn("orchestrator_consult", text)
+
     def test_postlaunch_block_distinguishes_a_launched_worker(self):
         self.synthetic_start()
         jobdir = self.folder / "jobs" / "impl-y"
