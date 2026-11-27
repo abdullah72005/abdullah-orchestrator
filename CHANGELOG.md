@@ -53,12 +53,22 @@ shell, so both mandatory live surfaces remain open blockers.
 
 - Foreground progress is bound to the admitted attempt and its real launch
   evidence rather than a run-wide rejection or a cleared `active_job`. A stale
-  preflight rejection cannot mask a newer running worker, a persisted launched
-  failure keeps its reason after cleanup, and a bare spawn `failure.json` is not
-  launch proof. Uncertain check ownership is blocked for reconciliation while a
-  live check is observation; MCP progress protects actor, next action and
-  elapsed time within its existing 240-character bound, and the plain viewer
-  refreshes on check or launch changes.
+  preflight rejection cannot mask a newer running worker or claim a newly
+  admitted retry that has yet to create its job, a persisted process identity
+  keeps a launched failure visible after cleanup, and a bare spawn
+  `failure.json` is not launch proof. A persisted check is observed only when
+  its recorded process identity is proven live or the stage owner is active; an
+  expired or unproven check owner is blocked for reconciliation. MCP progress
+  protects the compact launch/status statement, blocker code, actor, next action
+  and elapsed time within its existing 240-character bound, and the plain
+  viewer refreshes on check or launch changes.
+- The opt-in bounded parallel test runner (`scripts/run_tests_parallel.py`) keeps
+  serial execution as the default, partitions a large selection by module so
+  fixtures stay intact, runs timing-sensitive modules in a separate serial group,
+  accounts for every selected test exactly once, and limits two workers to four
+  logical CPUs in aggregate at lower priority. It falls back to serial when the
+  CPU limit cannot be applied or memory is tight, and reports exact commands,
+  logs, digests, worker/CPU limits and aggregate counts.
 - The Reviewer packet proof now runs through the real renderer and OpenCode
   argv/transport preparation with spawn intercepted in a linked worktree. It
   re-reads every manifest file, delta/index, referenced hunk, raw verification

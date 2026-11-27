@@ -42,8 +42,31 @@ with the combined incident shape and the real OpenCode argv/transport
 preparation is checked with spawn intercepted. A corrupted index, hunk, record
 or log is refused at the dispatch boundary before any spawn. The packet is
 explicitly a **representative** record, not an authority-bound saved-run
-verification. Implementer-owned full-discovery evidence is reported separately
+verification. A second combined-incident test uses scratch state with
+incident-sized requirements, a multi-file/multi-patch delta and the three-check
+schedule; when `ABDULLAH_IMPLEMENTER_LOG` points at the actual Implementer
+discovery log, those bytes are used in one check. That proof labels itself a
+transport fixture and distinguishes the `read_review_projection` helper and the
+generated permission profile from actual OpenCode model reads and live runtime
+enforcement. Implementer-owned full-discovery evidence is reported separately
 and does not become supervisor verification authority.
+
+**Bounded parallel test runner (v1.2.2 repair).**
+`scripts/run_tests_parallel.py` is an opt-in developer helper for a full
+discovery or a large selected set. Serial execution remains the default. It
+discovers with `unittest`, partitions by module so fixture boundaries are never
+split, accounts for every selected test exactly once, runs timing-sensitive
+modules in a separate serial group first, and runs at most two workers. On
+Ubuntu/WSL it limits the aggregate worker process trees to four logical CPUs with
+`taskset` and lowers scheduling priority with `nice`; if that limit cannot be
+applied or available memory is below the configured floor, it falls back to
+serial. Its JSON result records the exact selection, revision, commands, logs and
+digests, worker/CPU limits, and aggregate counts, failures, errors, skips,
+missing groups and interrupted groups. Focused fixtures in
+`test_parallel_test_runner.py` prove selection, module boundaries, exactly-once
+coverage, bounded overlap, CPU/nice commands, serial fallback and aggregation;
+they do not run the product suite. This helper does not replace the final local
+gate.
 
 Coverage areas:
 | Area | Representative tests |
@@ -68,7 +91,8 @@ Coverage areas:
 | OpenCode dialects | V1/V2 profile generation, effective-permission validation, glob-overlap rejection; version-aware source discovery and authoritative V2 normalization |
 | Usage accounting | nested OpenCode usage, derived/partial totals, bounded 429 detection |
 | MCP surface | nine tools, no approval/grant tools, cancellation, recovery guidance |
-| Foreground progress | `test_live_stage_progress.py`: attempt-bound launch evidence after `active_job` cleanup, stale rejection isolation, bare spawn-failure refusal, live versus uncertain check ownership, protected actor/next/elapsed rendering, and plain-mode refresh on check or launch changes |
+| Foreground progress | `test_live_stage_progress.py`: attempt-bound launch evidence after `active_job` cleanup, stale rejection isolation including a newly admitted retry with no job, persisted process-identity failures, bare spawn-failure refusal, live versus expired/unproven check ownership, protected status/blocker/actor/next/elapsed rendering, and plain-mode refresh on check or launch changes |
+| Bounded parallel test runner | `test_parallel_test_runner.py`: discovery/selection, module fixture boundaries, exactly-once coverage, two-worker overlap, four-CPU/`nice` command bounds, memory/CPU serial fallback, and result aggregation with skips/failures/missing groups |
 | Release identity | `test_release_version.py`: public version separated from supervisor/schema/contract identifiers, version command, pinned example config |
 | Security regressions | credential env scrubbing, API-billing fail-closed, sensitive CLI gating |
 

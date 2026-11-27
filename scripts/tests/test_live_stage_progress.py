@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 import test_interactive_recovery as recovery
 from test_interactive_recovery import _install_fake_clis, _wait_for
-from test_orchestrator import SRC, orc
+from test_orchestrator import SRC, dead_process_identity, orc
 
 
 def _records(run_dir):
@@ -40,6 +40,13 @@ def _identity(pid=None):
     stat = orc.process_stat(pid)
     return {"boot_id": orc._boot_identity(), "owner_pid": pid,
             "owner_pid_start": stat["starttime"]}
+
+
+def _check_identity(pid=None):
+    """A live check process identity in the shape persisted by active_check."""
+    pid = pid or os.getpid()
+    stat = orc.process_stat(pid)
+    return {"pid": pid, "pid_start": stat["starttime"]}
 
 
 class ProgressFixture(unittest.TestCase):
@@ -403,6 +410,7 @@ class ProgressMessageTests(unittest.TestCase):
             "elapsed_seconds": 42.0, "elapsed_source": "live",
             "next_action": "orchestrator_resume",
             "launch": {"state": "blocked", "actor_label": "operator",
+                       "blocked_by": {"code": "transport_too_large"},
                        "statement": ("zero launches · worker not started · blocked by "
                                      "transport_too_large · "
                                      + "mandatory handoff context is very large " * 8)},
@@ -415,6 +423,16 @@ class ProgressMessageTests(unittest.TestCase):
         self.assertIn("actor: operator", message)
         self.assertIn("next: orchestrator_resume", message)
         self.assertIn("blocked", message)
+        self.assertIn("transport_too_large", message)
+        self.assertIn("mandatory handoff context", message)
+        snapshot.update({"available": True, "next_action": "orchestrator_resume",
+                         "attempt_id": "blocked-attempt"})
+        lines = orc._viewer_lines({"id": "run", "status": "blocked",
+                                   "phase": "review"}, snapshot)
+        viewer = "\n".join(lines)
+        self.assertIn("transport_too_large", viewer)
+        self.assertIn("actor: operator", viewer)
+        self.assertIn("next: orchestrator_resume", viewer)
 
     def test_token_validation_rejects_booleans_and_objects(self):
         self.assertTrue(orc._valid_progress_token(1))
@@ -1303,7 +1321,8 @@ class LaunchEvidenceTests(ProgressFixture):
         commands = [["python3", "-m", "unittest"], ["git", "diff", "--check"]]
         state = self._rewrite(
             status="running", phase="verify", active_job=None,
-            active_check={"id": "check-1", "argv": commands[0]},
+            active_check={"id": "check-1", "argv": commands[0],
+                          **_check_identity()},
             check_progress={"identity": {"argv": commands},
                             "evidence": {"commands": [{"argv": commands[0]}]}})
         snapshot = self.snapshot()
@@ -1400,6 +1419,77 @@ class LaunchEvidenceTests(ProgressFixture):
         self.assertIn("worker active", text)
         self.assertNotIn("transport_too_large", text)
 
+    def test_admitted_retry_without_a_job_shows_pending_dispatch(self):
+        # The prior attempt was refused before a job existed; the next retry is
+        # admitted but has not created its job yet.  The old refusal is history.
+        _append(self.folder, {"event": "preflight_rejected",
+                              "job_id": "reviewer-old",
+                              "reason_code": "transport_too_large",
+                              "reasons": ["the prior packet exceeded the budget"]})
+        self.synthetic_start(attempt="synthetic-retry",
+                             monotonic_started=round(time.monotonic() - 1, 3))
+        state = self._rewrite(
+            status="running",
+            preflight_rejection={
+                "reason_code": "transport_too_large",
+                "reasons": ["the prior packet exceeded the budget"],
+                "active_job_created": False, "model_calls_counted": False},
+            active_job=None, active_check=None)
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "launching", launch)
+        self.assertFalse(launch["worker_started"])
+        self.assertFalse(launch["model_active"])
+        self.assertIn("pending dispatch", launch["statement"])
+        self.assertNotIn("zero launches", launch["statement"])
+        self.assertNotIn("transport_too_large", launch["statement"])
+        self.assertEqual(snapshot["next_action"], "orchestrator_stage")
+        self.assertEqual(launch["next_action"], "orchestrator_stage")
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("pending dispatch", text)
+        self.assertNotIn("transport_too_large", text)
+        # The prior refusal remains durable history for the refused attempt.
+        self.assertEqual(state["preflight_rejection"]["reason_code"],
+                         "transport_too_large")
+
+    def test_expired_check_owner_is_reconciled_not_observed(self):
+        commands = [["python3", "-m", "unittest"]]
+        dead = dead_process_identity()
+        self.synthetic_start(attempt="stale-owner", boot_id="another-boot",
+                             monotonic_started=1.0)
+        state = self._rewrite(
+            status="running", phase="verify", active_job=None,
+            active_check={"id": "check-1", "argv": commands[0],
+                          "pid": dead["pid"],
+                          "pid_start": None,
+                          "pgid": dead["pgid"], "sid": dead["sid"]},
+            check_progress={"identity": {"argv": commands},
+                            "evidence": {"commands": [{"argv": commands[0]}]}})
+        snapshot = self.snapshot()
+        launch = snapshot["launch"]
+        self.assertEqual(launch["state"], "blocked", launch)
+        self.assertEqual(launch["actor"], "operator")
+        self.assertEqual(launch["next_action"], "orchestrator_reconcile")
+        self.assertIn("expired or unproven", launch["statement"])
+        self.assertNotIn("supervisor check running", launch["statement"])
+        self.assertEqual(snapshot["ownership"], "stale")
+        self.assertEqual(snapshot["next_action"], "orchestrator_reconcile")
+        self.assertEqual(orc.next_action_for(state), "orchestrator_reconcile")
+        text = "\n".join(orc._viewer_lines(state, snapshot))
+        self.assertIn("next: orchestrator_reconcile", text)
+        self.assertNotIn("check running · no model", text)
+        # A legacy PID without a trustworthy start time is unproven, not live.
+        state = self._rewrite(
+            status="running", phase="verify", active_job=None,
+            active_check={"id": "check-2", "argv": commands[0],
+                          "pid": os.getpid()},
+            check_progress={"identity": {"argv": commands},
+                            "evidence": {"commands": []}})
+        unproven = self.snapshot()
+        self.assertEqual(unproven["launch"]["state"], "blocked")
+        self.assertIn("expired or unproven", unproven["launch"]["statement"])
+        self.assertEqual(orc.next_action_for(state), "orchestrator_reconcile")
+
     def test_persisted_launched_failure_survives_cleared_active_job(self):
         self.synthetic_start()
         jobdir = self.folder / "jobs" / "impl-failed"
@@ -1446,6 +1536,29 @@ class LaunchEvidenceTests(ProgressFixture):
         orc.atomic_json(jobdir / "execution.json", {"returncode": 1})
         self.assertTrue(orc._attempt_was_launched(job))
 
+    def test_persisted_process_identity_is_launch_evidence_after_cleanup(self):
+        jobdir = self.folder / "jobs" / "impl-identity-only"
+        jobdir.mkdir(parents=True)
+        orc.atomic_json(jobdir / "failure.json", {"error": "worker exited 1"})
+        dead = dead_process_identity()
+        job = {"id": "impl-identity-only", "status": "failed",
+               "path": str(jobdir), "error": "worker exited 1",
+               "pid": dead["pid"], "pid_start": None,
+               "pgid": dead["pgid"], "sid": dead["sid"]}
+        self.assertFalse((jobdir / "execution.json").exists())
+        self.assertFalse((jobdir / "launch.json").exists())
+        # A persisted process identity proves the child existed even when no
+        # launch or execution file survives; a bare spawn failure is still not
+        # launch evidence.
+        self.assertTrue(orc._attempt_was_launched(job))
+        nested = {"id": "impl-process-only", "status": "failed",
+                  "path": str(jobdir),
+                  "process": {"pid": dead["pid"], "pid_start": None,
+                              "pgid": dead["pgid"], "sid": dead["sid"]}}
+        self.assertTrue(orc._attempt_was_launched(nested))
+        self.assertFalse(orc._attempt_was_launched({"id": "no-evidence",
+                                                    "path": str(jobdir)}))
+
     def test_uncertain_check_is_blocked_not_reported_running(self):
         commands = [["python3", "-m", "unittest"]]
         state = self._rewrite(
@@ -1471,7 +1584,8 @@ class LaunchEvidenceTests(ProgressFixture):
         commands = [["python3", "-m", "unittest"], ["git", "diff", "--check"]]
         state = self._rewrite(
             status="running", phase="verify", active_job=None,
-            active_check={"id": "check-1", "argv": commands[0]},
+            active_check={"id": "check-1", "argv": commands[0],
+                          **_check_identity()},
             check_progress={"identity": {"argv": commands},
                             "evidence": {"commands": [{"argv": commands[0]}]}})
         snapshot = self.snapshot()

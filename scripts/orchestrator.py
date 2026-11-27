@@ -16836,13 +16836,19 @@ def _attempt_was_launched(job):
     """Distinguish an admitted-but-unlaunched job from a real child attempt.
 
     A bare ``failure.json`` is written when the spawn itself fails, so it is not
-    launch evidence.  Only a guard launch identity or a completed execution
-    record proves that a child actually existed.
+    launch evidence.  A guard launch identity, a persisted process/session
+    identity, or a completed execution record proves that a child actually
+    existed.  The process identity matters after cleanup: a worker that really
+    spawned and then failed keeps its recorded identity even when no launch or
+    execution file survives.
     """
     if not isinstance(job, dict) or not job.get("id"):
         return False
     launch_file = _job_launch_file(job)
     if launch_file and _launch_identity(launch_file):
+        return True
+    identity = job_identity(job)
+    if identity.get("pid") or identity.get("pgid") or identity.get("sid"):
         return True
     if not job.get("path"):
         return False
@@ -24870,16 +24876,38 @@ def _verification_commands(state):
     return (evidence or {}).get("commands", [])
 
 
-def next_action_for(state):
+def _check_process_alive(check):
+    """Return True only when the persisted check identity is proven alive.
+
+    A saved ``active_check`` is not proof by itself: a supervisor may have
+    expired while the record survived.  The recorded process/session identity
+    is the owner evidence used here; an absent, reused or stopped identity is
+    not live.
+    """
+    if not isinstance(check, dict) or not check:
+        return False
+    try:
+        liveness = job_liveness(check)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (liveness.get("alive") is True
+            and liveness.get("reason") != "unverified_pid")
+
+
+def next_action_for(state, *, attempt_owner=None):
     check = state.get("active_check")
     job = state.get("active_job") or {}
     if check:
         # A live, owned check is progress to observe.  Only unresolved
-        # ownership needs operator reconciliation.
+        # ownership needs operator reconciliation.  An active stage owner is
+        # sufficient; otherwise the persisted check identity must prove that
+        # this check is still the live owner.
         if (check.get("status") == "uncertain"
                 or state.get("status") == "uncertain"):
             return "orchestrator_reconcile"
-        return "orchestrator_status"
+        if attempt_owner == "active" or _check_process_alive(check):
+            return "orchestrator_status"
+        return "orchestrator_reconcile"
     if job and job.get("status") in {"running", "dispatched", "uncertain"}:
         if job.get("status") == "running":
             # A stage may be live in another tool call; do not launch a duplicate.
@@ -25394,13 +25422,50 @@ def _job_for_attempt(state, records, attempt):
     return None
 
 
-def launch_view(state, *, started=None, ended=None, job=None, records=None):
+def _rejection_is_current(state, *, started=None, ended=None, job=None,
+                          records=None):
+    """Whether the saved run-wide rejection belongs to the displayed attempt.
+
+    A preflight refusal pauses the run and leaves ``preflight_rejection`` in
+    state.  When the next attempt is admitted, the old refusal is history even
+    though it has not been cleared.  An active attempt without a job cannot be
+    in a preflight-blocked state; a paused legacy run without a newer attempt
+    keeps its truthful refusal.
+    """
+    rejection = (state or {}).get("preflight_rejection")
+    if not isinstance(rejection, dict) or not rejection:
+        return False
+    if job:
+        # A current job is handled by its own launch/block evidence.
+        return False
+    if not started:
+        return True
+    if ended is not None:
+        return True
+    if state.get("status") == "running":
+        return False
+    if not records:
+        return True
+    last_start = last_reject = None
+    for index, event in enumerate(records):
+        if event.get("event") == "stage_start":
+            last_start = index
+        elif event.get("event") == "preflight_rejected":
+            last_reject = index
+    if last_start is None or last_reject is None:
+        return True
+    return last_start < last_reject
+
+
+def launch_view(state, *, started=None, ended=None, job=None, records=None,
+                attempt_owner=None):
     """Durable statement of whether this attempt's model actually launched.
 
-    A status word never proves a launch: only the guard launch record or a
-    job's real execution/completion artifact does.  The view is bound to the
-    admitted attempt so a stale rejection cannot mask a newer worker and a
-    cleared ``active_job`` cannot erase a persisted launched failure.
+    A status word never proves a launch: only the guard launch record, a
+    persisted execution identity, or a job's real execution/completion artifact
+    does.  The view is bound to the admitted attempt so a stale rejection cannot
+    mask a newer worker and a cleared ``active_job`` cannot erase a persisted
+    launched failure.
     """
     state = state or {}
     if not isinstance(job, dict):
@@ -25409,11 +25474,13 @@ def launch_view(state, *, started=None, ended=None, job=None, records=None):
     check = state.get("active_check") if isinstance(state.get("active_check"), dict) else {}
     rejection = (state.get("preflight_rejection")
                  if isinstance(state.get("preflight_rejection"), dict) else {})
+    rejection_current = _rejection_is_current(
+        state, started=started, ended=ended, job=job, records=records)
     status = state.get("status")
     job_status = job.get("status")
     launched = bool(job) and _attempt_was_launched(job)
     job_reason = _safe_progress_text(job.get("error"), 240)
-    next_action = next_action_for(state)
+    next_action = next_action_for(state, attempt_owner=attempt_owner)
     view = {"worker_started": launched, "model_active": False,
             "model_calls": None, "actor": "unknown",
             "actor_label": _LAUNCH_ACTOR_LABELS["unknown"],
@@ -25433,6 +25500,17 @@ def launch_view(state, *, started=None, ended=None, job=None, records=None):
                                         "reason": reason},
                          "statement": ("supervisor check ownership is unresolved · "
                                        "no model is active"
+                                       + (" · " + reason if reason else ""))})
+            return view
+        if attempt_owner != "active" and not _check_process_alive(check):
+            reason = _safe_progress_text(state.get("pause_reason"), 240)
+            view.update({"state": "blocked", "actor": "operator",
+                         "actor_label": _LAUNCH_ACTOR_LABELS["operator"],
+                         "next_action": "orchestrator_reconcile",
+                         "blocked_by": {"code": "verification_ownership_unproven",
+                                        "reason": reason},
+                         "statement": ("supervisor check ownership is expired or "
+                                       "unproven · no model is active"
                                        + (" · " + reason if reason else ""))})
             return view
         statement = "supervisor check running · no model is active"
@@ -25475,7 +25553,7 @@ def launch_view(state, *, started=None, ended=None, job=None, records=None):
                                     if launched else "worker not launched · stage blocked")
                                    + (" · " + reason if reason else ""))})
         return view
-    if not job and rejection:
+    if not job and rejection and rejection_current:
         code = _safe_progress_text(rejection.get("reason_code"), 80) or "preflight_rejected"
         reasons = rejection.get("reasons") or []
         detail = _safe_progress_text(
@@ -25488,6 +25566,16 @@ def launch_view(state, *, started=None, ended=None, job=None, records=None):
                      "blocked_by": {"code": code, "reason": detail},
                      "statement": ("zero launches · worker not started · blocked by "
                                    + code + (" · " + detail if detail else ""))})
+        return view
+    if (not job and started and ended is None and status == "running"
+            and attempt_owner == "active"):
+        # A newly admitted retry has not created its job yet.  The prior
+        # rejection remains in history but cannot claim this attempt.
+        view.update({"state": "launching", "actor": "supervisor",
+                     "actor_label": _LAUNCH_ACTOR_LABELS["supervisor"],
+                     "worker_started": False, "model_active": False,
+                     "next_action": "orchestrator_stage",
+                     "statement": "pending dispatch · model not active yet"})
         return view
     if status == "awaiting_plan_approval":
         view.update({"state": "blocked", "actor": "user",
@@ -25624,6 +25712,7 @@ def stage_snapshot(folder, state):
     ownership = owner
     active = bool(started) and ended is None and ownership == "active" \
         and state.get("status") == "running"
+    attempt_owner = "active" if active else "stale"
     if ended is None and started and not active and ownership == "active":
         # Paused, cancelled or finished runs stop ticking even with a live owner.
         ownership = "stale"
@@ -25693,7 +25782,8 @@ def stage_snapshot(folder, state):
         "informational_only": True,
         "outcome": _safe_progress_text(outcome, 40),
         "next_action": _safe_progress_text(
-            (ended or {}).get("next_action") or next_action_for(state), 80),
+            (ended or {}).get("next_action")
+            or next_action_for(state, attempt_owner=attempt_owner), 80),
         "next": {"phase": next_phase,
                  "agent_label": _safe_progress_text(next_preview.get("agent_label"), 60),
                  "task": _safe_stage_task(state, next_phase,
@@ -25702,7 +25792,8 @@ def stage_snapshot(folder, state):
                  "model": _safe_progress_text(next_preview.get("model"), 60),
                  "effort": _safe_progress_text(next_preview.get("effort"), 24)},
         "launch": launch_view(state, started=started, ended=ended,
-                              job=attempt_job, records=records),
+                              job=attempt_job, records=records,
+                              attempt_owner=attempt_owner),
         "status": state.get("status"),
     }
 
@@ -25715,9 +25806,11 @@ def stage_progress(run_id):
 def stage_progress_message(snapshot):
     """One bounded human-readable line for MCP progress notifications.
 
-    Actor, next action and elapsed time are protected fields: a long blocked
-    handoff statement may be shortened, but it cannot push the decisive next
-    step or timing out of the existing 240-character bound.
+    The compact launch/status statement, its blocker code, the actor, next
+    action and elapsed time are protected fields.  Optional detail may be
+    shortened or dropped, but a long blocked handoff statement cannot push the
+    decisive launch result, next step or timing out of the existing
+    240-character bound.
     """
     snapshot = snapshot if isinstance(snapshot, dict) else {}
     launch = snapshot.get("launch") or {}
@@ -25739,9 +25832,6 @@ def stage_progress_message(snapshot):
         details.append(route)
     if snapshot.get("activity"):
         details.append(_safe_progress_text(snapshot["activity"], 80))
-    if launch_state in {"blocked", "verification", "finished", "not_launched",
-                        "launching", "running"} and launch.get("statement"):
-        details.append(_safe_progress_text(launch["statement"], 120))
     if snapshot.get("milestone"):
         details.append(_safe_progress_text(snapshot["milestone"], 100))
     assignments = snapshot.get("assignments") or []
@@ -25757,11 +25847,25 @@ def stage_progress_message(snapshot):
     if snapshot.get("outcome"):
         details.append(_safe_progress_text(snapshot["outcome"], 32))
     core = []
+    if launch_state not in {None, "unknown"}:
+        statement = _safe_progress_text(launch.get("statement"), 110)
+        code = _safe_progress_text(
+            (launch.get("blocked_by") or {}).get("code"), 60)
+        if code and code.lower() not in (statement or "").lower():
+            statement = ((statement + " · " + code) if statement else code)
+        statement = _safe_progress_text(statement or launch_state, 120)
+        if statement:
+            core.append(statement)
+    elif launch.get("blocked_by"):
+        code = _safe_progress_text(
+            (launch.get("blocked_by") or {}).get("code"), 60)
+        if code:
+            core.append("blocked: " + code)
     actor = _safe_progress_text(launch.get("actor_label"), 40)
     if actor and launch_state not in {None, "unknown"}:
         core.append("actor: " + actor)
     next_action = _safe_progress_text(
-        snapshot.get("next_action") or launch.get("next_action"), 60)
+        snapshot.get("next_action") or launch.get("next_action"), 50)
     if next_action:
         core.append("next: " + next_action)
     if snapshot.get("elapsed_seconds") is not None:
@@ -25778,7 +25882,7 @@ def stage_progress_message(snapshot):
         if len(candidate) > budget:
             continue
         selected.append(part)
-    message = " · ".join(selected + ([protected] if protected else []))
+    message = " · ".join(([protected] if protected else []) + selected)
     return _safe_progress_text(message, 240) or "stage running"
 
 

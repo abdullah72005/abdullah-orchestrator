@@ -42,6 +42,26 @@ Run one module while iterating:
 python3 -m unittest discover -s scripts/tests -p "test_checkpoint_a_containment.py"
 ```
 
+For a full discovery or a large selected set, the opt-in bounded parallel runner
+keeps serial execution as the default and requires an explicit `--parallel`
+(and a two-worker cap):
+
+```bash
+# Inspect the exact selection and module-preserving partition.
+python3 scripts/run_tests_parallel.py --parallel --list
+
+# Run a large named selection with logs and a JSON summary.
+python3 scripts/run_tests_parallel.py --parallel \
+  --module test_v120_release_workflow --module test_v121_parallel_writers \
+  --json /tmp/orchestrator-tests.json
+```
+
+It runs timing-sensitive modules in a separate serial group, limits the
+aggregate worker process trees to four logical CPUs with `taskset` at lower
+priority, and falls back to serial when that limit cannot be applied or memory is
+tight. It reports missing, failed and interrupted groups explicitly; a retry is a
+new invocation with a recorded reason, not a silent rerun.
+
 ## Ground rules
 
 1. **Never weaken a security control to make a test pass.** If a test exposes a
