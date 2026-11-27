@@ -308,7 +308,10 @@ side-effect-free reads, bounded and terminal-safe activity, verification
 argv exclusion, admission-bound progress notifications, nonblocking sink
 closure, containment during stalled writes, malformed tokens and `_meta`, and
 the terminal viewer's waiting, ticking, reattachment, plain-mode and narrow
-output paths.
+output paths. It also proves launch evidence: pending/preflight says the model
+has not launched, verification says no model is active with a safe check
+ordinal, running is claimed only from a job launch artifact, and a prelaunch
+refusal reads as zero launches with its reason code, actor and next action.
 
 Client behavior verified on this follow-up: Claude Code CLI `2.1.247` rendered
 native MCP progress in its TUI; Codex CLI `0.169.1` received notifications but
