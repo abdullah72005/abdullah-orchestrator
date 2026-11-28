@@ -87,6 +87,46 @@ class SelectionAndPartitionTests(RunnerFixture):
         with self.assertRaisesRegex(ValueError, "not discovered"):
             runner.select_tests(ids, tests=["test_missing.Cases.test_x"])
 
+    def test_imported_test_classes_are_counted_once_as_unique_ids(self):
+        (self.tests / "test_source.py").write_text(
+            "import unittest\n\n"
+            "class Cases(unittest.TestCase):\n"
+            "    def test_one(self):\n        self.assertTrue(True)\n"
+            "    def test_two(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8")
+        (self.tests / "test_importer.py").write_text(
+            "from test_source import Cases  # noqa: F401\n", encoding="utf-8")
+        discovery = {}
+        ids = runner.collect_test_ids(self.tests, discovery=discovery)
+        self.assertEqual(discovery["unique"], len(ids))
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertGreater(discovery["entries"], discovery["unique"])
+        self.assertEqual(discovery["duplicates"]["test_source.Cases.test_one"], 2)
+        self.assertEqual(discovery["duplicates"]["test_source.Cases.test_two"], 2)
+        self.assertNotIn("test_importer.Cases.test_one", ids)
+        plan = runner.partition_tests(ids, workers=2, serial_modules=())
+        grouped = [test_id for group in plan["serial"] + plan["parallel"]
+                   for test_id in group["tests"]]
+        self.assertEqual(sorted(grouped), sorted(ids))
+        owners = [group["name"] for group in plan["serial"] + plan["parallel"]
+                  if "test_source" in group["modules"]]
+        self.assertEqual(len(owners), 1, owners)
+        self.assertFalse(any("test_importer" in group["modules"]
+                             for group in plan["serial"] + plan["parallel"]))
+
+    def test_conflicting_duplicate_id_is_refused(self):
+        (self.tests / "test_spoof.py").write_text(
+            "import unittest\n\n"
+            "class One(unittest.TestCase):\n"
+            "    def test_same(self):\n        pass\n\n"
+            "class Two(unittest.TestCase):\n"
+            "    def test_same(self):\n        pass\n\n"
+            "One.__module__ = Two.__module__ = 'test_spoof'\n"
+            "One.__qualname__ = Two.__qualname__ = 'Cases'\n",
+            encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "conflicting tests"):
+            runner.collect_test_ids(self.tests)
+
 
 class LimitsAndCommandTests(unittest.TestCase):
     def test_serial_is_default_and_two_workers_are_opt_in(self):
@@ -131,6 +171,80 @@ class LimitsAndCommandTests(unittest.TestCase):
             {"name": "worker:2", "tests": ["test_beta.Cases.test_only"],
              "modules": ["test_beta"]}, limits=limits)
         self.assertEqual(second[2], "2,3")
+
+    def test_cli_cannot_relax_worker_cpu_or_priority_bounds(self):
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
+                patch.object(runner, "_available_cpus",
+                             return_value=list(range(8))), \
+                patch.object(runner, "_available_memory_mb", return_value=8192):
+            limits = runner.resolve_limits(workers=8, cpu_budget=8, nice=0,
+                                           require_taskset=True)
+        self.assertEqual(limits["workers"], 2)
+        self.assertEqual(limits["requested_workers"], 2)
+        self.assertEqual(limits["requested_cpu_budget"], 8)
+        self.assertEqual(limits["cpu_budget"], 4)
+        self.assertEqual(len(limits["allowed_cpus"]), 4)
+        self.assertEqual(limits["requested_nice"], 0)
+        self.assertEqual(limits["nice"], 10)
+        command = runner.build_group_command(
+            {"name": "worker:1", "tests": ["test_alpha.Cases.test_one"],
+             "modules": ["test_alpha"]}, limits=limits)
+        self.assertEqual(command[:3], ["/usr/bin/taskset", "-c", "0,1"])
+
+    def test_affinity_probe_failure_falls_back_before_any_group_starts(self):
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
+                patch.object(runner, "_available_cpus",
+                             return_value=[0, 1, 2, 3]), \
+                patch.object(runner, "_available_memory_mb", return_value=8192):
+            limits = runner.resolve_limits(workers=2, cpu_budget=4,
+                                           require_taskset=True)
+        failed = runner.probe_parallel_environment(
+            limits, probe=lambda command: (126, "failed to set pid affinity"))
+        self.assertEqual(failed["workers"], 1)
+        self.assertTrue(failed["serial_fallback"])
+        self.assertFalse(failed["affinity_verified"])
+        self.assertIn("affinity", failed["fallback_reason"])
+        verified = runner.probe_parallel_environment(
+            limits, probe=lambda command: (0, ""))
+        self.assertEqual(verified["workers"], 2)
+        self.assertTrue(verified["affinity_verified"])
+        self.assertFalse(verified["serial_fallback"])
+
+    def test_wsl_requires_provable_host_memory_headroom(self):
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
+                patch.object(runner, "_available_cpus",
+                             return_value=[0, 1, 2, 3]), \
+                patch.object(runner, "_available_memory_mb", return_value=8192):
+            unknown = runner.resolve_limits(workers=2, wsl=True,
+                                            host_memory_mb=None)
+            tight = runner.resolve_limits(workers=2, wsl=True,
+                                          host_memory_mb=512,
+                                          min_memory_mb=1024)
+            roomy = runner.resolve_limits(workers=2, wsl=True,
+                                          host_memory_mb=8192,
+                                          min_memory_mb=1024)
+        self.assertEqual(unknown["workers"], 1)
+        self.assertIn("headroom", unknown["fallback_reason"])
+        self.assertEqual(tight["workers"], 1)
+        self.assertIn("Windows host", tight["fallback_reason"])
+        self.assertEqual(roomy["workers"], 2)
+        self.assertFalse(roomy["serial_fallback"])
+
+    def test_incident_suites_stay_serial_and_outside_parallel_groups(self):
+        ids = ["test_v121_evidence_reuse.Cases.test_a",
+               "test_live_stage_progress.Cases.test_b",
+               "test_v31_review_recovery.Cases.test_c",
+               "test_alpha.Cases.test_one"]
+        plan = runner.partition_tests(
+            ids, workers=2, serial_modules=runner.DEFAULT_SERIAL_MODULES)
+        self.assertEqual(
+            sorted(group["name"] for group in plan["serial"]),
+            ["serial:test_live_stage_progress",
+             "serial:test_v121_evidence_reuse",
+             "serial:test_v31_review_recovery"])
+        parallel = [test_id for group in plan["parallel"]
+                    for test_id in group["tests"]]
+        self.assertEqual(parallel, ["test_alpha.Cases.test_one"])
 
 
 class ExecutionAggregationTests(RunnerFixture):
@@ -253,6 +367,102 @@ class ExecutionAggregationTests(RunnerFixture):
             self.assertTrue(result["log"]["sha256"])
             self.assertTrue(Path(result["log"]["path"]).is_file())
         json.dumps(report)
+
+    def test_class_level_skip_is_accounted_without_missing_coverage(self):
+        (self.tests / "test_classskip.py").write_text(
+            "import unittest\n\n"
+            "class Skipped(unittest.TestCase):\n"
+            "    @classmethod\n"
+            "    def setUpClass(cls):\n"
+            "        raise unittest.SkipTest('class unavailable')\n"
+            "    def test_first(self):\n        pass\n"
+            "    def test_second(self):\n        pass\n\n"
+            "class Running(unittest.TestCase):\n"
+            "    def test_third(self):\n        pass\n",
+            encoding="utf-8")
+        ids = runner.collect_test_ids(self.tests)
+        selected = [test_id for test_id in ids
+                    if test_id.startswith("test_classskip.")]
+        plan = runner.partition_tests(selected, workers=1)
+        limits = runner.resolve_limits(workers=1)
+        results = runner.execute_plan(
+            plan, start_dir=self.tests,
+            output_dir=self.root / "class-skip-logs", limits=limits)
+        totals = runner.aggregate(results, selected=len(selected))
+        self.assertEqual(totals["exit_code"], 0, totals)
+        self.assertEqual(totals["ran"], 1, totals)
+        self.assertEqual(totals["class_skips"], 1, totals)
+        self.assertEqual(totals["class_skipped_tests"], 2, totals)
+        self.assertEqual(totals["accounted"], len(selected), totals)
+
+    def test_sigint_child_is_interrupted_not_a_failed_group(self):
+        group = {"name": "worker:sigint", "modules": ["test_alpha"],
+                 "tests": ["test_alpha.Cases.test_one"], "serial": False}
+        limits = runner.resolve_limits(workers=1)
+        with patch.object(runner, "build_group_command", return_value=[
+                sys.executable, "-c",
+                "import os, signal; os.kill(os.getpid(), signal.SIGINT)"]):
+            result = runner.run_group(
+                group, start_dir=self.tests,
+                output_dir=self.root / "sigint-logs", limits=limits,
+                timeout=30)
+        self.assertEqual(result["returncode"], -2, result)
+        self.assertTrue(result["interrupted"])
+        self.assertIn("SIGINT", result["interrupt_reason"])
+        self.assertTrue(result["log"]["sha256"])
+        totals = runner.aggregate([result], selected=1)
+        self.assertEqual(totals["interrupted_groups"], ["worker:sigint"])
+        self.assertEqual(totals["failed_groups"], [])
+        self.assertEqual(totals["exit_code"], 1)
+
+    def test_runner_interrupt_marks_incomplete_and_cancelled_groups(self):
+        first = {"name": "serial:one", "modules": ["test_alpha"],
+                 "tests": ["test_alpha.Cases.test_one"], "serial": True}
+        second = {"name": "serial:two", "modules": ["test_beta"],
+                  "tests": ["test_beta.Cases.test_only"], "serial": True}
+
+        def fake(group, **_kwargs):
+            if group["name"] == "serial:one":
+                raise KeyboardInterrupt
+            return {"name": group["name"], "tests": group["tests"],
+                    "counts": {"ran": 1}, "returncode": 0}
+
+        limits = runner.resolve_limits(workers=1)
+        results = runner.execute_plan(
+            {"serial": [first, second], "parallel": [], "selected": 2},
+            start_dir=self.tests, output_dir=self.root / "cancel-logs",
+            limits=limits, group_runner=fake)
+        totals = runner.aggregate(results, selected=2)
+        self.assertEqual(totals["interrupted_groups"], ["serial:one"])
+        self.assertEqual(totals["cancelled_groups"], ["serial:two"])
+        self.assertEqual(totals["ran"], 0)
+        self.assertEqual(totals["exit_code"], 1)
+
+    def test_source_fingerprint_and_report_mark_a_changing_checkout(self):
+        before = {"head": "a" * 40, "dirty": False, "fingerprint": "before"}
+        after = {"head": "a" * 40, "dirty": True, "fingerprint": "after"}
+        ids = runner.collect_test_ids(self.tests)
+        plan = runner.partition_tests(ids, workers=1)
+        limits = runner.resolve_limits(workers=1)
+        report = runner.build_report(
+            start_dir=self.tests, pattern="test*.py", selected=ids,
+            plan=plan, limits=limits, results=[],
+            discovery={"entries": len(ids) + 2, "unique": len(ids),
+                       "duplicates": {"test_alpha.Cases.test_one": 2}},
+            source_before=before, source_after=after)
+        self.assertTrue(report["source"]["changed"])
+        self.assertEqual(report["selection"]["discovered_entries"],
+                         len(ids) + 2)
+        self.assertEqual(report["selection"]["duplicate_ids"],
+                         {"test_alpha.Cases.test_one": 2})
+        self.assertEqual(report["revision"], "a" * 40)
+
+    def test_source_state_fingerprints_the_real_checkout(self):
+        root = Path(runner.__file__).resolve().parents[1]
+        state = runner._source_state(root / "scripts" / "tests")
+        self.assertTrue(state["head"])
+        self.assertIsInstance(state["dirty"], bool)
+        self.assertTrue(state["fingerprint"])
 
 
 if __name__ == "__main__":

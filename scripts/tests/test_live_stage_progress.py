@@ -1452,6 +1452,62 @@ class LaunchEvidenceTests(ProgressFixture):
         self.assertEqual(state["preflight_rejection"]["reason_code"],
                          "transport_too_large")
 
+    def test_finished_retry_reports_its_own_outcome_not_the_old_refusal(self):
+        # Attempt 1 was refused before dispatch.  Attempt 2 was admitted and
+        # then ended on its own error.  The old transport reason is history and
+        # must not be shown as the current foreground blocker.
+        self.synthetic_start(attempt="attempt-old",
+                             monotonic_started=round(time.monotonic() - 5, 3))
+        _append(self.folder, {"event": "preflight_rejected",
+                              "job_id": "reviewer-old",
+                              "reason_code": "transport_too_large",
+                              "reasons": ["the prior packet exceeded the budget"]})
+        _append(self.folder, {"event": "stage_end", "stage": "implement",
+                              "role": "architect", "attempt": "attempt-old",
+                              "elapsed_seconds": 1.0, "outcome": "blocked",
+                              "error": "Dispatch not attempted: transport_too_large",
+                              "next_action": "orchestrator_resume"})
+        self.synthetic_start(attempt="attempt-retry",
+                             monotonic_started=round(time.monotonic() - 1, 3))
+        _append(self.folder, {"event": "stage_end", "stage": "implement",
+                              "role": "architect", "attempt": "attempt-retry",
+                              "elapsed_seconds": 2.0, "outcome": "blocked",
+                              "error": "review projection unavailable",
+                              "next_action": "orchestrator_resume"})
+        state = self._rewrite(
+            status="blocked",
+            pause_reason="review projection unavailable",
+            preflight_rejection={
+                "reason_code": "transport_too_large",
+                "reasons": ["the prior packet exceeded the budget"],
+                "job_id": "reviewer-old",
+                "active_job_created": False, "model_calls_counted": False},
+            active_job=None, active_check=None)
+        records = _records(self.folder)
+        started, ended = orc._attempt_markers(records)
+        self.assertEqual(started["attempt"], "attempt-retry")
+        self.assertFalse(orc._rejection_is_current(
+            state, started=started, ended=ended, records=records))
+        old_started = next(row for row in records
+                           if row.get("event") == "stage_start"
+                           and row.get("attempt") == "attempt-old")
+        old_ended = next(row for row in records
+                         if row.get("event") == "stage_end"
+                         and row.get("attempt") == "attempt-old")
+        self.assertTrue(orc._rejection_is_current(
+            state, started=old_started, ended=old_ended, records=records))
+        launch = self.snapshot()["launch"]
+        self.assertEqual(launch["state"], "blocked", launch)
+        self.assertNotIn("zero launches", launch["statement"])
+        self.assertNotIn("transport_too_large", launch["statement"])
+        self.assertIn("review projection unavailable", launch["statement"])
+        text = "\n".join(orc._viewer_lines(state, self.snapshot()))
+        self.assertNotIn("transport_too_large", text)
+        self.assertIn("review projection unavailable", text)
+        # The durable refusal record itself is preserved as history.
+        self.assertEqual(state["preflight_rejection"]["reason_code"],
+                         "transport_too_large")
+
     def test_expired_check_owner_is_reconciled_not_observed(self):
         commands = [["python3", "-m", "unittest"]]
         dead = dead_process_identity()

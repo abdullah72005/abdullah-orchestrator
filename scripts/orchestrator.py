@@ -25427,10 +25427,12 @@ def _rejection_is_current(state, *, started=None, ended=None, job=None,
     """Whether the saved run-wide rejection belongs to the displayed attempt.
 
     A preflight refusal pauses the run and leaves ``preflight_rejection`` in
-    state.  When the next attempt is admitted, the old refusal is history even
-    though it has not been cleared.  An active attempt without a job cannot be
-    in a preflight-blocked state; a paused legacy run without a newer attempt
-    keeps its truthful refusal.
+    state.  When a later attempt is admitted, the old refusal is history even
+    though it has not been cleared.  The refusal is bound to the displayed
+    attempt's journal window (start .. end) instead of every ended attempt, so
+    a finished retry reports its own outcome rather than the previous reason.
+    The legacy fallback is limited to runs whose journal predates or omits the
+    refusal evidence.
     """
     rejection = (state or {}).get("preflight_rejection")
     if not isinstance(rejection, dict) or not rejection:
@@ -25439,22 +25441,62 @@ def _rejection_is_current(state, *, started=None, ended=None, job=None,
         # A current job is handled by its own launch/block evidence.
         return False
     if not started:
+        # No attempt is displayed: the saved refusal is still the run's state.
         return True
-    if ended is not None:
-        return True
-    if state.get("status") == "running":
+    attempt_id = started.get("attempt")
+    if ended is None and state.get("status") == "running":
+        # An active attempt without a job cannot be preflight-blocked.
         return False
+    records = [event for event in (records or []) if isinstance(event, dict)]
     if not records:
+        # Journal history is unavailable, so the saved refusal cannot be
+        # disproven; keep the truthful legacy refusal.
         return True
-    last_start = last_reject = None
+    start_index = end_index = None
+    rejections = []
     for index, event in enumerate(records):
-        if event.get("event") == "stage_start":
-            last_start = index
-        elif event.get("event") == "preflight_rejected":
-            last_reject = index
-    if last_start is None or last_reject is None:
+        kind = event.get("event")
+        if kind == "stage_start":
+            if attempt_id:
+                if event.get("attempt") == attempt_id:
+                    start_index = index
+            else:
+                start_index = index
+        elif kind == "stage_end":
+            if attempt_id:
+                if event.get("attempt") == attempt_id:
+                    end_index = index
+            elif start_index is not None and index > start_index:
+                end_index = index
+        elif kind == "preflight_rejected":
+            rejections.append((index, event))
+    if not rejections:
+        # Older journals did not record the refusal event; the saved state is
+        # the only available history.
         return True
-    return last_start < last_reject
+    if start_index is None:
+        starts = [index for index, event in enumerate(records)
+                  if event.get("event") == "stage_start"]
+        if not starts:
+            return True
+        # The displayed attempt fell outside the retained journal window.  Use
+        # the newest visible start so an older refusal is still not attributed
+        # to the newer attempt.
+        start_index = starts[-1]
+    saved_job = rejection.get("job_id")
+    for index, event in rejections:
+        event_attempt = event.get("attempt")
+        if attempt_id and event_attempt:
+            if event_attempt == attempt_id:
+                return True
+            continue
+        if index <= start_index or (end_index is not None and index > end_index):
+            continue
+        event_job = event.get("job_id")
+        if saved_job and event_job and saved_job != event_job:
+            continue
+        return True
+    return False
 
 
 def launch_view(state, *, started=None, ended=None, job=None, records=None,

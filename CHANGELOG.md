@@ -64,11 +64,17 @@ shell, so both mandatory live surfaces remain open blockers.
   viewer refreshes on check or launch changes.
 - The opt-in bounded parallel test runner (`scripts/run_tests_parallel.py`) keeps
   serial execution as the default, partitions a large selection by module so
-  fixtures stay intact, runs timing-sensitive modules in a separate serial group,
-  accounts for every selected test exactly once, and limits two workers to four
-  logical CPUs in aggregate at lower priority. It falls back to serial when the
-  CPU limit cannot be applied or memory is tight, and reports exact commands,
-  logs, digests, worker/CPU limits and aggregate counts.
+  fixtures stay intact (including the three suites from the earlier concurrency
+  incident), accounts for every unique selected test exactly once, and limits two
+  workers to four logical CPUs in aggregate at lower priority; command-line
+  overrides can only tighten those bounds. The planned affinity/priority prefix
+  and, under WSL, Windows-host memory headroom are proved before parallel work
+  starts. It falls back to serial when a proof fails or memory is tight,
+  deduplicates imported discovery aliases (refusing conflicting ids), accounts
+  class-level skips as valid coverage, classifies signal-terminated workers as
+  interrupted rather than failed, fingerprints the source before and after the
+  run, and reports exact commands, logs, digests, worker/CPU limits, cancelled
+  groups and aggregate counts.
 - The Reviewer packet proof now runs through the real renderer and OpenCode
   argv/transport preparation with spawn intercepted in a linked worktree. It
   re-reads every manifest file, delta/index, referenced hunk, raw verification

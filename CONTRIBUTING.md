@@ -58,9 +58,15 @@ python3 scripts/run_tests_parallel.py --parallel \
 
 It runs timing-sensitive modules in a separate serial group, limits the
 aggregate worker process trees to four logical CPUs with `taskset` at lower
-priority, and falls back to serial when that limit cannot be applied or memory is
-tight. It reports missing, failed and interrupted groups explicitly; a retry is a
-new invocation with a recorded reason, not a silent rerun.
+priority, and falls back to serial when that limit cannot be applied, the
+affinity/priority probe fails, Windows-host headroom under WSL is tight or
+unprovable, or memory is tight. `--workers`, `--cpu-budget` and `--nice` may
+only tighten those bounds. Selection counts unique test ids, not discovery
+entries; imported test classes are collapsed and conflicting duplicate ids are
+refused. It reports missing, failed, unaccounted, cancelled and interrupted
+groups explicitly, accounts for class-level skips, and fingerprints the source
+before and after the run. A retry is a new invocation with a recorded reason, not
+a silent rerun.
 
 ## Ground rules
 

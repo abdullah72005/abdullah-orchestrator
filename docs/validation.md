@@ -55,18 +55,29 @@ and does not become supervisor verification authority.
 `scripts/run_tests_parallel.py` is an opt-in developer helper for a full
 discovery or a large selected set. Serial execution remains the default. It
 discovers with `unittest`, partitions by module so fixture boundaries are never
-split, accounts for every selected test exactly once, runs timing-sensitive
-modules in a separate serial group first, and runs at most two workers. On
+split, accounts for every unique selected test exactly once, runs
+timing-sensitive modules in a separate serial group first, and runs at most two
+workers. Discovery entries are distinct from unique test ids: an imported test
+class is found under every importing module while its id keeps the defining
+module, so both counts are reported and the duplicates are collapsed. On
 Ubuntu/WSL it limits the aggregate worker process trees to four logical CPUs with
-`taskset` and lowers scheduling priority with `nice`; if that limit cannot be
-applied or available memory is below the configured floor, it falls back to
-serial. Its JSON result records the exact selection, revision, commands, logs and
-digests, worker/CPU limits, and aggregate counts, failures, errors, skips,
-missing groups and interrupted groups. Focused fixtures in
-`test_parallel_test_runner.py` prove selection, module boundaries, exactly-once
-coverage, bounded overlap, CPU/nice commands, serial fallback and aggregation;
-they do not run the product suite. This helper does not replace the final local
-gate.
+`taskset` and lowers scheduling priority with `nice`; the command line can only
+tighten those bounds. The affinity/priority prefix is proved with a no-op probe
+before parallel work starts, and WSL runs also require provable Windows-host
+memory headroom. If a limit cannot be applied, that proof fails, host memory is
+tight or unprovable, or available guest memory is below the configured floor,
+the runner falls back to serial. Its JSON result records the exact selection and
+discovery counts, source revision and dirty-state fingerprint before and after
+execution, commands, logs and digests, worker/CPU limits, and aggregate counts,
+failures, errors, class-level skips, missing, unaccounted, cancelled and
+interrupted groups. A class/module `SkipTest` is accounted as valid skipped
+coverage rather than missing coverage, and a worker terminated by a signal is
+reported as interrupted rather than failed. Focused fixtures in
+`test_parallel_test_runner.py` prove selection, imported-alias deduplication,
+ambiguous-id refusal, module boundaries, exactly-once coverage, bounded overlap,
+CPU/nice clamping, affinity/host-headroom fallback, skip accounting, interrupt
+classification and aggregation; they do not run the product suite. This helper
+does not replace the final local gate.
 
 Coverage areas:
 | Area | Representative tests |
