@@ -101,7 +101,8 @@ effort   = architect.<host>.effort
 billing  = architect.<host>.auth
 ```
 
-Antigravity is opt-in and **not live-certified**: the shipped example omits
+Antigravity is opt-in, **fixture-tested, with authenticated live acceptance
+pending**: the shipped example omits
 `architect.antigravity`, existing Codex/Claude configs remain valid, and a run
 that names `antigravity` without the entry is refused with an actionable error.
 The installed `agy` version must advertise the adapter's required headless

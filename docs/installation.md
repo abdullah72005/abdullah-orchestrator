@@ -1,9 +1,7 @@
 # Installation
 
-This guide installs the published `v1.0.0` release, or the locally verified
-v1.2.1 candidate at the revision recorded in
-[release evidence](release-evidence/verified-parallel-orchestration/README.md),
-from a fresh clone. It
+This guide installs the published `v1.0.0` release, or the published v1.2.2
+release from `main` (there is no `v1.2.2` tag yet), from a fresh clone. It
 verifies the installation without spending a model call, and shows how to
 upgrade, roll back and uninstall.
 
@@ -50,11 +48,12 @@ Authentication is yours to arrange before preflight:
   `OPENAI_API_KEY` out of the environment for the orchestrator session if you
   intend to use subscription billing — `doctor` reports this as a billing risk.
 - **Claude host:** sign in with the Claude CLI.
-- **Antigravity host (opt-in, not live-certified):** install and authenticate the
+- **Antigravity host (opt-in, fixture-tested; live acceptance pending):** install
+  and authenticate the
   Antigravity CLI. Verify `agy --version` and `agy --help`, the model catalogue,
   supported effort levels and billing classification yourself; the supervisor
   refuses dispatch unless the installed help advertises the required headless
-  tokens. `agy` was not available in this candidate's validation shell.
+  tokens. `agy` was not available in this release's validation shell.
 - **Workers:** an OpenCode Go subscription (default), or an alternative provider
   you explicitly authorize per run.
 
@@ -67,16 +66,15 @@ would move work to unexpected API billing.
 ```bash
 git clone https://github.com/abdullah72005/abdullah-orchestrator.git
 cd abdullah-orchestrator
-git checkout v1.0.0          # pin the latest published release tag
+git checkout main             # v1.2.2 is published on main, not as a tag
 python3 scripts/install_wsl.py --register-codex
 ```
 
-> **v1.2.1 is a locally verified release candidate, not a published tag.**
-> `git checkout v1.2.1` fails until that release is published. To run the
-> candidate, check out the accepted revision recorded in
-> [release evidence](release-evidence/verified-parallel-orchestration/README.md),
-> then run the same installer. Install the published `v1.0.0` tag for a tagged
-> release.
+> **v1.2.2 is published on `main`, without a `v1.2.2` tag.**
+> `git checkout v1.2.2` fails until that tag is created. Install the release from
+> `main`, or record the commit you cloned with `git rev-parse HEAD` and install
+> from that revision. Install the published `v1.0.0` tag only when you
+> specifically need that older tagged release.
 
 What the installer does, and does not do:
 
@@ -224,8 +222,9 @@ The installer deliberately never rewrites host settings. Verify with
 
 ### Antigravity CLI in WSL2 (opt-in)
 
-Antigravity is a third controlling host, but it is **not live-certified** in this
-candidate. The supervisor keeps a separate adapter: `agy` is checked against its
+Antigravity is a third controlling host. It is **fixture-tested in this release;
+authenticated live acceptance is pending**. The supervisor keeps a separate
+adapter: `agy` is checked against its
 installed `--help` for `--print`, `--model` and `--output-format` (and
 `--effort`/`--session` when used), prompts travel on stdin, and acceptance
 requires a structured terminal report with a matching session, not just exit 0.
@@ -400,17 +399,19 @@ followed by a preflight. Your config and run state are separate and untouched.
 
 ```bash
 cd /path/to/abdullah-orchestrator
-git fetch --tags
+git fetch origin
 git status --short                 # stop if you have local changes you care about
-git checkout v1.0.0                # a published tag; use the candidate revision for 1.2.1
+git checkout main                  # v1.2.2 is published on main; no v1.2.2 tag exists
+git pull --ff-only origin main
 python3 -m unittest discover -s scripts/tests
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
 ```
 
-The published tags stop at `v1.0.0`. The v1.2.1 candidate is identified by the
-revision in
-[release evidence](release-evidence/verified-parallel-orchestration/README.md);
-check that revision out directly until a `v1.2.1` tag exists.
+The published tag remains `v1.0.0`. The v1.2.2 release is identified by the
+publication commit at the tip of `main` (record it with `git rev-parse HEAD`
+after checking out); the changes and evidence are recorded in the
+[changelog](../CHANGELOG.md#122--2026-11-28). Check out that revision directly
+until a `v1.2.2` tag is created.
 
 Finish or migrate active runs before changing versions. `python3
 scripts/orchestrator.py compatibility <RUN>` reports `current`, `legacy`,

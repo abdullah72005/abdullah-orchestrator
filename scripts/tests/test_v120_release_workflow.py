@@ -940,7 +940,7 @@ class WorkerInstructionTests(ReleaseFixture):
     def test_coordinator_startup_does_not_require_all_references(self):
         skill = (SRC.parents[1] / "SKILL.md").read_text()
         self.assertIn("You do not need to read the references first", skill)
-        self.assertIn("1.2.1", skill)
+        self.assertIn("1.2.2", skill)
         # Safety-critical stop/resume guidance stays in the entry skill.
         self.assertIn("orchestrator_reconcile", skill)
         self.assertIn("Never claim a worker stopped", skill)
@@ -949,7 +949,7 @@ class WorkerInstructionTests(ReleaseFixture):
 class ReleaseIdentityCurrentTests(unittest.TestCase):
     def test_product_version_keeps_unchanged_internal_versions(self):
         info = orc.version_info()
-        self.assertEqual(info["product_version"], "1.2.1")
+        self.assertEqual(info["product_version"], "1.2.2")
         self.assertEqual(info["supervisor_version"], "3.1.0")
         self.assertEqual(info["state_schema_version"], 3)
         self.assertEqual(info["config_schema_version"], 3)

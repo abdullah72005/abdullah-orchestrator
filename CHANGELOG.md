@@ -4,12 +4,22 @@ All notable changes to Abdullah Orchestrator are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.2.2] — 2026-11-28
 
-**Antigravity integration and autonomous progression candidate.** No public
-version, push or release is implied. Antigravity CLI and Windows desktop support
-is **fixture-tested, not live-certified**: `agy` was absent from the validation
-shell, so both mandatory live surfaces remain open blockers.
+**Published on `main`.** Adds opt-in Antigravity, automatic plan progression
+with in-chat consultation, model controls, compact Reviewer packets,
+attempt-aware progress, and opt-in parallel tests bounded to two workers and four
+logical CPUs. The code was Architect-approved at
+`b6b01eafa8f976b30ef16bb78ea7c1d564b68926` (`b6b01ea`). This is a publication
+on `main` without a `v1.2.2` tag or GitHub release. Internal identifiers are
+unchanged: supervisor protocol `3.1.0`, state/config schema `3`, worker report
+contract `2`, verification evidence `2`.
+
+Antigravity CLI and Windows desktop support is **fixture-tested with
+authenticated live acceptance pending**: `agy` was absent from the validation
+shell, so both mandatory live surfaces remain open blockers. The native Reviewer
+handoff also needs eligible, authority-bound verification evidence before a live
+dispatch.
 
 ### Added
 
@@ -113,12 +123,26 @@ shell, so both mandatory live surfaces remain open blockers.
   operator-only boundaries and free-route behavior are asserted against policy,
   not the shell that launched the suite.
 
+### Verification
+
+- Full discovery at `7ec3d4a`: **1,399 tests, 10 skipped, OK**, 2,474.80 s on
+  Python 3.10.12, clean tree.
+- Final focused checks at `b6b01ea`: **34 parallel-runner tests** and
+  **4 CLI-relative selection tests**, both OK.
+- The full suite was not rerun at `b6b01ea`; the earlier result is not claimed as
+  a `b6b01ea` run. This publication commit changes only the public version
+  constant, its assertions and documentation.
+
 ### Limitations
 
 - No authenticated Antigravity CLI or desktop acceptance; desktop >180 s stage,
   rendering, interruption, reconnect and resume are unverified.
+- The native Reviewer handoff has no eligible authority-bound verification
+  record for the repaired candidate; a live Reviewer dispatch remains blocked.
 - Deterministic three-host, transport, setup, consultation, authorization,
   progression, recovery and environment tests are fixture-based.
+- The full discovery belongs to `7ec3d4a`; only focused checks were rerun at
+  `b6b01ea`.
 
 ## [1.2.1] — 2026-11-25
 
@@ -808,7 +832,8 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.2.1...main
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/commits/main
+[1.2.2]: https://github.com/abdullah72005/abdullah-orchestrator/commits/main
 [1.2.1]: docs/release-evidence/verified-parallel-orchestration/README.md
 [1.2.0]: docs/release-evidence/v1.2.0/README.md
 [1.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0

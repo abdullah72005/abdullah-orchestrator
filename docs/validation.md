@@ -410,9 +410,31 @@ The Architect verdict was **CONDITIONAL PASS**: authenticated candidate host
 validation remains open. Fixture results and local supervisor checks are not
 authenticated host or provider-settlement evidence.
 
-### Antigravity and autonomous progression candidate (fixture-tested)
+### v1.2.2 publication (2026-11-28)
 
-The three-host candidate adds deterministic coverage for: Codex/Claude/Antigravity
+The v1.2.2 code was Architect-approved at
+`b6b01eafa8f976b30ef16bb78ea7c1d564b68926` (`b6b01ea`) and published on `main`
+without a tag or GitHub release. Public product version is `1.2.2`; supervisor
+`3.1.0`, state/config schema `3`, worker report contract `2` and verification
+evidence `2` are unchanged.
+
+| Check | Result |
+|---|---|
+| Full discovery at `7ec3d4a` | exit 0 — **1,399 tests, 10 skipped, OK**, 2,474.80 s on Python 3.10.12, clean tree |
+| Focused parallel-runner tests at `b6b01ea` | exit 0 — **34 tests, OK** |
+| CLI-relative selection tests at `b6b01ea` | exit 0 — **4 tests, OK**, revision `b6b01ea` |
+| `orchestrator.py version` at publication | product `1.2.2`; supervisor `3.1.0`; state schema `3`; config schema `3`; report contract `2` |
+
+The full discovery belongs to `7ec3d4a` and was not rerun at `b6b01ea`; the
+final focused checks are the `b6b01ea` results. The publication commit changes
+only the public version constant, its assertions and documentation. Antigravity
+remains fixture-tested with authenticated CLI/desktop acceptance pending, and
+the native Reviewer handoff still needs an eligible authority-bound verification
+record before a live dispatch.
+
+### Antigravity fixture coverage (v1.2.2)
+
+The three-host release adds deterministic coverage for: Codex/Claude/Antigravity
 routing with explicit host validation; guarded `agy` capability checks; large
 Arabic UTF-8 prompts on stdin only; terminal-report/session/conflict validation;
 configure-models projection; automatic high-risk multi-writer progression;
@@ -443,7 +465,7 @@ absent from the validation shell. Therefore:
   observed;
 - fixture success is never reported as live host support.
 
-The candidate's validation shell was checked directly: `command -v agy` and
+The release's validation shell was checked directly: `command -v agy` and
 `command -v antigravity` returned nothing; the only matching local file,
 `/usr/lib/python3.10/antigravity.py`, is Python's standard-library simulation
 module, not the Antigravity CLI. On the Windows side, no Antigravity application
@@ -629,7 +651,8 @@ Be explicit with reviewers and users:
 - **Linux-only managed configuration.** Managed OpenCode/Claude files are
   covered on Linux; macOS and Windows managed delivery is not certified.
 - **`doctor`** does not authenticate, prove entitlement, or run a model.
-- **Antigravity is not live-certified.** No authenticated `agy` CLI or Windows
+- **Antigravity is fixture-tested; authenticated live acceptance is pending.**
+  No authenticated `agy` CLI or Windows
   desktop stage has run; `agy` was absent from the validation shell. Guarded
   argv, stdin UTF-8 transport, report validation, setup merging and routing are
   fixture-tested only. The mandatory real CLI and desktop acceptance, a >180 s

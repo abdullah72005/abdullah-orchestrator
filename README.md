@@ -7,7 +7,7 @@
 <p align="center"><strong>Strong-model decisions. Cost-conscious execution. Independent verification. One controlling conversation.</strong></p>
 
 <p align="center">
-  <a href="docs/release-evidence/verified-parallel-orchestration/README.md"><img alt="Release v1.2.1 candidate" src="https://img.shields.io/badge/release-v1.2.1%20candidate-2f6f4e"></a>
+  <a href="CHANGELOG.md#122--2026-11-28"><img alt="Release v1.2.2 on main" src="https://img.shields.io/badge/release-v1.2.2%20on%20main-2f6f4e"></a>
   <a href="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab"></a>
   <a href="#requirements"><img alt="Runtime: standard library only" src="https://img.shields.io/badge/runtime-stdlib%20only-4b5563"></a>
@@ -27,24 +27,27 @@ provider, model, reasoning variant and billing classification per role. The
 default worker route is OpenCode Go.
 
 > [!IMPORTANT]
-> **Project status — v1.2.1 release candidate.** Codex + OpenCode V2 is
+> **Project status — v1.2.2 published on `main`.** Codex + OpenCode V2 is
 > the primary route; Codex + OpenCode Go end-to-end execution and
 > interrupted-run recovery are demonstrated. OpenCode V1 remains experimental.
 > Claude Code has passed installed-CLI registration and a headless
 > fixture-backed planning stage, and the Windows Codex desktop with a WSL agent
 > completed planning and implementation through the disposable supervisor.
-> Antigravity is **opt-in and not live-certified**: guarded `agy` routing, stdin
-> transport, terminal report validation and CLI/desktop setup are fixture-tested,
-> but no authenticated Antigravity CLI or desktop run has passed, and `agy` was
-> absent from the validation shell.
+> The v1.2.2 code was Architect-approved at `b6b01ea`.
+> **v1.2.2** adds opt-in Antigravity, automatic plan progression with in-chat
+> consultation, model controls, compact Reviewer packets, attempt-aware
+> progress, and an opt-in bounded parallel test runner capped at two workers and
+> four logical CPUs. It includes the post-v1.2.0 live-progress and single-chat
+> reporting follow-up. Antigravity is **fixture-tested with authenticated live
+> acceptance pending**: guarded `agy` routing, stdin transport, terminal report
+> validation and CLI/desktop setup pass deterministic fixtures, but no
+> authenticated Antigravity CLI or desktop run has passed, and `agy` was absent
+> from the validation shell. The native Reviewer handoff still needs eligible
+> verification evidence for a live dispatch.
 > Authenticated long Claude stages, desktop Stop controls and same-session
-> Reviewer shell/edit capability remain unverified.
-> **v1.2.1** adds supervisor-bound verification reuse, bounded stage progress,
-> opt-in parallel writers, explicit skill routing and grouped permission
-> preflight. It includes the post-v1.2.0 live-progress and single-chat reporting
-> follow-up. Native in-chat progress was observed only on Claude Code CLI; Codex
-> CLI and Claude desktop lack a verified in-chat live view, and Codex desktop
-> tool-card progress remains unverified.
+> Reviewer shell/edit capability remain unverified. Native in-chat progress was
+> observed only on Claude Code CLI; Codex CLI and Claude desktop lack a verified
+> in-chat live view, and Codex desktop tool-card progress remains unverified.
 > Broader live compatibility and long-duration endurance testing remain ongoing.
 > See [Tested behavior](#tested-behavior) and
 > [Security and limitations](#security-and-limitations).
@@ -150,7 +153,7 @@ See [Tested behavior](#tested-behavior) and [docs/validation.md](docs/validation
 | OS | **Linux or WSL2 (Ubuntu)** — the verified platform. Native macOS/Windows and managed configuration delivery are not certified. |
 | Python | **3.10+**, standard library only (no `pip install`, no virtualenv required). CI runs 3.10, 3.12 and 3.13. |
 | Git | Any reasonably current `git`; verification uses real checkouts and worktrees. |
-| Host CLI | Codex CLI, Claude Code CLI, or the opt-in Antigravity `agy` CLI, authenticated for your own account. Antigravity is not live-certified in this candidate. |
+| Host CLI | Codex CLI, Claude Code CLI, or the opt-in Antigravity `agy` CLI, authenticated for your own account. Antigravity is fixture-tested; authenticated live acceptance is pending. |
 | Worker CLI | OpenCode on a tested line: `>=1.18 <2.0` or `>=2.2 <3.0`. Other versions are refused instead of guessed. |
 | Worker account | **OpenCode Go** subscription by default, or another OpenCode provider with an explicit, human-authorized billing route. |
 | Docker | Only for projects whose verification needs containers. |
@@ -167,21 +170,23 @@ cd abdullah-orchestrator
 python3 scripts/install_wsl.py --register-codex
 ```
 
-The v1.2.1 candidate is available on `main` without a v1.2.1 release tag.
-To install a specific candidate, check out its recorded commit and run the
-installer:
+v1.2.2 is published on `main` without a `v1.2.2` tag. The clone above is
+sufficient; no tag checkout is required. If you need a reproducible pin, record
+the cloned commit and install from it:
 
 ```bash
 cd /path/to/abdullah-orchestrator
-git rev-parse HEAD
+git rev-parse HEAD          # record this for reproducible installs
 python3 scripts/install_wsl.py --register-codex
 ```
 
-The last published release instructions remain
-[the existing `v1.0.0` tag](https://github.com/abdullah72005/abdullah-orchestrator/tree/v1.0.0).
-The candidate's deterministic evidence is in
+The last tagged release remains
+[`v1.0.0`](https://github.com/abdullah72005/abdullah-orchestrator/tree/v1.0.0).
+The v1.2.2 changes, approval and evidence are in
+[CHANGELOG.md](CHANGELOG.md#122--2026-11-28); historical v1.2.1 Batch 01
+evidence remains in
 [docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md).
-Do not assume a public `v1.2.1` tag or release exists.
+Do not assume a public `v1.2.2` tag or GitHub release exists.
 
 The installer is idempotent and refuses to overwrite unrelated skills or
 servers. It:
@@ -567,6 +572,85 @@ Remaining unverified client behavior:
 - Authenticated long Claude stages and native Claude desktop stop/reconnect
   behavior remain unverified.
 
+## Antigravity, automatic progression and bounded test fan-out (v1.2.2)
+
+v1.2.2 is additive: supervisor protocol `3.1.0`, state/config schema `3`, worker
+report contract `2` and verification evidence `2` are unchanged, and existing
+Codex/Claude configurations stay valid. The code was Architect-approved at
+`b6b01ea`.
+
+### Opt-in Antigravity
+
+Antigravity is an optional third controlling host, enabled by configuration.
+CLI/MCP schemas, doctor, route resolution, billing preflight, skill discovery,
+progress, cancellation and recovery all understand it; a config without
+`architect.antigravity` behaves exactly as before, and adapters never fall
+through to Claude behavior. `agy` dispatch is separately guarded: installed-help
+capability gating, stdin-only UTF-8 transport for large Arabic prompts, terminal
+structured reports with session identity, and rejection of incomplete streams,
+conflicting results, wrong sessions, permission-denied work and unsupported
+model/effort. Setup merges settings by explicit path, backs up first, is
+idempotent, and refuses missing, invalid or conflicting files. Antigravity is
+**fixture-tested; authenticated CLI and Windows desktop acceptance is pending**,
+including a stage longer than 180 s, rendering, interruption, reconnect and
+resume.
+
+### Automatic progression and consultation
+
+A valid plan proceeds to implementation without a terminal approval step,
+regardless of risk, complexity or writer count. Design consultation remains
+opt-in: an explicit request creates a gate, and the user answers in the
+controlling conversation. The coordinator records that reply with
+`orchestrator_consult`; a material reply creates a versioned amended plan, a
+stale reply is rejected, and accepting an unchanged proposal needs no separate
+command. Human-only `approve-plan`, `authorize-route`, `approve-fallback` and
+`retire` remain CLI-only.
+
+### Model controls
+
+`orchestrator_models` (or `orchestrator.py models`) shows and validates every
+role and host, separating the host-managed conversation model from the
+dispatched Architect. Future-run defaults change only through the human-only,
+atomic, backup-first `set-default` preview/apply with typed confirmation, High
+Architect enforcement and explicit billing acknowledgment; existing run pins
+and evidence are untouched.
+
+### Compact Reviewer packets
+
+The Reviewer handoff no longer inlines bulk delta-index entries. It carries a
+validated digest-bound reference to the read-only projection, whose complete
+index, hunks, raw verification record and byte-identical check logs stay
+readable there. Prompts keep each command's argv, exit code, `log_path`,
+`log_sha256`, `log_bytes` and a concise 300-character excerpt, so a large review
+stays below the route's UTF-8 argv budget. Missing, altered, symlinked, escaping
+or mismatched references block before Reviewer launch. The native Reviewer
+handoff still needs eligible verification evidence for a live dispatch; fixture
+packets are explicitly not authority-bound saved-run verification.
+
+### Attempt-aware progress
+
+Foreground progress is bound to the admitted attempt and its real launch
+evidence rather than a run-wide rejection or a cleared `active_job`. A stale
+preflight rejection cannot mask a newer running worker, a launched failure stays
+visible after cleanup, a bare spawn failure is not launch proof, and an
+unproven or expired check owner is blocked for reconciliation. MCP progress
+keeps the launch/status statement, blocker code, actor, next action and elapsed
+time inside its 240-character bound, and the plain viewer refreshes on check or
+launch changes.
+
+### Opt-in bounded parallel tests
+
+`scripts/run_tests_parallel.py` is a developer helper, not the default gate.
+Serial execution stays the default; opting in allows at most two workers and
+four logical CPUs in aggregate at lower priority, and command-line overrides can
+only tighten those bounds. It partitions by module so fixtures stay intact,
+accounts for every unique selected test exactly once, proves the affinity and
+priority prefix (plus Windows-host memory headroom under WSL) before launching,
+falls back to serial when a proof fails, and contains each group's whole process
+tree. Per-group counts come from `TestResult` sidecars, signal-terminated workers
+are classified as interrupted, and a dirty or changing checkout is labelled a
+local diagnostic.
+
 ## Verified verification reuse, parallel writers, skills and preflight (v1.2.1)
 
 v1.2.1 is additive: existing state/protocol versions, manual plan approval,
@@ -810,6 +894,18 @@ part of this v1.2.0 list.
 
 ## Tested behavior
 
+**v1.2.2 release (offline, no model calls):** the code was Architect-approved at
+`b6b01eafa8f976b30ef16bb78ea7c1d564b68926` (`b6b01ea`). The earlier full
+discovery belongs to `7ec3d4a`: **1,399 tests, 10 skipped, OK** in 2,474.80 s on
+Python 3.10.12, clean tree. After the final runner corrections, focused checks at
+`b6b01ea` passed: **34 parallel-runner tests** and **4 CLI-relative selection
+tests**, both OK. The full discovery was not rerun at `b6b01ea`; those focused
+results are the final checks, and the earlier full-suite result is not presented
+as a `b6b01ea` run. Antigravity, consultation, progression and Reviewer-packet
+coverage is fixture-based; no authenticated Antigravity or live Reviewer run is
+claimed. This publication changed only the public version constant, its
+assertions and documentation.
+
 **v1.2.1 candidate suite (offline, no model calls):** the accepted Batch 01
 candidate `bfa77f2407900e0155aceaa66b3d1398e63bdbc6` (`bfa77f2`) ran **1,342
 tests, with 1,332 passing and 10 skipped** in 2,338.90 s on Python 3.10.12.
@@ -939,7 +1035,8 @@ Reporting: [SECURITY.md](SECURITY.md).
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → exact recovery command |
 | [docs/versioning.md](docs/versioning.md) | Public release vs supervisor, schema and contract versions |
 | [docs/validation.md](docs/validation.md) | Test evidence, E2E milestone, explicit non-claims |
-| [docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md) | v1.2.1 Batch 01 acceptance evidence and measurements |
+| [CHANGELOG.md](CHANGELOG.md) | v1.2.2 changes, approval, evidence and historical release notes |
+| [docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md) | v1.2.1 Batch 01 acceptance evidence and measurements (historical) |
 | [docs/release-evidence/live-progress/](docs/release-evidence/live-progress/README.md) | Follow-up live-progress evidence, desktop fixture and operator steps |
 | [docs/security-model.md](docs/security-model.md) | Trust boundaries, permissions, limitations |
 | [docs/maintenance.md](docs/maintenance.md) | Distribution, backup, rollback, OpenCode V1→V2 handoff |
@@ -948,20 +1045,27 @@ Reporting: [SECURITY.md](SECURITY.md).
 
 ## Project status
 
-**v1.2.1 release candidate.** Adds supervisor-bound reuse of the formal
-verification for final acceptance, bounded stage progress with replay, opt-in
-parallel writers with isolated worktrees and exact integration, explicit
-role/writer skill routing, and grouped permission preflight with durable blocked
-recovery. It keeps the v1.2.0 escalation, versioned replans, verbatim user
-requirements, independent review evidence, stdin prompt transport, byte-aware
-OpenCode exec checks, foreground stage announcements, the ordinary Medium
-planning trial, the `gpt-6.2-sol` Codex Architect default, and scoped Superpowers
-instructions for active runs. The Batch 01 candidate suite result is recorded in
+**v1.2.2 published on `main`.** Adds opt-in Antigravity, automatic plan
+progression with in-chat consultation, model controls, compact Reviewer packets,
+attempt-aware progress, and opt-in parallel tests bounded to two workers and four
+logical CPUs. The code was Architect-approved at `b6b01ea`; Antigravity is
+fixture-tested with authenticated live acceptance pending, and the native
+Reviewer handoff still needs eligible verification evidence. Internal versions
+are unchanged: supervisor `3.1.0`, state/config schema `3`, worker report
+contract `2`. The release keeps the v1.2.1 supervisor-bound reuse of formal
+verification, bounded stage progress with replay, opt-in parallel writers with
+isolated worktrees and exact integration, explicit role/writer skill routing,
+and grouped permission preflight with durable blocked recovery, plus the v1.2.0
+escalation, versioned replans, verbatim user requirements, independent review
+evidence, stdin prompt transport, byte-aware OpenCode exec checks, foreground
+stage announcements, the ordinary Medium planning trial, the `gpt-6.2-sol`
+Codex Architect default, and scoped Superpowers instructions for active runs.
+The v1.2.1 Batch 01 candidate suite result remains recorded in
 [docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md);
 the historical v1.2.0 result remains in
 [docs/release-evidence/v1.2.0/](docs/release-evidence/v1.2.0/README.md).
 The post-v1.2.0 live-progress and single-chat reporting follow-up is included in
-v1.2.1; its 1,183-test evidence belongs to revision `720dd7c` and is preserved
+v1.2.2; its 1,183-test evidence belongs to revision `720dd7c` and is preserved
 as that follow-up's result.
 Codex + OpenCode Go E2E and interrupted-run recovery demonstrated at v1.0.0.
 Broader live compatibility and endurance testing remain ongoing. Earlier

@@ -120,7 +120,7 @@ CONFIG_SELECTION_PREFERENCE_PATHS = tuple(
 # Public product release.  Independent of the internal supervisor/protocol
 # version, state schema and worker report contract so that a public tag never
 # invalidates pinned configuration or saved runs.
-PRODUCT_VERSION = "1.2.1"
+PRODUCT_VERSION = "1.2.2"
 SUPERVISOR_VERSION = "3.1.0"
 STATE_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 3
