@@ -638,7 +638,7 @@ def run_group(group, *, start_dir, output_dir, limits, env=None,
               timeout=None, registry=None, termination_grace=5.0):
     """Run one group in its own process tree and capture a bounded result."""
     start_dir = Path(start_dir).resolve()
-    output = Path(output_dir)
+    output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(output, group["name"])
     result_path = output / ("%s.result.json"
@@ -747,6 +747,7 @@ def execute_plan(plan, *, start_dir, output_dir, limits, group_runner=None,
                  serial_first=True, registry=None):
     """Execute serial groups first, then at most two parallel groups."""
     group_runner = group_runner or run_group
+    output_dir = Path(output_dir).resolve()
     results = []
     planned = list(plan.get("serial") or [])
     parallel = list(plan.get("parallel") or [])
@@ -760,6 +761,8 @@ def execute_plan(plan, *, start_dir, output_dir, limits, group_runner=None,
     all_groups = planned + parallel
     started_groups = set()
     cancelled = threading.Event()
+    unproven_groups = set()
+    active_futures = []
 
     def run(group):
         if cancelled.is_set():
@@ -791,6 +794,7 @@ def execute_plan(plan, *, start_dir, output_dir, limits, group_runner=None,
                     with concurrent.futures.ThreadPoolExecutor(
                             max_workers=len(batch)) as pool:
                         futures = [pool.submit(run, group) for group in batch]
+                        active_futures = futures
                         try:
                             for future in futures:
                                 results.append(future.result())
@@ -798,20 +802,43 @@ def execute_plan(plan, *, start_dir, output_dir, limits, group_runner=None,
                             # Stop live trees before the executor's shutdown
                             # waits, and prevent any queued shard from starting.
                             cancelled.set()
-                            _terminate_active(registry)
+                            unproven_groups.update(_terminate_active(registry))
                             raise
                 index += limits["workers"]
     except KeyboardInterrupt:
         # Stop every live process tree before returning an interrupted report.
         cancelled.set()
-        unproven = set(_terminate_active(registry))
+        unproven_groups.update(_terminate_active(registry))
         done = {result.get("name") for result in results}
+        # The executor has shut down by now.  Keep results from workers that
+        # finished, even when a sibling's KeyboardInterrupt won the race.
+        for future in active_futures:
+            if not future.done() or future.cancelled():
+                continue
+            try:
+                captured = future.result()
+            except BaseException:
+                continue
+            if not isinstance(captured, dict):
+                continue
+            name = captured.get("name")
+            if not name or name in done:
+                continue
+            results.append(captured)
+            done.add(name)
+            if captured.get("containment_failed"):
+                unproven_groups.add(name)
+            elif not captured.get("cancelled"):
+                # A captured result from a worker that actually ran with
+                # proven containment is affirmative stop evidence.  A
+                # never-started cancelled placeholder is not.
+                unproven_groups.discard(name)
         for group in all_groups:
             if group["name"] not in done:
                 results.append(_unstarted_result(
                     group, output_dir, "runner interrupted",
                     started=group["name"] in started_groups,
-                    termination_unproven=group["name"] in unproven))
+                    termination_unproven=group["name"] in unproven_groups))
     return results
 
 
@@ -1075,8 +1102,8 @@ def main(argv=None):
         print(json.dumps({"discovery": discovery, "selection": selected,
                           "plan": plan, "limits": limits}, indent=2))
         return 0
-    output_dir = Path(args.output_dir) if args.output_dir else Path(
-        tempfile.mkdtemp(prefix="abdullah-tests-"))
+    output_dir = (Path(args.output_dir) if args.output_dir else Path(
+        tempfile.mkdtemp(prefix="abdullah-tests-"))).resolve()
     source_before = _source_state(start_dir)
     results = execute_plan(plan, start_dir=start_dir, output_dir=output_dir,
                            limits=limits,

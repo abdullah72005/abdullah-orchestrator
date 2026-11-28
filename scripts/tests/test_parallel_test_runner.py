@@ -8,6 +8,7 @@ and result aggregation.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "run_tests_parallel.py"
@@ -648,6 +650,61 @@ class ExecutionAggregationTests(RunnerFixture):
         self.assertEqual(totals["ran"], 0)
         self.assertEqual(totals["exit_code"], 1)
 
+    def test_parallel_cancellation_keeps_cleanup_verdict_and_result(self):
+        groups = [
+            {"name": "worker:%d" % index, "modules": ["module%d" % index],
+             "tests": ["module%d.Cases.test_one" % index], "serial": False}
+            for index in (1, 2, 3)
+        ]
+        calls = []
+        cleanups = []
+        second_started = threading.Event()
+
+        def fake(group, **_kwargs):
+            calls.append(group["name"])
+            if group["name"] == "worker:1":
+                self.assertTrue(second_started.wait(5),
+                                "worker:2 never started")
+                raise KeyboardInterrupt
+            if group["name"] == "worker:2":
+                second_started.set()
+                return {"name": "worker:2", "tests": group["tests"],
+                        "counts": {"ran": 1, "failures": 0,
+                                   "errors": 0, "skipped": 0},
+                        "outcomes": {"module2.Cases.test_one": "success"},
+                        "returncode": 0}
+            return {"name": group["name"], "tests": group["tests"],
+                    "counts": {"ran": 1}, "returncode": 0}
+
+        def cleanup(_registry=None):
+            cleanups.append(True)
+            return ["worker:1"] if len(cleanups) == 1 else []
+
+        output = self.root / "cancel-verdict-logs"
+        output.mkdir()
+        (output / "worker-1.log").write_text("partial output\n",
+                                             encoding="utf-8")
+        limits = runner.resolve_limits(workers=1)
+        limits["workers"] = 2
+        with patch.object(runner, "_terminate_active", side_effect=cleanup):
+            results = runner.execute_plan(
+                {"serial": [], "parallel": groups, "selected": 3},
+                start_dir=self.tests, output_dir=output, limits=limits,
+                group_runner=fake)
+        self.assertEqual(len(cleanups), 2)
+        by_name = {result["name"]: result for result in results}
+        self.assertTrue(by_name["worker:1"].get("interrupted"))
+        self.assertTrue(by_name["worker:1"].get("partial"))
+        self.assertTrue(Path(by_name["worker:1"]["log"]["path"]).is_file())
+        self.assertTrue(by_name["worker:2"].get("counts"))
+        self.assertEqual(by_name["worker:2"]["counts"]["ran"], 1)
+        self.assertTrue(by_name["worker:3"].get("cancelled"))
+        self.assertNotIn("worker:3", calls)
+        totals = runner.aggregate(results, selected=3)
+        self.assertEqual(totals["unproven_groups"], ["worker:1"])
+        self.assertEqual(totals["cancelled_groups"], ["worker:3"])
+        self.assertEqual(totals["exit_code"], 1)
+
     def test_source_fingerprint_and_report_mark_a_changing_checkout(self):
         before = {"head": "a" * 40, "dirty": False, "fingerprint": "before"}
         after = {"head": "a" * 40, "dirty": True, "fingerprint": "after"}
@@ -669,6 +726,28 @@ class ExecutionAggregationTests(RunnerFixture):
         self.assertEqual(report["selection"]["duplicate_ids"],
                          {"test_alpha.Cases.test_one": 2})
         self.assertEqual(report["revision"], "a" * 40)
+
+    def test_relative_output_dir_keeps_logs_and_sidecar_out_of_checkout(self):
+        previous = Path.cwd()
+        os.chdir(self.root)
+        try:
+            with redirect_stdout(io.StringIO()):
+                code = runner.main([
+                    "--start-dir", "tests", "--module", "test_alpha",
+                    "--output-dir", "logs", "--workers", "1"])
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 0)
+        logs = self.root / "logs"
+        self.assertEqual(
+            sorted(path.name for path in logs.iterdir()),
+            ["serial-worker-1.log", "serial-worker-1.result.json"])
+        self.assertFalse((self.tests / "logs").exists())
+        self.assertEqual(list(self.tests.rglob("*.log")), [])
+        self.assertEqual(list(self.tests.rglob("*.result.json")), [])
+        report = json.loads(
+            (logs / "serial-worker-1.result.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["ran"], 3)
 
     def test_clean_stable_source_is_labelled_reusable(self):
         stable = {"head": "b" * 40, "dirty": False, "fingerprint": "same"}
