@@ -68,13 +68,19 @@ shell, so both mandatory live surfaces remain open blockers.
   incident), accounts for every unique selected test exactly once, and limits two
   workers to four logical CPUs in aggregate at lower priority; command-line
   overrides can only tighten those bounds. The planned affinity/priority prefix
-  and, under WSL, Windows-host memory headroom are proved before parallel work
-  starts. It falls back to serial when a proof fails or memory is tight,
-  deduplicates imported discovery aliases (refusing conflicting ids), accounts
-  class-level skips as valid coverage, classifies signal-terminated workers as
-  interrupted rather than failed, fingerprints the source before and after the
-  run, and reports exact commands, logs, digests, worker/CPU limits, cancelled
-  groups and aggregate counts.
+  for every worker and, under WSL, Windows-host memory headroom are proved before
+  parallel work starts; the memory floor can only be raised. It falls back to
+  serial when a proof fails, guest memory is unprovable or tight, or host
+  headroom is unavailable. Each group's counts and per-test outcomes come from
+  its own `TestResult` sidecar, so nested suites or printed summaries cannot
+  change accounting; class/module skips cover only their own tests. It also
+  deduplicates imported discovery aliases (refusing conflicting ids), classifies
+  signal-terminated workers as interrupted rather than failed, stops and proves
+  containment of each group's whole process tree (including descendants that
+  outlive the leader), fingerprints tracked changes and untracked source bytes
+  before and after the run, labels dirty or changing runs as local diagnostics,
+  and reports exact commands, logs, digests, worker/CPU limits, cancelled and
+  unproven groups and aggregate counts.
 - The Reviewer packet proof now runs through the real renderer and OpenCode
   argv/transport preparation with spawn intercepted in a linked worktree. It
   re-reads every manifest file, delta/index, referenced hunk, raw verification

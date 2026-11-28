@@ -28,6 +28,12 @@ Hard bounds are repository policy, not defaults that a flag can relax: at most
 two workers, at most four logical CPUs across their process trees, and reduced
 scheduling priority.  ``--workers``/``--cpu-budget`` may only tighten those
 bounds and ``--nice`` only raises the effective niceness.
+
+Each group runs through ``_unittest_group.py``, which writes the child's own
+``TestResult`` counts and per-test outcomes to a sidecar file.  The runner never
+derives its accounting from ordinary test output, so nested suites and printed
+``Ran N tests`` lines cannot change the result.  A group whose process tree or
+sidecar cannot be proven is reported as unproven rather than passed.
 """
 from __future__ import annotations
 
@@ -64,7 +70,9 @@ DEFAULT_WORKERS = 2
 DEFAULT_NICE = 10
 DEFAULT_MIN_MEMORY_MB = 1024
 _TEST_ID = re.compile(r"^[A-Za-z_][\w.]*$")
-_CLASS_SKIP = re.compile(r"^skipped\s+'", re.MULTILINE)
+_CLASS_SKIP_PREFIX = "setUpClass ("
+_MODULE_SKIP_PREFIX = "setUpModule ("
+_GROUP_HELPER = Path(__file__).resolve().with_name("_unittest_group.py")
 
 
 def _module_of(test_id):
@@ -283,14 +291,17 @@ def resolve_limits(*, workers=DEFAULT_WORKERS, cpu_budget=DEFAULT_CPU_BUDGET,
 
     Repository bounds can only be tightened: at most two workers, at most
     ``DEFAULT_CPU_BUDGET`` logical CPUs and at least ``DEFAULT_NICE`` reduced
-    priority.  ``wsl``/``host_memory_mb`` add the Windows-host headroom gate;
-    an unprovable host value is treated conservatively as unavailable.
+    priority.  ``min_memory_mb`` may only raise the repository floor; a caller
+    cannot lower it to admit parallel work on a tight host.  ``wsl``/
+    ``host_memory_mb`` add the Windows-host headroom gate; an unprovable host
+    value is treated conservatively as unavailable.
     """
     requested = min(2, max(1, int(workers)))
     requested_cpu_budget = max(1, int(cpu_budget))
     cpu_budget = min(requested_cpu_budget, DEFAULT_CPU_BUDGET)
     requested_nice = int(nice)
     effective_nice = min(19, max(DEFAULT_NICE, requested_nice))
+    min_memory_mb = max(DEFAULT_MIN_MEMORY_MB, int(min_memory_mb))
     if taskset_available is False:
         taskset = None
     else:
@@ -308,6 +319,9 @@ def resolve_limits(*, workers=DEFAULT_WORKERS, cpu_budget=DEFAULT_CPU_BUDGET,
     if (requested > 1 and memory is not None
             and memory < int(min_memory_mb)):
         fallback = ("available memory is below %d MB" % int(min_memory_mb))
+    if requested > 1 and memory is None:
+        fallback = ("available memory could not be proven, so a conservative "
+                    "serial run is required")
     if requested > 1 and wsl:
         if host_memory_mb is None:
             fallback = ("the Windows host memory headroom is unavailable under "
@@ -351,54 +365,76 @@ def _run_affinity_probe(command):
     return completed.returncode, completed.stdout or ""
 
 
+def _affinity_prefix(taskset, cpus, nice):
+    prefix = [taskset, "-c", ",".join(str(cpu) for cpu in cpus)]
+    if nice:
+        prefix.extend(["nice", "-n", str(nice)])
+    return prefix
+
+
 def probe_parallel_environment(limits, *, probe=None):
-    """Prove the planned affinity and priority before starting parallel work.
+    """Prove every planned affinity and priority before starting parallel work.
 
     ``taskset`` being installed does not mean the planned affinity is legal in
-    the current container or WSL session.  Exercise the exact prefix once with
-    an interpreter no-op.  A failure returns the serial fallback: this runs
-    before any group starts, so no parallel test work has been launched.
+    the current container or WSL session.  Exercise the exact prefix for each
+    planned worker once with an interpreter no-op.  A failure returns the serial
+    fallback: this runs before any group starts, so no parallel test work has
+    been launched.
     """
     limits = dict(limits or {})
     limits.setdefault("affinity_verified", False)
     if limits.get("workers", 1) <= 1 or not limits.get("taskset"):
         return limits
     assignments = limits.get("cpu_assignments") or []
-    chosen = assignments[0] if assignments else []
-    if not chosen:
+    if not assignments or not all(assignments):
         limits.update({"workers": 1, "serial_fallback": True,
                        "affinity_verified": False,
                        "fallback_reason": "no logical CPU is available for "
                                           "affinity"})
         return limits
-    command = [limits["taskset"], "-c",
-               ",".join(str(cpu) for cpu in chosen)]
     nice = int(limits.get("nice") or 0)
-    if nice:
-        command.extend(["nice", "-n", str(nice)])
-    command.extend([sys.executable, "-c", "pass"])
+    commands = []
+    for chosen in assignments:
+        command = _affinity_prefix(limits["taskset"], chosen, nice)
+        command.extend([sys.executable, "-c", "pass"])
+        commands.append(command)
     runner = probe or _run_affinity_probe
-    try:
-        returncode, detail = runner(command)
-    except (OSError, subprocess.SubprocessError) as exc:
-        returncode, detail = None, str(exc)
-    if returncode != 0:
-        reason = ("taskset could not apply the planned CPU affinity/priority"
-                  + (": " + detail.strip() if detail and detail.strip() else ""))
-        limits.update({"workers": 1, "serial_fallback": True,
-                       "affinity_verified": False, "fallback_reason": reason})
-        return limits
+    verified = []
+    for command in commands:
+        try:
+            returncode, detail = runner(command)
+        except (OSError, subprocess.SubprocessError) as exc:
+            returncode, detail = None, str(exc)
+        if returncode != 0:
+            reason = ("taskset could not apply the planned CPU affinity/priority"
+                      + (": " + detail.strip()
+                         if detail and detail.strip() else ""))
+            limits.update({"workers": 1, "serial_fallback": True,
+                           "affinity_verified": False,
+                           "verified_assignments": verified,
+                           "fallback_reason": reason})
+            return limits
+        verified.append(command[command.index("-c") + 1])
     limits["affinity_verified"] = True
+    limits["verified_assignments"] = verified
     return limits
 
 
 def build_group_command(group, *, python=sys.executable, limits=None,
-                        start_dir=None):
-    """Build one exact unittest command with the CPU/nice prefix."""
-    command = [python, "-m", "unittest", "-v"] + list(group["tests"])
+                        start_dir=None, result_path=None):
+    """Build one exact group command with the CPU/nice prefix.
+
+    With ``result_path`` the command runs ``_unittest_group.py`` so the child
+    records its own counts and outcomes.  Without it, the command is the plain
+    ``python -m unittest -v`` form used by diagnostics and command fixtures.
+    """
+    tests = list(group["tests"])
+    if result_path is not None:
+        command = [python, str(_GROUP_HELPER), str(result_path)] + tests
+    else:
+        command = [python, "-m", "unittest", "-v"] + tests
     limits = limits or {}
     if limits.get("workers", 0) > 1 and limits.get("taskset"):
-        prefix = []
         index = None
         name = group.get("name") or ""
         if name.startswith("worker:"):
@@ -409,22 +445,25 @@ def build_group_command(group, *, python=sys.executable, limits=None,
         assignments = limits.get("cpu_assignments") or []
         chosen = assignments[index] if index is not None and index < len(assignments) else []
         if chosen:
-            prefix.extend([limits["taskset"], "-c", ",".join(str(cpu) for cpu in chosen)])
-        nice = int(limits.get("nice") or 0)
-        if nice:
-            prefix.extend(["nice", "-n", str(nice)])
-        command = prefix + command
+            command = _affinity_prefix(limits["taskset"], chosen,
+                                       int(limits.get("nice") or 0)) + command
     return command
 
 
 def _parse_unittest_output(text):
+    """Read the runner's own final summary from a combined log.
+
+    Ordinary tests can print their own ``Ran N tests`` and ``OK`` lines (for
+    example when they run a nested suite).  The group's summary is emitted last,
+    so the final match is the authoritative one for display and fallback.
+    """
     counts = {"ran": 0, "failures": 0, "errors": 0, "skipped": 0}
-    match = re.search(r"^Ran (\d+) tests? in ", text, re.MULTILINE)
-    if match:
-        counts["ran"] = int(match.group(1))
-    status = re.search(r"^(OK|FAILED)\b(.*)$", text, re.MULTILINE)
-    if status:
-        detail = status.group(2)
+    matches = list(re.finditer(r"^Ran (\d+) tests? in ", text, re.MULTILINE))
+    if matches:
+        counts["ran"] = int(matches[-1].group(1))
+    statuses = list(re.finditer(r"^(OK|FAILED)\b(.*)$", text, re.MULTILINE))
+    if statuses:
+        detail = statuses[-1].group(2)
         for key in ("failures", "errors", "skipped"):
             found = re.search(r"%s=(\d+)" % key, detail)
             if found:
@@ -445,68 +484,171 @@ _ACTIVE_PROCS = {}
 _ACTIVE_LOCK = threading.Lock()
 
 
-def _signal_group(proc, number):
+def _signal_group(proc, number, pgid=None):
+    if pgid is None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (OSError, ProcessLookupError):
+            pgid = proc.pid
     try:
-        os.killpg(os.getpgid(proc.pid), number)
-    except (OSError, ProcessLookupError):
+        os.killpg(pgid, number)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
         try:
             proc.send_signal(number)
+            return True
         except (OSError, ProcessLookupError):
-            pass
+            return False
+
+
+def _group_alive(pgid):
+    """Whether any process remains in ``pgid``'s process group."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_group_gone(pgid, timeout):
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if not _group_alive(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
 
 
 def _terminate_group(proc, *, grace=5.0):
-    """Stop one group's whole process tree; return its final return code."""
+    """Stop one group's whole process tree.
+
+    Waiting for the leader is not enough: a descendant can ignore SIGTERM (or
+    keep running) after the leader exits and would otherwise escape the runner.
+    This waits for the entire process group, escalates to SIGKILL, and reports
+    whether containment could actually be proven.
+
+    Returns ``(returncode, contained)``.
+    """
     if proc is None:
-        return None
-    if proc.poll() is not None:
-        return proc.returncode
-    _signal_group(proc, signal.SIGTERM)
+        return None, True
     try:
-        return proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        _signal_group(proc, signal.SIGKILL)
+        pgid = os.getpgid(proc.pid)
+    except (OSError, ProcessLookupError):
+        pgid = proc.pid
+    if proc.poll() is None:
+        _signal_group(proc, signal.SIGTERM, pgid)
         try:
-            return proc.wait(timeout=grace)
+            proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
-            return None
+            pass
+    if _group_alive(pgid):
+        _signal_group(proc, signal.SIGTERM, pgid)
+        if not _wait_group_gone(pgid, grace):
+            _signal_group(proc, signal.SIGKILL, pgid)
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+            if not _wait_group_gone(pgid, grace):
+                return proc.poll(), False
+    return proc.poll(), True
 
 
 def _terminate_active(registry=None):
+    """Stop every registered group; return names whose containment is unproven."""
     registry = _ACTIVE_PROCS if registry is None else registry
     with _ACTIVE_LOCK:
         procs = list(registry.items())
-    for _name, proc in procs:
-        _terminate_group(proc)
+    unproven = []
+    for name, proc in procs:
+        _returncode, contained = _terminate_group(proc)
+        if not contained:
+            unproven.append(name)
+    return unproven
 
 
 def _log_path(output_dir, name):
     return Path(output_dir) / ("%s.log" % name.replace(":", "-"))
 
 
-def _annotate_log(result, path):
+def _annotate_log(result, path, *, parse_counts=False):
     path = Path(path)
     if not path.is_file():
         return result
     text = path.read_text(encoding="utf-8", errors="replace")
-    result.update({"counts": _parse_unittest_output(text),
-                   "class_skips": _count_class_skips(text),
-                   "log": _log_digest(path)})
+    if parse_counts and "counts" not in result:
+        result["counts"] = _parse_unittest_output(text)
+    result["log"] = _log_digest(path)
     return result
 
 
-def _count_class_skips(text):
-    """Count bare verbose ``skipped 'reason'`` lines (class/module skips)."""
-    return len(_CLASS_SKIP.findall(text or ""))
+def _read_group_result(path):
+    """Load the child's structured result, or ``None`` when it is unusable."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not all(key in data for key in ("ran", "failures", "errors", "skipped",
+                                       "outcomes")):
+        return None
+    if not isinstance(data.get("outcomes"), dict):
+        return None
+    return data
+
+
+def _covered_ids(selected, outcomes):
+    """Return selected ids with a terminal outcome and class/module expansions.
+
+    A class/module ``SkipTest`` is recorded by unittest as one sentinel skip
+    (``setUpClass (module.Class)``), not as per-test outcomes.  Expanding only
+    the selected tests that belong to that exact class/module keeps a skip
+    elsewhere in the group from accounting for an unrelated missing test.
+    """
+    selected_set = set(selected)
+    outcomes = outcomes or {}
+    covered = {test_id for test_id in outcomes if test_id in selected_set}
+    expanded = set()
+    for test_id, status in outcomes.items():
+        if status != "skipped":
+            continue
+        targets = []
+        if test_id.startswith(_CLASS_SKIP_PREFIX) and test_id.endswith(")"):
+            class_name = test_id[len(_CLASS_SKIP_PREFIX):-1]
+            targets = [selected_id for selected_id in selected_set
+                       if selected_id.startswith(class_name + ".")]
+        elif test_id.startswith(_MODULE_SKIP_PREFIX) and test_id.endswith(")"):
+            module = test_id[len(_MODULE_SKIP_PREFIX):-1]
+            targets = [selected_id for selected_id in selected_set
+                       if _module_of(selected_id) == module]
+        for selected_id in targets:
+            if selected_id not in covered:
+                covered.add(selected_id)
+                expanded.add(selected_id)
+    return covered, expanded
 
 
 def run_group(group, *, start_dir, output_dir, limits, env=None,
-              timeout=None, registry=None):
+              timeout=None, registry=None, termination_grace=5.0):
     """Run one group in its own process tree and capture a bounded result."""
+    start_dir = Path(start_dir).resolve()
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(output, group["name"])
-    command = build_group_command(group, limits=limits, start_dir=start_dir)
+    result_path = output / ("%s.result.json"
+                            % group["name"].replace(":", "-"))
+    try:
+        result_path.unlink()
+    except FileNotFoundError:
+        pass
+    command = build_group_command(group, limits=limits, start_dir=start_dir,
+                                  result_path=result_path)
     child_env = dict(os.environ)
     child_env.pop("PYTHONDONTWRITEBYTECODE", None)
     child_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -534,6 +676,9 @@ def run_group(group, *, start_dir, output_dir, limits, env=None,
             finally:
                 with _ACTIVE_LOCK:
                     registry.pop(group["name"], None)
+        returncode, contained = _terminate_group(proc, grace=termination_grace)
+        if not contained:
+            result["containment_failed"] = True
         if returncode is not None and returncode < 0:
             interrupted = _SIGNAL_NAMES.get(-returncode,
                                             "signal %d" % -returncode)
@@ -543,27 +688,46 @@ def run_group(group, *, start_dir, output_dir, limits, env=None,
                        "elapsed_seconds": round(time.monotonic() - started, 2)})
         return result
     except subprocess.TimeoutExpired:
-        returncode = _terminate_group(proc)
+        returncode, contained = _terminate_group(proc, grace=termination_grace)
+        if not contained:
+            result["containment_failed"] = True
         interrupted = "timeout after %ss" % timeout
         result["error"] = "timed out"
     except BaseException:
-        _terminate_group(proc)
+        _terminate_group(proc, grace=termination_grace)
         raise
     result.update({"returncode": returncode,
                    "elapsed_seconds": round(time.monotonic() - started, 2)})
-    _annotate_log(result, log_path)
+    payload = _read_group_result(result_path)
+    if payload is not None:
+        result.update({
+            "counts": {"ran": int(payload.get("ran") or 0),
+                       "failures": int(payload.get("failures") or 0),
+                       "errors": int(payload.get("errors") or 0),
+                       "skipped": int(payload.get("skipped") or 0)},
+            "outcomes": dict(payload.get("outcomes") or {}),
+            "skip_reasons": dict(payload.get("skip_reasons") or {}),
+            "counts_source": "result",
+        })
+        if payload.get("error"):
+            result["error"] = str(payload["error"])
+    else:
+        result["counts_source"] = "unavailable"
+    _annotate_log(result, log_path, parse_counts=payload is None)
     if interrupted:
         result.update({"interrupted": True, "interrupt_reason": interrupted})
     return result
 
 
-def _unstarted_result(group, output_dir, reason, *, started):
+def _unstarted_result(group, output_dir, reason, *, started,
+                      termination_unproven=False):
     """Result for a group that started but lost its result, or never started."""
     result = {"name": group["name"],
               "modules": list(group.get("modules") or []),
               "tests": list(group["tests"]),
               "serial": bool(group.get("serial")),
               "returncode": None, "counts": {},
+              "counts_source": "unavailable",
               "elapsed_seconds": 0.0}
     if started:
         # The group began before the runner was interrupted: keep any partial
@@ -574,6 +738,8 @@ def _unstarted_result(group, output_dir, reason, *, started):
             result["partial"] = True
     else:
         result.update({"cancelled": True, "cancel_reason": reason})
+    if termination_unproven:
+        result["containment_failed"] = True
     return result
 
 
@@ -593,49 +759,60 @@ def execute_plan(plan, *, start_dir, output_dir, limits, group_runner=None,
             parallel.append(sequential)
     all_groups = planned + parallel
     started_groups = set()
+    cancelled = threading.Event()
 
     def run(group):
+        if cancelled.is_set():
+            return _unstarted_result(group, output_dir, "runner cancelled",
+                                     started=False)
         started_groups.add(group["name"])
         return group_runner(group, start_dir=start_dir,
                             output_dir=output_dir, limits=limits)
 
     try:
         for group in planned:
+            if cancelled.is_set():
+                break
             results.append(run(group))
         if limits.get("workers", 1) <= 1:
             for group in parallel:
+                if cancelled.is_set():
+                    break
                 results.append(run(group))
-            return results
-        # Two workers at most; the plan itself is already disjoint by module.
-        index = 0
-        while index < len(parallel):
-            batch = parallel[index:index + limits["workers"]]
-            if len(batch) == 1:
-                results.append(run(batch[0]))
-            else:
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=len(batch)) as pool:
-                    futures = [pool.submit(run, group) for group in batch]
-                    try:
-                        for future in futures:
-                            results.append(future.result())
-                    except KeyboardInterrupt:
-                        # Stop live trees before the executor's shutdown waits.
-                        _terminate_active(registry)
-                        raise
-            index += limits["workers"]
-        return results
+        else:
+            # Two workers at most; the plan itself is already disjoint by module.
+            index = 0
+            while index < len(parallel) and not cancelled.is_set():
+                batch = parallel[index:index + limits["workers"]]
+                if len(batch) == 1:
+                    results.append(run(batch[0]))
+                else:
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=len(batch)) as pool:
+                        futures = [pool.submit(run, group) for group in batch]
+                        try:
+                            for future in futures:
+                                results.append(future.result())
+                        except KeyboardInterrupt:
+                            # Stop live trees before the executor's shutdown
+                            # waits, and prevent any queued shard from starting.
+                            cancelled.set()
+                            _terminate_active(registry)
+                            raise
+                index += limits["workers"]
     except KeyboardInterrupt:
         # Stop every live process tree before returning an interrupted report.
-        _terminate_active(registry)
+        cancelled.set()
+        unproven = set(_terminate_active(registry))
         done = {result.get("name") for result in results}
         for group in all_groups:
             if group["name"] not in done:
                 results.append(_unstarted_result(
                     group, output_dir, "runner interrupted",
-                    started=group["name"] in started_groups))
-        return results
+                    started=group["name"] in started_groups,
+                    termination_unproven=group["name"] in unproven))
+    return results
 
 
 def aggregate(results, *, selected):
@@ -645,7 +822,8 @@ def aggregate(results, *, selected):
               "groups": len(results),
               "missing_groups": [], "failed_groups": [],
               "interrupted_groups": [], "cancelled_groups": [],
-              "unaccounted_groups": []}
+              "unaccounted_groups": [], "unproven_groups": [],
+              "missing_tests": {}}
     for result in results:
         counts = result.get("counts") or {}
         ran = int(counts.get("ran") or 0)
@@ -653,36 +831,48 @@ def aggregate(results, *, selected):
         totals["failures"] += int(counts.get("failures") or 0)
         totals["errors"] += int(counts.get("errors") or 0)
         totals["skipped"] += int(counts.get("skipped") or 0)
-        totals["class_skips"] += int(result.get("class_skips") or 0)
         if result.get("missing"):
             totals["missing_groups"].append(result["name"])
         if result.get("cancelled"):
             totals["cancelled_groups"].append(result["name"])
+        if result.get("containment_failed"):
+            totals["unproven_groups"].append(result["name"])
         returncode = result.get("returncode")
         if (result.get("interrupted")
                 or (isinstance(returncode, int) and returncode < 0)):
             totals["interrupted_groups"].append(result["name"])
         elif returncode not in (0, None):
             totals["failed_groups"].append(result["name"])
-        if returncode == 0 and not result.get("cancelled"):
-            # A class/module-level ``SkipTest`` makes unittest report fewer
-            # "Ran" tests than the group selected while still returning OK.
-            # The unrun remainder is a legitimate class skip, not missing
-            # coverage; without skip evidence it is reported as unaccounted.
-            group_selected = len(result.get("tests") or [])
-            remaining = max(0, group_selected - ran)
-            skipped = int(counts.get("skipped") or 0)
-            if remaining and (result.get("class_skips") or skipped):
-                totals["class_skipped_tests"] += remaining
-            elif remaining:
+        outcomes = result.get("outcomes")
+        if isinstance(outcomes, dict):
+            totals["class_skips"] += sum(
+                1 for test_id, status in outcomes.items()
+                if status == "skipped"
+                and (test_id.startswith(_CLASS_SKIP_PREFIX)
+                     or test_id.startswith(_MODULE_SKIP_PREFIX)))
+        if (returncode == 0 and not result.get("cancelled")
+                and not result.get("interrupted")):
+            group_tests = list(result.get("tests") or [])
+            if isinstance(outcomes, dict):
+                covered, expanded = _covered_ids(group_tests, outcomes)
+                totals["accounted"] += len(covered)
+                totals["class_skipped_tests"] += len(expanded)
+                missing = set(group_tests) - covered
+                if missing:
+                    totals["unaccounted_groups"].append(result["name"])
+                    totals["missing_tests"][result["name"]] = sorted(missing)
+            else:
+                # Without the child's own outcomes a skip anywhere in the log
+                # cannot prove which selected test ran, so the group is not
+                # reusable evidence.
                 totals["unaccounted_groups"].append(result["name"])
-    totals["accounted"] = totals["ran"] + totals["class_skipped_tests"]
     totals["exit_code"] = 0 if (totals["accounted"] == totals["selected"]
                                 and not totals["missing_groups"]
                                 and not totals["interrupted_groups"]
                                 and not totals["cancelled_groups"]
                                 and not totals["failed_groups"]
                                 and not totals["unaccounted_groups"]
+                                and not totals["unproven_groups"]
                                 and totals["failures"] == 0
                                 and totals["errors"] == 0) else 1
     return totals
@@ -697,7 +887,9 @@ def _source_state(start_dir):
     """Source identity before/after a run, including dirty worktree bytes.
 
     A bare ``HEAD`` cannot show a dirty or mid-run-changing checkout, so this
-    fingerprints the revision, status and binary diff together.
+    fingerprints the revision, status, tracked binary diff and the bytes of
+    every untracked, non-ignored file.  Hashing only status would leave an edit
+    to an existing untracked test invisible.
     """
     root = Path(start_dir).resolve().parents[1]
     try:
@@ -705,6 +897,8 @@ def _source_state(start_dir):
         status = _git(root, "status", "--porcelain=v1",
                       "--untracked-files=normal")
         diff = _git(root, "diff", "HEAD", "--binary")
+        untracked = _git(root, "ls-files", "--others", "--exclude-standard",
+                         "-z")
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return {"head": None, "dirty": None, "fingerprint": None}
     digest = hashlib.sha256()
@@ -713,7 +907,19 @@ def _source_state(start_dir):
     digest.update(status)
     digest.update(b"\0")
     digest.update(diff)
+    digest.update(b"\0untracked\0")
+    paths = sorted(part for part in untracked.split(b"\0") if part)
+    for relative in paths:
+        digest.update(relative)
+        digest.update(b"\0")
+        try:
+            data = (root / os.fsdecode(relative)).read_bytes()
+        except OSError:
+            digest.update(b"<unreadable>")
+        else:
+            digest.update(hashlib.sha256(data).digest())
     return {"head": head, "dirty": bool(status.strip()),
+            "untracked": len(paths),
             "fingerprint": digest.hexdigest()}
 
 
@@ -726,6 +932,17 @@ def build_report(*, start_dir, pattern, selected, plan, limits, results,
         source_before = source_after
     discovery = dict(discovery or {})
     entry_count = int(discovery.get("entries", len(selected)))
+    before_fingerprint = source_before.get("fingerprint")
+    after_fingerprint = source_after.get("fingerprint")
+    changed = before_fingerprint != after_fingerprint
+    unstable = []
+    if changed:
+        unstable.append("source changed during execution")
+    if source_before.get("dirty") or source_after.get("dirty"):
+        unstable.append("checkout was dirty")
+    if not before_fingerprint or not after_fingerprint:
+        unstable.append("source fingerprint unavailable")
+    stable = not unstable and not changed
     return {
         "version": 1,
         "start_dir": str(start_dir),
@@ -735,8 +952,12 @@ def build_report(*, start_dir, pattern, selected, plan, limits, results,
                       "discovered_entries": entry_count,
                       "duplicate_ids": discovery.get("duplicates") or {}},
         "source": {"before": source_before, "after": source_after,
-                   "changed": (source_before.get("fingerprint")
-                               != source_after.get("fingerprint"))},
+                   "changed": changed,
+                   "stable": stable,
+                   "evidence_label": ("reusable" if stable
+                                      else "local diagnostics"),
+                   "unstable_reason": ("; ".join(unstable) if unstable
+                                       else None)},
         "limits": limits,
         "plan": plan,
         "results": results,
@@ -767,6 +988,12 @@ def _print_summary(report):
         print("source changed during execution: %s -> %s"
               % ((source.get("before") or {}).get("fingerprint"),
                  (source.get("after") or {}).get("fingerprint")))
+    if not source.get("stable", True):
+        print("evidence: %s (%s)"
+              % (source.get("evidence_label", "local diagnostics"),
+                 source.get("unstable_reason") or "unstable source"))
+    else:
+        print("evidence: reusable (clean, stable source)")
     for result in report["results"]:
         counts = result.get("counts") or {}
         print("%-24s exit=%s ran=%s failures=%s errors=%s skipped=%s %s"
@@ -787,6 +1014,8 @@ def _print_summary(report):
         print("cancelled groups: " + ", ".join(totals["cancelled_groups"]))
     if totals["unaccounted_groups"]:
         print("unaccounted groups: " + ", ".join(totals["unaccounted_groups"]))
+    if totals["unproven_groups"]:
+        print("containment unproven: " + ", ".join(totals["unproven_groups"]))
     if totals["failed_groups"]:
         print("failed groups: " + ", ".join(totals["failed_groups"]))
 
@@ -809,7 +1038,10 @@ def main(argv=None):
                         help="scheduling niceness; values below %d are raised "
                              "to keep reduced priority" % DEFAULT_NICE)
     parser.add_argument("--min-memory-mb", type=int,
-                        default=DEFAULT_MIN_MEMORY_MB)
+                        default=DEFAULT_MIN_MEMORY_MB,
+                        help="available-memory floor; values below %d are "
+                             "raised to the repository minimum"
+                             % DEFAULT_MIN_MEMORY_MB)
     parser.add_argument("--no-taskset", action="store_true",
                         help="test serial fallback when taskset is unavailable")
     parser.add_argument("--output-dir", default=None)

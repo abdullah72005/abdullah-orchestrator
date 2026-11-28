@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -32,6 +33,22 @@ def _write_module(folder, name, tests):
         lines.append("    def %s(self):\n        self.assertTrue(True)\n" % test_name)
     lines.append("\n\nif __name__ == '__main__':\n    unittest.main()\n")
     (Path(folder) / (name + ".py")).write_text("".join(lines), encoding="utf-8")
+
+
+def _process_alive(pid):
+    """Whether ``pid`` is a live (non-zombie) process, using /proc when present."""
+    try:
+        stat = Path("/proc/%d/stat" % pid).read_text(encoding="utf-8")
+    except OSError:
+        try:
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            return False
+        return True
+    try:
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+    except IndexError:
+        return True
 
 
 class RunnerFixture(unittest.TestCase):
@@ -210,6 +227,37 @@ class LimitsAndCommandTests(unittest.TestCase):
         self.assertTrue(verified["affinity_verified"])
         self.assertFalse(verified["serial_fallback"])
 
+    def test_every_planned_affinity_assignment_is_probed(self):
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
+                patch.object(runner, "_available_cpus",
+                             return_value=[0, 1, 2, 3]), \
+                patch.object(runner, "_available_memory_mb", return_value=8192):
+            limits = runner.resolve_limits(workers=2, cpu_budget=4, nice=10,
+                                           require_taskset=True)
+        commands = []
+
+        def probe(command):
+            commands.append(command)
+            return 0, ""
+
+        verified = runner.probe_parallel_environment(limits, probe=probe)
+        self.assertEqual(len(commands), 2, commands)
+        self.assertEqual(commands[0][:5],
+                         ["/usr/bin/taskset", "-c", "0,1", "nice", "-n"])
+        self.assertEqual(commands[1][2], "2,3")
+        self.assertEqual(verified["verified_assignments"], ["0,1", "2,3"])
+        self.assertTrue(verified["affinity_verified"])
+
+        def second_fails(command):
+            return (0, "") if command[2] == "0,1" else (126, "denied")
+
+        failed = runner.probe_parallel_environment(limits, probe=second_fails)
+        self.assertEqual(failed["workers"], 1)
+        self.assertTrue(failed["serial_fallback"])
+        self.assertFalse(failed["affinity_verified"])
+        self.assertEqual(failed["verified_assignments"], ["0,1"])
+        self.assertIn("affinity", failed["fallback_reason"])
+
     def test_wsl_requires_provable_host_memory_headroom(self):
         with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
                 patch.object(runner, "_available_cpus",
@@ -229,6 +277,40 @@ class LimitsAndCommandTests(unittest.TestCase):
         self.assertIn("Windows host", tight["fallback_reason"])
         self.assertEqual(roomy["workers"], 2)
         self.assertFalse(roomy["serial_fallback"])
+
+    def test_min_memory_floor_cannot_be_lowered(self):
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
+                patch.object(runner, "_available_cpus",
+                             return_value=[0, 1, 2, 3]), \
+                patch.object(runner, "_available_memory_mb", return_value=1):
+            guest = runner.resolve_limits(workers=2, min_memory_mb=0)
+        self.assertEqual(guest["workers"], 1)
+        self.assertEqual(guest["min_memory_mb"], 1024)
+        self.assertIn("memory", guest["fallback_reason"])
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
+                patch.object(runner, "_available_cpus",
+                             return_value=[0, 1, 2, 3]), \
+                patch.object(runner, "_available_memory_mb", return_value=8192):
+            host = runner.resolve_limits(workers=2, wsl=True,
+                                         host_memory_mb=1, min_memory_mb=0)
+            raised = runner.resolve_limits(workers=2, wsl=True,
+                                           host_memory_mb=8192,
+                                           min_memory_mb=2048)
+        self.assertEqual(host["workers"], 1)
+        self.assertEqual(host["min_memory_mb"], 1024)
+        self.assertIn("Windows host", host["fallback_reason"])
+        self.assertEqual(raised["workers"], 2)
+        self.assertEqual(raised["min_memory_mb"], 2048)
+
+    def test_unprovable_guest_memory_falls_back_before_groups(self):
+        with patch.object(runner.shutil, "which", return_value="/usr/bin/taskset"), \
+                patch.object(runner, "_available_cpus",
+                             return_value=[0, 1, 2, 3]), \
+                patch.object(runner, "_available_memory_mb", return_value=None):
+            limits = runner.resolve_limits(workers=2)
+        self.assertEqual(limits["workers"], 1)
+        self.assertTrue(limits["serial_fallback"])
+        self.assertIn("could not be proven", limits["fallback_reason"])
 
     def test_incident_suites_stay_serial_and_outside_parallel_groups(self):
         ids = ["test_v121_evidence_reuse.Cases.test_a",
@@ -320,17 +402,30 @@ class ExecutionAggregationTests(RunnerFixture):
         self.assertEqual(len(ran), len(set(ran)))
 
     def test_aggregation_reports_skips_failures_and_missing_groups(self):
-        passed = {"name": "worker:1", "counts": {"ran": 3, "failures": 0,
-                                                  "errors": 0, "skipped": 1},
+        passed = {"name": "worker:1",
+                  "tests": ["m.Cases.test_a", "m.Cases.test_b",
+                            "m.Cases.test_c"],
+                  "counts": {"ran": 3, "failures": 0,
+                             "errors": 0, "skipped": 1},
+                  "outcomes": {"m.Cases.test_a": "success",
+                               "m.Cases.test_b": "skipped",
+                               "m.Cases.test_c": "success"},
                   "returncode": 0}
-        skipped = {"name": "worker:2", "counts": {"ran": 2, "failures": 0,
-                                                   "errors": 0, "skipped": 2},
+        skipped = {"name": "worker:2",
+                   "tests": ["n.Cases.test_d", "n.Cases.test_e"],
+                   "counts": {"ran": 2, "failures": 0,
+                              "errors": 0, "skipped": 2},
+                   "outcomes": {"n.Cases.test_d": "skipped",
+                                "n.Cases.test_e": "skipped"},
                    "returncode": 0}
         totals = runner.aggregate([passed, skipped], selected=5)
         self.assertEqual(totals["exit_code"], 0, totals)
         self.assertEqual(totals["skipped"], 3)
-        failed = {"name": "worker:3", "counts": {"ran": 1, "failures": 1,
-                                                  "errors": 0, "skipped": 0},
+        failed = {"name": "worker:3",
+                  "tests": ["m.Cases.test_a"],
+                  "counts": {"ran": 1, "failures": 1,
+                             "errors": 0, "skipped": 0},
+                  "outcomes": {"m.Cases.test_a": "failure"},
                   "returncode": 1}
         totals = runner.aggregate([passed, failed], selected=4)
         self.assertEqual(totals["exit_code"], 1)
@@ -350,6 +445,14 @@ class ExecutionAggregationTests(RunnerFixture):
             "Ran 3 tests in 0.1s\n\nFAILED (failures=1, errors=2, skipped=1)\n")
         self.assertEqual(failed, {"ran": 3, "failures": 1, "errors": 2,
                                   "skipped": 1})
+        nested = runner._parse_unittest_output(
+            "test_outer ... test_inner ... ok\n\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 40 tests in 0.010s\n\nOK\nok\n\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.020s\n\nOK\n")
+        self.assertEqual(nested, {"ran": 1, "failures": 0, "errors": 0,
+                                  "skipped": 0})
 
     def test_report_records_selection_limits_logs_and_totals(self):
         ids = runner.collect_test_ids(self.tests)
@@ -394,6 +497,113 @@ class ExecutionAggregationTests(RunnerFixture):
         self.assertEqual(totals["class_skips"], 1, totals)
         self.assertEqual(totals["class_skipped_tests"], 2, totals)
         self.assertEqual(totals["accounted"], len(selected), totals)
+
+    def test_a_skip_elsewhere_does_not_account_for_a_missing_test(self):
+        result = {"name": "worker:1",
+                  "tests": ["m.Cases.test_a", "m.Cases.test_b"],
+                  "counts": {"ran": 1, "failures": 0,
+                             "errors": 0, "skipped": 1},
+                  "outcomes": {"m.Cases.test_a": "skipped"},
+                  "returncode": 0}
+        totals = runner.aggregate([result], selected=2)
+        self.assertEqual(totals["unaccounted_groups"], ["worker:1"])
+        self.assertEqual(totals["missing_tests"],
+                         {"worker:1": ["m.Cases.test_b"]})
+        self.assertEqual(totals["exit_code"], 1)
+
+    def test_nested_unittest_output_does_not_change_runner_counts(self):
+        inner_ids = runner.collect_test_ids(self.tests)
+        inner = ",\n                ".join(repr(test_id) for test_id in inner_ids)
+        (self.tests / "test_nested_outer.py").write_text(
+            "import unittest\n\n"
+            "class Outer(unittest.TestCase):\n"
+            "    def test_nested(self):\n"
+            "        suite = unittest.defaultTestLoader.loadTestsFromNames([\n"
+            "                %s])\n"
+            "        unittest.TextTestRunner(verbosity=2).run(suite)\n"
+            "        self.assertTrue(True)\n" % inner,
+            encoding="utf-8")
+        outer = "test_nested_outer.Outer.test_nested"
+        limits = runner.resolve_limits(workers=1)
+        plan = runner.partition_tests([outer], workers=1)
+        results = runner.execute_plan(
+            plan, start_dir=self.tests,
+            output_dir=self.root / "nested-logs", limits=limits)
+        totals = runner.aggregate(results, selected=1)
+        self.assertEqual(results[0]["counts"]["ran"], 1, results[0])
+        self.assertEqual(totals["accounted"], 1, totals)
+        self.assertEqual(totals["exit_code"], 0, totals)
+        log_text = Path(results[0]["log"]["path"]).read_text(encoding="utf-8")
+        self.assertIn("Ran %d tests" % len(inner_ids), log_text)
+
+    def test_descendant_ignoring_sigterm_is_contained_after_leader_exit(self):
+        script = self.root / "spawn_descendant.py"
+        pid_file = self.root / "child.pid"
+        script.write_text(
+            "import subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-c',\n"
+            "    'import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'])\n"
+            "open(%r, 'w', encoding='utf-8').write(str(child.pid))\n"
+            "sys.exit(0)\n" % str(pid_file),
+            encoding="utf-8")
+        group = {"name": "serial:descendant", "modules": ["test_alpha"],
+                 "tests": ["test_alpha.Cases.test_one"], "serial": True}
+        with patch.object(runner, "build_group_command",
+                          return_value=[sys.executable, str(script)]):
+            result = runner.run_group(
+                group, start_dir=self.tests,
+                output_dir=self.root / "descendant-logs",
+                limits=runner.resolve_limits(workers=1), timeout=30,
+                termination_grace=0.5)
+        self.assertEqual(result["returncode"], 0, result)
+        self.assertFalse(result.get("containment_failed"), result)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 3.0
+        while _process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(_process_alive(pid),
+                         "descendant %d escaped the runner" % pid)
+
+    def test_timeout_terminates_a_sigterm_ignoring_descendant(self):
+        script = self.root / "spawn_timeout_tree.py"
+        pid_file = self.root / "timeout-child.pid"
+        script.write_text(
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c',\n"
+            "    'import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'])\n"
+            "open(%r, 'w', encoding='utf-8').write(str(child.pid))\n"
+            "time.sleep(120)\n" % str(pid_file),
+            encoding="utf-8")
+        group = {"name": "serial:timeout-tree", "modules": ["test_alpha"],
+                 "tests": ["test_alpha.Cases.test_one"], "serial": True}
+        with patch.object(runner, "build_group_command",
+                          return_value=[sys.executable, str(script)]):
+            result = runner.run_group(
+                group, start_dir=self.tests,
+                output_dir=self.root / "timeout-logs",
+                limits=runner.resolve_limits(workers=1), timeout=1,
+                termination_grace=0.5)
+        self.assertTrue(result.get("interrupted"), result)
+        self.assertIn("timeout", result["interrupt_reason"])
+        self.assertFalse(result.get("containment_failed"), result)
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 3.0
+        while _process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(_process_alive(pid),
+                         "timed-out descendant %d escaped the runner" % pid)
+
+    def test_unproven_containment_is_reported_as_a_failure(self):
+        result = {"name": "worker:1", "tests": ["m.Cases.test_a"],
+                  "counts": {"ran": 1, "failures": 0,
+                             "errors": 0, "skipped": 0},
+                  "outcomes": {"m.Cases.test_a": "success"},
+                  "returncode": 0, "containment_failed": True}
+        totals = runner.aggregate([result], selected=1)
+        self.assertEqual(totals["unproven_groups"], ["worker:1"])
+        self.assertEqual(totals["exit_code"], 1)
 
     def test_sigint_child_is_interrupted_not_a_failed_group(self):
         group = {"name": "worker:sigint", "modules": ["test_alpha"],
@@ -451,11 +661,47 @@ class ExecutionAggregationTests(RunnerFixture):
                        "duplicates": {"test_alpha.Cases.test_one": 2}},
             source_before=before, source_after=after)
         self.assertTrue(report["source"]["changed"])
+        self.assertFalse(report["source"]["stable"])
+        self.assertEqual(report["source"]["evidence_label"], "local diagnostics")
+        self.assertIn("changed", report["source"]["unstable_reason"])
         self.assertEqual(report["selection"]["discovered_entries"],
                          len(ids) + 2)
         self.assertEqual(report["selection"]["duplicate_ids"],
                          {"test_alpha.Cases.test_one": 2})
         self.assertEqual(report["revision"], "a" * 40)
+
+    def test_clean_stable_source_is_labelled_reusable(self):
+        stable = {"head": "b" * 40, "dirty": False, "fingerprint": "same"}
+        ids = runner.collect_test_ids(self.tests)
+        plan = runner.partition_tests(ids, workers=1)
+        report = runner.build_report(
+            start_dir=self.tests, pattern="test*.py", selected=ids,
+            plan=plan, limits=runner.resolve_limits(workers=1), results=[],
+            source_before=stable, source_after=dict(stable))
+        self.assertEqual(report["source"]["evidence_label"], "reusable")
+        self.assertTrue(report["source"]["stable"])
+        self.assertIsNone(report["source"]["unstable_reason"])
+
+    def test_source_state_includes_untracked_test_bytes(self):
+        root = Path(tempfile.mkdtemp(prefix="source-state-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        tests = root / "scripts" / "tests"
+        tests.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.com",
+                        "commit", "-qm", "base", "--allow-empty"],
+                       cwd=root, check=True, capture_output=True)
+        candidate = tests / "test_untracked.py"
+        candidate.write_text("VALUE = 1\n", encoding="utf-8")
+        before = runner._source_state(tests)
+        candidate.write_text("VALUE = 2\n", encoding="utf-8")
+        after = runner._source_state(tests)
+        self.assertTrue(before["dirty"])
+        self.assertEqual(before["untracked"], 1)
+        self.assertEqual(before["head"], after["head"])
+        self.assertNotEqual(before["fingerprint"], after["fingerprint"])
 
     def test_source_state_fingerprints_the_real_checkout(self):
         root = Path(runner.__file__).resolve().parents[1]

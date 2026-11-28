@@ -62,22 +62,30 @@ class is found under every importing module while its id keeps the defining
 module, so both counts are reported and the duplicates are collapsed. On
 Ubuntu/WSL it limits the aggregate worker process trees to four logical CPUs with
 `taskset` and lowers scheduling priority with `nice`; the command line can only
-tighten those bounds. The affinity/priority prefix is proved with a no-op probe
+tighten those bounds, and `--min-memory-mb` can only raise the memory floor. The
+affinity/priority prefix is proved for every planned worker with a no-op probe
 before parallel work starts, and WSL runs also require provable Windows-host
-memory headroom. If a limit cannot be applied, that proof fails, host memory is
+memory headroom. If a limit cannot be applied, any proof fails, host memory is
 tight or unprovable, or available guest memory is below the configured floor,
-the runner falls back to serial. Its JSON result records the exact selection and
-discovery counts, source revision and dirty-state fingerprint before and after
-execution, commands, logs and digests, worker/CPU limits, and aggregate counts,
-failures, errors, class-level skips, missing, unaccounted, cancelled and
-interrupted groups. A class/module `SkipTest` is accounted as valid skipped
-coverage rather than missing coverage, and a worker terminated by a signal is
-reported as interrupted rather than failed. Focused fixtures in
-`test_parallel_test_runner.py` prove selection, imported-alias deduplication,
-ambiguous-id refusal, module boundaries, exactly-once coverage, bounded overlap,
-CPU/nice clamping, affinity/host-headroom fallback, skip accounting, interrupt
-classification and aggregation; they do not run the product suite. This helper
-does not replace the final local gate.
+the runner falls back to serial. Each group runs through
+`scripts/_unittest_group.py`, whose own `TestResult` writes counts and per-test
+outcomes to a sidecar, so nested output or a printed `Ran N tests` summary cannot
+change accounting. A class/module `SkipTest` covers only its own selected tests;
+an unrelated skip elsewhere in the group cannot account for a missing test. Its
+JSON result records the exact selection and discovery counts, source revision and
+dirty-state fingerprint (tracked changes plus untracked source bytes) before and
+after execution, commands, logs and digests, worker/CPU limits, and aggregate
+counts, failures, errors, class/module skips, missing, unaccounted, cancelled,
+interrupted and containment-unproven groups. Dirty or changing runs are labelled
+local diagnostics rather than reusable evidence. The runner stops and proves the
+whole process tree, including descendants that outlive the group leader, and a
+worker terminated by a signal is reported as interrupted rather than failed.
+Focused fixtures in `test_parallel_test_runner.py` prove selection, imported-alias
+deduplication, ambiguous-id refusal, module boundaries, exactly-once coverage,
+bounded overlap, CPU/nice clamping, every-assignment affinity and host-headroom
+fallback, skip scoping, nested-output independence, descendant containment,
+interrupt classification, untracked-byte fingerprinting and aggregation; they do
+not run the product suite. This helper does not replace the final local gate.
 
 Coverage areas:
 | Area | Representative tests |
