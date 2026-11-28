@@ -1,7 +1,7 @@
 # Installation
 
-This guide installs the published `v1.0.0` release, or the published v1.2.2
-release from `main` (there is no `v1.2.2` tag yet), from a fresh clone. It
+This guide installs the published `v1.0.0` release or the current `v1.2.2`
+release from a fresh clone. It
 verifies the installation without spending a model call, and shows how to
 upgrade, roll back and uninstall.
 
@@ -66,15 +66,14 @@ would move work to unexpected API billing.
 ```bash
 git clone https://github.com/abdullah72005/abdullah-orchestrator.git
 cd abdullah-orchestrator
-git checkout main             # v1.2.2 is published on main, not as a tag
+git checkout v1.2.2          # the current release tag
 python3 scripts/install_wsl.py --register-codex
 ```
 
-> **v1.2.2 is published on `main`, without a `v1.2.2` tag.**
-> `git checkout v1.2.2` fails until that tag is created. Install the release from
-> `main`, or record the commit you cloned with `git rev-parse HEAD` and install
-> from that revision. Install the published `v1.0.0` tag only when you
-> specifically need that older tagged release.
+> **`v1.2.2` is the current release tag.**
+> Check out `v1.2.2` for a reproducible install, or `main` for the latest state.
+> Install the older `v1.0.0` tag only when you specifically need that tagged
+> release.
 
 What the installer does, and does not do:
 
@@ -399,19 +398,16 @@ followed by a preflight. Your config and run state are separate and untouched.
 
 ```bash
 cd /path/to/abdullah-orchestrator
-git fetch origin
+git fetch --tags origin
 git status --short                 # stop if you have local changes you care about
-git checkout main                  # v1.2.2 is published on main; no v1.2.2 tag exists
-git pull --ff-only origin main
+git checkout v1.2.2                # current release tag; use main for latest state
 python3 -m unittest discover -s scripts/tests
 python3 scripts/orchestrator.py doctor --project /absolute/path/to/dev/repo
 ```
 
-The published tag remains `v1.0.0`. The v1.2.2 release is identified by the
-publication commit at the tip of `main` (record it with `git rev-parse HEAD`
-after checking out); the changes and evidence are recorded in the
-[changelog](../CHANGELOG.md#122--2026-11-28). Check out that revision directly
-until a `v1.2.2` tag is created.
+Release tags are `v1.0.0` and `v1.2.2`. The v1.2.2 changes, approval and evidence
+are recorded in the [changelog](../CHANGELOG.md#122--2026-11-28); `main` may be
+ahead of the tag as later documentation or fixes land.
 
 Finish or migrate active runs before changing versions. `python3
 scripts/orchestrator.py compatibility <RUN>` reports `current`, `legacy`,

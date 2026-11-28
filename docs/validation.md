@@ -413,8 +413,9 @@ authenticated host or provider-settlement evidence.
 ### v1.2.2 publication (2026-11-28)
 
 The v1.2.2 code was Architect-approved at
-`b6b01eafa8f976b30ef16bb78ea7c1d564b68926` (`b6b01ea`) and published on `main`
-without a tag or GitHub release. Public product version is `1.2.2`; supervisor
+`b6b01eafa8f976b30ef16bb78ea7c1d564b68926` (`b6b01ea`) and released as the
+`v1.2.2` tag and GitHub Release; it is also on `main`. Public product version is
+`1.2.2`; supervisor
 `3.1.0`, state/config schema `3`, worker report contract `2` and verification
 evidence `2` are unchanged.
 

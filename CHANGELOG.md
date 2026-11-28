@@ -6,12 +6,12 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [1.2.2] — 2026-11-28
 
-**Published on `main`.** Adds opt-in Antigravity, automatic plan progression
+**Published as the `v1.2.2` tag and GitHub Release, and on `main`.** Adds opt-in
+Antigravity, automatic plan progression
 with in-chat consultation, model controls, compact Reviewer packets,
 attempt-aware progress, and opt-in parallel tests bounded to two workers and four
 logical CPUs. The code was Architect-approved at
-`b6b01eafa8f976b30ef16bb78ea7c1d564b68926` (`b6b01ea`). This is a publication
-on `main` without a `v1.2.2` tag or GitHub release. Internal identifiers are
+`b6b01eafa8f976b30ef16bb78ea7c1d564b68926` (`b6b01ea`). Internal identifiers are
 unchanged: supervisor protocol `3.1.0`, state/config schema `3`, worker report
 contract `2`, verification evidence `2`.
 
@@ -832,8 +832,8 @@ state schema `2`, config schema `2`, verification evidence `2`.
 - Added MIT license, contribution guide, security policy, changelog, CI, and
   issue/PR templates.
 
-[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/commits/main
-[1.2.2]: https://github.com/abdullah72005/abdullah-orchestrator/commits/main
+[Unreleased]: https://github.com/abdullah72005/abdullah-orchestrator/compare/v1.2.2...main
+[1.2.2]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.2.2
 [1.2.1]: docs/release-evidence/verified-parallel-orchestration/README.md
 [1.2.0]: docs/release-evidence/v1.2.0/README.md
 [1.0.0]: https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.0.0

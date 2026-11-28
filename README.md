@@ -7,7 +7,7 @@
 <p align="center"><strong>Strong-model decisions. Cost-conscious execution. Independent verification. One controlling conversation.</strong></p>
 
 <p align="center">
-  <a href="CHANGELOG.md#122--2026-11-28"><img alt="Release v1.2.2 on main" src="https://img.shields.io/badge/release-v1.2.2%20on%20main-2f6f4e"></a>
+  <a href="https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.2.2"><img alt="Release v1.2.2" src="https://img.shields.io/badge/release-v1.2.2-2f6f4e"></a>
   <a href="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/abdullah72005/abdullah-orchestrator/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab"></a>
   <a href="#requirements"><img alt="Runtime: standard library only" src="https://img.shields.io/badge/runtime-stdlib%20only-4b5563"></a>
@@ -25,32 +25,6 @@ toolchain or an unverified "it works" cannot silently become accepted work.
 Every model identifier is configurable: Architect models per host, and worker
 provider, model, reasoning variant and billing classification per role. The
 default worker route is OpenCode Go.
-
-> [!IMPORTANT]
-> **Project status — v1.2.2 published on `main`.** Codex + OpenCode V2 is
-> the primary route; Codex + OpenCode Go end-to-end execution and
-> interrupted-run recovery are demonstrated. OpenCode V1 remains experimental.
-> Claude Code has passed installed-CLI registration and a headless
-> fixture-backed planning stage, and the Windows Codex desktop with a WSL agent
-> completed planning and implementation through the disposable supervisor.
-> The v1.2.2 code was Architect-approved at `b6b01ea`.
-> **v1.2.2** adds opt-in Antigravity, automatic plan progression with in-chat
-> consultation, model controls, compact Reviewer packets, attempt-aware
-> progress, and an opt-in bounded parallel test runner capped at two workers and
-> four logical CPUs. It includes the post-v1.2.0 live-progress and single-chat
-> reporting follow-up. Antigravity is **fixture-tested with authenticated live
-> acceptance pending**: guarded `agy` routing, stdin transport, terminal report
-> validation and CLI/desktop setup pass deterministic fixtures, but no
-> authenticated Antigravity CLI or desktop run has passed, and `agy` was absent
-> from the validation shell. The native Reviewer handoff still needs eligible
-> verification evidence for a live dispatch.
-> Authenticated long Claude stages, desktop Stop controls and same-session
-> Reviewer shell/edit capability remain unverified. Native in-chat progress was
-> observed only on Claude Code CLI; Codex CLI and Claude desktop lack a verified
-> in-chat live view, and Codex desktop tool-card progress remains unverified.
-> Broader live compatibility and long-duration endurance testing remain ongoing.
-> See [Tested behavior](#tested-behavior) and
-> [Security and limitations](#security-and-limitations).
 
 ---
 
@@ -167,26 +141,22 @@ application permissions. It never launches inference.
 ```bash
 git clone https://github.com/abdullah72005/abdullah-orchestrator.git
 cd abdullah-orchestrator
+git checkout v1.2.2
 python3 scripts/install_wsl.py --register-codex
 ```
 
-v1.2.2 is published on `main` without a `v1.2.2` tag. The clone above is
-sufficient; no tag checkout is required. If you need a reproducible pin, record
-the cloned commit and install from it:
+v1.2.2 is published as the
+[`v1.2.2` release](https://github.com/abdullah72005/abdullah-orchestrator/releases/tag/v1.2.2)
+and on `main`. Install from the tag for a reproducible release, or from `main`
+for the latest state. If you install from `main`, record `git rev-parse HEAD` so
+you can return to the exact commit you validated.
 
-```bash
-cd /path/to/abdullah-orchestrator
-git rev-parse HEAD          # record this for reproducible installs
-python3 scripts/install_wsl.py --register-codex
-```
-
-The last tagged release remains
+The previous tagged release remains
 [`v1.0.0`](https://github.com/abdullah72005/abdullah-orchestrator/tree/v1.0.0).
 The v1.2.2 changes, approval and evidence are in
 [CHANGELOG.md](CHANGELOG.md#122--2026-11-28); historical v1.2.1 Batch 01
 evidence remains in
 [docs/release-evidence/verified-parallel-orchestration/](docs/release-evidence/verified-parallel-orchestration/README.md).
-Do not assume a public `v1.2.2` tag or GitHub release exists.
 
 The installer is idempotent and refuses to overwrite unrelated skills or
 servers. It:
@@ -1045,14 +1015,35 @@ Reporting: [SECURITY.md](SECURITY.md).
 
 ## Project status
 
-**v1.2.2 published on `main`.** Adds opt-in Antigravity, automatic plan
-progression with in-chat consultation, model controls, compact Reviewer packets,
-attempt-aware progress, and opt-in parallel tests bounded to two workers and four
-logical CPUs. The code was Architect-approved at `b6b01ea`; Antigravity is
-fixture-tested with authenticated live acceptance pending, and the native
-Reviewer handoff still needs eligible verification evidence. Internal versions
-are unchanged: supervisor `3.1.0`, state/config schema `3`, worker report
-contract `2`. The release keeps the v1.2.1 supervisor-bound reuse of formal
+> [!IMPORTANT]
+> **Project status — v1.2.2 released.** Codex + OpenCode V2 is
+> the primary route; Codex + OpenCode Go end-to-end execution and
+> interrupted-run recovery are demonstrated. OpenCode V1 remains experimental.
+> Claude Code has passed installed-CLI registration and a headless
+> fixture-backed planning stage, and the Windows Codex desktop with a WSL agent
+> completed planning and implementation through the disposable supervisor.
+> The v1.2.2 code was Architect-approved at `b6b01ea`.
+> **v1.2.2** adds opt-in Antigravity, automatic plan progression with in-chat
+> consultation, model controls, compact Reviewer packets, attempt-aware
+> progress, and an opt-in bounded parallel test runner capped at two workers and
+> four logical CPUs. It includes the post-v1.2.0 live-progress and single-chat
+> reporting follow-up. Antigravity is **fixture-tested with authenticated live
+> acceptance pending**: guarded `agy` routing, stdin transport, terminal report
+> validation and CLI/desktop setup pass deterministic fixtures, but no
+> authenticated Antigravity CLI or desktop run has passed, and `agy` was absent
+> from the validation shell. The native Reviewer handoff still needs eligible
+> verification evidence for a live dispatch.
+> Authenticated long Claude stages, desktop Stop controls and same-session
+> Reviewer shell/edit capability remain unverified. Native in-chat progress was
+> observed only on Claude Code CLI; Codex CLI and Claude desktop lack a verified
+> in-chat live view, and Codex desktop tool-card progress remains unverified.
+> Broader live compatibility and long-duration endurance testing remain ongoing.
+> See [Tested behavior](#tested-behavior) and
+> [Security and limitations](#security-and-limitations).
+
+Internal versions are unchanged: supervisor `3.1.0`, state/config schema `3`,
+worker report contract `2`. The release keeps the v1.2.1 supervisor-bound reuse
+of formal
 verification, bounded stage progress with replay, opt-in parallel writers with
 isolated worktrees and exact integration, explicit role/writer skill routing,
 and grouped permission preflight with durable blocked recovery, plus the v1.2.0

@@ -62,7 +62,7 @@ schema ordering.
 | `v3.1.0-audit-candidate.1` | Internal v3.1 audit candidate | Preserved; never moved |
 | `final-audit-baseline`, `final-hardening-checkpoint` | Internal checkpoints | Preserved; never moved |
 | **`v1.0.0`** | **First public release** | Immutable release tag |
-| **`v1.2.2`** | **Antigravity, autonomous progression and bounded test fan-out** | Published on `main`; no tag yet |
+| **`v1.2.2`** | **Antigravity, autonomous progression and bounded test fan-out** | Release tag and GitHub Release published |
 | `v1.2.1` | Verified parallel orchestration | Historical; published on `main` without a tag |
 | `v1.2.0` | Workflow and review-evidence release candidate | Historical local candidate; never moved |
 
